@@ -74,6 +74,51 @@ impl ArchivedString {
             core::str::from_utf8_unchecked(bytes)
         }
     }
+
+    /// Zero-copy equality check against `expected` (`TASK-057`).
+    #[inline]
+    pub fn eq_str(&self, payload: &[u8], expected: &str) -> bool {
+        self.as_str(payload) == expected
+    }
+
+    /// Zero-copy prefix check (`STARTS WITH`, `TASK-057`).
+    #[inline]
+    pub fn starts_with(&self, payload: &[u8], prefix: &str) -> bool {
+        self.as_str(payload).starts_with(prefix)
+    }
+
+    /// Zero-copy suffix check (`ENDS WITH`, `TASK-057`).
+    #[inline]
+    pub fn ends_with(&self, payload: &[u8], suffix: &str) -> bool {
+        self.as_str(payload).ends_with(suffix)
+    }
+
+    /// Zero-copy substring check (`CONTAINS`, `TASK-057`).
+    #[inline]
+    pub fn contains(&self, payload: &[u8], needle: &str) -> bool {
+        self.as_str(payload).contains(needle)
+    }
+
+    /// Zero-copy ASCII case-insensitive equality check (`TASK-057`).
+    #[inline]
+    pub fn eq_ignore_ascii_case(&self, payload: &[u8], expected: &str) -> bool {
+        self.as_str(payload).eq_ignore_ascii_case(expected)
+    }
+
+    /// Zero-copy ASCII case-insensitive substring check (`ILIKE '%needle%'`, `0` heap allocations, `TASK-057`).
+    #[inline]
+    pub fn contains_ignore_ascii_case(&self, payload: &[u8], needle: &str) -> bool {
+        let n_bytes = needle.as_bytes();
+        if n_bytes.is_empty() {
+            return true;
+        }
+        let hay = self.as_str(payload).as_bytes();
+        if n_bytes.len() > hay.len() {
+            return false;
+        }
+        hay.windows(n_bytes.len())
+            .any(|w| w.eq_ignore_ascii_case(n_bytes))
+    }
 }
 
 impl fmt::Debug for ArchivedString {
@@ -408,6 +453,36 @@ impl<'a, T: ZeroCopyRecord> RecordView<'a, T> {
     #[inline]
     pub fn get_str(&self, field: &ArchivedString) -> &'a str {
         field.as_str(self.payload)
+    }
+
+    /// Zero-copy exact string comparison on an `ArchivedString` field (`TASK-057`).
+    #[inline]
+    pub fn str_eq(&self, field: &ArchivedString, expected: &str) -> bool {
+        field.eq_str(self.payload, expected)
+    }
+
+    /// Zero-copy prefix check (`STARTS WITH`) on an `ArchivedString` field (`TASK-057`).
+    #[inline]
+    pub fn str_starts_with(&self, field: &ArchivedString, prefix: &str) -> bool {
+        field.starts_with(self.payload, prefix)
+    }
+
+    /// Zero-copy suffix check (`ENDS WITH`) on an `ArchivedString` field (`TASK-057`).
+    #[inline]
+    pub fn str_ends_with(&self, field: &ArchivedString, suffix: &str) -> bool {
+        field.ends_with(self.payload, suffix)
+    }
+
+    /// Zero-copy substring check (`CONTAINS`) on an `ArchivedString` field (`TASK-057`).
+    #[inline]
+    pub fn str_contains(&self, field: &ArchivedString, needle: &str) -> bool {
+        field.contains(self.payload, needle)
+    }
+
+    /// Zero-copy ASCII case-insensitive substring check (`ILIKE '%needle%'`) on an `ArchivedString` field (`TASK-057`).
+    #[inline]
+    pub fn str_contains_ignore_ascii_case(&self, field: &ArchivedString, needle: &str) -> bool {
+        field.contains_ignore_ascii_case(self.payload, needle)
     }
 
     /// Resolves an `ArchivedBytes` field directly to `&'a [u8]` with zero allocation.

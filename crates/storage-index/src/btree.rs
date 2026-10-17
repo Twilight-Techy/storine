@@ -319,6 +319,53 @@ impl NumericRangeIndex {
         bm
     }
 
+    /// Single-leaf $O(\log N)$ point lookup returning a `CompressedBitmap` for `field_id == value` (`TASK-057`).
+    pub fn eq_bitmap(&self, field_id: u16, value: i64) -> CompressedBitmap {
+        let guard = self
+            .trees
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut bm = CompressedBitmap::new();
+        if let Some(tree) = guard.get(&field_id) {
+            if let Some(leaf) = tree.get(&value) {
+                leaf.insert_into_bitmap(&mut bm);
+            }
+        }
+        bm
+    }
+
+    /// Multi-point $O(M \log N)$ lookup returning a `CompressedBitmap` for `WHERE field_id IN (values)` (`TASK-057`).
+    pub fn in_values_bitmap(&self, field_id: u16, values: &[i64]) -> CompressedBitmap {
+        let guard = self
+            .trees
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut bm = CompressedBitmap::new();
+        if let Some(tree) = guard.get(&field_id) {
+            for &v in values {
+                if let Some(leaf) = tree.get(&v) {
+                    leaf.insert_into_bitmap(&mut bm);
+                }
+            }
+        }
+        bm
+    }
+
+    /// Returns a `CompressedBitmap` of all `RecordOrdinal`s that have any numeric value on `field_id` (`IS NOT NULL`, `TASK-057`).
+    pub fn all_on_field_bitmap(&self, field_id: u16) -> CompressedBitmap {
+        let guard = self
+            .trees
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut bm = CompressedBitmap::new();
+        if let Some(tree) = guard.get(&field_id) {
+            for (_k, leaf) in tree.iter() {
+                leaf.insert_into_bitmap(&mut bm);
+            }
+        }
+        bm
+    }
+
     /// Counts matching `RecordOrdinal`s in `range` on `field_id` with **zero heap allocations** (`TASK-048`, `F-OPT-01`).
     #[inline]
     pub fn count_in_range<R: RangeBounds<i64>>(&self, field_id: u16, range: R) -> usize {

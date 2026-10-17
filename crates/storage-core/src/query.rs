@@ -1,13 +1,14 @@
-//! Zero-allocation Query Builder, Set Filtering & Keyset/Offset Pagination (`TASK-019`, `TASK-027`, `TASK-055`, `TASK-056`).
+//! Zero-allocation Query Builder, Set Filtering & Keyset/Offset Pagination (`TASK-019`, `TASK-027`, `TASK-055`..`TASK-058`).
 
+use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::ops::RangeInclusive;
-use storage_codec::ZeroCopyRecord;
+use storage_codec::{RecordView, ZeroCopyRecord};
 use storage_index::{
     cosine_similarity_f32, sortable_f64_to_i64, sortable_u64_to_i64, CompressedBitmap, Indexable,
     KeysetCursor, SortOrder, VectorTopKHit,
 };
-use storage_types::{InlineId, RecordOrdinal, Result};
+use storage_types::{FastHashSet, InlineId, RecordOrdinal, Result};
 
 use crate::engine::{RecordRef, StorageEngine};
 use crate::optimizer::{QueryExplainPlan, QueryOptimizer};
@@ -43,12 +44,16 @@ pub struct QueryPage<Item> {
     pub next_cursor: Option<KeysetCursor>,
 }
 
-/// Fluent query builder combining secondary tag bitmaps (`AND`, `OR`/`IN`, `AND NOT`),
-/// numeric/timestamp B+Tree ranges (`i64`, `u64`, `f64`), bidirectional sort order (`Asc`/`Desc`),
-/// `offset` + `limit` windowing, $O(\log N)$ `KeysetCursor` pagination, zero-copy payload predicates,
-/// and SIMD cosine similarity scoring over AI memory embeddings.
+/// Fluent query builder combining:
+/// - Secondary tag bitmaps (`==`, `!=`, `IN`/`OR`, `STARTS WITH` prefix, `IS NOT NULL`, `IS NULL`),
+/// - Numeric/timestamp/float B+Tree comparisons (`==`, `!=`, `>`, `>=`, `<`, `<=`, `BETWEEN`, `NOT BETWEEN`, `IN`, `IS NOT NULL`, `IS NULL`),
+/// - Primary-key (`InlineId`) set & prefix filters (`IN`, `NOT IN`, `STARTS WITH`),
+/// - Graph BFS neighborhood scoping (`filter_within_bfs`),
+/// - Composable zero-copy memory-mapped `RecordView` predicates (`.filter(|view| ...)`),
+/// - Bidirectional sort order (`Asc`/`Desc`), `offset` + `limit` windowing, and $O(\log N)$ `KeysetCursor` pagination,
+/// - SIMD cosine similarity scoring over AI memory embeddings.
 ///
-/// Stack-inlines predicates so constructing and executing a query performs **zero intermediate
+/// Stack-inlines common predicates so constructing and executing a query performs **zero intermediate
 /// heap allocations** (`RULE-MEM-02`).
 pub struct QueryBuilder<'a, T: ZeroCopyRecord + Indexable> {
     engine: &'a StorageEngine<T>,
@@ -60,6 +65,9 @@ pub struct QueryBuilder<'a, T: ZeroCopyRecord + Indexable> {
     any_tag_clauses: [AnyTagClause; 2],
     range_len: usize,
     range_predicates: [(u16, RangeInclusive<i64>); 4],
+    extra_include_bm: Option<CompressedBitmap>,
+    extra_exclude_bm: Option<CompressedBitmap>,
+    view_predicate: Option<Box<dyn Fn(&RecordView<'_, T>) -> bool + 'a>>,
     order: SortOrder,
     offset: usize,
     limit: Option<usize>,
@@ -73,6 +81,9 @@ impl<'a, T: ZeroCopyRecord + Indexable> core::fmt::Debug for QueryBuilder<'a, T>
             .field("tag_predicates", &self.tag_slice())
             .field("not_tag_predicates", &self.not_tag_slice())
             .field("range_predicates", &self.range_slice())
+            .field("has_extra_include_bm", &self.extra_include_bm.is_some())
+            .field("has_extra_exclude_bm", &self.extra_exclude_bm.is_some())
+            .field("has_view_predicate", &self.view_predicate.is_some())
             .field("order", &self.order)
             .field("offset", &self.offset)
             .field("limit", &self.limit)
@@ -94,6 +105,9 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
             any_tag_clauses: [AnyTagClause::default(); 2],
             range_len: 0,
             range_predicates: [(0, 0..=0), (0, 0..=0), (0, 0..=0), (0, 0..=0)],
+            extra_include_bm: None,
+            extra_exclude_bm: None,
+            view_predicate: None,
             order: SortOrder::Asc,
             offset: 0,
             limit: None,
@@ -121,10 +135,36 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
     fn is_simple_unpaginated(&self) -> bool {
         self.not_tag_len == 0
             && self.any_tag_len == 0
+            && self.extra_include_bm.is_none()
+            && self.extra_exclude_bm.is_none()
+            && self.view_predicate.is_none()
             && self.offset == 0
             && self.cursor.is_none()
             && self.order == SortOrder::Asc
     }
+
+    #[inline]
+    fn intersect_extra_include(&mut self, bm: CompressedBitmap) {
+        self.extra_include_bm = Some(match self.extra_include_bm.take() {
+            Some(prev) => prev.intersect(&bm),
+            None => bm,
+        });
+    }
+
+    #[inline]
+    fn union_extra_exclude(&mut self, bm: CompressedBitmap) {
+        if bm.is_empty() {
+            return;
+        }
+        self.extra_exclude_bm = Some(match self.extra_exclude_bm.take() {
+            Some(prev) => prev.union(&bm),
+            None => bm,
+        });
+    }
+
+    // =========================================================================
+    // 1. Tag / Categorical Filters (`==`, `!=`, `IN`, `STARTS WITH`, `IS NULL`)
+    // =========================================================================
 
     /// Adds a required tag equality predicate (`field_id == tag`, bitwise `AND`).
     #[inline]
@@ -132,6 +172,9 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
         if self.tag_len < self.tag_predicates.len() {
             self.tag_predicates[self.tag_len] = (field_id, tag);
             self.tag_len += 1;
+        } else {
+            let bm = self.engine.tag_index().get_bitmap(field_id, tag);
+            self.intersect_extra_include(bm);
         }
         self
     }
@@ -142,6 +185,9 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
         if self.not_tag_len < self.not_tag_predicates.len() {
             self.not_tag_predicates[self.not_tag_len] = (field_id, tag);
             self.not_tag_len += 1;
+        } else {
+            let bm = self.engine.tag_index().get_bitmap(field_id, tag);
+            self.union_extra_exclude(bm);
         }
         self
     }
@@ -149,18 +195,49 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
     /// Adds a set-membership disjunction predicate (`field_id IN tags`, bitwise `OR`, `TASK-056`).
     #[inline]
     pub fn filter_any_tag(mut self, field_id: u16, tags: &[InlineId]) -> Self {
-        if self.any_tag_len < self.any_tag_clauses.len() {
+        if self.any_tag_len < self.any_tag_clauses.len() && tags.len() <= 8 {
             let mut clause = AnyTagClause {
                 field_id,
-                len: tags.len().min(8),
+                len: tags.len(),
                 tags: [InlineId::EMPTY; 8],
             };
-            clause.tags[..clause.len].copy_from_slice(&tags[..clause.len]);
+            clause.tags[..clause.len].copy_from_slice(tags);
             self.any_tag_clauses[self.any_tag_len] = clause;
             self.any_tag_len += 1;
+        } else {
+            let bm = self.engine.tag_index().union_tags(field_id, tags);
+            self.intersect_extra_include(bm);
         }
         self
     }
+
+    /// Filters for records having any tag on `field_id` starting with `prefix` (`WHERE tag LIKE 'prefix%'`, `TASK-058`).
+    #[inline]
+    pub fn filter_tag_prefix(mut self, field_id: u16, prefix: &str) -> Self {
+        let bm = self.engine.tag_index().union_tag_prefix(field_id, prefix);
+        self.intersect_extra_include(bm);
+        self
+    }
+
+    /// Filters for records that have at least one tag on `field_id` (`WHERE tag_field IS NOT NULL`, `TASK-058`).
+    #[inline]
+    pub fn filter_has_tag_field(mut self, field_id: u16) -> Self {
+        let bm = self.engine.tag_index().all_on_field_bitmap(field_id);
+        self.intersect_extra_include(bm);
+        self
+    }
+
+    /// Filters for records that have no tags on `field_id` (`WHERE tag_field IS NULL`, `TASK-058`).
+    #[inline]
+    pub fn filter_missing_tag_field(mut self, field_id: u16) -> Self {
+        let bm = self.engine.tag_index().all_on_field_bitmap(field_id);
+        self.union_extra_exclude(bm);
+        self
+    }
+
+    // =========================================================================
+    // 2. Numeric / Timestamp / Float Comparisons (`=`, `!=`, `>`, `>=`, `<`, `<=`, `BETWEEN`, `NOT BETWEEN`, `IN`)
+    // =========================================================================
 
     /// Adds an inclusive numeric or timestamp range predicate (`field_id in min..=max`).
     #[inline]
@@ -168,6 +245,9 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
         if self.range_len < self.range_predicates.len() {
             self.range_predicates[self.range_len] = (field_id, range);
             self.range_len += 1;
+        } else {
+            let bm = self.engine.range_index().range_bitmap(field_id, range);
+            self.intersect_extra_include(bm);
         }
         self
     }
@@ -183,6 +263,237 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
     pub fn filter_range_u64(self, field_id: u16, min: u64, max: u64) -> Self {
         self.filter_range(field_id, sortable_u64_to_i64(min)..=sortable_u64_to_i64(max))
     }
+
+    /// Exact numeric equality filter (`field_id == value`, `TASK-058`).
+    #[inline]
+    pub fn filter_eq(self, field_id: u16, value: i64) -> Self {
+        self.filter_range(field_id, value..=value)
+    }
+
+    /// Exact `u64` equality filter (`field_id == value`, `TASK-058`).
+    #[inline]
+    pub fn filter_eq_u64(self, field_id: u16, value: u64) -> Self {
+        let enc = sortable_u64_to_i64(value);
+        self.filter_range(field_id, enc..=enc)
+    }
+
+    /// Exact `f64` equality filter (`field_id == value`, `TASK-058`).
+    #[inline]
+    pub fn filter_eq_f64(self, field_id: u16, value: f64) -> Self {
+        let enc = sortable_f64_to_i64(value);
+        self.filter_range(field_id, enc..=enc)
+    }
+
+    /// Numeric inequality exclusion filter (`field_id != value`, `TASK-058`).
+    #[inline]
+    pub fn filter_ne(mut self, field_id: u16, value: i64) -> Self {
+        let bm = self.engine.range_index().eq_bitmap(field_id, value);
+        self.union_extra_exclude(bm);
+        self
+    }
+
+    /// Unsigned 64-bit inequality exclusion filter (`field_id != value`, `TASK-058`).
+    #[inline]
+    pub fn filter_ne_u64(self, field_id: u16, value: u64) -> Self {
+        self.filter_ne(field_id, sortable_u64_to_i64(value))
+    }
+
+    /// Floating-point inequality exclusion filter (`field_id != value`, `TASK-058`).
+    #[inline]
+    pub fn filter_ne_f64(self, field_id: u16, value: f64) -> Self {
+        self.filter_ne(field_id, sortable_f64_to_i64(value))
+    }
+
+    /// Strict greater-than filter (`field_id > value`, `TASK-058`).
+    #[inline]
+    pub fn filter_gt(mut self, field_id: u16, value: i64) -> Self {
+        if value == i64::MAX {
+            self.intersect_extra_include(CompressedBitmap::new());
+            self
+        } else {
+            self.filter_range(field_id, (value + 1)..=i64::MAX)
+        }
+    }
+
+    /// Greater-than-or-equal filter (`field_id >= value`, `TASK-058`).
+    #[inline]
+    pub fn filter_gte(self, field_id: u16, value: i64) -> Self {
+        self.filter_range(field_id, value..=i64::MAX)
+    }
+
+    /// Strict less-than filter (`field_id < value`, `TASK-058`).
+    #[inline]
+    pub fn filter_lt(mut self, field_id: u16, value: i64) -> Self {
+        if value == i64::MIN {
+            self.intersect_extra_include(CompressedBitmap::new());
+            self
+        } else {
+            self.filter_range(field_id, i64::MIN..=(value - 1))
+        }
+    }
+
+    /// Less-than-or-equal filter (`field_id <= value`, `TASK-058`).
+    #[inline]
+    pub fn filter_lte(self, field_id: u16, value: i64) -> Self {
+        self.filter_range(field_id, i64::MIN..=value)
+    }
+
+    /// Strict greater-than filter for `f64` (`field_id > value`, `TASK-058`).
+    #[inline]
+    pub fn filter_gt_f64(self, field_id: u16, value: f64) -> Self {
+        self.filter_gt(field_id, sortable_f64_to_i64(value))
+    }
+
+    /// Greater-than-or-equal filter for `f64` (`field_id >= value`, `TASK-058`).
+    #[inline]
+    pub fn filter_gte_f64(self, field_id: u16, value: f64) -> Self {
+        self.filter_gte(field_id, sortable_f64_to_i64(value))
+    }
+
+    /// Strict less-than filter for `f64` (`field_id < value`, `TASK-058`).
+    #[inline]
+    pub fn filter_lt_f64(self, field_id: u16, value: f64) -> Self {
+        self.filter_lt(field_id, sortable_f64_to_i64(value))
+    }
+
+    /// Less-than-or-equal filter for `f64` (`field_id <= value`, `TASK-058`).
+    #[inline]
+    pub fn filter_lte_f64(self, field_id: u16, value: f64) -> Self {
+        self.filter_lte(field_id, sortable_f64_to_i64(value))
+    }
+
+    /// Negated range exclusion filter (`WHERE field_id NOT BETWEEN min AND max`, `TASK-058`).
+    #[inline]
+    pub fn filter_not_range(mut self, field_id: u16, range: RangeInclusive<i64>) -> Self {
+        let bm = self.engine.range_index().range_bitmap(field_id, range);
+        self.union_extra_exclude(bm);
+        self
+    }
+
+    /// Numeric set membership filter (`WHERE field_id IN (values)`, `TASK-058`).
+    #[inline]
+    pub fn filter_in_i64(mut self, field_id: u16, values: &[i64]) -> Self {
+        let bm = self.engine.range_index().in_values_bitmap(field_id, values);
+        self.intersect_extra_include(bm);
+        self
+    }
+
+    /// Filters for records that have a numeric value indexed on `field_id` (`WHERE num_field IS NOT NULL`, `TASK-058`).
+    #[inline]
+    pub fn filter_has_numeric_field(mut self, field_id: u16) -> Self {
+        let bm = self.engine.range_index().all_on_field_bitmap(field_id);
+        self.intersect_extra_include(bm);
+        self
+    }
+
+    /// Filters for records that have no numeric value indexed on `field_id` (`WHERE num_field IS NULL`, `TASK-058`).
+    #[inline]
+    pub fn filter_missing_numeric_field(mut self, field_id: u16) -> Self {
+        let bm = self.engine.range_index().all_on_field_bitmap(field_id);
+        self.union_extra_exclude(bm);
+        self
+    }
+
+    // =========================================================================
+    // 3. Primary-Key (`InlineId`) Set, Prefix & Graph Neighborhood Filters
+    // =========================================================================
+
+    /// Restricts results to a specific set of primary keys (`WHERE id IN (...)`, `TASK-058`).
+    #[inline]
+    pub fn filter_ids(mut self, ids: &[InlineId]) -> Self {
+        let bm = self.engine.primary_index().ids_to_bitmap(ids);
+        self.intersect_extra_include(bm);
+        self
+    }
+
+    /// Excludes a specific set of primary keys (`WHERE id NOT IN (...)`, `TASK-058`).
+    #[inline]
+    pub fn filter_not_ids(mut self, ids: &[InlineId]) -> Self {
+        let bm = self.engine.primary_index().ids_to_bitmap(ids);
+        self.union_extra_exclude(bm);
+        self
+    }
+
+    /// Filters for records whose primary key (`InlineId`) starts with `prefix` (`WHERE id LIKE 'prefix%'`, `TASK-058`).
+    #[inline]
+    pub fn filter_id_prefix(mut self, prefix: &str) -> Self {
+        let bm = self.engine.primary_index().id_prefix_bitmap(prefix);
+        self.intersect_extra_include(bm);
+        self
+    }
+
+    /// Scopes the query to records reachable within `max_depth` BFS hops from `root_id` (`TASK-058`).
+    ///
+    /// `extract_neighbors` inspects each visited `RecordView` zero-copy and pushes neighbor `InlineId`s.
+    pub fn filter_within_bfs<FN>(
+        mut self,
+        root_id: InlineId,
+        max_depth: usize,
+        extract_neighbors: FN,
+    ) -> Self
+    where
+        FN: Fn(&RecordView<'_, T>, &mut Vec<InlineId>),
+    {
+        let mut visited: FastHashSet<InlineId> = FastHashSet::default();
+        let mut queue: VecDeque<(InlineId, usize)> = VecDeque::new();
+        let mut scratch_neighbors = Vec::new();
+        let mut bm = CompressedBitmap::new();
+
+        if let Some(root_ord) = self.engine.primary_index().with_entry(root_id, |e| e.ordinal) {
+            visited.insert(root_id);
+            bm.insert(root_ord);
+            queue.push_back((root_id, 0));
+        }
+
+        while let Some((cur_id, depth)) = queue.pop_front() {
+            if depth >= max_depth {
+                continue;
+            }
+            scratch_neighbors.clear();
+            let _ = self.engine.with_ref(cur_id, |view| {
+                extract_neighbors(&view, &mut scratch_neighbors);
+            });
+            for &peer_id in &scratch_neighbors {
+                if visited.insert(peer_id) {
+                    if let Some(peer_ord) =
+                        self.engine.primary_index().with_entry(peer_id, |e| e.ordinal)
+                    {
+                        bm.insert(peer_ord);
+                        queue.push_back((peer_id, depth + 1));
+                    }
+                }
+            }
+        }
+
+        self.intersect_extra_include(bm);
+        self
+    }
+
+    // =========================================================================
+    // 4. Composable Zero-Copy RecordView Predicate (`.filter(|view| ...)`)
+    // =========================================================================
+
+    /// Attaches a zero-copy record predicate closure evaluated directly on the memory-mapped
+    /// `RecordView<'_, T>` (`0` heap allocations per inspected record, `TASK-058`).
+    ///
+    /// Multiple `.filter(...)` calls compose via logical `AND`.
+    /// Because `RecordView<'_, T>` derefs to `T::Archived` and exposes `.str_contains(...)`,
+    /// `.str_starts_with(...)`, `.str_contains_ignore_ascii_case(...)`, and `.get_slice(...)`,
+    /// callers can filter on any fixed or variable-length field before pagination!
+    pub fn filter<P>(mut self, predicate: P) -> Self
+    where
+        P: Fn(&RecordView<'_, T>) -> bool + 'a,
+    {
+        self.view_predicate = Some(match self.view_predicate.take() {
+            Some(prev) => Box::new(move |view| prev(view) && predicate(view)),
+            None => Box::new(predicate),
+        });
+        self
+    }
+
+    // =========================================================================
+    // 5. Ordering & Pagination (`Asc`, `Desc`, `offset`, `limit`, `KeysetCursor`)
+    // =========================================================================
 
     /// Sets the sort direction (`SortOrder::Asc` or `SortOrder::Desc`, `TASK-056`).
     #[inline]
@@ -235,8 +546,33 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
         )
     }
 
+    #[inline]
+    fn check_extra_and_view(&self, ord: RecordOrdinal) -> bool {
+        if let Some(ref inc) = self.extra_include_bm {
+            if !inc.contains(ord) {
+                return false;
+            }
+        }
+        if let Some(ref exc) = self.extra_exclude_bm {
+            if exc.contains(ord) {
+                return false;
+            }
+        }
+        if let Some(ref pred) = self.view_predicate {
+            let Some(id) = self.engine.primary_index().resolve_ordinal(ord) else {
+                return false;
+            };
+            match self.engine.with_ref(id, |view| pred(&view)) {
+                Ok(matched) => matched,
+                Err(_) => false,
+            }
+        } else {
+            true
+        }
+    }
+
     /// Resolves matching `RecordOrdinal`s using secondary index intersections without
-    /// touching any record files on disk.
+    /// touching any record files on disk (unless a `.filter(|view| ...)` payload closure was attached).
     pub fn resolve_ordinals(&self) -> Vec<RecordOrdinal> {
         if !self.is_simple_unpaginated() {
             let (items, _) = self.resolve_paginated_ordinals();
@@ -308,8 +644,14 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
         }
     }
 
-    /// Resolves a paginated window of `(Option<sort_key>, RecordOrdinal)` and `total_matched` (`TASK-056`).
+    /// Resolves a paginated window of `(Option<sort_key>, RecordOrdinal)` and `total_matched` (`TASK-056`, `TASK-058`).
     fn resolve_paginated_ordinals(&self) -> (Vec<(Option<i64>, RecordOrdinal)>, usize) {
+        if let Some(ref inc) = self.extra_include_bm {
+            if inc.is_empty() {
+                return (Vec::new(), 0);
+            }
+        }
+
         let tags = self.tag_slice();
         let not_tags = self.not_tag_slice();
         let ranges = self.range_slice();
@@ -337,6 +679,9 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
             let (field_id, ref range) = ranges[0];
             let has_tag_filters =
                 !tags.is_empty() || !not_tags.is_empty() || !any_slice.is_empty();
+            let has_extra = self.extra_include_bm.is_some()
+                || self.extra_exclude_bm.is_some()
+                || self.view_predicate.is_some();
             let (pairs, total) = self.engine.range_index().range_collect_paginated(
                 field_id,
                 *range.start(),
@@ -346,13 +691,18 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
                 self.offset,
                 self.limit,
                 |ord| {
-                    if !has_tag_filters {
-                        true
-                    } else {
-                        self.engine
+                    if has_tag_filters
+                        && !self
+                            .engine
                             .tag_index()
                             .matches_ordinal(ord, tags, not_tags, any_slice)
+                    {
+                        return false;
                     }
+                    if has_extra && !self.check_extra_and_view(ord) {
+                        return false;
+                    }
+                    true
                 },
             );
             let out = pairs
@@ -362,36 +712,52 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
             return (out, total);
         }
 
-        // 3. Full-collection scan path when no positive index driver (`tags`, `any_tags`, `ranges`) is specified
-        if tags.is_empty() && any_slice.is_empty() && ranges.is_empty() {
+        // 3. Full-collection scan path when no positive index driver (`tags`, `any_tags`, `ranges`, `extra_include_bm`) is specified
+        if tags.is_empty()
+            && any_slice.is_empty()
+            && ranges.is_empty()
+            && self.extra_include_bm.is_none()
+        {
+            let has_extra = self.extra_exclude_bm.is_some() || self.view_predicate.is_some();
             let (pairs, total) = self.engine.primary_index().scan_ordinals_paginated(
                 self.order == SortOrder::Desc,
                 self.cursor.map(|c| c.ordinal),
                 self.offset,
                 self.limit,
                 |ord, _id| {
-                    if not_tags.is_empty() {
-                        true
-                    } else {
-                        self.engine
+                    if !not_tags.is_empty()
+                        && !self
+                            .engine
                             .tag_index()
                             .matches_ordinal(ord, &[], not_tags, &[])
+                    {
+                        return false;
                     }
+                    if has_extra && !self.check_extra_and_view(ord) {
+                        return false;
+                    }
+                    true
                 },
             );
             let out = pairs.into_iter().map(|(ord, _)| (None, ord)).collect();
             return (out, total);
         }
 
-        // 4. Multi-index CompressedBitmap intersection + POPCNT window collection
-        let mut candidate_bm: Option<CompressedBitmap> = None;
+        // 4. Multi-index CompressedBitmap intersection
+        let mut candidate_bm: Option<CompressedBitmap> = self.extra_include_bm.clone();
 
         if !tags.is_empty() {
             let bm = self.engine.tag_index().intersect_all(tags);
             if bm.is_empty() {
                 return (Vec::new(), 0);
             }
-            candidate_bm = Some(bm);
+            candidate_bm = Some(match candidate_bm {
+                Some(prev) => prev.intersect(&bm),
+                None => bm,
+            });
+            if candidate_bm.as_ref().map_or(false, |b| b.is_empty()) {
+                return (Vec::new(), 0);
+            }
         }
 
         for &(field_id, group) in any_slice {
@@ -433,24 +799,60 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
             }
         }
 
-        let (ords, total) = bm.collect_window(
-            self.offset,
-            self.limit,
+        if let Some(ref exc) = self.extra_exclude_bm {
+            bm.and_not_in_place(exc);
+            if bm.is_empty() {
+                return (Vec::new(), 0);
+            }
+        }
+
+        // If no custom `view_predicate` closure is attached, use hardware POPCNT windowing directly!
+        if self.view_predicate.is_none() {
+            let (ords, total) = bm.collect_window(
+                self.offset,
+                self.limit,
+                self.cursor.map(|c| c.ordinal),
+                self.order == SortOrder::Desc,
+            );
+            let out = ords.into_iter().map(|ord| (None, ord)).collect();
+            return (out, total);
+        }
+
+        // When `view_predicate` is attached, evaluate `check_extra_and_view(ord)` before offset/limit
+        let (all_ords, _) = bm.collect_window(
+            0,
+            None,
             self.cursor.map(|c| c.ordinal),
             self.order == SortOrder::Desc,
         );
-        let out = ords.into_iter().map(|ord| (None, ord)).collect();
-        (out, total)
+        let max_items = self.limit.unwrap_or(usize::MAX);
+        let mut out = Vec::with_capacity(max_items.min(all_ords.len().min(256)));
+        let mut total_matched = 0usize;
+        let mut skipped = 0usize;
+        for ord in all_ords {
+            if !self.check_extra_and_view(ord) {
+                continue;
+            }
+            total_matched += 1;
+            if skipped < self.offset {
+                skipped += 1;
+                continue;
+            }
+            if out.len() < max_items {
+                out.push((None, ord));
+            }
+        }
+        (out, total_matched)
     }
 
-    /// Resolves matching primary keys (`InlineId`s) from secondary indexes.
+    /// Resolves matching primary keys (`InlineId`s) from secondary indexes (and optional `.filter(...)`).
     pub fn execute_ids(&self) -> Vec<InlineId> {
         let ordinals = self.resolve_ordinals();
         self.engine.primary_index().resolve_ordinals_batch(&ordinals)
     }
 
     /// Executes the query and returns a `QueryPage<InlineId>` with `total_matched`, `has_more`,
-    /// and an $O(\log N)$ `next_cursor` without touching any record files on disk (`TASK-056`).
+    /// and an $O(\log N)$ `next_cursor` (`TASK-056`).
     pub fn execute_page_ids(&self) -> QueryPage<InlineId> {
         let (pairs, total_matched) = self.resolve_paginated_ordinals();
         let mut items = Vec::with_capacity(pairs.len());
@@ -501,67 +903,14 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
     /// Executes the query with an additional zero-copy payload predicate `predicate(&T::Archived) -> bool`
     /// evaluated directly on the memory-mapped record view **before** pagination (`offset`/`limit`/`next_cursor`, `TASK-056`).
     pub fn execute_page_filtered_with<P>(
-        &self,
+        self,
         predicate: P,
     ) -> Result<QueryPage<(InlineId, RecordRef<T>)>>
     where
-        P: Fn(&T::Archived) -> bool,
+        P: Fn(&T::Archived) -> bool + 'a,
     {
-        // Resolve index candidates without offset/limit truncation so `predicate` filters before windowing
-        let unwindowed = Self {
-            engine: self.engine,
-            tag_len: self.tag_len,
-            tag_predicates: self.tag_predicates,
-            not_tag_len: self.not_tag_len,
-            not_tag_predicates: self.not_tag_predicates,
-            any_tag_len: self.any_tag_len,
-            any_tag_clauses: self.any_tag_clauses,
-            range_len: self.range_len,
-            range_predicates: self.range_predicates.clone(),
-            order: self.order,
-            offset: 0,
-            limit: None,
-            cursor: self.cursor,
-            _marker: PhantomData,
-        };
-        let (candidates, _) = unwindowed.resolve_paginated_ordinals();
-        let max_items = self.limit.unwrap_or(usize::MAX);
-        let mut items = Vec::with_capacity(max_items.min(candidates.len().min(256)));
-        let mut total_matched = 0usize;
-        let mut skipped = 0usize;
-        let mut last_cursor = None;
-
-        for (sort_key, ord) in candidates {
-            let Some(id) = self.engine.primary_index().resolve_ordinal(ord) else {
-                continue;
-            };
-            let Ok(rec_ref) = self.engine.get_ref(id) else {
-                continue;
-            };
-            if !predicate(rec_ref.archived()) {
-                continue;
-            }
-            total_matched += 1;
-            if skipped < self.offset {
-                skipped += 1;
-                continue;
-            }
-            if items.len() < max_items {
-                items.push((id, rec_ref));
-                last_cursor = Some(KeysetCursor {
-                    sort_key,
-                    ordinal: ord,
-                });
-            }
-        }
-
-        let has_more = self.offset.saturating_add(items.len()) < total_matched;
-        Ok(QueryPage {
-            items,
-            total_matched,
-            has_more,
-            next_cursor: if has_more { last_cursor } else { None },
-        })
+        self.filter(move |view| predicate(view.archived()))
+            .execute_page_refs()
     }
 
     /// Visits every matching record in the current query window using a zero-allocation `with_ref` closure (`TASK-056`).
@@ -597,7 +946,8 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
 
     /// Executes a hybrid metadata + SIMD vector similarity top-$K$ search (`TASK-027`, `F-OPS-05`).
     ///
-    /// If tag/range predicates are provided, only candidates matching the metadata filter are scored!
+    /// If any tag, range, key, graph, or `.filter(|view| ...)` predicates are provided, only candidates
+    /// matching all filters are scored!
     pub fn top_k_similar(&self, query_embedding: &[f32], k: usize) -> Vec<(InlineId, VectorTopKHit)> {
         if k == 0 || query_embedding.is_empty() {
             return Vec::new();
@@ -606,6 +956,9 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
             && self.not_tag_len == 0
             && self.any_tag_len == 0
             && self.range_len == 0
+            && self.extra_include_bm.is_none()
+            && self.extra_exclude_bm.is_none()
+            && self.view_predicate.is_none()
         {
             None
         } else {
@@ -647,10 +1000,10 @@ mod tests {
         cfg.background_flush = false;
         let engine = StorageEngine::<AgentObjectRecord>::open(&dir, cfg).unwrap();
 
-        let tag_alpha = InlineId::from_static("alpha");
-        let tag_beta = InlineId::from_static("beta");
-        let tag_gamma = InlineId::from_static("gamma");
-        let tag_banned = InlineId::from_static("banned");
+        let tag_alpha = InlineId::from_static("env:alpha");
+        let tag_beta = InlineId::from_static("env:beta");
+        let tag_gamma = InlineId::from_static("role:gamma");
+        let tag_banned = InlineId::from_static("status:banned");
 
         // Insert 30 records with scores 10..=300
         for i in 1..=30i64 {
@@ -666,13 +1019,17 @@ mod tests {
             if i % 5 == 0 {
                 rec.tags.push(tag_banned);
             }
+            if i == 1 {
+                rec.children.link(InlineId::from_static("rec_02"));
+                rec.children.link(InlineId::from_static("rec_03"));
+            }
+            if i == 2 {
+                rec.children.link(InlineId::from_static("rec_04"));
+            }
             engine.put(id, &rec).unwrap();
         }
 
         // 1. Test `filter_any_tag` (`OR` / `IN`) + `filter_not_tag` (`AND NOT`) + `filter_range` + `order_desc`
-        // Records in 1..=30 where primary_tag IN (alpha, beta) [excludes multiples of 3 -> 20 records]
-        // AND tag != banned [excludes multiples of 5 that aren't multiples of 3: 5, 10, 20, 25 -> 16 records]
-        // AND score in 10..=300
         let page1 = engine
             .query()
             .filter_any_tag(FIELD_PRIMARY_TAG, &[tag_alpha, tag_beta])
@@ -685,7 +1042,6 @@ mod tests {
         assert_eq!(page1.total_matched, 16);
         assert!(page1.has_more);
         assert_eq!(page1.items.len(), 5);
-        // Highest matching scores in descending order: 290 (29), 280 (28), 260 (26), 230 (23), 220 (22)
         assert_eq!(page1.items[0], InlineId::from_static("rec_29"));
         assert_eq!(page1.items[1], InlineId::from_static("rec_28"));
         assert_eq!(page1.items[2], InlineId::from_static("rec_26"));
@@ -706,7 +1062,6 @@ mod tests {
 
         assert_eq!(page2.total_matched, 11);
         assert!(page2.has_more);
-        // Next 5 descending: 190 (19), 170 (17), 160 (16), 140 (14), 130 (13)
         assert_eq!(page2.items[0], InlineId::from_static("rec_19"));
         assert_eq!(page2.items[4], InlineId::from_static("rec_13"));
 
@@ -722,26 +1077,66 @@ mod tests {
             .execute_page_ids();
         assert_eq!(offset_page2.items, page2.items);
 
-        // 4. Test zero-copy payload filter `execute_page_filtered_with` (`|arch| ...`)
-        let filtered_page = engine
+        // 4. Test `filter_tag_prefix("env:")`, `filter_gt`, `filter_lt`, `filter_ne`, and composable `.filter(|view| ...)`
+        let prefix_filtered = engine
             .query()
-            .filter_range(FIELD_SCORE, 10..=300)
-            .order_asc()
-            .offset(2)
-            .limit(3)
-            .execute_page_filtered_with(|arch| arch.score % 40 == 0)
-            .unwrap();
-        // Multiples of 40 in 10..=300 are: 40 (4), 80 (8), 120 (12), 160 (16), 200 (20), 240 (24), 280 (28) -> 7 total
-        // With offset=2, limit=3 -> 120 (rec_12), 160 (rec_16), 200 (rec_20)
-        assert_eq!(filtered_page.total_matched, 7);
-        assert!(filtered_page.has_more);
-        assert_eq!(filtered_page.items.len(), 3);
-        assert_eq!(filtered_page.items[0].0, InlineId::from_static("rec_12"));
-        assert_eq!(filtered_page.items[1].0, InlineId::from_static("rec_16"));
-        assert_eq!(filtered_page.items[2].0, InlineId::from_static("rec_20"));
+            .filter_tag_prefix(FIELD_PRIMARY_TAG, "env:")
+            .filter_gt(FIELD_SCORE, 50)
+            .filter_lte(FIELD_SCORE, 150)
+            .filter_ne(FIELD_SCORE, 100)
+            .filter(|view| view.str_contains_ignore_ascii_case(&view.title, "ITEM"))
+            .execute_ids();
+        // Scores in 60..=150 (i=6..=15) where tag starts with "env:" (not multiple of 3: 7, 8, 10, 11, 13, 14)
+        // and score != 100 (excludes 10) -> [rec_07, rec_08, rec_11, rec_13, rec_14]
+        assert_eq!(
+            prefix_filtered,
+            vec![
+                InlineId::from_static("rec_07"),
+                InlineId::from_static("rec_08"),
+                InlineId::from_static("rec_11"),
+                InlineId::from_static("rec_13"),
+                InlineId::from_static("rec_14"),
+            ]
+        );
+
+        // 5. Test `filter_in_i64`, `filter_id_prefix`, and `filter_not_ids`
+        let set_filtered = engine
+            .query()
+            .filter_in_i64(FIELD_SCORE, &[20, 40, 60, 80])
+            .filter_id_prefix("rec_0")
+            .filter_not_ids(&[InlineId::from_static("rec_04")])
+            .execute_ids();
+        assert_eq!(
+            set_filtered,
+            vec![
+                InlineId::from_static("rec_02"),
+                InlineId::from_static("rec_06"),
+                InlineId::from_static("rec_08"),
+            ]
+        );
+
+        // 6. Test Hybrid Graph BFS + Index Filtering (`filter_within_bfs`)
+        let bfs_filtered = engine
+            .query()
+            .filter_within_bfs(InlineId::from_static("rec_01"), 2, |view, out| {
+                out.extend_from_slice(view.children.as_slice(view.payload()));
+            })
+            .filter_gte(FIELD_SCORE, 20)
+            .execute_ids();
+        // Reachable within 2 hops of rec_01: rec_01 (10), rec_02 (20), rec_03 (30), rec_04 (40)
+        // With score >= 20 -> rec_02, rec_03, rec_04
+        assert_eq!(
+            bfs_filtered,
+            vec![
+                InlineId::from_static("rec_02"),
+                InlineId::from_static("rec_03"),
+                InlineId::from_static("rec_04"),
+            ]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
 
 

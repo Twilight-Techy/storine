@@ -414,3 +414,25 @@ This document defines the strict chronological execution order for building the 
     - Extend `OP_QUERY_HYBRID` and `StorageClient::query_range_paginated` in `storage-server` to support `offset`, `limit`, `descending`, and `total_matched` over TCP.
   - **Exit Criteria**: `test_query_filtering_and_pagination_end_to_end` and `test_tcp_server_wire_protocol_v2_cas_batch_query_auth_and_metrics` pass with zero warnings (`44` total workspace tests passing).
 
+---
+
+## Stage 17: Full Filtering Coverage — Relational Operators, Prefix/Key-Set Matchers, Nullability, Hybrid Graph BFS & Composable Zero-Copy `RecordView` Predicates (`TASK-057` – `TASK-058`)
+
+- [x] **TASK-057: Implement Index-Backed Relational Operators (`=`, `!=`, `>`, `>=`, `<`, `<=`, `NOT BETWEEN`, `IN`), Prefix Scans (`STARTS WITH`), Key-Set Filters & Field Existence (`IS NULL` / `IS NOT NULL`)**
+  - **Deliverables**: `crates/storage-types/src/id.rs`, `crates/storage-codec/src/archive.rs`, `crates/storage-index/src/bitmap.rs`, `crates/storage-index/src/btree.rs`, `crates/storage-index/src/primary.rs`.
+  - **Optimizations**:
+    - Add zero-allocation string matchers on `InlineId` (`starts_with_str`, `ends_with_str`, `contains_str`), `ArchivedString` (`eq_str`, `starts_with`, `ends_with`, `contains`, `eq_ignore_ascii_case`, `contains_ignore_ascii_case`), and `RecordView` (`str_eq`, `str_starts_with`, `str_ends_with`, `str_contains`, `str_contains_ignore_ascii_case`).
+    - Implement `BitmapTagIndex::union_tag_prefix` ($O(M)$ prefix scan over tag entries) and `BitmapTagIndex::all_on_field_bitmap` (`IS NOT NULL` for tag fields).
+    - Implement `NumericRangeIndex::eq_bitmap` ($O(\log U)$ exact B+Tree lookup without range traversal), `NumericRangeIndex::in_values_bitmap` ($O(K \log U)$ multi-point lookup), and `NumericRangeIndex::all_on_field_bitmap` (`IS NOT NULL` for numeric fields).
+    - Implement `PrimaryIndex::ids_to_bitmap` ($O(K)$ lock-free shard point lookups) and `PrimaryIndex::id_prefix_bitmap` (`STARTS WITH` on primary keys).
+  - **Exit Criteria**: All index primitives execute in $O(\log N)$ or bitwise-64-bit word time with zero string allocations.
+
+- [x] **TASK-058: Integrate All 5 Filtering Categories & Composable `.filter(|view: &RecordView<T>|)` into `QueryBuilder` Across All Terminal Methods**
+  - **Deliverables**: `crates/storage-core/src/query.rs`.
+  - **Optimizations**:
+    - Add relational comparison methods (`filter_eq`, `filter_eq_u64`, `filter_eq_f64`, `filter_ne`, `filter_ne_u64`, `filter_ne_f64`, `filter_gt`, `filter_gte`, `filter_lt`, `filter_lte`, `filter_gt_f64`, `filter_gte_f64`, `filter_lt_f64`, `filter_lte_f64`, `filter_not_range`, `filter_in_i64`).
+    - Add prefix and key-set methods (`filter_tag_prefix`, `filter_id_prefix`, `filter_ids`, `filter_not_ids`) and field existence methods (`filter_has_tag_field`, `filter_missing_tag_field`, `filter_has_numeric_field`, `filter_missing_numeric_field`).
+    - Add hybrid graph neighborhood filtering (`filter_within_bfs(root_id, max_depth, extract_neighbors)`) intersecting zero-copy BFS reachability bitmaps directly with secondary index bitmaps.
+    - Add composable zero-copy `.filter(|view: &RecordView<'_, T>| -> bool)` honored across all terminal methods (`resolve_ordinals`, `execute_ids`, `execute_refs`, `execute_page_ids`, `execute_page_refs`, `for_each_ref`, and `top_k_similar`) while preserving the 1-allocation fast path when unused (`is_simple_unpaginated`).
+  - **Exit Criteria**: `test_query_filtering_and_pagination_end_to_end` verifies all 11 filtering scenarios end-to-end (`44` workspace tests passing, `0` warnings).
+

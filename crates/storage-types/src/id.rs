@@ -248,6 +248,24 @@ impl InlineId {
         unsafe { core::str::from_utf8_unchecked(self.as_bytes()) }
     }
 
+    /// Returns `true` if this `InlineId` starts with `prefix` (`0` allocations, `TASK-057`).
+    #[inline]
+    pub fn starts_with_str(&self, prefix: &str) -> bool {
+        self.as_bytes().starts_with(prefix.as_bytes())
+    }
+
+    /// Returns `true` if this `InlineId` ends with `suffix` (`0` allocations, `TASK-057`).
+    #[inline]
+    pub fn ends_with_str(&self, suffix: &str) -> bool {
+        self.as_bytes().ends_with(suffix.as_bytes())
+    }
+
+    /// Returns `true` if this `InlineId` contains `needle` (`0` allocations, `TASK-057`).
+    #[inline]
+    pub fn contains_str(&self, needle: &str) -> bool {
+        self.as_str().contains(needle)
+    }
+
     /// Loads the 24-byte struct as three 64-bit words for 1-cycle register equality and hashing.
     #[inline]
     pub const fn as_u64_words(&self) -> [u64; 3] {

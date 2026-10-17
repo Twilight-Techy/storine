@@ -351,6 +351,34 @@ impl PrimaryIndex {
         bm
     }
 
+    /// Resolves a slice of `InlineId`s (`WHERE id IN (...)`) into a `CompressedBitmap` of their live `RecordOrdinal`s (`TASK-057`).
+    pub fn ids_to_bitmap(&self, ids: &[InlineId]) -> crate::bitmap::CompressedBitmap {
+        let mut bm = crate::bitmap::CompressedBitmap::new();
+        for &id in ids {
+            if let Some(ord) = self.with_entry(id, |e| e.ordinal) {
+                bm.insert(ord);
+            }
+        }
+        bm
+    }
+
+    /// Builds a `CompressedBitmap` of all live records whose `InlineId` starts with `prefix` (`WHERE id LIKE 'prefix%'`, `TASK-057`).
+    pub fn id_prefix_bitmap(&self, prefix: &str) -> crate::bitmap::CompressedBitmap {
+        let table = self
+            .ordinals
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut bm = crate::bitmap::CompressedBitmap::new();
+        for (idx, slot) in table.ids.iter().enumerate() {
+            if let Some(id) = slot {
+                if !id.is_empty() && id.starts_with_str(prefix) {
+                    bm.insert(RecordOrdinal(idx as u32));
+                }
+            }
+        }
+        bm
+    }
+
     /// Scans live `(RecordOrdinal, InlineId)` pairs from the dense ordinal table with $O(1)$ array-indexed
     /// keyset cursor seeking, `offset`, `limit`, and ascending/descending order (`TASK-055`).
     pub fn scan_ordinals_paginated<F: Fn(RecordOrdinal, InlineId) -> bool>(

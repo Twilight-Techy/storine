@@ -555,6 +555,42 @@ impl BitmapTagIndex {
         acc.unwrap_or_default()
     }
 
+    /// Computes the union of all tags on `field_id` whose `InlineId` starts with `prefix` (`WHERE tag LIKE 'prefix%'`, `TASK-057`).
+    pub fn union_tag_prefix(&self, field_id: u16, prefix: &str) -> CompressedBitmap {
+        let guard = self
+            .map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut acc: Option<CompressedBitmap> = None;
+        for (&(fid, tag), bm) in guard.iter() {
+            if fid == field_id && !bm.is_empty() && tag.starts_with_str(prefix) {
+                acc = Some(match acc {
+                    Some(prev) => prev.union(bm),
+                    None => bm.clone(),
+                });
+            }
+        }
+        acc.unwrap_or_default()
+    }
+
+    /// Computes the union of all tags on `field_id` (`WHERE tag_field IS NOT NULL`, `TASK-057`).
+    pub fn all_on_field_bitmap(&self, field_id: u16) -> CompressedBitmap {
+        let guard = self
+            .map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut acc: Option<CompressedBitmap> = None;
+        for (&(fid, _), bm) in guard.iter() {
+            if fid == field_id && !bm.is_empty() {
+                acc = Some(match acc {
+                    Some(prev) => prev.union(bm),
+                    None => bm.clone(),
+                });
+            }
+        }
+        acc.unwrap_or_default()
+    }
+
     /// Removes all bits matching any `(field_id, not_tag)` in `not_predicates` from `target` in-place
     /// under a single read lock with **zero heap allocations** (`TASK-055`).
     #[inline]
