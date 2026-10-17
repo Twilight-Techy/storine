@@ -168,6 +168,238 @@ impl CompressedBitmap {
         out
     }
 
+    /// Computes the bitwise `AND NOT` difference (`self \ other`) using 64-bit word instructions (`TASK-055`).
+    pub fn and_not(&self, other: &Self) -> Self {
+        let mut out = self.clone();
+        out.and_not_in_place(other);
+        out
+    }
+
+    /// Removes all bits present in `other` from `self` in-place (`self &= !other`) with zero heap allocations (`TASK-055`).
+    pub fn and_not_in_place(&mut self, other: &Self) {
+        if self.is_empty() || other.is_empty() {
+            return;
+        }
+        let mut ia = 0usize;
+        let mut ib = 0usize;
+        while ia < self.chunks.len() && ib < other.chunks.len() {
+            let id_a = self.chunks[ia].0;
+            let id_b = other.chunks[ib].0;
+            if id_a < id_b {
+                ia += 1;
+            } else if id_a > id_b {
+                ib += 1;
+            } else {
+                let a_words = &mut self.chunks[ia].1;
+                let b_words = &other.chunks[ib].1;
+                let mut remaining_in_chunk = 0usize;
+                for i in 0..64 {
+                    let prev = a_words[i];
+                    let next = prev & !b_words[i];
+                    if next != prev {
+                        let removed = (prev ^ next).count_ones() as usize;
+                        self.cardinality -= removed;
+                        a_words[i] = next;
+                    }
+                    remaining_in_chunk += next.count_ones() as usize;
+                }
+                if remaining_in_chunk == 0 {
+                    self.chunks.remove(ia);
+                } else {
+                    ia += 1;
+                }
+                ib += 1;
+            }
+        }
+    }
+
+    /// Collects a paginated window `(items, total_matched)` from the bitmap (`TASK-055`).
+    ///
+    /// - Uses hardware `POPCNT` (`count_ones`) to skip whole 64-bit words during `offset` skipping in 1 CPU cycle.
+    /// - Supports both ascending (`BLSR` `w &= w - 1`) and descending (`leading_zeros`) traversal.
+    /// - Supports $O(1)$ keyset cursor seek via `after_ordinal`.
+    pub fn collect_window(
+        &self,
+        offset: usize,
+        limit: Option<usize>,
+        after_ordinal: Option<RecordOrdinal>,
+        descending: bool,
+    ) -> (Vec<RecordOrdinal>, usize) {
+        if self.is_empty() {
+            return (Vec::new(), 0);
+        }
+        let max_items = limit.unwrap_or(usize::MAX);
+        if after_ordinal.is_none() {
+            let total = self.cardinality;
+            if offset >= total || max_items == 0 {
+                return (Vec::new(), total);
+            }
+            let cap = (total - offset).min(max_items);
+            let mut out = Vec::with_capacity(cap);
+            let mut skipped = 0usize;
+
+            if !descending {
+                'outer_asc: for &(chunk_id, ref words) in &self.chunks {
+                    let base = chunk_id * CHUNK_BITS;
+                    for (word_idx, &raw_w) in words.iter().enumerate() {
+                        if raw_w == 0 {
+                            continue;
+                        }
+                        let ones = raw_w.count_ones() as usize;
+                        if skipped + ones <= offset {
+                            skipped += ones;
+                            continue;
+                        }
+                        let mut w = raw_w;
+                        let word_base = base + (word_idx as u32) * 64;
+                        while skipped < offset && w != 0 {
+                            w &= w - 1;
+                            skipped += 1;
+                        }
+                        while w != 0 {
+                            let tz = w.trailing_zeros();
+                            out.push(RecordOrdinal(word_base + tz));
+                            if out.len() >= max_items {
+                                break 'outer_asc;
+                            }
+                            w &= w - 1;
+                        }
+                    }
+                }
+            } else {
+                'outer_desc: for &(chunk_id, ref words) in self.chunks.iter().rev() {
+                    let base = chunk_id * CHUNK_BITS;
+                    for (word_idx, &raw_w) in words.iter().enumerate().rev() {
+                        if raw_w == 0 {
+                            continue;
+                        }
+                        let ones = raw_w.count_ones() as usize;
+                        if skipped + ones <= offset {
+                            skipped += ones;
+                            continue;
+                        }
+                        let mut w = raw_w;
+                        let word_base = base + (word_idx as u32) * 64;
+                        while skipped < offset && w != 0 {
+                            let hi = 63 - w.leading_zeros();
+                            w &= !(1u64 << hi);
+                            skipped += 1;
+                        }
+                        while w != 0 {
+                            let hi = 63 - w.leading_zeros();
+                            out.push(RecordOrdinal(word_base + hi));
+                            if out.len() >= max_items {
+                                break 'outer_desc;
+                            }
+                            w &= !(1u64 << hi);
+                        }
+                    }
+                }
+            }
+            return (out, total);
+        }
+
+        // Cursor-filtered path (`after_ordinal == Some(cursor)`)
+        let cursor = after_ordinal.unwrap().0;
+        let mut out = Vec::with_capacity(max_items.min(self.cardinality));
+        let mut total_matched = 0usize;
+        let mut skipped = 0usize;
+
+        if !descending {
+            for &(chunk_id, ref words) in &self.chunks {
+                let base = chunk_id * CHUNK_BITS;
+                if base + CHUNK_BITS - 1 <= cursor {
+                    continue;
+                }
+                for (word_idx, &raw_w) in words.iter().enumerate() {
+                    if raw_w == 0 {
+                        continue;
+                    }
+                    let word_base = base + (word_idx as u32) * 64;
+                    if word_base + 63 <= cursor {
+                        continue;
+                    }
+                    let mut w = if word_base <= cursor {
+                        let shift = (cursor - word_base) + 1;
+                        if shift >= 64 {
+                            0
+                        } else {
+                            raw_w & (!0u64 << shift)
+                        }
+                    } else {
+                        raw_w
+                    };
+                    if w == 0 {
+                        continue;
+                    }
+                    let ones = w.count_ones() as usize;
+                    total_matched += ones;
+                    if out.len() >= max_items {
+                        continue;
+                    }
+                    if skipped + ones <= offset {
+                        skipped += ones;
+                        continue;
+                    }
+                    while skipped < offset && w != 0 {
+                        w &= w - 1;
+                        skipped += 1;
+                    }
+                    while w != 0 && out.len() < max_items {
+                        let tz = w.trailing_zeros();
+                        out.push(RecordOrdinal(word_base + tz));
+                        w &= w - 1;
+                    }
+                }
+            }
+        } else {
+            for &(chunk_id, ref words) in self.chunks.iter().rev() {
+                let base = chunk_id * CHUNK_BITS;
+                if base >= cursor {
+                    continue;
+                }
+                for (word_idx, &raw_w) in words.iter().enumerate().rev() {
+                    if raw_w == 0 {
+                        continue;
+                    }
+                    let word_base = base + (word_idx as u32) * 64;
+                    if word_base >= cursor {
+                        continue;
+                    }
+                    let mut w = if word_base + 64 > cursor {
+                        let keep_bits = cursor - word_base;
+                        raw_w & ((1u64 << keep_bits) - 1)
+                    } else {
+                        raw_w
+                    };
+                    if w == 0 {
+                        continue;
+                    }
+                    let ones = w.count_ones() as usize;
+                    total_matched += ones;
+                    if out.len() >= max_items {
+                        continue;
+                    }
+                    if skipped + ones <= offset {
+                        skipped += ones;
+                        continue;
+                    }
+                    while skipped < offset && w != 0 {
+                        let hi = 63 - w.leading_zeros();
+                        w &= !(1u64 << hi);
+                        skipped += 1;
+                    }
+                    while w != 0 && out.len() < max_items {
+                        let hi = 63 - w.leading_zeros();
+                        out.push(RecordOrdinal(word_base + hi));
+                        w &= !(1u64 << hi);
+                    }
+                }
+            }
+        }
+        (out, total_matched)
+    }
+
     /// Appends all set `RecordOrdinal`s in ascending order into `out` without extra intermediate allocations.
     pub fn collect_into(&self, out: &mut Vec<RecordOrdinal>) {
         out.reserve(self.cardinality);
@@ -300,7 +532,55 @@ impl BitmapTagIndex {
         acc
     }
 
-    /// Filters `candidates` in-place against all `predicates` under a single read lock
+    /// Computes the union (`OR`) of multiple tags on `field_id` (`WHERE field_id IN (tags)`) under a single read lock (`TASK-055`).
+    pub fn union_tags(&self, field_id: u16, tags: &[InlineId]) -> CompressedBitmap {
+        if tags.is_empty() {
+            return CompressedBitmap::new();
+        }
+        let guard = self
+            .map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut acc: Option<CompressedBitmap> = None;
+        for &tag in tags {
+            if let Some(bm) = guard.get(&(field_id, tag)) {
+                if !bm.is_empty() {
+                    acc = Some(match acc {
+                        Some(prev) => prev.union(bm),
+                        None => bm.clone(),
+                    });
+                }
+            }
+        }
+        acc.unwrap_or_default()
+    }
+
+    /// Removes all bits matching any `(field_id, not_tag)` in `not_predicates` from `target` in-place
+    /// under a single read lock with **zero heap allocations** (`TASK-055`).
+    #[inline]
+    pub fn exclude_from_bitmap(
+        &self,
+        not_predicates: &[(u16, InlineId)],
+        target: &mut CompressedBitmap,
+    ) {
+        if not_predicates.is_empty() || target.is_empty() {
+            return;
+        }
+        let guard = self
+            .map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in not_predicates {
+            if let Some(neg_bm) = guard.get(key) {
+                target.and_not_in_place(neg_bm);
+                if target.is_empty() {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Filters `candidates` in-place against all required `predicates` under a single read lock
     /// without cloning any `CompressedBitmap` (`0` heap allocations!).
     #[inline]
     pub fn filter_in_place(
@@ -326,6 +606,82 @@ impl BitmapTagIndex {
             }
         }
     }
+
+    /// Filters `candidates` in-place by excluding any ordinal present in `not_predicates` (`AND NOT`)
+    /// under a single read lock (`0` heap allocations, `TASK-055`).
+    #[inline]
+    pub fn filter_not_in_place(
+        &self,
+        not_predicates: &[(u16, InlineId)],
+        candidates: &mut Vec<RecordOrdinal>,
+    ) {
+        if not_predicates.is_empty() || candidates.is_empty() {
+            return;
+        }
+        let guard = self
+            .map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in not_predicates {
+            if let Some(neg_bm) = guard.get(key) {
+                candidates.retain(|&ord| !neg_bm.contains(ord));
+                if candidates.is_empty() {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Returns `true` if `ord` satisfies all required `must_tags`, none of `not_tags`, and all `any_tag_groups` (`TASK-055`).
+    #[inline]
+    pub fn matches_ordinal(
+        &self,
+        ord: RecordOrdinal,
+        must_tags: &[(u16, InlineId)],
+        not_tags: &[(u16, InlineId)],
+        any_tag_groups: &[(u16, &[InlineId])],
+    ) -> bool {
+        if must_tags.is_empty() && not_tags.is_empty() && any_tag_groups.is_empty() {
+            return true;
+        }
+        let guard = self
+            .map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in must_tags {
+            let Some(bm) = guard.get(key) else {
+                return false;
+            };
+            if !bm.contains(ord) {
+                return false;
+            }
+        }
+        for key in not_tags {
+            if let Some(bm) = guard.get(key) {
+                if bm.contains(ord) {
+                    return false;
+                }
+            }
+        }
+        for &(field_id, group) in any_tag_groups {
+            if group.is_empty() {
+                return false;
+            }
+            let mut matched_any = false;
+            for &tag in group {
+                if let Some(bm) = guard.get(&(field_id, tag)) {
+                    if bm.contains(ord) {
+                        matched_any = true;
+                        break;
+                    }
+                }
+            }
+            if !matched_any {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[cfg(test)]
@@ -337,6 +693,7 @@ mod tests {
         let idx = BitmapTagIndex::new();
         let tag_rust = InlineId::new("rust").unwrap();
         let tag_ai = InlineId::new("ai").unwrap();
+        let tag_deprecated = InlineId::new("deprecated").unwrap();
 
         for i in (0..10_000).step_by(2) {
             idx.insert(1, tag_rust, RecordOrdinal(i));
@@ -344,12 +701,41 @@ mod tests {
         for i in (0..10_000).step_by(3) {
             idx.insert(1, tag_ai, RecordOrdinal(i));
         }
+        for i in (0..10_000).step_by(12) {
+            idx.insert(1, tag_deprecated, RecordOrdinal(i));
+        }
 
-        let both = idx.intersect_all(&[(1, tag_rust), (1, tag_ai)]);
+        let mut both = idx.intersect_all(&[(1, tag_rust), (1, tag_ai)]);
         let vec = both.to_vec();
         // Multiples of 6 in 0..10_000 = 1667 elements
         assert_eq!(vec.len(), 1667);
         assert_eq!(vec[0], RecordOrdinal(0));
         assert_eq!(vec[1], RecordOrdinal(6));
+
+        // Exclude multiples of 12 (`AND NOT`) -> only odd multiples of 6 (6, 18, 30, ...) remain!
+        idx.exclude_from_bitmap(&[(1, tag_deprecated)], &mut both);
+        assert_eq!(both.len(), 833);
+        let (page, total) = both.collect_window(10, Some(5), None, false);
+        assert_eq!(total, 833);
+        assert_eq!(
+            page,
+            vec![
+                RecordOrdinal(126),
+                RecordOrdinal(138),
+                RecordOrdinal(150),
+                RecordOrdinal(162),
+                RecordOrdinal(174),
+            ]
+        );
+
+        // Keyset cursor seek after RecordOrdinal(138)
+        let (cursor_page, rem_total) =
+            both.collect_window(0, Some(3), Some(RecordOrdinal(138)), false);
+        assert_eq!(rem_total, 833 - 12);
+        assert_eq!(
+            cursor_page,
+            vec![RecordOrdinal(150), RecordOrdinal(162), RecordOrdinal(174)]
+        );
     }
 }
+

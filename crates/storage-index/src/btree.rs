@@ -71,6 +71,59 @@ impl LeafPostingList {
             bm.insert(ord);
         }
     }
+
+    #[inline]
+    fn iter_asc(&self) -> impl Iterator<Item = RecordOrdinal> + '_ {
+        self.inline[..self.inline_len as usize]
+            .iter()
+            .copied()
+            .chain(self.spill.iter().copied())
+    }
+
+    #[inline]
+    fn iter_desc(&self) -> impl Iterator<Item = RecordOrdinal> + '_ {
+        self.spill
+            .iter()
+            .rev()
+            .copied()
+            .chain(self.inline[..self.inline_len as usize].iter().rev().copied())
+    }
+}
+
+/// Sort direction for numeric/timestamp range scans and paginated queries (`TASK-055`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SortOrder {
+    #[default]
+    Asc,
+    Desc,
+}
+
+/// Opaque $O(\log N)$ keyset/seek pagination cursor (`TASK-055`).
+///
+/// Captures the `(sort_key, ordinal)` of the last record on a page so the next page can seek
+/// directly in the B+Tree or bitmap without scanning prior pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeysetCursor {
+    pub sort_key: Option<i64>,
+    pub ordinal: RecordOrdinal,
+}
+
+impl KeysetCursor {
+    #[inline]
+    pub const fn from_ordinal(ordinal: RecordOrdinal) -> Self {
+        Self {
+            sort_key: None,
+            ordinal,
+        }
+    }
+
+    #[inline]
+    pub const fn from_key_and_ordinal(sort_key: i64, ordinal: RecordOrdinal) -> Self {
+        Self {
+            sort_key: Some(sort_key),
+            ordinal,
+        }
+    }
 }
 
 /// Secondary range index over 64-bit signed integer / timestamp fields (`field_id -> BTreeMap<i64, LeafPostingList>`).
@@ -140,6 +193,110 @@ impl NumericRangeIndex {
             }
         }
         out
+    }
+
+    /// Executes a paginated, direction-aware (`Asc`/`Desc`), keyset-cursor-seekable B+Tree range scan (`TASK-055`).
+    ///
+    /// - Seeks directly to `cursor.sort_key` in $O(\log N)$ time using `BTreeMap::range`.
+    /// - Applies `filter_fn(ord)` before counting toward `offset`, `limit`, and `total_matched`.
+    /// - Returns `(Vec<(sort_key, RecordOrdinal)>, total_matched)`.
+    pub fn range_collect_paginated<F: Fn(RecordOrdinal) -> bool>(
+        &self,
+        field_id: u16,
+        min_inclusive: i64,
+        max_inclusive: i64,
+        order: SortOrder,
+        cursor: Option<KeysetCursor>,
+        offset: usize,
+        limit: Option<usize>,
+        filter_fn: F,
+    ) -> (Vec<(i64, RecordOrdinal)>, usize) {
+        if min_inclusive > max_inclusive {
+            return (Vec::new(), 0);
+        }
+        let guard = self
+            .trees
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(tree) = guard.get(&field_id) else {
+            return (Vec::new(), 0);
+        };
+
+        let max_items = limit.unwrap_or(usize::MAX);
+        let mut out = Vec::with_capacity(max_items.min(256));
+        let mut total_matched = 0usize;
+        let mut skipped = 0usize;
+
+        match order {
+            SortOrder::Asc => {
+                let effective_start = match cursor.and_then(|c| c.sort_key) {
+                    Some(ck) if ck > min_inclusive => ck,
+                    _ => min_inclusive,
+                };
+                if effective_start > max_inclusive {
+                    return (Vec::new(), 0);
+                }
+                for (&k, leaf) in tree.range(effective_start..=max_inclusive) {
+                    for ord in leaf.iter_asc() {
+                        if let Some(cur) = cursor {
+                            if let Some(ck) = cur.sort_key {
+                                if k == ck && ord <= cur.ordinal {
+                                    continue;
+                                }
+                            } else if ord <= cur.ordinal {
+                                continue;
+                            }
+                        }
+                        if !filter_fn(ord) {
+                            continue;
+                        }
+                        total_matched += 1;
+                        if skipped < offset {
+                            skipped += 1;
+                            continue;
+                        }
+                        if out.len() < max_items {
+                            out.push((k, ord));
+                        }
+                    }
+                }
+            }
+            SortOrder::Desc => {
+                let effective_end = match cursor.and_then(|c| c.sort_key) {
+                    Some(ck) if ck < max_inclusive => ck,
+                    _ => max_inclusive,
+                };
+                if min_inclusive > effective_end {
+                    return (Vec::new(), 0);
+                }
+                for (&k, leaf) in tree.range(min_inclusive..=effective_end).rev() {
+                    for ord in leaf.iter_desc() {
+                        if let Some(cur) = cursor {
+                            if let Some(ck) = cur.sort_key {
+                                if k == ck && ord >= cur.ordinal {
+                                    continue;
+                                }
+                            } else if ord >= cur.ordinal {
+                                continue;
+                            }
+                        }
+                        if !filter_fn(ord) {
+                            continue;
+                        }
+                        total_matched += 1;
+                        if skipped < offset {
+                            skipped += 1;
+                            continue;
+                        }
+                        if out.len() < max_items {
+                            out.push((k, ord));
+                        }
+                    }
+                }
+            }
+        }
+
+        (out, total_matched)
     }
 
     /// Returns a `CompressedBitmap` of all `RecordOrdinal`s matching `range` on `field_id`
@@ -253,6 +410,38 @@ mod tests {
         assert_eq!(hits.len(), 10);
         assert_eq!(hits[0], RecordOrdinal(100));
         assert_eq!(hits[9], RecordOrdinal(109));
+
+        // Verify descending pagination + keyset cursor seek
+        let (page1, total) = idx.range_collect_paginated(
+            1,
+            1_700_000_100,
+            1_700_000_109,
+            SortOrder::Desc,
+            None,
+            0,
+            Some(4),
+            |_| true,
+        );
+        assert_eq!(total, 10);
+        assert_eq!(page1.len(), 4);
+        assert_eq!(page1[0].1, RecordOrdinal(109));
+        assert_eq!(page1[3].1, RecordOrdinal(106));
+
+        let cursor = KeysetCursor::from_key_and_ordinal(page1[3].0, page1[3].1);
+        let (page2, rem_total) = idx.range_collect_paginated(
+            1,
+            1_700_000_100,
+            1_700_000_109,
+            SortOrder::Desc,
+            Some(cursor),
+            0,
+            Some(4),
+            |_| true,
+        );
+        assert_eq!(rem_total, 6);
+        assert_eq!(page2.len(), 4);
+        assert_eq!(page2[0].1, RecordOrdinal(105));
+        assert_eq!(page2[3].1, RecordOrdinal(102));
     }
 
     #[test]
@@ -269,3 +458,4 @@ mod tests {
         assert!(sortable_u64_to_i64(0) < sortable_u64_to_i64(u64::MAX));
     }
 }
+

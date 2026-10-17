@@ -334,6 +334,102 @@ impl PrimaryIndex {
         out
     }
 
+    /// Builds a `CompressedBitmap` of all currently live `RecordOrdinal`s from the dense ordinal table (`TASK-055`).
+    pub fn live_ordinals_bitmap(&self) -> crate::bitmap::CompressedBitmap {
+        let table = self
+            .ordinals
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut bm = crate::bitmap::CompressedBitmap::new();
+        for (idx, slot) in table.ids.iter().enumerate() {
+            if let Some(id) = slot {
+                if !id.is_empty() {
+                    bm.insert(RecordOrdinal(idx as u32));
+                }
+            }
+        }
+        bm
+    }
+
+    /// Scans live `(RecordOrdinal, InlineId)` pairs from the dense ordinal table with $O(1)$ array-indexed
+    /// keyset cursor seeking, `offset`, `limit`, and ascending/descending order (`TASK-055`).
+    pub fn scan_ordinals_paginated<F: Fn(RecordOrdinal, InlineId) -> bool>(
+        &self,
+        descending: bool,
+        after_ordinal: Option<RecordOrdinal>,
+        offset: usize,
+        limit: Option<usize>,
+        filter_fn: F,
+    ) -> (Vec<(RecordOrdinal, InlineId)>, usize) {
+        let table = self
+            .ordinals
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let len = table.ids.len();
+        if len == 0 {
+            return (Vec::new(), 0);
+        }
+        let max_items = limit.unwrap_or(usize::MAX);
+        let mut out = Vec::with_capacity(max_items.min(self.len().min(256)));
+        let mut total_matched = 0usize;
+        let mut skipped = 0usize;
+
+        if !descending {
+            let start_idx = match after_ordinal {
+                Some(cur) => (cur.0 as usize).saturating_add(1),
+                None => 0,
+            };
+            if start_idx >= len {
+                return (Vec::new(), 0);
+            }
+            for (idx, slot) in table.ids[start_idx..].iter().enumerate() {
+                if let Some(id) = slot {
+                    if !id.is_empty() {
+                        let ord = RecordOrdinal((start_idx + idx) as u32);
+                        if !filter_fn(ord, *id) {
+                            continue;
+                        }
+                        total_matched += 1;
+                        if skipped < offset {
+                            skipped += 1;
+                            continue;
+                        }
+                        if out.len() < max_items {
+                            out.push((ord, *id));
+                        }
+                    }
+                }
+            }
+        } else {
+            let end_exclusive = match after_ordinal {
+                Some(cur) => (cur.0 as usize).min(len),
+                None => len,
+            };
+            if end_exclusive == 0 {
+                return (Vec::new(), 0);
+            }
+            for (idx, slot) in table.ids[..end_exclusive].iter().enumerate().rev() {
+                if let Some(id) = slot {
+                    if !id.is_empty() {
+                        let ord = RecordOrdinal(idx as u32);
+                        if !filter_fn(ord, *id) {
+                            continue;
+                        }
+                        total_matched += 1;
+                        if skipped < offset {
+                            skipped += 1;
+                            continue;
+                        }
+                        if out.len() < max_items {
+                            out.push((ord, *id));
+                        }
+                    }
+                }
+            }
+        }
+        (out, total_matched)
+    }
+
     /// Restores an entry loaded from a checkpoint on startup. A fresh dense ordinal is always
     /// allocated (the on-disk checkpoint never dictates ordinal values, so a corrupted or
     /// malicious `primary.idx` cannot force a huge ordinal-table allocation).

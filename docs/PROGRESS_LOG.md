@@ -176,4 +176,10 @@
 - **[x] `TASK-054`: Implement Incremental $O(\Delta)$ Primary Index Delta Checkpointing (`STGEDLT2`)**
   - Implemented `append_primary_checkpoint_delta`, `delta_checkpoint_path`, and automatic `.delta` replay in `load_primary_checkpoint` (`crates/storage-index/src/checkpoint.rs`), plus `StorageEngine::checkpoint_incremental` with automatic 1 MiB compaction (`43` total workspace tests passing, `0` warnings, `0` errors).
 
+### Stage 16: Engine-Level Set Filtering, Bidirectional Sorting & Keyset/Offset Pagination (`TASK-055` – `TASK-056`)
+- **[x] `TASK-055`: Implement Hardware-Accelerated Bitmap `AND NOT` / `OR` Windowing & Bidirectional Keyset-Seekable B+Tree Scans**
+  - Added `and_not`, `and_not_in_place`, `collect_window` (using 1-cycle `POPCNT` word skipping for `offset` and `BLSR`/`leading_zeros` for `Asc`/`Desc`), `union_tags`, `exclude_from_bitmap`, and `matches_ordinal` in `crates/storage-index/src/bitmap.rs`; added `SortOrder`, `KeysetCursor`, and `range_collect_paginated` in `crates/storage-index/src/btree.rs`; and added $O(1)$ array-indexed `scan_ordinals_paginated` in `crates/storage-index/src/primary.rs`.
+- **[x] `TASK-056`: Implement Zero-Allocation `QueryBuilder` Set Filters, Zero-Copy Payload Predicates, `QueryPage` & Paginated TCP RPC**
+  - Upgraded `QueryBuilder` (`crates/storage-core/src/query.rs`) with stack-inlined `filter_not_tag`, `filter_any_tag`, `filter_range_f64`, `filter_range_u64`, `order_asc`, `order_desc`, `offset`, `after_cursor`, `execute_page_ids`, `execute_page_refs`, `execute_page_filtered_with`, and `for_each_ref`, plus `StorageClient::query_range_paginated` (`crates/storage-server/src/lib.rs`, `44` total workspace tests passing, `0` warnings, `0` errors).
+
 

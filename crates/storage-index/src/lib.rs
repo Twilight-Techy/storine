@@ -17,7 +17,9 @@ pub mod traits;
 pub mod vector;
 
 pub use bitmap::{BitmapTagIndex, CompressedBitmap};
-pub use btree::{sortable_f64_to_i64, sortable_u64_to_i64, NumericRangeIndex};
+pub use btree::{
+    sortable_f64_to_i64, sortable_u64_to_i64, KeysetCursor, NumericRangeIndex, SortOrder,
+};
 pub use checkpoint::{
     append_primary_checkpoint_delta, delta_checkpoint_path, load_primary_checkpoint,
     save_primary_checkpoint,

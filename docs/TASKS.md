@@ -394,3 +394,23 @@ This document defines the strict chronological execution order for building the 
     - Replay all valid `.delta` frames automatically during `load_primary_checkpoint`, clean up `.delta` when a full `save_primary_checkpoint` executes, and expose `StorageEngine::checkpoint_incremental` with automatic full compaction once `.delta` reaches `1 MiB`.
   - **Exit Criteria**: `test_v2_checkpoint_and_incremental_delta_roundtrip` and `test_minimal_footprint_invariants_and_arena_compaction` verify $O(\Delta)$ incremental checkpointing and recovery.
 
+---
+
+## Stage 16: Engine-Level Set Filtering (`AND NOT`, `IN`/`OR`), Bidirectional Sorting & $O(\log N)$ Keyset/Offset Pagination (`TASK-055` – `TASK-056`)
+
+- [x] **TASK-055: Implement Hardware-Accelerated Bitmap `AND NOT` / `OR` Windowing & Bidirectional Keyset-Seekable B+Tree Scans**
+  - **Deliverables**: `crates/storage-index/src/bitmap.rs`, `crates/storage-index/src/btree.rs`, `crates/storage-index/src/primary.rs`, `crates/storage-index/src/lib.rs`.
+  - **Optimizations**:
+    - Implement `CompressedBitmap::and_not`, `and_not_in_place` (`0` heap allocations), `BitmapTagIndex::union_tags` (`WHERE tag IN (...)`), `exclude_from_bitmap`, `filter_not_in_place`, and `matches_ordinal`.
+    - Implement `CompressedBitmap::collect_window` using hardware `POPCNT` (`count_ones`) to skip whole 64-bit words during `offset` skipping in 1 CPU cycle (`64x` faster than bit-by-bit iteration), supporting both ascending (`BLSR`) and descending (`leading_zeros`) traversal plus `after_ordinal` cursor seeking.
+    - Implement `SortOrder::{Asc, Desc}`, `KeysetCursor`, `NumericRangeIndex::range_collect_paginated` ($O(\log N)$ B+Tree cursor seek via `BTreeMap::range` + `.rev()`), and `PrimaryIndex::scan_ordinals_paginated` ($O(1)$ array-indexed ordinal cursor seek).
+  - **Exit Criteria**: Unit tests in `bitmap.rs` and `btree.rs` verify `AND NOT`, `POPCNT` window skipping, descending B+Tree range pagination, and $O(\log N)$ `KeysetCursor` continuation.
+
+- [x] **TASK-056: Implement Zero-Allocation `QueryBuilder` Set Filters, Zero-Copy Payload Predicates, `QueryPage` & Paginated TCP RPC**
+  - **Deliverables**: `crates/storage-core/src/query.rs`, `crates/storage-core/src/lib.rs`, `crates/storage-server/src/lib.rs`.
+  - **Optimizations**:
+    - Extend `QueryBuilder` with stack-inlined `.filter_not_tag(field_id, tag)`, `.filter_any_tag(field_id, &[tags])`, `.filter_range_f64(field_id, min, max)`, `.filter_range_u64(field_id, min, max)`, `.order_asc()`, `.order_desc()`, `.offset(skip)`, and `.after_cursor(cursor)`.
+    - Add `QueryPage<Item>` (`items`, `total_matched`, `has_more`, `next_cursor`), `execute_page_ids()`, `execute_page_refs()`, `execute_page_filtered_with(|archived: &T::Archived| -> bool)` (evaluating caller predicates directly on zero-copy `mmap` pointers before pagination), and `for_each_ref`.
+    - Extend `OP_QUERY_HYBRID` and `StorageClient::query_range_paginated` in `storage-server` to support `offset`, `limit`, `descending`, and `total_matched` over TCP.
+  - **Exit Criteria**: `test_query_filtering_and_pagination_end_to_end` and `test_tcp_server_wire_protocol_v2_cas_batch_query_auth_and_metrics` pass with zero warnings (`44` total workspace tests passing).
+

@@ -38,7 +38,8 @@ pub use model::{
 };
 pub use mvcc::{CommitTs, MvccManager, ReadSnapshot, VersionChainNode};
 pub use optimizer::{AccessPathKind, PredicateCostEstimate, QueryExplainPlan, QueryOptimizer};
-pub use query::QueryBuilder;
+pub use query::{QueryBuilder, QueryPage};
+pub use storage_index::{KeysetCursor, SortOrder};
 pub use raft::{
     AppendEntriesReq, AppendEntriesResp, RaftLogEntry, RaftNode, RaftReplicationGroup, RaftRole,
     RequestVoteReq, RequestVoteResp,

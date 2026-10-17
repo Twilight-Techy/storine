@@ -47,11 +47,11 @@
 
 ---
 
-## 4. Write Coalescing, Durability & `v1.0` Production Verification (`TASK-030`, `TASK-050` & `TASK-054`)
+## 4. Write Coalescing, Durability & `v1.0` Production Verification (`TASK-030`, `TASK-050` & `TASK-056`)
 - **Live Records**: `2,000`
 - **Total Foreground Writes**: `7,256`
 - **Coalesced Background Flushes Saved**: `5,193` (**`71.6%` reduction in physical disk writes**)
-- **Full-Scale `v1.0` + Stage 15 Production Verification Gate (`43` Workspace Tests Passing, `0` Warnings)**:
+- **Full-Scale `v1.0` + Stages 15–16 Production Verification Gate (`44` Workspace Tests Passing, `0` Warnings)**:
   - **Multi-Collection Catalog & Heterogeneous Graph (`TASK-031`–`TASK-033`)**: Cross-collection ACID transactions (`Users` + `Orders`), `IntegrityPolicy::{Restrict, Cascade, Unlink}` enforcement across collections, and typed schema evolution (`v1 -> v2 -> v3`) during arena compaction.
   - **Paged Disk Indexes (`TASK-034`–`TASK-035`)**: 4 KiB memory-mapped `PagedBTreeIndex`, `PagedBitmapIndex`, 64-byte cache-line `SplitBlockBloomFilter`, and `< 2.5B/record` `ColdPrimaryIndex`.
   - **HNSW & `SQ8` Vector Quantization (`TASK-036`–`TASK-038`)**: Multi-layer `HnswVectorIndex` with `4x` `SQ8` quantization, `hnsw.idx` persistence, and filter-aware hybrid search (`>= 95%` recall@10 with exact `f32` re-ranking).
@@ -60,5 +60,7 @@
   - **Consistent-Hash Sharding & Raft Consensus (`TASK-045`–`TASK-047`)**: `1,024` virtual shards, 2 KiB `ClusterMap`, live `migrate_vshard` with 64-bit `XXH3-64` digest verification, and 3-node `RaftReplicationGroup` leader election, quorum commit, and leader failover.
   - **Cost-Based Optimizer & Prometheus Telemetry (`TASK-048`–`TASK-050`)**: `QueryBuilder::explain()` cardinality ordering, $O(1)$ zero-cardinality short-circuiting, lock-free 64-bucket `LatencyHistogram`, and `/metrics` Prometheus exposition.
   - **On-Disk I/O, Slot Recycling, WAL Compression & Incremental Checkpoints (`TASK-051`–`TASK-054`)**: Single-syscall positional `write_all_at` + lazy superblock fast-forward recovery, $O(1)$ 64B size-class dead-slot reuse (`reclaim_dead_slot`), transparent LZ4 WAL frame compression (`>= 1 KiB`), and incremental $O(\Delta)$ `STGEDLT2` delta checkpoints (`primary.idx.delta`).
+  - **Engine-Level Set Filtering, Bidirectional Sorting & Keyset/Offset Pagination (`TASK-055`–`TASK-056`)**: 64-bit `POPCNT`-accelerated bitmap `AND NOT` / `OR` windowing (`filter_not_tag`, `filter_any_tag`), bidirectional `SortOrder::{Asc, Desc}` B+Tree range scans, $O(\log N)$ `KeysetCursor` + `offset`/`limit` pagination (`QueryPage<T>`), zero-copy `execute_page_filtered_with` (`|archived: &T::Archived|`), and paginated `OP_QUERY_HYBRID` TCP RPC.
+
 
 

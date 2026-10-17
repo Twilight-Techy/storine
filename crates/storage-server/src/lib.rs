@@ -785,18 +785,29 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
             let min_val = i64::from_le_bytes(body[2..10].try_into().unwrap());
             let max_val = i64::from_le_bytes(body[10..18].try_into().unwrap());
             let limit = u32::from_le_bytes(body[18..22].try_into().unwrap()) as usize;
+            let (offset, desc) = if body.len() >= 27 {
+                let off = u32::from_le_bytes(body[22..26].try_into().unwrap()) as usize;
+                let is_desc = body[26] != 0;
+                (off, is_desc)
+            } else {
+                (0usize, false)
+            };
 
-            let ids = engine
+            let mut q = engine
                 .query()
                 .filter_range(field_id, min_val..=max_val)
-                .limit(limit.max(1))
-                .execute_ids();
-            let mut out = Vec::with_capacity(4 + ids.len() * 24);
-            out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
-            for id in &ids {
+                .offset(offset)
+                .limit(limit.max(1));
+            if desc {
+                q = q.order_desc();
+            }
+            let page = q.execute_page_ids();
+            let mut out = Vec::with_capacity(4 + page.items.len() * 24);
+            out.extend_from_slice(&(page.items.len() as u32).to_le_bytes());
+            for id in &page.items {
                 out.extend_from_slice(&id.to_raw_bytes());
             }
-            conn.send_or_queue_response(STATUS_OK, ids.len() as u64, &out)
+            conn.send_or_queue_response(STATUS_OK, page.total_matched as u64, &out)
         }
         OP_DELETE => {
             if !conn.role.can_write() {
@@ -1022,6 +1033,45 @@ impl StorageClient {
         Ok(ids)
     }
 
+    /// Executes a remote paginated range query (`offset`, `limit`, `descending`) over TCP (`OP_QUERY_HYBRID`, `TASK-056`),
+    /// returning `(page_ids, total_matched)`.
+    pub fn query_range_paginated(
+        &mut self,
+        field_id: u16,
+        min_val: i64,
+        max_val: i64,
+        offset: u32,
+        limit: u32,
+        descending: bool,
+    ) -> Result<(Vec<InlineId>, usize)> {
+        let mut body = [0u8; 27];
+        body[0..2].copy_from_slice(&field_id.to_le_bytes());
+        body[2..10].copy_from_slice(&min_val.to_le_bytes());
+        body[10..18].copy_from_slice(&max_val.to_le_bytes());
+        body[18..22].copy_from_slice(&limit.to_le_bytes());
+        body[22..26].copy_from_slice(&offset.to_le_bytes());
+        body[26] = u8::from(descending);
+        let (status, total_matched, resp) =
+            self.rpc(OP_QUERY_HYBRID, InlineId::from_static("_"), &body)?;
+        if status != STATUS_OK || resp.len() < 4 {
+            return Err(StorageError::corrupted_header(
+                "QueryHybrid paginated failed",
+            ));
+        }
+        let count = u32::from_le_bytes(resp[0..4].try_into().unwrap()) as usize;
+        let mut ids = Vec::with_capacity(count);
+        for i in 0..count {
+            let off = 4 + i * 24;
+            if off + 24 <= resp.len() {
+                let raw: [u8; 24] = resp[off..off + 24].try_into().unwrap();
+                if let Ok(id) = InlineId::from_raw_bytes(raw) {
+                    ids.push(id);
+                }
+            }
+        }
+        Ok((ids, total_matched as usize))
+    }
+
     /// Scrapes Prometheus/OpenMetrics text exposition from the server (`OP_METRICS`).
     pub fn scrape_metrics(&mut self) -> Result<String> {
         let (status, _, resp) = self.rpc(OP_METRICS, InlineId::from_static("_"), &[])?;
@@ -1227,9 +1277,14 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert!(frames[0].is_some() && frames[1].is_some());
 
-        // 6. Remote QueryHybrid by score range
+        // 6. Remote QueryHybrid by score range (and paginated descending query)
         let q_ids = client.query_range_ids(FIELD_SCORE, 140, 160, 10).unwrap();
         assert_eq!(q_ids, vec![id1]);
+        let (page_ids, total_matched) = client
+            .query_range_paginated(FIELD_SCORE, 100, 300, 0, 1, true)
+            .unwrap();
+        assert_eq!(total_matched, 2);
+        assert_eq!(page_ids, vec![id2]);
 
         // 7. Scrape Prometheus metrics
         let prom = client.scrape_metrics().unwrap();
