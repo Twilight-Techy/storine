@@ -362,3 +362,35 @@ This document defines the strict chronological execution order for building the 
     2. Run `cargo test --workspace` and `cargo run --release -p storage-benches` verifying `0.00` hot-read allocations, sub-microsecond hot reads, minimal binary/data footprint, and 100% chaos crash recovery.
   - **Exit Criteria**: All tests pass with zero warnings, benchmark report updated with v1.0 metrics, and all changes committed and pushed to `origin/main`.
 
+---
+
+## Stage 15: On-Disk I/O, Slot Recycling, WAL Compression & Incremental Delta Checkpoint Optimizations (`TASK-051` – `TASK-054`)
+
+- [x] **TASK-051: Implement Positional `write_all_at` (`seek_write`/`pwrite`) & Lazy Superblock Fast-Forward Recovery in `ArenaSegment`**
+  - **Deliverables**: `crates/storage-mmap/src/arena.rs`.
+  - **Optimizations**:
+    - Replace the 4-syscall `(seek(offset) + write_all(frame) + seek(12) + write_all(head))` pattern in `ArenaSegment::append_frame` with a single positional `write_all_at(&w.file, frame, offset as u64)` (`FileExt::seek_write` on Windows, `FileExt::write_at` on Unix), cutting per-flush syscalls by `75%` (`4 -> 1`).
+    - Eliminate SSD page-0 write amplification by updating the 64-byte superblock `write_head` lazily (every `SUPERBLOCK_SYNC_INTERVAL = 64` appends, on segment capacity doubling, on explicit `sync_data`, or on `Drop`), and fast-forwarding `write_head` across valid checksummed `RecordHeader` slots at `ArenaSegment::open_or_create` startup.
+  - **Exit Criteria**: `test_arena_positional_write_fast_forward_recovery_and_slot_reuse` verifies that even if a process crashes before the 64-append superblock flush interval, reopening the segment deterministically fast-forwards `write_head` across all valid appended frames without data loss.
+
+- [x] **TASK-052: Implement In-Segment 64-Byte Size-Class Free-Slot Reuse (`reclaim_dead_slot`)**
+  - **Deliverables**: `crates/storage-mmap/src/arena.rs`, `crates/storage-core/src/engine.rs`.
+  - **Optimizations**:
+    - Maintain `free_slots: FastHashMap<u32, Vec<u32>>` (mapping `64B-aligned size class -> stack of free offsets`) inside `ArenaWriter`.
+    - When no MVCC snapshot is active (`!self.mvcc.has_active_snapshots()`), `delete_record_locked` and `flush_single_record_impl` call `arena.reclaim_dead_slot(old_loc)` so subsequent writes of the same 64B size class pop and overwrite the dead slot in-place in $O(1)$ without growing `.seg` files or waiting for full segment compaction.
+  - **Exit Criteria**: Repeated updates or delete+reinsert cycles of same-sized records reuse existing 64B slots in-place with zero `.seg` file growth.
+
+- [x] **TASK-053: Implement Transparent LZ4 WAL Frame Compression for Payloads `>= 1 KiB`**
+  - **Deliverables**: `crates/storage-wal/src/lib.rs`.
+  - **Optimizations**:
+    - Introduce `WAL_FLAG_LZ4 = 0x01` in header byte `7` and store `uncompressed_len: u32` in previously reserved header bytes `60..64` of the 64-byte WAL frame header.
+    - Automatically compress WAL payloads `>= 1024` bytes (`WAL_LZ4_THRESHOLD`) via `storage_codec::compress_lz4` when compressible, and transparently decompress on recovery via `storage_codec::decompress_lz4` (`recover_committed`), cutting sequential WAL disk bandwidth by `2x–4x` on medium/large records while keeping small frames (`< 1 KiB`) zero-overhead.
+  - **Exit Criteria**: `test_wal_group_commit_lz4_compression_and_torn_frame_recovery` verifies an 8 KiB record compresses to `< 2 KiB` on disk and recovers bit-for-bit identically.
+
+- [x] **TASK-054: Implement Incremental $O(\Delta)$ Primary Index Delta Checkpointing (`STGEDLT2`)**
+  - **Deliverables**: `crates/storage-index/src/checkpoint.rs`, `crates/storage-index/src/lib.rs`, `crates/storage-core/src/engine.rs`.
+  - **Optimizations**:
+    - Implement `append_primary_checkpoint_delta` and `delta_checkpoint_path` (`<collection>_primary.idx.delta`) writing compact checksummed `STGEDLT2` delta frames containing only modified upserted entries and deleted `InlineId` tombstones in $O(\Delta)$ time and bytes.
+    - Replay all valid `.delta` frames automatically during `load_primary_checkpoint`, clean up `.delta` when a full `save_primary_checkpoint` executes, and expose `StorageEngine::checkpoint_incremental` with automatic full compaction once `.delta` reaches `1 MiB`.
+  - **Exit Criteria**: `test_v2_checkpoint_and_incremental_delta_roundtrip` and `test_minimal_footprint_invariants_and_arena_compaction` verify $O(\Delta)$ incremental checkpointing and recovery.
+

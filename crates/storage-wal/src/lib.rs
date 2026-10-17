@@ -11,11 +11,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
-use storage_codec::checksum_payload;
+use storage_codec::{checksum_payload, compress_lz4, decompress_lz4};
 use storage_types::{CachePadded, InlineId, Result, StorageError, Version, MAX_PAYLOAD_SIZE};
 
 const WAL_MAGIC: u32 = 0x5741_4C31; // "WAL1"
 const WAL_FRAME_HEADER_LEN: usize = 72;
+const WAL_FLAG_LZ4: u8 = 0x01;
+/// Minimum WAL frame payload size (`1 KiB`) before transparent LZ4 frame compression is applied (`TASK-053`).
+const WAL_LZ4_THRESHOLD: usize = 1024;
 
 /// Durability policy controlling when WAL appends call `sync_data()` (`F-DURA-02`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,9 +174,10 @@ impl GroupCommitWal {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !guard.flushing && guard.queue.is_empty() {
-            // Zero-allocation uncontended leader fast path!
+            // Zero-allocation uncontended leader fast path (with transparent LZ4 compression for >= 1KB frames)!
             self.total_frames.fetch_add(1, Ordering::Relaxed);
-            let hdr_bytes = encode_wal_frame_header(
+            Self::write_single_frame_locked(
+                &mut guard.writer,
                 lsn,
                 0,
                 collection_id,
@@ -181,17 +185,7 @@ impl GroupCommitWal {
                 record_id,
                 version,
                 frame_bytes,
-            );
-            guard
-                .writer
-                .write_all(&hdr_bytes)
-                .map_err(|e| StorageError::io("write WAL frame header", e))?;
-            if !frame_bytes.is_empty() {
-                guard
-                    .writer
-                    .write_all(frame_bytes)
-                    .map_err(|e| StorageError::io("write WAL frame body", e))?;
-            }
+            )?;
             let sync_disk = matches!(
                 self.policy,
                 SyncPolicy::Immediate | SyncPolicy::GroupCommit { .. }
@@ -314,13 +308,71 @@ impl GroupCommitWal {
         }
     }
 
+    #[inline]
+    fn write_single_frame_locked(
+        writer: &mut BufWriter<File>,
+        lsn: u64,
+        txn_id: u64,
+        collection_id: u16,
+        kind: WalOpKind,
+        record_id: InlineId,
+        version: Version,
+        frame_bytes: &[u8],
+    ) -> Result<()> {
+        if frame_bytes.len() >= WAL_LZ4_THRESHOLD {
+            let compressed = compress_lz4(frame_bytes);
+            if compressed.len() < frame_bytes.len() {
+                let hdr_bytes = encode_wal_frame_header(
+                    lsn,
+                    txn_id,
+                    collection_id,
+                    kind,
+                    WAL_FLAG_LZ4,
+                    record_id,
+                    version,
+                    &compressed,
+                    frame_bytes.len() as u32,
+                );
+                writer
+                    .write_all(&hdr_bytes)
+                    .map_err(|e| StorageError::io("write compressed WAL frame header", e))?;
+                writer
+                    .write_all(&compressed)
+                    .map_err(|e| StorageError::io("write compressed WAL frame body", e))?;
+                return Ok(());
+            }
+        }
+
+        let hdr_bytes = encode_wal_frame_header(
+            lsn,
+            txn_id,
+            collection_id,
+            kind,
+            0,
+            record_id,
+            version,
+            frame_bytes,
+            0,
+        );
+        writer
+            .write_all(&hdr_bytes)
+            .map_err(|e| StorageError::io("write WAL frame header", e))?;
+        if !frame_bytes.is_empty() {
+            writer
+                .write_all(frame_bytes)
+                .map_err(|e| StorageError::io("write WAL frame body", e))?;
+        }
+        Ok(())
+    }
+
     fn write_batch_locked(
         writer: &mut BufWriter<File>,
         items: &[PendingBatchItem],
         sync_disk: bool,
     ) -> Result<()> {
         for item in items {
-            let hdr_bytes = encode_wal_frame_header(
+            Self::write_single_frame_locked(
+                writer,
                 item.assigned_lsn,
                 item.txn_id,
                 item.collection_id,
@@ -328,15 +380,7 @@ impl GroupCommitWal {
                 item.record_id,
                 item.version,
                 &item.frame_bytes,
-            );
-            writer
-                .write_all(&hdr_bytes)
-                .map_err(|e| StorageError::io("write WAL frame header", e))?;
-            if !item.frame_bytes.is_empty() {
-                writer
-                    .write_all(&item.frame_bytes)
-                    .map_err(|e| StorageError::io("write WAL frame body", e))?;
-            }
+            )?;
         }
         writer
             .flush()
@@ -399,9 +443,11 @@ impl GroupCommitWal {
                 txn_id,
                 collection_id,
                 kind,
+                flags,
                 record_id,
                 version,
                 body_len,
+                uncompressed_len,
                 expected_sum,
             )) = decode_wal_frame_header(hdr_slice)
             else {
@@ -422,13 +468,27 @@ impl GroupCommitWal {
                 txn_id,
                 collection_id,
                 kind,
+                flags,
                 record_id,
                 version,
                 body,
+                uncompressed_len as u32,
             );
             if actual_sum != expected_sum {
                 break;
             }
+
+            let decoded_frame = if (flags & WAL_FLAG_LZ4) != 0 {
+                if uncompressed_len > MAX_PAYLOAD_SIZE as usize {
+                    break;
+                }
+                let Ok(decompressed) = decompress_lz4(body, uncompressed_len) else {
+                    break;
+                };
+                decompressed
+            } else {
+                body.to_vec()
+            };
 
             let entry = WalEntry {
                 lsn,
@@ -437,7 +497,7 @@ impl GroupCommitWal {
                 kind,
                 record_id,
                 version,
-                frame_bytes: body.to_vec(),
+                frame_bytes: decoded_frame,
             };
 
             if txn_id == 0 {
@@ -587,52 +647,70 @@ impl Drop for GroupCommitWal {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn compute_wal_checksum(
     lsn: u64,
     txn_id: u64,
     collection_id: u16,
     kind: WalOpKind,
+    flags: u8,
     record_id: InlineId,
     version: Version,
     body: &[u8],
+    uncompressed_len: u32,
 ) -> u64 {
     let mut meta = [0u8; 64];
     meta[0..4].copy_from_slice(&WAL_MAGIC.to_le_bytes());
     meta[4..6].copy_from_slice(&collection_id.to_le_bytes());
     meta[6] = kind as u8;
+    meta[7] = flags;
     meta[8..16].copy_from_slice(&lsn.to_le_bytes());
     meta[16..24].copy_from_slice(&txn_id.to_le_bytes());
     meta[24..32].copy_from_slice(&version.0.to_le_bytes());
     meta[32..56].copy_from_slice(&record_id.to_raw_bytes());
     meta[56..60].copy_from_slice(&(body.len() as u32).to_le_bytes());
+    meta[60..64].copy_from_slice(&uncompressed_len.to_le_bytes());
     let h1 = checksum_payload(&meta);
     let h2 = checksum_payload(body);
     h1 ^ h2.rotate_left(29)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn encode_wal_frame_header(
     lsn: u64,
     txn_id: u64,
     collection_id: u16,
     kind: WalOpKind,
+    flags: u8,
     record_id: InlineId,
     version: Version,
     body: &[u8],
+    uncompressed_len: u32,
 ) -> [u8; WAL_FRAME_HEADER_LEN] {
-    let sum = compute_wal_checksum(lsn, txn_id, collection_id, kind, record_id, version, body);
+    let sum = compute_wal_checksum(
+        lsn,
+        txn_id,
+        collection_id,
+        kind,
+        flags,
+        record_id,
+        version,
+        body,
+        uncompressed_len,
+    );
     let mut out = [0u8; WAL_FRAME_HEADER_LEN];
     out[0..4].copy_from_slice(&WAL_MAGIC.to_le_bytes());
     out[4..6].copy_from_slice(&collection_id.to_le_bytes());
     out[6] = kind as u8;
-    out[7] = 0;
+    out[7] = flags;
     out[8..16].copy_from_slice(&lsn.to_le_bytes());
     out[16..24].copy_from_slice(&txn_id.to_le_bytes());
     out[24..32].copy_from_slice(&version.0.to_le_bytes());
     out[32..56].copy_from_slice(&record_id.to_raw_bytes());
     out[56..60].copy_from_slice(&(body.len() as u32).to_le_bytes());
-    out[60..64].copy_from_slice(&0u32.to_le_bytes());
+    out[60..64].copy_from_slice(&uncompressed_len.to_le_bytes());
     out[64..72].copy_from_slice(&sum.to_le_bytes());
     out
 }
@@ -641,7 +719,7 @@ fn encode_wal_frame_header(
 #[inline]
 fn decode_wal_frame_header(
     hdr: &[u8],
-) -> Option<(u64, u64, u16, WalOpKind, InlineId, Version, usize, u64)> {
+) -> Option<(u64, u64, u16, WalOpKind, u8, InlineId, Version, usize, usize, u64)> {
     if hdr.len() < WAL_FRAME_HEADER_LEN {
         return None;
     }
@@ -651,21 +729,25 @@ fn decode_wal_frame_header(
     }
     let collection_id = u16::from_le_bytes(hdr[4..6].try_into().ok()?);
     let kind = WalOpKind::from_u8(hdr[6])?;
+    let flags = hdr[7];
     let lsn = u64::from_le_bytes(hdr[8..16].try_into().ok()?);
     let txn_id = u64::from_le_bytes(hdr[16..24].try_into().ok()?);
     let version = Version(u64::from_le_bytes(hdr[24..32].try_into().ok()?));
     let raw_id: [u8; 24] = hdr[32..56].try_into().ok()?;
     let record_id = InlineId::from_raw_bytes(raw_id).ok()?;
     let body_len = u32::from_le_bytes(hdr[56..60].try_into().ok()?) as usize;
+    let uncompressed_len = u32::from_le_bytes(hdr[60..64].try_into().ok()?) as usize;
     let checksum = u64::from_le_bytes(hdr[64..72].try_into().ok()?);
     Some((
         lsn,
         txn_id,
         collection_id,
         kind,
+        flags,
         record_id,
         version,
         body_len,
+        uncompressed_len,
         checksum,
     ))
 }
@@ -675,16 +757,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_wal_group_commit_and_torn_frame_recovery() {
+    fn test_wal_group_commit_lz4_compression_and_torn_frame_recovery() {
         let dir = std::env::temp_dir().join("storage_wal_test_1");
         let _ = fs::remove_dir_all(&dir);
         let wal_path = dir.join("engine.wal");
 
+        let large_payload = vec![0x5A_u8; 8192]; // 8 KiB compressible frame
         {
             let wal = GroupCommitWal::open(&wal_path, SyncPolicy::Immediate).unwrap();
             let id1 = InlineId::new("rec_1").unwrap();
             let id2 = InlineId::new("rec_2").unwrap();
+            let id3 = InlineId::new("rec_large").unwrap();
             wal.append_single(1, WalOpKind::Upsert, id1, Version(1), &[0xAA; 64])
+                .unwrap();
+            wal.append_single(1, WalOpKind::Upsert, id3, Version(1), &large_payload)
                 .unwrap();
 
             let txn_id = wal.allocate_txn_id();
@@ -698,6 +784,13 @@ mod tests {
             .unwrap();
         }
 
+        // Verify the WAL file on disk is smaller than the raw 8 KiB payload thanks to LZ4 compression!
+        let wal_disk_bytes = fs::metadata(&wal_path).unwrap().len();
+        assert!(
+            wal_disk_bytes < 2048,
+            "expected LZ4-compressed WAL (<2KB), got {wal_disk_bytes} bytes"
+        );
+
         // Append simulated torn tail bytes (uncommitted crash mid-write)
         {
             let mut f = OpenOptions::new().append(true).open(&wal_path).unwrap();
@@ -705,11 +798,13 @@ mod tests {
         }
 
         let entries = GroupCommitWal::recover_committed(&wal_path).unwrap();
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].record_id.as_str(), "rec_1");
         assert_eq!(entries[0].version, Version(1));
-        assert_eq!(entries[1].version, Version(2));
-        assert_eq!(entries[2].record_id.as_str(), "rec_2");
+        assert_eq!(entries[1].record_id.as_str(), "rec_large");
+        assert_eq!(entries[1].frame_bytes, large_payload);
+        assert_eq!(entries[2].version, Version(2));
+        assert_eq!(entries[3].record_id.as_str(), "rec_2");
 
         let _ = fs::remove_dir_all(&dir);
     }

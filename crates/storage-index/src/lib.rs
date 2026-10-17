@@ -18,7 +18,10 @@ pub mod vector;
 
 pub use bitmap::{BitmapTagIndex, CompressedBitmap};
 pub use btree::{sortable_f64_to_i64, sortable_u64_to_i64, NumericRangeIndex};
-pub use checkpoint::{load_primary_checkpoint, save_primary_checkpoint};
+pub use checkpoint::{
+    append_primary_checkpoint_delta, delta_checkpoint_path, load_primary_checkpoint,
+    save_primary_checkpoint,
+};
 pub use hnsw::{HnswConfig, HnswVectorIndex};
 pub use paged_bitmap::{
     BloomCacheBlock, ColdPageSeparator, ColdPrimaryEntry, ColdPrimaryIndex, MappedChunkRef,

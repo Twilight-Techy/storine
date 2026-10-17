@@ -166,4 +166,14 @@
 - **[x] `TASK-050`: Execute Full-Scale `v1.0` Distributed Chaos, Security & Performance Gate**
   - Built and executed `crates/storage-core/tests/production_v1_gate.rs` verifying all Stages 8–14 capabilities end-to-end (`42` total workspace tests passing, `0` warnings, `0` errors).
 
+### Stage 15: On-Disk I/O, Slot Recycling, WAL Compression & Incremental Delta Checkpoint Optimizations (`TASK-051` – `TASK-054`)
+- **[x] `TASK-051`: Implement Positional `write_all_at` (`seek_write`/`pwrite`) & Lazy Superblock Fast-Forward Recovery in `ArenaSegment`**
+  - Replaced the 4-syscall `(seek + write + seek + write)` arena flush path in `crates/storage-mmap/src/arena.rs` with a single positional `write_all_at` syscall (`75%` syscall reduction) and lazy superblock `write_head` updates (`SUPERBLOCK_SYNC_INTERVAL = 64`) with deterministic startup fast-forward recovery across valid checksummed `RecordHeader` slots.
+- **[x] `TASK-052`: Implement In-Segment 64-Byte Size-Class Free-Slot Reuse (`reclaim_dead_slot`)**
+  - Added `free_slots: FastHashMap<u32, Vec<u32>>` inside `ArenaSegment` (`crates/storage-mmap/src/arena.rs`) and wired `arena.reclaim_dead_slot(old_loc)` into `StorageEngine` (`crates/storage-core/src/engine.rs`) when no MVCC snapshot is active so same-size updates reuse freed 64B slots in-place without growing `.seg` files.
+- **[x] `TASK-053`: Implement Transparent LZ4 WAL Frame Compression for Payloads `>= 1 KiB`**
+  - Added `WAL_FLAG_LZ4 = 0x01` and `uncompressed_len` (`bytes 60..64`) to the 64-byte WAL header (`crates/storage-wal/src/lib.rs`), transparently compressing WAL payloads `>= 1024` bytes via `compress_lz4` and decompressing during `recover_committed`.
+- **[x] `TASK-054`: Implement Incremental $O(\Delta)$ Primary Index Delta Checkpointing (`STGEDLT2`)**
+  - Implemented `append_primary_checkpoint_delta`, `delta_checkpoint_path`, and automatic `.delta` replay in `load_primary_checkpoint` (`crates/storage-index/src/checkpoint.rs`), plus `StorageEngine::checkpoint_incremental` with automatic 1 MiB compaction (`43` total workspace tests passing, `0` warnings, `0` errors).
+
 

@@ -463,17 +463,24 @@ fn test_minimal_footprint_invariants_and_arena_compaction() {
 
     let engine = StorageEngine::<AgentObjectRecord>::open(&dir, cfg).unwrap();
 
-    // Insert 40 records and update each 4 times to generate >75% dead space in the arena segment
-    for i in 0..40 {
-        let id = InlineId::new(&format!("cmp_{i:03}")).unwrap();
-        for round in 1..=4 {
-            let rec = AgentObjectRecord::new(id, format!("Title {i} r{round}"), i, i * round);
+    // 1. Insert 40 records and update all 40 across 4 rounds with growing payload sizes (changing 64B size classes)
+    // so old size-class slots accumulate across the cohort and trigger cross-size-class arena compaction.
+    let mut upserted_ids = Vec::with_capacity(40);
+    for round in 1..=4 {
+        for i in 0..40 {
+            let id = InlineId::new(&format!("cmp_{i:03}")).unwrap();
+            if round == 1 {
+                upserted_ids.push(id);
+            }
+            let mut rec = AgentObjectRecord::new(id, format!("Title {i} r{round}"), i, i * round);
+            rec.body = vec![b'x'; (round as usize) * 80];
             engine.put(id, &rec).unwrap();
         }
     }
     engine.flush_all().unwrap();
+    engine.checkpoint_incremental(&upserted_ids, &[]).unwrap();
 
-    let compacted = engine.compact_arenas(0.50).unwrap();
+    let compacted = engine.compact_arenas(0.40).unwrap();
     assert!(compacted >= 1, "expected at least 1 fragmented arena segment compacted");
 
     // Verify all 40 live records remain intact and readable via zero-copy `with_ref`

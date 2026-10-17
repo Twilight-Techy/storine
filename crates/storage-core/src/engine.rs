@@ -14,9 +14,10 @@ use storage_codec::{
 };
 use storage_graph::{DanglingEdge, OnDelete};
 use storage_index::{
-    cosine_similarity_f32, load_primary_checkpoint, save_primary_checkpoint, BitmapTagIndex,
-    CompressedBitmap, DiskLocation, HnswConfig, HnswVectorIndex, IndexDelta, IndexSnapshot,
-    Indexable, NumericRangeIndex, PrimaryEntry, PrimaryIndex, VectorTopKHit,
+    append_primary_checkpoint_delta, cosine_similarity_f32, delta_checkpoint_path,
+    load_primary_checkpoint, save_primary_checkpoint, BitmapTagIndex, CompressedBitmap,
+    DiskLocation, HnswConfig, HnswVectorIndex, IndexDelta, IndexSnapshot, Indexable,
+    NumericRangeIndex, PrimaryEntry, PrimaryIndex, VectorTopKHit,
 };
 use storage_mmap::{
     atomic_write_replace, cleanup_temp_files, read_ping_pong_active, write_ping_pong_slot,
@@ -1069,6 +1070,38 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         Ok(flushed)
     }
 
+    /// Appends an incremental $O(\Delta)$ delta frame (`STGEDLT2`) of modified `upserted_ids` and
+    /// `deleted_ids` to `<collection>_primary.idx.delta` without rewriting the full `primary.idx` (`TASK-054`).
+    /// Automatically compacts the `.delta` log into the base `primary.idx` once `.delta` exceeds `1 MiB`.
+    pub fn checkpoint_incremental(
+        &self,
+        upserted_ids: &[InlineId],
+        deleted_ids: &[InlineId],
+    ) -> Result<usize> {
+        for &id in upserted_ids {
+            let _ = self.inner.flush_single_record_to_disk(id, false)?;
+        }
+        let idx_path = self
+            .inner
+            .paths
+            .base_dir()
+            .join("indexes")
+            .join(format!("{}_primary.idx", self.inner.config.collection_name));
+        let written = append_primary_checkpoint_delta(
+            &self.inner.primary,
+            &idx_path,
+            upserted_ids,
+            deleted_ids,
+        )?;
+        let delta_path = delta_checkpoint_path(&idx_path);
+        if let Ok(meta) = fs::metadata(&delta_path) {
+            if meta.len() >= 1024 * 1024 {
+                save_primary_checkpoint(&self.inner.primary, &idx_path)?;
+            }
+        }
+        Ok(written)
+    }
+
     /// Reclaims fragmented dead slots across Slotted Arena Segments (`seg_XXXXX.dat`) whose
     /// dead-byte ratio meets or exceeds `min_fragmentation_ratio` (`0.0..=1.0`), evacuating live
     /// records into a clean segment and deleting the old `.dat` files from disk (`F-OPS-03`).
@@ -1962,7 +1995,11 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             }
             DiskLocation::Arena(loc) => {
                 if let Some(ref arena) = self.arena {
-                    arena.mark_dead(loc);
+                    if self.mvcc.has_active_snapshots() {
+                        arena.mark_dead(loc);
+                    } else {
+                        arena.reclaim_dead_slot(loc);
+                    }
                 }
             }
             DiskLocation::Unflushed => {}
@@ -2020,7 +2057,11 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                     .ok_or_else(|| StorageError::corrupted_header("arena manager not enabled"))?;
                 let loc = arena.write_record(frame_slice, sync_disk)?;
                 if let DiskLocation::Arena(old_loc) = entry.location {
-                    arena.mark_dead(old_loc);
+                    if self.mvcc.has_active_snapshots() {
+                        arena.mark_dead(old_loc);
+                    } else {
+                        arena.reclaim_dead_slot(old_loc);
+                    }
                 }
                 DiskLocation::Arena(loc)
             }
