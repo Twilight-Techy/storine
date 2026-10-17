@@ -76,6 +76,7 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 100_000;
 
 struct ReactorShard {
     incoming: Mutex<Vec<TcpStream>>,
+    has_incoming: AtomicBool,
     wake_cv: Condvar,
 }
 
@@ -83,6 +84,7 @@ impl ReactorShard {
     fn new() -> Self {
         Self {
             incoming: Mutex::new(Vec::new()),
+            has_incoming: AtomicBool::new(false),
             wake_cv: Condvar::new(),
         }
     }
@@ -94,6 +96,7 @@ impl ReactorShard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.push(stream);
+        self.has_incoming.store(true, Ordering::Release);
         self.wake_cv.notify_one();
     }
 }
@@ -382,50 +385,60 @@ fn reactor_worker_loop<T: ZeroCopyRecord + Indexable>(
 ) {
     let mut conns: Vec<NonBlockingConn> = Vec::with_capacity(64);
     let mut poller = SocketPoller::with_capacity(64);
+    let mut idle_polls: u32 = 0;
+    let mut made_progress = false;
 
     while !shutdown.load(Ordering::Relaxed) {
         let mut newly_added = false;
-        {
+        if conns.is_empty() || shard.has_incoming.load(Ordering::Acquire) {
             let mut inc = shard
                 .incoming
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if conns.is_empty() && inc.is_empty() {
-                let (mut inc2, _) = shard
+            // Sleep indefinitely (`0.0%` CPU, zero timer wakeups) when shard has zero connections
+            while conns.is_empty() && inc.is_empty() && !shutdown.load(Ordering::Relaxed) {
+                inc = shard
                     .wake_cv
-                    .wait_timeout(inc, Duration::from_millis(25))
+                    .wait(inc)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                for stream in inc2.drain(..) {
-                    conns.push(NonBlockingConn::new(stream, &security));
-                    newly_added = true;
-                }
-            } else {
-                for stream in inc.drain(..) {
-                    conns.push(NonBlockingConn::new(stream, &security));
-                    newly_added = true;
-                }
             }
+            for stream in inc.drain(..) {
+                conns.push(NonBlockingConn::new(stream, &security));
+                newly_added = true;
+            }
+            shard.has_incoming.store(false, Ordering::Release);
         }
 
         if conns.is_empty() {
             continue;
         }
 
-        // Wait in OS kernel (`WSAPoll` / `poll`) if no newly accepted connection needs immediate first-pass service
-        let use_kernel_filter = if !newly_added {
+        // Wait in OS kernel (`WSAPoll` / `poll`) when no connection is newly accepted or actively progressing
+        let use_kernel_filter = if !newly_added && !made_progress {
             poller.clear();
             for conn in &conns {
                 poller.register(&conn.stream, conn.wants_write());
             }
-            let ready = poller.wait(2);
+            let poll_timeout_ms = if idle_polls < 8 {
+                1
+            } else if idle_polls < 32 {
+                5
+            } else {
+                25
+            };
+            let ready = poller.wait(poll_timeout_ms);
             if ready == 0 {
+                idle_polls = idle_polls.saturating_add(1);
                 continue;
             }
+            idle_polls = 0;
             true
         } else {
+            idle_polls = 0;
             false
         };
 
+        made_progress = false;
         let mut idx = 0usize;
         let mut poll_idx = 0usize;
         while idx < conns.len() {
@@ -435,7 +448,12 @@ fn reactor_worker_loop<T: ZeroCopyRecord + Indexable>(
                 continue;
             }
             match drive_connection(&mut conns[idx], &engine, &security) {
-                ConnStep::Progress | ConnStep::WouldBlock => {
+                ConnStep::Progress => {
+                    made_progress = true;
+                    idx += 1;
+                    poll_idx += 1;
+                }
+                ConnStep::WouldBlock => {
                     idx += 1;
                     poll_idx += 1;
                 }

@@ -1831,17 +1831,21 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             },
         };
 
-        // Differential secondary index update without any global IndexSnapshot map (`TASK-016`, `F-INDX-05`)
+        // Differential secondary index update without any global IndexSnapshot map (`TASK-016`, `F-INDX-05`, `RULE-INDX-01`)
         let new_snap = record.extract_index_snapshot();
         self.apply_index_snapshot_diff(ordinal, &old_snap, &new_snap);
-        if let Some(emb) = record.embedding_slice() {
-            if !emb.is_empty() {
-                self.vector_index.insert(ordinal, emb);
+        if old_snap.has_embedding != new_snap.has_embedding
+            || old_snap.embedding_hash != new_snap.embedding_hash
+        {
+            if let Some(emb) = record.embedding_slice() {
+                if !emb.is_empty() {
+                    self.vector_index.insert(ordinal, emb);
+                } else if old_snap.has_embedding {
+                    self.vector_index.remove(ordinal);
+                }
             } else if old_snap.has_embedding {
                 self.vector_index.remove(ordinal);
             }
-        } else if old_snap.has_embedding {
-            self.vector_index.remove(ordinal);
         }
 
         self.primary.upsert(PrimaryEntry {
@@ -1866,11 +1870,12 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                     .flush_queue
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let was_empty = q.is_empty();
                 if !q.enqueue(id) {
                     // `id` was already in the flush queue! This update coalesced in memory (`F-CONC-04`)!
                     self.coalesced_flushes.fetch_add(1, Ordering::Relaxed);
                 }
-                if q.order.len() >= 64 {
+                if was_empty || q.order.len() == 256 {
                     self.flush_cv.notify_one();
                 }
             }
@@ -2110,15 +2115,25 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                     .flush_queue
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if q.is_empty() {
-                    let (mut q2, _) = self
+                // Sleep indefinitely (`0.0%` CPU, zero timer wakeups) when queue is empty
+                while q.is_empty() && !self.shutdown.load(Ordering::Relaxed) {
+                    q = self
+                        .flush_cv
+                        .wait(q)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                if self.shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                // Coalesce rapid updates over `interval` unless batch threshold (`256`) is already reached
+                if q.order.len() < 256 && !self.shutdown.load(Ordering::Relaxed) {
+                    let (q2, _) = self
                         .flush_cv
                         .wait_timeout(q, interval)
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    q2.drain_batch(128)
-                } else {
-                    q.drain_batch(128)
+                    q = q2;
                 }
+                q.drain_batch(128)
             };
 
             for id in batch {
@@ -2129,6 +2144,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     q.enqueue(id);
+                    self.flush_cv.notify_one();
                 }
             }
         }
