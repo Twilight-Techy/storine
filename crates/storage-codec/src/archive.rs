@@ -770,7 +770,7 @@ mod tests {
             id: InlineId::new("user_123").unwrap(),
             age: 29,
             score: 99_500,
-            name: "Ibrahim Makanjuola".to_string(),
+            name: "Sample User".to_string(),
             tags: vec![
                 InlineId::new("rust").unwrap(),
                 InlineId::new("systems").unwrap(),
@@ -783,7 +783,7 @@ mod tests {
         assert_eq!(view.version(), Version(7));
         assert_eq!(view.age, 29);
         assert_eq!(view.score, 99_500);
-        assert_eq!(view.get_str(&view.name), "Ibrahim Makanjuola");
+        assert_eq!(view.get_str(&view.name), "Sample User");
         assert_eq!(view.get_slice(&view.tags).len(), 2);
         assert_eq!(view.get_slice(&view.tags)[0].as_str(), "rust");
         assert_eq!(view.to_owned_record().unwrap(), user);

@@ -185,7 +185,7 @@ fn test_referential_integrity_restrict_unlink_and_cascade() {
     let post1_id = InlineId::new("post_1").unwrap();
     let post2_id = InlineId::new("post_2").unwrap();
 
-    let mut user = AgentObjectRecord::new(user_id, "Ibrahim", 1000, 10);
+    let mut user = AgentObjectRecord::new(user_id, "User 1", 1000, 10);
     user.children.link(post1_id);
     user.children.link(post2_id);
 
