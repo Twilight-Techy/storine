@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/storage-types",
+    "crates/storage-codec",
+    "crates/storage-mmap",
+    "crates/storage-wal",
+    "crates/storage-index",
+    "crates/storage-graph",
+    "crates/storage-core",
+    "crates/storage-cli",
+    "crates/storage-server",
+    "benches",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Ibrahim Makanjuola"]
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+perf = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+ptr_as_ptr = "warn"
+cast_lossless = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+overflow-checks = false
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+overflow-checks = false
+
+[profile.test]
+opt-level = 2
+overflow-checks = true

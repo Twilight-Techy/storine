@@ -1,0 +1,13 @@
+[package]
+name = "storage-codec"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Zero-copy relative-pointer archive codec, SIMD XXH3-64 & CRC32C checksums, and LZ4/dictionary compression"
+
+[dependencies]
+storage-types = { path = "../storage-types" }
+
+[lints]
+workspace = true

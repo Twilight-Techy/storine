@@ -1,0 +1,23 @@
+[package]
+name = "storage-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Command-line utility for inspecting, verifying, compacting, snapshotting, and benchmarking the storage engine"
+
+[[bin]]
+name = "storage-cli"
+path = "src/main.rs"
+
+[dependencies]
+storage-types = { path = "../storage-types" }
+storage-codec = { path = "../storage-codec" }
+storage-mmap = { path = "../storage-mmap" }
+storage-wal = { path = "../storage-wal" }
+storage-index = { path = "../storage-index" }
+storage-graph = { path = "../storage-graph" }
+storage-core = { path = "../storage-core" }
+
+[lints]
+workspace = true

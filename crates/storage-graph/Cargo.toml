@@ -1,0 +1,15 @@
+[package]
+name = "storage-graph"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Explicit 1:1, 1:N, M:N zero-copy relationship containers, deadlock-free bidirectional linking, and Cascade/Restrict/Unlink referential integrity"
+
+[dependencies]
+storage-types = { path = "../storage-types" }
+storage-codec = { path = "../storage-codec" }
+storage-index = { path = "../storage-index" }
+
+[lints]
+workspace = true

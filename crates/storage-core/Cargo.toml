@@ -1,0 +1,18 @@
+[package]
+name = "storage-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core storage engine: 2048-way striped per-record write queues, HotDirtyArc coalescing, MVCC/OCC transactions, schema evolution, TTL, and query engine"
+
+[dependencies]
+storage-types = { path = "../storage-types" }
+storage-codec = { path = "../storage-codec" }
+storage-mmap = { path = "../storage-mmap" }
+storage-wal = { path = "../storage-wal" }
+storage-index = { path = "../storage-index" }
+storage-graph = { path = "../storage-graph" }
+
+[lints]
+workspace = true

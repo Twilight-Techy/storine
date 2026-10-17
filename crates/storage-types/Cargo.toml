@@ -1,0 +1,10 @@
+[package]
+name = "storage-types"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core zero-allocation types, 24-byte stack-inlined InlineId, and 64-byte cache-line-aligned RecordHeader"
+
+[lints]
+workspace = true

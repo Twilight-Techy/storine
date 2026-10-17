@@ -1,0 +1,3 @@
+[build]
+# Unlock host SIMD instruction sets (AVX2, SSE4.2, BMI2, NEON) for hardware CRC32C, XXH3, and vector scans.
+rustflags = ["-C", "target-cpu=native"]

@@ -1,0 +1,28 @@
+[package]
+name = "storage-benches"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Allocation-counting harness and p50/p99/p99.9 latency & throughput benchmark suite"
+
+[lib]
+name = "storage_benches"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench-runner"
+path = "src/main.rs"
+
+[dependencies]
+storage-types = { path = "../crates/storage-types" }
+storage-codec = { path = "../crates/storage-codec" }
+storage-mmap = { path = "../crates/storage-mmap" }
+storage-wal = { path = "../crates/storage-wal" }
+storage-index = { path = "../crates/storage-index" }
+storage-graph = { path = "../crates/storage-graph" }
+storage-core = { path = "../crates/storage-core" }
+storage-server = { path = "../crates/storage-server" }
+
+[lints]
+workspace = true

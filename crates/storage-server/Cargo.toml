@@ -1,0 +1,27 @@
+[package]
+name = "storage-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "High-throughput zero-copy length-prefixed binary protocol TCP server and client for the storage engine"
+
+[lib]
+name = "storage_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "storage-server"
+path = "src/main.rs"
+
+[dependencies]
+storage-types = { path = "../storage-types" }
+storage-codec = { path = "../storage-codec" }
+storage-mmap = { path = "../storage-mmap" }
+storage-wal = { path = "../storage-wal" }
+storage-index = { path = "../storage-index" }
+storage-graph = { path = "../storage-graph" }
+storage-core = { path = "../storage-core" }
+
+[lints]
+workspace = true

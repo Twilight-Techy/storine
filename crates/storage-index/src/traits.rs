@@ -1,0 +1,266 @@
+//! `Indexable` trait and stack-allocated differential index delta extraction (`TASK-016`, `F-INDX-05`, `RULE-MEM-02`).
+
+use storage_types::InlineId;
+
+const MAX_NUMERICS: usize = 4;
+const MAX_TAGS: usize = 8;
+
+/// Up to 4 stack-inlined numeric/timestamp fields, 8 stack-inlined tag fields, and a 64-bit
+/// embedding fingerprint per record so computing index deltas during `db.update` performs
+/// **zero heap allocations** (`RULE-MEM-02`).
+///
+/// Field ids and values are stored in separate arrays (struct-of-arrays) so no per-element
+/// alignment padding is wasted: the snapshot is 264 bytes instead of 352 bytes with
+/// `(u16, InlineId)` tuples. The engine keeps one snapshot per live record in RAM.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexSnapshot {
+    tags: [InlineId; MAX_TAGS],
+    numeric_values: [i64; MAX_NUMERICS],
+    pub embedding_hash: u64,
+    tag_fields: [u16; MAX_TAGS],
+    numeric_fields: [u16; MAX_NUMERICS],
+    numerics_len: u8,
+    tags_len: u8,
+    pub has_embedding: bool,
+}
+
+impl Default for IndexSnapshot {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl IndexSnapshot {
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            tags: [InlineId::EMPTY; MAX_TAGS],
+            numeric_values: [0; MAX_NUMERICS],
+            embedding_hash: 0,
+            tag_fields: [0; MAX_TAGS],
+            numeric_fields: [0; MAX_NUMERICS],
+            numerics_len: 0,
+            tags_len: 0,
+            has_embedding: false,
+        }
+    }
+
+    /// `true` when this snapshot contributes nothing to any secondary index.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.numerics_len == 0 && self.tags_len == 0 && !self.has_embedding
+    }
+
+    #[inline]
+    pub fn push_numeric(&mut self, field_id: u16, value: i64) {
+        let n = self.numerics_len as usize;
+        if n < MAX_NUMERICS {
+            self.numeric_fields[n] = field_id;
+            self.numeric_values[n] = value;
+            self.numerics_len += 1;
+        }
+    }
+
+    #[inline]
+    pub fn push_tag(&mut self, field_id: u16, tag: InlineId) {
+        let n = self.tags_len as usize;
+        if n < MAX_TAGS {
+            self.tag_fields[n] = field_id;
+            self.tags[n] = tag;
+            self.tags_len += 1;
+        }
+    }
+
+    /// Computes a zero-allocation 64-bit fingerprint of `slice` so `IndexSnapshot` remains `Copy`.
+    #[inline]
+    pub fn set_embedding_slice(&mut self, slice: &[f32]) {
+        if slice.is_empty() {
+            self.has_embedding = false;
+            self.embedding_hash = 0;
+            return;
+        }
+        let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ (slice.len() as u64);
+        for &v in slice {
+            h = (h ^ (v.to_bits() as u64)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            h ^= h >> 31;
+        }
+        self.has_embedding = true;
+        self.embedding_hash = h;
+    }
+
+    #[inline]
+    pub fn set_embedding(&mut self, vec: Vec<f32>) {
+        self.set_embedding_slice(&vec);
+    }
+
+    /// Iterates `(field_id, value)` numeric postings.
+    #[inline]
+    pub fn numerics(&self) -> impl Iterator<Item = (u16, i64)> + '_ {
+        let n = self.numerics_len as usize;
+        self.numeric_fields[..n]
+            .iter()
+            .copied()
+            .zip(self.numeric_values[..n].iter().copied())
+    }
+
+    /// Iterates `(field_id, tag)` tag postings.
+    #[inline]
+    pub fn tags(&self) -> impl Iterator<Item = (u16, InlineId)> + '_ {
+        let n = self.tags_len as usize;
+        self.tag_fields[..n]
+            .iter()
+            .copied()
+            .zip(self.tags[..n].iter().copied())
+    }
+
+    #[inline]
+    fn contains_numeric(&self, item: (u16, i64)) -> bool {
+        self.numerics().any(|x| x == item)
+    }
+
+    #[inline]
+    fn contains_tag(&self, item: (u16, InlineId)) -> bool {
+        self.tags().any(|x| x == item)
+    }
+}
+
+/// Differential changes between an old `IndexSnapshot` and a new `IndexSnapshot`.
+/// If `is_empty()` is true, secondary index locks are completely bypassed during `db.update`!
+#[derive(Clone, Copy, Debug)]
+pub struct IndexDelta {
+    pub removed_numerics_len: usize,
+    pub removed_numerics: [(u16, i64); MAX_NUMERICS],
+    pub added_numerics_len: usize,
+    pub added_numerics: [(u16, i64); MAX_NUMERICS],
+    pub removed_tags_len: usize,
+    pub removed_tags: [(u16, InlineId); MAX_TAGS],
+    pub added_tags_len: usize,
+    pub added_tags: [(u16, InlineId); MAX_TAGS],
+    pub embedding_changed: bool,
+}
+
+impl Default for IndexDelta {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            removed_numerics_len: 0,
+            removed_numerics: [(0, 0); MAX_NUMERICS],
+            added_numerics_len: 0,
+            added_numerics: [(0, 0); MAX_NUMERICS],
+            removed_tags_len: 0,
+            removed_tags: [(0, InlineId::EMPTY); MAX_TAGS],
+            added_tags_len: 0,
+            added_tags: [(0, InlineId::EMPTY); MAX_TAGS],
+            embedding_changed: false,
+        }
+    }
+}
+
+impl IndexDelta {
+    /// Computes the exact minimal delta from `old` to `new` on the stack (`0` heap allocations).
+    #[inline]
+    pub fn diff(old: &IndexSnapshot, new: &IndexSnapshot) -> Self {
+        let mut delta = Self::default();
+
+        for item in old.numerics() {
+            if !new.contains_numeric(item) {
+                delta.removed_numerics[delta.removed_numerics_len] = item;
+                delta.removed_numerics_len += 1;
+            }
+        }
+        for item in new.numerics() {
+            if !old.contains_numeric(item) {
+                delta.added_numerics[delta.added_numerics_len] = item;
+                delta.added_numerics_len += 1;
+            }
+        }
+        for tag in old.tags() {
+            if !new.contains_tag(tag) {
+                delta.removed_tags[delta.removed_tags_len] = tag;
+                delta.removed_tags_len += 1;
+            }
+        }
+        for tag in new.tags() {
+            if !old.contains_tag(tag) {
+                delta.added_tags[delta.added_tags_len] = tag;
+                delta.added_tags_len += 1;
+            }
+        }
+
+        if old.has_embedding != new.has_embedding || old.embedding_hash != new.embedding_hash {
+            delta.embedding_changed = true;
+        }
+
+        delta
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.removed_numerics_len == 0
+            && self.added_numerics_len == 0
+            && self.removed_tags_len == 0
+            && self.added_tags_len == 0
+            && !self.embedding_changed
+    }
+}
+
+/// Implemented by domain records to declare secondary numeric/timestamp indexes, tag indexes,
+/// and optional AI vector embeddings.
+pub trait Indexable: storage_codec::ZeroCopyRecord {
+    #[inline]
+    fn extract_index_snapshot(&self) -> IndexSnapshot {
+        IndexSnapshot::new()
+    }
+
+    /// Extracts an `IndexSnapshot` directly from the zero-copy archived representation (`mmap` / `hot_dirty`)
+    /// without allocating an owned record or storing a persistent `IndexSnapshot` map in RAM.
+    #[inline]
+    fn extract_archived_snapshot(root: &Self::Archived, payload: &[u8]) -> Option<IndexSnapshot> {
+        Self::unarchive(root, payload)
+            .ok()
+            .map(|owned| owned.extract_index_snapshot())
+    }
+
+    #[inline]
+    fn embedding_slice(&self) -> Option<&[f32]> {
+        None
+    }
+
+    /// Borrows the `f32` vector embedding slice directly from the zero-copy archived payload (`mmap` / `hot_dirty`)
+    /// without duplicating `Vec<f32>` in heap RAM.
+    #[inline]
+    fn archived_embedding_slice<'a>(
+        _root: &'a Self::Archived,
+        _payload: &'a [u8],
+    ) -> Option<&'a [f32]> {
+        None
+    }
+}
+
+// Layout guard: keep the per-record RAM cost of secondary-index bookkeeping tight.
+const _: () = assert!(core::mem::size_of::<IndexSnapshot>() <= 264);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_delta_detects_changes_and_noop() {
+        let t1 = InlineId::new("a").unwrap();
+        let t2 = InlineId::new("b").unwrap();
+        let mut old = IndexSnapshot::new();
+        old.push_numeric(1, 10);
+        old.push_tag(1, t1);
+        let mut new = old;
+        assert!(IndexDelta::diff(&old, &new).is_empty());
+        new = IndexSnapshot::new();
+        new.push_numeric(1, 11);
+        new.push_tag(1, t2);
+        let d = IndexDelta::diff(&old, &new);
+        assert_eq!(d.removed_numerics[..d.removed_numerics_len], [(1, 10)]);
+        assert_eq!(d.added_numerics[..d.added_numerics_len], [(1, 11)]);
+        assert_eq!(d.removed_tags[..d.removed_tags_len], [(1, t1)]);
+        assert_eq!(d.added_tags[..d.added_tags_len], [(1, t2)]);
+    }
+}
