@@ -21,7 +21,7 @@ use storage_index::{
 };
 use storage_mmap::{
     atomic_write_replace, cleanup_temp_files, read_ping_pong_active, write_ping_pong_slot,
-    ArenaManager, MmapGuard, MmapPool, MmapPoolConfig, MmapRegion, PathResolver,
+    ArenaManager, DirectoryLock, MmapGuard, MmapPool, MmapPoolConfig, MmapRegion, PathResolver,
     DEFAULT_SEGMENT_CAPACITY,
 };
 use storage_types::{
@@ -247,6 +247,7 @@ impl CoalescingQueue {
 pub type MigrationFn<T> = Box<dyn Fn(u16, &[u8]) -> Result<T> + Send + Sync>;
 
 struct SharedEngineInner<T: ZeroCopyRecord + Indexable> {
+    _dir_lock: DirectoryLock,
     config: EngineConfig,
     paths: PathResolver,
     locks: StripedLockTable,
@@ -303,6 +304,10 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                 .map_err(|e| StorageError::io("create engine base directory", e))?;
         }
 
+        // Acquire OS-level exclusive lock on `<base_dir>/<collection_name>.lock` (`TASK-059`)
+        let lock_path = base_dir.join(format!("{}.lock", config.collection_name));
+        let dir_lock = DirectoryLock::try_acquire(&lock_path)?;
+
         // Clean up any orphaned `.tmp` files left from a prior power loss (`F-DURA-04`)
         let _ = cleanup_temp_files(&base_dir)?;
 
@@ -332,6 +337,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         let shared_wal_mode = shared_wal.is_some();
 
         let inner = Arc::new(SharedEngineInner {
+            _dir_lock: dir_lock,
             config: config.clone(),
             paths,
             locks: StripedLockTable::new(),
@@ -403,6 +409,11 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             inner,
             flusher_handle: Mutex::new(flusher_handle),
         })
+    }
+
+    #[inline]
+    pub fn base_dir(&self) -> &Path {
+        self.inner.paths.base_dir()
     }
 
     #[inline]
@@ -2408,6 +2419,9 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<usize> {
     for entry in fs::read_dir(src).map_err(|e| StorageError::io("read source dir", e))? {
         let entry = entry.map_err(|e| StorageError::io("read dir entry", e))?;
         let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "lock") {
+            continue;
+        }
         let dest_path = dst.join(entry.file_name());
         if path.is_dir() {
             files_copied += copy_dir_recursive(&path, &dest_path)?;

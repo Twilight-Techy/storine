@@ -25,6 +25,7 @@ dependencies = [
  "storage-graph",
  "storage-index",
  "storage-mmap",
+ "storage-server",
  "storage-types",
  "storage-wal",
 ]

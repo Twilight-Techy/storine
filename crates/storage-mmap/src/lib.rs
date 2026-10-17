@@ -17,6 +17,7 @@ pub use net_poll::SocketPoller;
 pub use path::{PathResolver, StackRelPath};
 pub use persist::{
     atomic_write_replace, cleanup_temp_files, read_ping_pong_active, write_ping_pong_slot,
+    DirectoryLock,
 };
 pub use pool::{MmapGuard, MmapPool, MmapPoolConfig, MmapPoolStats};
 pub use raw::{Advice, MmapRegion};

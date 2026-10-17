@@ -7,14 +7,19 @@
 //! - Supports online live `vshard` migration with 64-bit checksum digest verification and atomic epoch cutover.
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use storage_codec::{xxh3_64, RecordCodec, RecordView, ZeroCopyRecord};
+use storage_codec::{checksum_payload, xxh3_64, RecordCodec, RecordView, ZeroCopyRecord};
 use storage_index::Indexable;
+use storage_mmap::atomic_write_replace;
 use storage_types::{InlineId, Result, StorageError, Version};
 
 use crate::engine::StorageEngine;
+
+const CLUSTER_MAP_MAGIC: u32 = 0x434D_4150; // "CMAP"
 
 /// Number of virtual shards across the consistent hash ring (`2^10 = 1,024`).
 pub const VIRTUAL_SHARD_COUNT: usize = 1024;
@@ -30,7 +35,7 @@ pub const fn vshard_for_id(id: InlineId) -> u16 {
 }
 
 /// Compact 2 KiB cluster routing table mapping each of the `1,024` virtual shards to its owner `NodeId`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClusterMap {
     pub epoch: u64,
     owners: [NodeId; VIRTUAL_SHARD_COUNT],
@@ -71,6 +76,47 @@ impl ClusterMap {
     /// Returns the number of virtual shards currently owned by `node_id`.
     pub fn vshard_count_for_node(&self, node_id: NodeId) -> usize {
         self.owners.iter().filter(|&&n| n == node_id).count()
+    }
+
+    /// Atomically persists the 2 KiB `ClusterMap` + epoch + 64-bit `XXH3-64` checksum to `path` (`TASK-060`).
+    pub fn save_to_file(&self, path: &Path) -> Result<()> {
+        let mut payload = Vec::with_capacity(8 + VIRTUAL_SHARD_COUNT * 2);
+        payload.extend_from_slice(&self.epoch.to_le_bytes());
+        for &owner in &self.owners {
+            payload.extend_from_slice(&owner.to_le_bytes());
+        }
+        let crc = checksum_payload(&payload);
+        let mut full = Vec::with_capacity(12 + payload.len());
+        full.extend_from_slice(&CLUSTER_MAP_MAGIC.to_le_bytes());
+        full.extend_from_slice(&crc.to_le_bytes());
+        full.extend_from_slice(&payload);
+        atomic_write_replace(path, &full, true)
+    }
+
+    /// Loads and verifies a persisted `ClusterMap` from `path` (`TASK-060`).
+    pub fn load_from_file(path: &Path) -> Result<Self> {
+        let bytes = fs::read(path).map_err(|e| StorageError::io("read cluster.map", e))?;
+        let expected_len = 12 + 8 + VIRTUAL_SHARD_COUNT * 2;
+        if bytes.len() != expected_len {
+            return Err(StorageError::corrupted_header("cluster.map invalid file length"));
+        }
+        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        if magic != CLUSTER_MAP_MAGIC {
+            return Err(StorageError::corrupted_header("cluster.map invalid magic"));
+        }
+        let expected_crc = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+        let payload = &bytes[12..];
+        let actual_crc = checksum_payload(payload);
+        if actual_crc != expected_crc {
+            return Err(StorageError::checksum_mismatch(expected_crc, actual_crc));
+        }
+        let epoch = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let mut owners = [0u16; VIRTUAL_SHARD_COUNT];
+        for (i, slot) in owners.iter_mut().enumerate() {
+            let off = 8 + i * 2;
+            *slot = u16::from_le_bytes(payload[off..off + 2].try_into().unwrap());
+        }
+        Ok(Self { epoch, owners })
     }
 }
 
@@ -127,6 +173,20 @@ impl<T: ZeroCopyRecord + Indexable> ClusterRouter<T> {
     #[inline]
     pub fn epoch(&self) -> u64 {
         self.map.read().unwrap_or_else(|p| p.into_inner()).epoch
+    }
+
+    /// Persists the current `ClusterMap` to `path` (`TASK-060`).
+    pub fn save_cluster_map(&self, path: &Path) -> Result<()> {
+        let map = self.map.read().unwrap_or_else(|p| p.into_inner()).clone();
+        map.save_to_file(path)
+    }
+
+    /// Loads and installs a persisted `ClusterMap` from `path` (`TASK-060`).
+    pub fn load_cluster_map(&self, path: &Path) -> Result<()> {
+        let loaded = ClusterMap::load_from_file(path)?;
+        let mut map = self.map.write().unwrap_or_else(|p| p.into_inner());
+        *map = loaded;
+        Ok(())
     }
 
     /// Returns the `NodeId` and `Arc<StorageEngine<T>>` owning `id` in $O(1)$ time.

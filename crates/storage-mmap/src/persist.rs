@@ -249,3 +249,188 @@ pub fn cleanup_temp_files(root: &Path) -> Result<usize> {
     }
     Ok(removed)
 }
+
+/// Exclusive OS-level file lock (`LockFileEx` on Windows, `flock` on Unix) preventing
+/// concurrent processes or duplicate `StorageEngine` instances from corrupting the same
+/// database collection directory (`TASK-059`).
+#[derive(Debug)]
+pub struct DirectoryLock {
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl DirectoryLock {
+    /// Acquires an immediate non-blocking exclusive lock on `lock_path`.
+    /// Returns `Err(StorageError::Io)` if another instance or OS process already holds the lock.
+    pub fn try_acquire(lock_path: &Path) -> Result<Self> {
+        if let Some(parent) = lock_path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| StorageError::io("create lock parent directory", e))?;
+            }
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .map_err(|e| StorageError::io("open database collection .lock file", e))?;
+
+        platform_try_lock_exclusive(&file)?;
+
+        Ok(Self {
+            file,
+            path: lock_path.to_path_buf(),
+        })
+    }
+
+    #[inline]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for DirectoryLock {
+    fn drop(&mut self) {
+        platform_unlock(&self.file);
+    }
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    h_event: isize,
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn LockFileEx(
+        hFile: isize,
+        dwFlags: u32,
+        dwReserved: u32,
+        nNumberOfBytesToLockLow: u32,
+        nNumberOfBytesToLockHigh: u32,
+        lpOverlapped: *mut Overlapped,
+    ) -> i32;
+
+    fn UnlockFileEx(
+        hFile: isize,
+        dwReserved: u32,
+        nNumberOfBytesToUnlockLow: u32,
+        nNumberOfBytesToUnlockHigh: u32,
+        lpOverlapped: *mut Overlapped,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+fn platform_try_lock_exclusive(file: &fs::File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+
+    let handle = file.as_raw_handle() as isize;
+    let mut overlapped = Overlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        h_event: 0,
+    };
+    // SAFETY: `handle` is a valid open file handle and `overlapped` is zero-initialized on the stack.
+    let ok = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if ok == 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(StorageError::io(
+            "acquire exclusive database lock (another process or engine instance already holds .lock)",
+            err,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn platform_unlock(file: &fs::File) {
+    use std::os::windows::io::AsRawHandle;
+
+    let handle = file.as_raw_handle() as isize;
+    let mut overlapped = Overlapped {
+        internal: 0,
+        internal_high: 0,
+        offset: 0,
+        offset_high: 0,
+        h_event: 0,
+    };
+    // SAFETY: `handle` is valid and unlocks the exact 1-byte region locked in `platform_try_lock_exclusive`.
+    let _ = unsafe { UnlockFileEx(handle, 0, 1, 0, &mut overlapped) };
+}
+
+#[cfg(unix)]
+extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
+}
+
+#[cfg(unix)]
+fn platform_try_lock_exclusive(file: &fs::File) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+
+    // SAFETY: `file.as_raw_fd()` is a valid open file descriptor.
+    let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(StorageError::io(
+            "acquire exclusive database lock (another process or engine instance already holds .lock)",
+            err,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn platform_unlock(file: &fs::File) {
+    use std::os::unix::io::AsRawFd;
+    const LOCK_UN: i32 = 8;
+    // SAFETY: `file.as_raw_fd()` is a valid open file descriptor.
+    let _ = unsafe { flock(file.as_raw_fd(), LOCK_UN) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_directory_lock_prevents_concurrent_open_and_releases_on_drop() {
+        let dir = std::env::temp_dir().join("stge_test_dir_lock");
+        let _ = fs::remove_dir_all(&dir);
+        let lock_path = dir.join("agent_object.lock");
+
+        let lock1 = DirectoryLock::try_acquire(&lock_path).unwrap();
+        assert!(
+            DirectoryLock::try_acquire(&lock_path).is_err(),
+            "second concurrent lock acquisition on the same collection must fail immediately"
+        );
+        drop(lock1);
+
+        let lock2 = DirectoryLock::try_acquire(&lock_path).unwrap();
+        drop(lock2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+

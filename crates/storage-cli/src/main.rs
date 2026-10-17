@@ -6,13 +6,16 @@
 
 use std::env;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use storage_core::{
+    backup::{archive_wal_for_pitr, create_online_backup, restore_point_in_time},
     AgentObjectRecord, EngineConfig, StorageEngine, StorageLayoutMode,
 };
+use storage_server::StorageClient;
 use storage_types::{InlineId, RecordHeader};
 
 fn main() -> ExitCode {
@@ -42,7 +45,15 @@ fn print_usage() {
          \x20 verify <db_dir>                                   Verify checksums & relationship integrity\n\
          \x20 compact <db_dir> [min_ratio]                      Compact fragmented arena segments\n\
          \x20 snapshot <db_dir> <dest_dir>                      Create a point-in-time snapshot backup\n\
-         \x20 bench <db_dir> [count]                            Run quick CLI throughput benchmark"
+         \x20 bench <db_dir> [count]                            Run quick CLI throughput benchmark\n\
+         \x20 backup <db_dir> <backup_dir>                      Online hot backup with WAL LSN manifest\n\
+         \x20 archive-wal <db_dir> <backup_dir>                 Archive WAL segment for PITR replay\n\
+         \x20 restore-pitr <backup_dir> <restore_dir> <ts_ns>   Restore database to a nanosecond timestamp\n\
+         \x20 remote-health <addr>                              Health check a remote StorageServer\n\
+         \x20 remote-compact <addr>                             Trigger remote arena compaction (admin)\n\
+         \x20 remote-backup <addr> <dest_path>                  Trigger remote online backup (admin)\n\
+         \x20 remote-checkpoint <addr>                          Trigger remote incremental checkpoint (admin)\n\
+         \x20 remote-metrics <addr>                             Scrape Prometheus metrics from remote server"
     );
 }
 
@@ -235,9 +246,119 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
             );
             Ok(())
         }
+        "backup" => {
+            if args.len() < 3 {
+                print_usage();
+                return Err(storage_types::StorageError::invalid_key(
+                    "missing required <db_dir> and <backup_dir> for 'backup'",
+                ));
+            }
+            let db_dir = &args[1];
+            let backup_dir = Path::new(&args[2]);
+            let engine = StorageEngine::<AgentObjectRecord>::open(db_dir, EngineConfig::default())?;
+            let manifest = create_online_backup(&engine, backup_dir)?;
+            println!(
+                "Online backup created at {:?}\n  Collection : {}\n  Base LSN   : {}\n  Files      : {}",
+                backup_dir, manifest.collection_name, manifest.base_lsn, manifest.files_copied,
+            );
+            Ok(())
+        }
+        "archive-wal" => {
+            if args.len() < 3 {
+                print_usage();
+                return Err(storage_types::StorageError::invalid_key(
+                    "missing required <db_dir> and <backup_dir> for 'archive-wal'",
+                ));
+            }
+            let db_dir = &args[1];
+            let backup_dir = Path::new(&args[2]);
+            let engine = StorageEngine::<AgentObjectRecord>::open(db_dir, EngineConfig::default())?;
+            let archived = archive_wal_for_pitr(&engine, backup_dir)?;
+            println!("Archived {archived} WAL segment(s) to {:?}/wal_pitr", backup_dir);
+            Ok(())
+        }
+        "restore-pitr" => {
+            if args.len() < 4 {
+                print_usage();
+                return Err(storage_types::StorageError::invalid_key(
+                    "missing required <backup_dir>, <restore_dir>, and <target_ts_ns> for 'restore-pitr'",
+                ));
+            }
+            let backup_dir = Path::new(&args[1]);
+            let restore_dir = Path::new(&args[2]);
+            let target_ts_ns: u64 = args[3].parse().map_err(|_| {
+                storage_types::StorageError::invalid_key(
+                    "target_ts_ns must be a valid 64-bit unsigned integer (nanoseconds since epoch)",
+                )
+            })?;
+            let engine = restore_point_in_time::<AgentObjectRecord>(
+                backup_dir,
+                restore_dir,
+                EngineConfig::default(),
+                target_ts_ns,
+            )?;
+            let st = engine.stats();
+            println!(
+                "PITR restored to {:?} (target_ts_ns={})\n  Live Records: {}",
+                restore_dir, target_ts_ns, st.live_records,
+            );
+            Ok(())
+        }
+        "remote-health" => {
+            let addr = parse_addr(args.get(1))?;
+            let mut client = StorageClient::connect(addr)?;
+            let health = client.health()?;
+            println!("{health}");
+            Ok(())
+        }
+        "remote-compact" => {
+            let addr = parse_addr(args.get(1))?;
+            let mut client = StorageClient::connect(addr)?;
+            let msg = client.admin_compact()?;
+            println!("{msg}");
+            Ok(())
+        }
+        "remote-backup" => {
+            if args.len() < 3 {
+                print_usage();
+                return Err(storage_types::StorageError::invalid_key(
+                    "missing required <addr> and <dest_path> for 'remote-backup'",
+                ));
+            }
+            let addr = parse_addr(Some(&args[1]))?;
+            let dest_path = &args[2];
+            let mut client = StorageClient::connect(addr)?;
+            let msg = client.admin_backup(dest_path)?;
+            println!("{msg}");
+            Ok(())
+        }
+        "remote-checkpoint" => {
+            let addr = parse_addr(args.get(1))?;
+            let mut client = StorageClient::connect(addr)?;
+            let msg = client.admin_checkpoint()?;
+            println!("{msg}");
+            Ok(())
+        }
+        "remote-metrics" => {
+            let addr = parse_addr(args.get(1))?;
+            let mut client = StorageClient::connect(addr)?;
+            let metrics = client.scrape_metrics()?;
+            print!("{metrics}");
+            Ok(())
+        }
         _ => {
             print_usage();
             Err(storage_types::StorageError::invalid_key("unknown CLI command"))
         }
     }
+}
+
+/// Parses a `host:port` string into a `SocketAddr` with user-friendly error messages.
+fn parse_addr(arg: Option<&String>) -> storage_types::Result<SocketAddr> {
+    let s = arg.ok_or_else(|| {
+        storage_types::StorageError::invalid_key("missing required <addr> (host:port)")
+    })?;
+    s.parse::<SocketAddr>().map_err(|_| {
+        storage_types::StorageError::invalid_key("addr must be a valid socket address (e.g. 127.0.0.1:9090)")
+    })
 }

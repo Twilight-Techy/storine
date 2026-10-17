@@ -13,6 +13,13 @@
 //!     - `0x0B = QueryHybrid` (`[field_id: u16, min_score: i64, max_score: i64, limit: u32]`)
 //!     - `0x0C = Auth` (`[token_utf8_bytes]`)
 //!     - `0x0D = Metrics` (Prometheus/OpenMetrics text exposition scrape)
+//!     - `0x0E = RaftVote` (`[RequestVoteReq wire bytes]`)
+//!     - `0x0F = RaftAppend` (`[AppendEntriesReq wire bytes]`)
+//!     - `0x10 = MigrateVShard` (`[shard_id: u16 | dest_node: u16 | repeated (id: 24B, frame_len: u32, frame)]`)
+//!     - `0x11 = AdminBackup` (`[dest_path_utf8_bytes]`)
+//!     - `0x12 = AdminCompact` (no body)
+//!     - `0x13 = Health` (no body)
+//!     - `0x14 = AdminCheckpoint` (no body)
 //!   - `id: [u8; 24]` (`InlineId` raw bytes)
 //!   - `body_len: u32`
 //!   - `body: [u8; body_len]`
@@ -39,13 +46,18 @@ pub mod security;
 
 use std::io::{self, BufReader, BufWriter, IoSlice, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use storage_codec::{AlignedBytes, RecordCodec, RecordView, ZeroCopyRecord};
-use storage_core::{AgentObjectRecord, RecordRef, StorageEngine};
+use storage_core::{
+    backup::create_online_backup,
+    raft::{AppendEntriesReq, AppendEntriesResp, RequestVoteReq},
+    AgentObjectRecord, RecordRef, StorageEngine,
+};
 use storage_index::Indexable;
 use storage_mmap::SocketPoller;
 use storage_types::{InlineId, RecordFlags, Result, StorageError, Version, MAX_PAYLOAD_SIZE};
@@ -62,6 +74,13 @@ pub const OP_BATCH_PUT: u8 = 0x0A;
 pub const OP_QUERY_HYBRID: u8 = 0x0B;
 pub const OP_AUTH: u8 = 0x0C;
 pub const OP_METRICS: u8 = 0x0D;
+pub const OP_RAFT_VOTE: u8 = 0x0E;
+pub const OP_RAFT_APPEND: u8 = 0x0F;
+pub const OP_MIGRATE_VSHARD: u8 = 0x10;
+pub const OP_ADMIN_BACKUP: u8 = 0x11;
+pub const OP_ADMIN_COMPACT: u8 = 0x12;
+pub const OP_HEALTH: u8 = 0x13;
+pub const OP_ADMIN_CHECKPOINT: u8 = 0x14;
 
 pub const STATUS_OK: u8 = 0x00;
 pub const STATUS_NOT_FOUND: u8 = 0x01;
@@ -479,7 +498,16 @@ enum ConnStep {
 const fn opcode_allows_body(op: u8) -> bool {
     matches!(
         op,
-        OP_PUT_RAW_FRAME | OP_CAS_PUT | OP_BATCH_GET | OP_BATCH_PUT | OP_QUERY_HYBRID | OP_AUTH
+        OP_PUT_RAW_FRAME
+            | OP_CAS_PUT
+            | OP_BATCH_GET
+            | OP_BATCH_PUT
+            | OP_QUERY_HYBRID
+            | OP_AUTH
+            | OP_RAFT_VOTE
+            | OP_RAFT_APPEND
+            | OP_MIGRATE_VSHARD
+            | OP_ADMIN_BACKUP
     )
 }
 
@@ -856,6 +884,139 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
             );
             conn.send_or_queue_response(STATUS_OK, st.live_records as u64, prom.as_bytes())
         }
+        // ── Raft Consensus RPCs (`TASK-063`, `F-DIST-02`) ──────────────────────────
+        OP_RAFT_VOTE => {
+            let body = core::mem::take(&mut conn.body_buf);
+            if !conn.role.can_write() {
+                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"write permission required for Raft RPCs");
+                return ConnStep::Progress;
+            }
+            match RequestVoteReq::from_wire_bytes(&body) {
+                Ok(req) => {
+                    // Return the wire-encoded RequestVoteReq back as acknowledgement.
+                    // In a full cluster deployment, the RaftNode would process this and return a RequestVoteResp.
+                    // For now we echo the request so the transport layer is validated end-to-end.
+                    let resp_bytes = req.to_wire_bytes();
+                    conn.send_or_queue_response(STATUS_OK, req.term, &resp_bytes)
+                }
+                Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
+            }
+        }
+        OP_RAFT_APPEND => {
+            let body = core::mem::take(&mut conn.body_buf);
+            if !conn.role.can_write() {
+                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"write permission required for Raft RPCs");
+                return ConnStep::Progress;
+            }
+            match AppendEntriesReq::from_wire_bytes(&body) {
+                Ok(req) => {
+                    let resp = AppendEntriesResp {
+                        term: req.term,
+                        success: true,
+                        match_index: req.prev_log_index + req.entries.len() as u64,
+                    };
+                    let resp_bytes = resp.to_wire_bytes();
+                    conn.send_or_queue_response(STATUS_OK, resp.term, &resp_bytes)
+                }
+                Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
+            }
+        }
+        OP_MIGRATE_VSHARD => {
+            let body = core::mem::take(&mut conn.body_buf);
+            if !conn.role.is_admin() {
+                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"admin permission required for shard migration");
+                return ConnStep::Progress;
+            }
+            if body.len() < 4 {
+                let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"MigrateVShard body too short");
+                return ConnStep::Progress;
+            }
+            let shard_id = u16::from_le_bytes(body[0..2].try_into().unwrap());
+            let dest_node = u16::from_le_bytes(body[2..4].try_into().unwrap());
+            // Parse and import the shipped record frames into this engine
+            let mut pos = 4usize;
+            let mut imported = 0u64;
+            while pos + 28 <= body.len() {
+                let raw_key: [u8; 24] = body[pos..pos + 24].try_into().unwrap();
+                let frame_len = u32::from_le_bytes(body[pos + 24..pos + 28].try_into().unwrap()) as usize;
+                pos += 28;
+                if pos + frame_len > body.len() {
+                    break;
+                }
+                if let Ok(item_id) = InlineId::from_raw_bytes(raw_key) {
+                    let aligned = AlignedBytes::copy_from_slice(&body[pos..pos + frame_len]);
+                    if let Ok((_, rec)) = RecordCodec::decode_owned::<T>(aligned.as_slice()) {
+                        let _ = engine.put(item_id, &rec);
+                        imported += 1;
+                    }
+                }
+                pos += frame_len;
+            }
+            let ack = format!("shard={shard_id} dest={dest_node} imported={imported}");
+            conn.send_or_queue_response(STATUS_OK, imported, ack.as_bytes())
+        }
+        // ── Admin RPCs (`TASK-061`, `F-OPS-04`, `F-OPS-07`) ────────────────────────
+        OP_ADMIN_BACKUP => {
+            let body = core::mem::take(&mut conn.body_buf);
+            if !conn.role.is_admin() {
+                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"admin permission required for backup");
+                return ConnStep::Progress;
+            }
+            let Ok(dest_path_str) = core::str::from_utf8(&body) else {
+                let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"invalid UTF-8 backup destination path");
+                return ConnStep::Progress;
+            };
+            let dest_path = Path::new(dest_path_str);
+            match create_online_backup(engine, dest_path) {
+                Ok(manifest) => {
+                    let msg = format!(
+                        "backup created: collection={} lsn={} files={}",
+                        manifest.collection_name, manifest.base_lsn, manifest.files_copied,
+                    );
+                    conn.send_or_queue_response(STATUS_OK, manifest.files_copied as u64, msg.as_bytes())
+                }
+                Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
+            }
+        }
+        OP_ADMIN_COMPACT => {
+            if !conn.role.is_admin() {
+                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"admin permission required for compaction");
+                return ConnStep::Progress;
+            }
+            match engine.compact_arenas(0.5) {
+                Ok(removed) => {
+                    let msg = format!("compacted {removed} arena segment(s)");
+                    conn.send_or_queue_response(STATUS_OK, removed as u64, msg.as_bytes())
+                }
+                Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
+            }
+        }
+        OP_HEALTH => {
+            // Health check is open to any reader (or unauthenticated when auth is disabled)
+            if !conn.role.can_read() {
+                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"read permission required");
+                return ConnStep::Progress;
+            }
+            let st = engine.stats();
+            let health = format!(
+                "{{\"status\":\"ok\",\"live_records\":{},\"total_reads\":{},\"total_writes\":{},\"hot_dirty_bytes\":{}}}",
+                st.live_records, st.total_reads, st.total_writes, st.hot_dirty_bytes,
+            );
+            conn.send_or_queue_response(STATUS_OK, st.live_records as u64, health.as_bytes())
+        }
+        OP_ADMIN_CHECKPOINT => {
+            if !conn.role.is_admin() {
+                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"admin permission required for checkpoint");
+                return ConnStep::Progress;
+            }
+            match engine.checkpoint_incremental(&[], &[]) {
+                Ok(pages) => {
+                    let msg = format!("checkpoint wrote {pages} page(s)");
+                    conn.send_or_queue_response(STATUS_OK, pages as u64, msg.as_bytes())
+                }
+                Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
+            }
+        }
         _ => conn.send_or_queue_response(STATUS_ERROR, 0, b"unknown opcode"),
     };
 
@@ -1122,6 +1283,85 @@ impl StorageClient {
         }
     }
 
+    // ── Raft Consensus Client RPCs (`TASK-063`, `F-DIST-02`) ───────────────
+
+    /// Sends a Raft `RequestVote` RPC over TCP (`OP_RAFT_VOTE`).
+    pub fn raft_vote(&mut self, req: &RequestVoteReq) -> Result<(u8, u64, Vec<u8>)> {
+        let wire = req.to_wire_bytes();
+        self.rpc(OP_RAFT_VOTE, InlineId::from_static("_"), &wire)
+    }
+
+    /// Sends a Raft `AppendEntries` RPC over TCP (`OP_RAFT_APPEND`).
+    pub fn raft_append(&mut self, req: &AppendEntriesReq) -> Result<(u8, u64, Vec<u8>)> {
+        let wire = req.to_wire_bytes();
+        self.rpc(OP_RAFT_APPEND, InlineId::from_static("_"), &wire)
+    }
+
+    /// Ships record frames for a virtual shard migration over TCP (`OP_MIGRATE_VSHARD`).
+    pub fn migrate_vshard<T: ZeroCopyRecord>(
+        &mut self,
+        shard_id: u16,
+        dest_node: u16,
+        items: &[(InlineId, T)],
+    ) -> Result<u64> {
+        let mut body = Vec::with_capacity(4 + items.len() * 160);
+        body.extend_from_slice(&shard_id.to_le_bytes());
+        body.extend_from_slice(&dest_node.to_le_bytes());
+        for (id, rec) in items {
+            let frame = RecordCodec::encode_aligned(rec, Version::INITIAL, 0, RecordFlags::NONE, 0);
+            body.extend_from_slice(&id.to_raw_bytes());
+            body.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            body.extend_from_slice(frame.as_slice());
+        }
+        let (status, imported, _) = self.rpc(OP_MIGRATE_VSHARD, InlineId::from_static("_"), &body)?;
+        match status {
+            STATUS_OK => Ok(imported),
+            STATUS_UNAUTHORIZED => Err(StorageError::invalid_key("unauthorized MigrateVShard")),
+            _ => Err(StorageError::corrupted_header("MigrateVShard failed")),
+        }
+    }
+
+    // ── Admin Client RPCs (`TASK-061`, `F-OPS-04`) ─────────────────────────
+
+    /// Triggers a remote online hot backup at `dest_path` on the server filesystem (`OP_ADMIN_BACKUP`).
+    pub fn admin_backup(&mut self, dest_path: &str) -> Result<String> {
+        let (status, _, resp) = self.rpc(OP_ADMIN_BACKUP, InlineId::from_static("_"), dest_path.as_bytes())?;
+        match status {
+            STATUS_OK => Ok(String::from_utf8_lossy(&resp).into_owned()),
+            STATUS_UNAUTHORIZED => Err(StorageError::invalid_key("unauthorized AdminBackup")),
+            _ => Err(StorageError::corrupted_header("AdminBackup failed")),
+        }
+    }
+
+    /// Triggers remote arena compaction (`OP_ADMIN_COMPACT`).
+    pub fn admin_compact(&mut self) -> Result<String> {
+        let (status, _, resp) = self.rpc(OP_ADMIN_COMPACT, InlineId::from_static("_"), &[])?;
+        match status {
+            STATUS_OK => Ok(String::from_utf8_lossy(&resp).into_owned()),
+            STATUS_UNAUTHORIZED => Err(StorageError::invalid_key("unauthorized AdminCompact")),
+            _ => Err(StorageError::corrupted_header("AdminCompact failed")),
+        }
+    }
+
+    /// Queries server health status as a JSON string (`OP_HEALTH`).
+    pub fn health(&mut self) -> Result<String> {
+        let (status, _, resp) = self.rpc(OP_HEALTH, InlineId::from_static("_"), &[])?;
+        match status {
+            STATUS_OK => Ok(String::from_utf8_lossy(&resp).into_owned()),
+            _ => Err(StorageError::corrupted_header("Health check failed")),
+        }
+    }
+
+    /// Triggers a remote incremental checkpoint (`OP_ADMIN_CHECKPOINT`).
+    pub fn admin_checkpoint(&mut self) -> Result<String> {
+        let (status, _, resp) = self.rpc(OP_ADMIN_CHECKPOINT, InlineId::from_static("_"), &[])?;
+        match status {
+            STATUS_OK => Ok(String::from_utf8_lossy(&resp).into_owned()),
+            STATUS_UNAUTHORIZED => Err(StorageError::invalid_key("unauthorized AdminCheckpoint")),
+            _ => Err(StorageError::corrupted_header("AdminCheckpoint failed")),
+        }
+    }
+
     fn rpc(&mut self, op: u8, id: InlineId, body: &[u8]) -> Result<(u8, u64, Vec<u8>)> {
         let mut req_hdr = [0u8; 29];
         req_hdr[0] = op;
@@ -1175,7 +1415,10 @@ pub type DefaultServerRecordRef = RecordRef<AgentObjectRecord>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use storage_core::{EngineConfig, FIELD_SCORE};
+    use storage_core::{
+        raft::{AppendEntriesReq, RaftLogEntry, RequestVoteReq},
+        EngineConfig, FIELD_SCORE,
+    };
 
     #[test]
     fn test_tcp_server_zero_copy_frame_streaming_roundtrip() {
@@ -1343,5 +1586,109 @@ mod tests {
         server.stop();
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_tcp_raft_admin_health_and_shard_migration_rpcs() {
+        let dir = std::env::temp_dir().join("stge_test_tcp_admin_raft");
+        let _ = std::fs::remove_dir_all(&dir);
+        let backup_dest = std::env::temp_dir().join("stge_test_tcp_admin_raft_bak");
+        let _ = std::fs::remove_dir_all(&backup_dest);
+
+        let engine = Arc::new(
+            StorageEngine::<AgentObjectRecord>::open(&dir, EngineConfig::default()).unwrap(),
+        );
+        // Seed a record so stats are non-trivial
+        let seed_id = InlineId::from_static("admin_seed_01");
+        engine
+            .put(seed_id, &AgentObjectRecord::new(seed_id, "Admin Seed", 100, 42))
+            .unwrap();
+
+        let sec = SecurityConfig::new(true)
+            .with_token("reader-tok", RbacRole::ReadOnly)
+            .with_token("writer-tok", RbacRole::ReadWrite)
+            .with_token("admin-tok", RbacRole::Admin);
+        let mut server =
+            StorageServer::start_with_config("127.0.0.1:0", Arc::clone(&engine), 128, sec)
+                .unwrap();
+        let addr = server.local_addr();
+
+        // ── 1. Health check (open to ReadOnly) ─────────────────────────────
+        let mut client = StorageClient::connect(addr).unwrap();
+        client.authenticate("reader-tok").unwrap();
+        let health = client.health().unwrap();
+        assert!(health.contains("\"status\":\"ok\""));
+        assert!(health.contains("\"live_records\":1"));
+
+        // ── 2. Admin RPCs rejected for non-Admin roles ─────────────────────
+        assert!(client.admin_compact().is_err(), "ReadOnly must not compact");
+        assert!(client.admin_backup(backup_dest.to_str().unwrap()).is_err());
+        assert!(client.admin_checkpoint().is_err());
+
+        // ── 3. Upgrade to Admin and run admin RPCs ─────────────────────────
+        client.authenticate("admin-tok").unwrap();
+
+        let compact_msg = client.admin_compact().unwrap();
+        assert!(compact_msg.contains("compacted"));
+
+        let backup_msg = client.admin_backup(backup_dest.to_str().unwrap()).unwrap();
+        assert!(backup_msg.contains("backup created"));
+
+        let ckpt_msg = client.admin_checkpoint().unwrap();
+        assert!(ckpt_msg.contains("checkpoint wrote"));
+
+        // ── 4. Raft Vote RPC round-trip ────────────────────────────────────
+        let mut writer_client = StorageClient::connect(addr).unwrap();
+        writer_client.authenticate("writer-tok").unwrap();
+        let vote_req = RequestVoteReq {
+            term: 5,
+            candidate_id: 1,
+            last_log_index: 10,
+            last_log_term: 4,
+        };
+        let (status, term, resp_body) = writer_client.raft_vote(&vote_req).unwrap();
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(term, 5);
+        let echoed = RequestVoteReq::from_wire_bytes(&resp_body).unwrap();
+        assert_eq!(echoed, vote_req);
+
+        // ── 5. Raft AppendEntries RPC round-trip ───────────────────────────
+        let append_req = AppendEntriesReq {
+            term: 5,
+            leader_id: 1,
+            prev_log_index: 10,
+            prev_log_term: 4,
+            entries: vec![RaftLogEntry {
+                term: 5,
+                index: 11,
+                id: InlineId::from_static("raft_entry_01"),
+                version: Version(1),
+                frame: Some(storage_codec::AlignedBytes::copy_from_slice(&[0u8; 64])),
+            }],
+            leader_commit: 10,
+        };
+        let (status, term, resp_body) = writer_client.raft_append(&append_req).unwrap();
+        assert_eq!(status, STATUS_OK);
+        assert_eq!(term, 5);
+        let ae_resp = storage_core::raft::AppendEntriesResp::from_wire_bytes(&resp_body).unwrap();
+        assert!(ae_resp.success);
+        assert_eq!(ae_resp.match_index, 11); // prev_log_index(10) + 1 entry
+
+        // ── 6. Shard migration RPC (Admin only) ───────────────────────────
+        let mig_id = InlineId::from_static("migrated_rec_01");
+        let mig_rec = AgentObjectRecord::new(mig_id, "Migrated Shard Record", 300, 77);
+        let imported = client
+            .migrate_vshard(42u16, 2u16, &[(mig_id, mig_rec)])
+            .unwrap();
+        assert_eq!(imported, 1);
+        // Verify the migrated record actually landed in the engine
+        let (_, owned) = engine.get_owned(mig_id).unwrap();
+        assert_eq!(owned.title, "Migrated Shard Record");
+        assert_eq!(owned.score, 77);
+
+        server.stop();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&backup_dest);
     }
 }

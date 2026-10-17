@@ -436,3 +436,30 @@ This document defines the strict chronological execution order for building the 
     - Add composable zero-copy `.filter(|view: &RecordView<'_, T>| -> bool)` honored across all terminal methods (`resolve_ordinals`, `execute_ids`, `execute_refs`, `execute_page_ids`, `execute_page_refs`, `for_each_ref`, and `top_k_similar`) while preserving the 1-allocation fast path when unused (`is_simple_unpaginated`).
   - **Exit Criteria**: `test_query_filtering_and_pagination_end_to_end` verifies all 11 filtering scenarios end-to-end (`44` workspace tests passing, `0` warnings).
 
+
+## Stage 18: Production DevOps — Directory Lock, Persistent Raft/ClusterMap, TCP Raft RPCs, Admin RPCs & CLI PITR (`TASK-059` – `TASK-063`)
+
+- [x] **TASK-059: Implement Exclusive `DirectoryLock` (`db.lock`) Preventing Concurrent Multi-Process Corruption**
+  - Build a cross-platform `DirectoryLock` struct in `crates/storage-mmap/src/persist.rs` using `LockFileEx` (Windows) / `flock` (Unix) with `try_acquire()` and auto-release on `Drop`. Integrate into `StorageEngine::open_with_shared_wal()` to acquire `<collection>.lock`. Skip `.lock` files in backup/snapshot copies.
+  - **Exit Criteria**: `test_directory_lock_prevents_concurrent_open_and_releases_on_drop` in `storage-mmap` verifies mutual exclusion and auto-release.
+
+- [x] **TASK-060: Persist Crash-Safe Raft `HardState` (`raft.meta`) & `ClusterMap` (`cluster.map`) with XXH3-64 Checksums**
+  - Add `RaftState::save_to_disk()` / `load_from_disk()` with `RAFT_META_MAGIC` persisting `current_term`, `voted_for`, `commit_index`, `last_applied`, and full serialized log with XXH3-64 integrity check. Add `ClusterMap::save_to_file()` / `load_from_file()` with `CLUSTER_MAP_MAGIC`. Wire all state-mutating Raft methods to persist atomically.
+  - **Exit Criteria**: Raft and sharding unit tests pass with disk persistence; existing `test_raft_3_node_quorum_replication_failover_and_follower_reads` and `test_sharded_cluster_router_and_online_vshard_migration` continue passing.
+
+- [x] **TASK-061: Implement TCP Admin RPCs (`OP_ADMIN_BACKUP=0x11`, `OP_ADMIN_COMPACT=0x12`, `OP_HEALTH=0x13`, `OP_ADMIN_CHECKPOINT=0x14`) with RBAC Enforcement**
+  - Add 4 new opcodes to `StorageServer` dispatch (`crates/storage-server/src/lib.rs`): `OP_ADMIN_BACKUP` (Admin-gated, calls `create_online_backup()`), `OP_ADMIN_COMPACT` (Admin-gated, calls `compact_arenas(0.5)`), `OP_HEALTH` (ReadOnly+, returns JSON `{"status":"ok",...}`), `OP_ADMIN_CHECKPOINT` (Admin-gated, calls `checkpoint_incremental(&[],&[])`).
+  - Add corresponding `StorageClient` methods: `admin_backup()`, `admin_compact()`, `health()`, `admin_checkpoint()`.
+  - **Exit Criteria**: `test_tcp_raft_admin_health_and_shard_migration_rpcs` validates RBAC enforcement (non-Admin rejected), health check JSON, and successful admin operations.
+
+- [x] **TASK-062: Implement CLI PITR & Remote Admin Commands in `storage-cli`**
+  - Add local commands: `backup <db_dir> <backup_dir>`, `archive-wal <db_dir> <backup_dir>`, `restore-pitr <backup_dir> <restore_dir> <target_ts_ns>`.
+  - Add remote admin commands: `remote-health <addr>`, `remote-compact <addr>`, `remote-backup <addr> <dest_path>`, `remote-checkpoint <addr>`, `remote-metrics <addr>`.
+  - Add `storage-server` dependency to `crates/storage-cli/Cargo.toml`.
+  - **Exit Criteria**: CLI builds cleanly, all workspace tests pass.
+
+- [x] **TASK-063: Implement TCP Raft Consensus & Shard Migration RPCs (`OP_RAFT_VOTE=0x0E`, `OP_RAFT_APPEND=0x0F`, `OP_MIGRATE_VSHARD=0x10`)**
+  - Add 3 new opcodes: `OP_RAFT_VOTE` (ReadWrite+, deserializes/echoes `RequestVoteReq`), `OP_RAFT_APPEND` (ReadWrite+, deserializes `AppendEntriesReq`, returns `AppendEntriesResp`), `OP_MIGRATE_VSHARD` (Admin-gated, imports shipped record frames into local engine).
+  - Add `StorageClient` methods: `raft_vote()`, `raft_append()`, `migrate_vshard()`.
+  - **Exit Criteria**: `test_tcp_raft_admin_health_and_shard_migration_rpcs` validates Raft wire round-trip, shard import lands records in engine, RBAC enforcement (`46` total workspace tests, `0` failures).
+

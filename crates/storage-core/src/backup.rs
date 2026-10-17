@@ -136,6 +136,9 @@ fn copy_dir_excluding_pitr(src: &Path, dst: &Path) -> Result<()> {
             continue;
         }
         let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "lock") {
+            continue;
+        }
         let dst_path = dst.join(fname);
         if path.is_dir() {
             copy_dir_excluding_pitr(&path, &dst_path)?;

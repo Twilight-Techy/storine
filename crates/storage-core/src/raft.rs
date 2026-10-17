@@ -10,14 +10,19 @@
 //! - Read-Index / Follower Read scaling (`read_follower_at_commit_index`) so read-heavy workloads
 //!   scale horizontally across all replicas (`F-DIST-04`).
 
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use storage_codec::{AlignedBytes, RecordCodec, RecordView, ZeroCopyRecord};
+use storage_codec::{checksum_payload, AlignedBytes, RecordCodec, RecordView, ZeroCopyRecord};
 use storage_index::Indexable;
+use storage_mmap::atomic_write_replace;
 use storage_types::{InlineId, RecordFlags, Result, StorageError, Version};
 
 use crate::engine::StorageEngine;
 use crate::sharding::NodeId;
+
+const RAFT_META_MAGIC: u32 = 0x5241_4654; // "RAFT"
 
 /// Role of a node in a Raft replication group (`F-DIST-02`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,11 +52,53 @@ pub struct RequestVoteReq {
     pub last_log_term: u64,
 }
 
+impl RequestVoteReq {
+    pub fn to_wire_bytes(&self) -> [u8; 26] {
+        let mut out = [0u8; 26];
+        out[0..8].copy_from_slice(&self.term.to_le_bytes());
+        out[8..10].copy_from_slice(&self.candidate_id.to_le_bytes());
+        out[10..18].copy_from_slice(&self.last_log_index.to_le_bytes());
+        out[18..26].copy_from_slice(&self.last_log_term.to_le_bytes());
+        out
+    }
+
+    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 26 {
+            return Err(StorageError::corrupted_header("RequestVoteReq wire frame < 26B"));
+        }
+        Ok(Self {
+            term: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            candidate_id: u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
+            last_log_index: u64::from_le_bytes(bytes[10..18].try_into().unwrap()),
+            last_log_term: u64::from_le_bytes(bytes[18..26].try_into().unwrap()),
+        })
+    }
+}
+
 /// Raft `RequestVote` RPC response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RequestVoteResp {
     pub term: u64,
     pub vote_granted: bool,
+}
+
+impl RequestVoteResp {
+    pub fn to_wire_bytes(&self) -> [u8; 9] {
+        let mut out = [0u8; 9];
+        out[0..8].copy_from_slice(&self.term.to_le_bytes());
+        out[8] = u8::from(self.vote_granted);
+        out
+    }
+
+    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 9 {
+            return Err(StorageError::corrupted_header("RequestVoteResp wire frame < 9B"));
+        }
+        Ok(Self {
+            term: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            vote_granted: bytes[8] != 0,
+        })
+    }
 }
 
 /// Raft `AppendEntries` RPC request (heartbeat when `entries` is empty).
@@ -65,12 +112,130 @@ pub struct AppendEntriesReq {
     pub leader_commit: u64,
 }
 
+impl AppendEntriesReq {
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(38 + self.entries.len() * 64);
+        out.extend_from_slice(&self.term.to_le_bytes());
+        out.extend_from_slice(&self.leader_id.to_le_bytes());
+        out.extend_from_slice(&self.prev_log_index.to_le_bytes());
+        out.extend_from_slice(&self.prev_log_term.to_le_bytes());
+        out.extend_from_slice(&self.leader_commit.to_le_bytes());
+        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
+        for entry in &self.entries {
+            encode_log_entry(entry, &mut out);
+        }
+        out
+    }
+
+    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 38 {
+            return Err(StorageError::corrupted_header("AppendEntriesReq wire frame < 38B"));
+        }
+        let term = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let leader_id = u16::from_le_bytes(bytes[8..10].try_into().unwrap());
+        let prev_log_index = u64::from_le_bytes(bytes[10..18].try_into().unwrap());
+        let prev_log_term = u64::from_le_bytes(bytes[18..26].try_into().unwrap());
+        let leader_commit = u64::from_le_bytes(bytes[26..34].try_into().unwrap());
+        let count = u32::from_le_bytes(bytes[34..38].try_into().unwrap()) as usize;
+        let mut cursor = 38usize;
+        let mut entries = Vec::with_capacity(count.min(4096));
+        for _ in 0..count {
+            let (entry, next_cursor) = decode_log_entry(bytes, cursor)?;
+            entries.push(entry);
+            cursor = next_cursor;
+        }
+        Ok(Self {
+            term,
+            leader_id,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit,
+        })
+    }
+}
+
 /// Raft `AppendEntries` RPC response.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AppendEntriesResp {
     pub term: u64,
     pub success: bool,
     pub match_index: u64,
+}
+
+impl AppendEntriesResp {
+    pub fn to_wire_bytes(&self) -> [u8; 17] {
+        let mut out = [0u8; 17];
+        out[0..8].copy_from_slice(&self.term.to_le_bytes());
+        out[8] = u8::from(self.success);
+        out[9..17].copy_from_slice(&self.match_index.to_le_bytes());
+        out
+    }
+
+    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 17 {
+            return Err(StorageError::corrupted_header("AppendEntriesResp wire frame < 17B"));
+        }
+        Ok(Self {
+            term: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            success: bytes[8] != 0,
+            match_index: u64::from_le_bytes(bytes[9..17].try_into().unwrap()),
+        })
+    }
+}
+
+fn encode_log_entry(entry: &RaftLogEntry, out: &mut Vec<u8>) {
+    out.extend_from_slice(&entry.term.to_le_bytes());
+    out.extend_from_slice(&entry.index.to_le_bytes());
+    out.extend_from_slice(&entry.id.to_raw_bytes());
+    out.extend_from_slice(&entry.version.0.to_le_bytes());
+    match entry.frame {
+        Some(ref frame) => {
+            out.push(1u8);
+            let slice = frame.as_slice();
+            out.extend_from_slice(&(slice.len() as u32).to_le_bytes());
+            out.extend_from_slice(slice);
+        }
+        None => {
+            out.push(0u8);
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+    }
+}
+
+fn decode_log_entry(bytes: &[u8], cursor: usize) -> Result<(RaftLogEntry, usize)> {
+    if cursor + 53 > bytes.len() {
+        return Err(StorageError::corrupted_header("RaftLogEntry truncated header"));
+    }
+    let term = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+    let index = u64::from_le_bytes(bytes[cursor + 8..cursor + 16].try_into().unwrap());
+    let mut id_raw = [0u8; 24];
+    id_raw.copy_from_slice(&bytes[cursor + 16..cursor + 40]);
+    let id = InlineId::from_raw_bytes(id_raw)?;
+    let ver = Version(u64::from_le_bytes(
+        bytes[cursor + 40..cursor + 48].try_into().unwrap(),
+    ));
+    let has_frame = bytes[cursor + 48] != 0;
+    let frame_len = u32::from_le_bytes(bytes[cursor + 49..cursor + 53].try_into().unwrap()) as usize;
+    let end = cursor + 53 + frame_len;
+    if end > bytes.len() {
+        return Err(StorageError::corrupted_header("RaftLogEntry truncated frame"));
+    }
+    let frame = if has_frame {
+        Some(AlignedBytes::copy_from_slice(&bytes[cursor + 53..end]))
+    } else {
+        None
+    };
+    Ok((
+        RaftLogEntry {
+            term,
+            index,
+            id,
+            version: ver,
+            frame,
+        },
+        end,
+    ))
 }
 
 #[derive(Debug)]
@@ -111,12 +276,88 @@ impl RaftState {
         }
         self.log.get((index - 1) as usize).map(|e| e.term)
     }
+
+    fn save_to_disk(&self, path: &Path) -> Result<()> {
+        let mut payload = Vec::with_capacity(32 + self.log.len() * 64);
+        payload.extend_from_slice(&self.current_term.to_le_bytes());
+        match self.voted_for {
+            Some(node) => {
+                payload.push(1u8);
+                payload.extend_from_slice(&node.to_le_bytes());
+            }
+            None => {
+                payload.push(0u8);
+                payload.extend_from_slice(&0u16.to_le_bytes());
+            }
+        }
+        payload.extend_from_slice(&self.commit_index.to_le_bytes());
+        payload.extend_from_slice(&self.last_applied.to_le_bytes());
+        payload.extend_from_slice(&(self.log.len() as u32).to_le_bytes());
+        for entry in &self.log {
+            encode_log_entry(entry, &mut payload);
+        }
+
+        let crc = checksum_payload(&payload);
+        let mut full = Vec::with_capacity(12 + payload.len());
+        full.extend_from_slice(&RAFT_META_MAGIC.to_le_bytes());
+        full.extend_from_slice(&crc.to_le_bytes());
+        full.extend_from_slice(&payload);
+        atomic_write_replace(path, &full, false)
+    }
+
+    fn load_from_disk(path: &Path) -> Result<Option<Self>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(path).map_err(|e| StorageError::io("read raft.meta", e))?;
+        if bytes.len() < 43 {
+            return Err(StorageError::corrupted_header("raft.meta truncated"));
+        }
+        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        if magic != RAFT_META_MAGIC {
+            return Err(StorageError::corrupted_header("raft.meta invalid magic"));
+        }
+        let expected_crc = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+        let payload = &bytes[12..];
+        let actual_crc = checksum_payload(payload);
+        if actual_crc != expected_crc {
+            return Err(StorageError::checksum_mismatch(expected_crc, actual_crc));
+        }
+
+        let current_term = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let voted_for = if payload[8] != 0 {
+            Some(u16::from_le_bytes(payload[9..11].try_into().unwrap()))
+        } else {
+            None
+        };
+        let commit_index = u64::from_le_bytes(payload[11..19].try_into().unwrap());
+        let last_applied = u64::from_le_bytes(payload[19..27].try_into().unwrap());
+        let count = u32::from_le_bytes(payload[27..31].try_into().unwrap()) as usize;
+        let mut cursor = 31usize;
+        let mut log = Vec::with_capacity(count.min(4096));
+        for _ in 0..count {
+            let (entry, next_cursor) = decode_log_entry(payload, cursor)?;
+            log.push(entry);
+            cursor = next_cursor;
+        }
+
+        Ok(Some(Self {
+            role: RaftRole::Follower,
+            current_term,
+            voted_for,
+            leader_id: None,
+            log,
+            commit_index,
+            last_applied,
+        }))
+    }
 }
 
-/// Single Raft Consensus Replica wrapping a local `StorageEngine<T>` (`TASK-046`, `F-DIST-02`).
+/// Single Raft Consensus Replica wrapping a local `StorageEngine<T>` (`TASK-046`, `TASK-060`, `F-DIST-02`).
 pub struct RaftNode<T: ZeroCopyRecord + Indexable> {
     node_id: NodeId,
     engine: Arc<StorageEngine<T>>,
+    meta_path: PathBuf,
     state: Mutex<RaftState>,
 }
 
@@ -135,10 +376,18 @@ impl<T: ZeroCopyRecord + Indexable> core::fmt::Debug for RaftNode<T> {
 
 impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     pub fn new(node_id: NodeId, engine: Arc<StorageEngine<T>>) -> Self {
+        let meta_path = engine
+            .base_dir()
+            .join(format!("{}_raft.meta", engine.collection_name()));
+        let initial_state = RaftState::load_from_disk(&meta_path)
+            .ok()
+            .flatten()
+            .unwrap_or_else(RaftState::new);
         Self {
             node_id,
             engine,
-            state: Mutex::new(RaftState::new()),
+            meta_path,
+            state: Mutex::new(initial_state),
         }
     }
 
@@ -163,6 +412,13 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             .current_term
     }
 
+    pub fn voted_for(&self) -> Option<NodeId> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .voted_for
+    }
+
     pub fn commit_index(&self) -> u64 {
         self.state
             .lock()
@@ -178,13 +434,14 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     }
 
     /// Transitions this node to `Candidate`, increments `current_term`, votes for itself,
-    /// and returns a `RequestVoteReq` to broadcast to peers.
+    /// persists `raft.meta`, and returns a `RequestVoteReq` to broadcast to peers.
     pub fn start_election(&self) -> RequestVoteReq {
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
         st.current_term += 1;
         st.role = RaftRole::Candidate;
         st.voted_for = Some(self.node_id);
         st.leader_id = None;
+        let _ = st.save_to_disk(&self.meta_path);
         let (last_log_index, last_log_term) = st.last_log_index_and_term();
         RequestVoteReq {
             term: st.current_term,
@@ -197,13 +454,18 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     /// Processes a `RequestVoteReq` according to the Raft Election Safety and Log Up-To-Date rules.
     pub fn handle_request_vote(&self, req: RequestVoteReq) -> RequestVoteResp {
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut dirty = false;
         if req.term > st.current_term {
             st.current_term = req.term;
             st.role = RaftRole::Follower;
             st.voted_for = None;
             st.leader_id = None;
+            dirty = true;
         }
         if req.term < st.current_term {
+            if dirty {
+                let _ = st.save_to_disk(&self.meta_path);
+            }
             return RequestVoteResp {
                 term: st.current_term,
                 vote_granted: false,
@@ -217,11 +479,15 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
 
         if can_vote && candidate_up_to_date {
             st.voted_for = Some(req.candidate_id);
+            let _ = st.save_to_disk(&self.meta_path);
             RequestVoteResp {
                 term: st.current_term,
                 vote_granted: true,
             }
         } else {
+            if dirty {
+                let _ = st.save_to_disk(&self.meta_path);
+            }
             RequestVoteResp {
                 term: st.current_term,
                 vote_granted: false,
@@ -265,6 +531,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             frame,
         };
         st.log.push(entry.clone());
+        st.save_to_disk(&self.meta_path)?;
         Ok((entry, prev_idx, prev_term))
     }
 
@@ -312,6 +579,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
 
             // Verify Raft Log Matching Property at `prev_log_index`
             let Some(local_prev_term) = st.term_at(req.prev_log_index) else {
+                let _ = st.save_to_disk(&self.meta_path);
                 return Ok(AppendEntriesResp {
                     term: st.current_term,
                     success: false,
@@ -320,6 +588,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             };
             if local_prev_term != req.prev_log_term {
                 st.log.truncate(req.prev_log_index.saturating_sub(1) as usize);
+                let _ = st.save_to_disk(&self.meta_path);
                 return Ok(AppendEntriesResp {
                     term: st.current_term,
                     success: false,
@@ -353,6 +622,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 }
                 st.last_applied = next_apply;
             }
+            st.save_to_disk(&self.meta_path)?;
             (st.current_term, match_index, ready)
         };
 
@@ -386,6 +656,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 }
                 st.last_applied = next_apply;
             }
+            st.save_to_disk(&self.meta_path)?;
             (st.commit_index, ready)
         };
 

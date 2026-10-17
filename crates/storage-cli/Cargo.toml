@@ -18,6 +18,7 @@ storage-wal = { path = "../storage-wal" }
 storage-index = { path = "../storage-index" }
 storage-graph = { path = "../storage-graph" }
 storage-core = { path = "../storage-core" }
+storage-server = { path = "../storage-server" }
 
 [lints]
 workspace = true
