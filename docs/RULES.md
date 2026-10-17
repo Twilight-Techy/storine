@@ -1,109 +1,115 @@
 # Engineering, Safety & Extreme Optimization Rules (`RULES.md`)
 
-> **Core Philosophy**: Every CPU cycle, cache line, heap allocation, file descriptor, and system call is budgeted. We never trade correctness or features for speed—instead, we design data structures and memory layouts so that the fastest path is also the cleanest, safest, and most deterministic path.
+> **Core Philosophy**: Every CPU cycle, cache line, heap allocation, file descriptor, disk byte, and system call is budgeted. We never trade correctness or features for speed—instead, we design data structures, algorithms, and memory layouts so that the fastest path is also the smallest, safest, and most deterministic path.
 
 ---
 
-## 1. Zero-Allocation & Memory Footprint Rules
+## 1. Zero-Allocation, Anti-Bloat & Minimal Footprint Rules
 
 ### RULE-MEM-01: Zero Heap Allocations on the Hot Read Path
-- Calling `db.get_ref::<T>(id)` or querying a primary/secondary index on a warm record **MUST NOT** perform a single heap allocation (`malloc` / `alloc`).
-- All read guards (`RecordRef<'a, T>`) must borrow directly from the pinned `Mmap` page or the in-flight `HotDirtyArc` buffer on the stack.
-- Every hot-path function is verified in CI using a custom `CountingAllocator` wrapper that asserts `alloc_count == 0` during read benchmarks.
+- Calling `db.with_ref::<T>(id, ...)` or `db.get_ref::<T>(id)` on a clean mapped record **MUST NOT** perform a single heap allocation (`malloc` / `alloc`).
+- All read views (`RecordView<'a, T>`, `RecordRef<T>`) borrow directly from the pinned `MmapRegion` page or in-flight `hot_dirty` buffer.
+- Verified continuously via `TrackingAllocator` (`benches/src/lib.rs`) asserting `allocs_per_op == 0.00`.
 
-### RULE-MEM-02: Stack-Inlined Small Types Over Heap Containers
-- **Primary Keys (`InlineId`)**: Keys `<= 23` bytes MUST be stored inline on the stack (using a 24-byte tagged representation) with zero heap indirection.
-- **Temporary Collections**: Use `SmallVec<[T; N]>` or `ArrayVec<T, N>` for index delta lists, relationship batch operations, and path construction (`ArrayString` / stack buffer `[u8; 256]`) instead of `Vec<T>` or `String`/`PathBuf` heap allocations.
-- **Scratch Buffers**: `rkyv` serialization during writes MUST reuse thread-local or queue-pooled `AlignedVec` scratch buffers via `.clear()` rather than allocating and dropping buffers per write.
+### RULE-MEM-02: Stack-Inlined Small Types & Zero Duplicate In-RAM Maps
+- **Primary Keys (`InlineId`)**: Keys `<= 23` bytes are stored inline on the stack in a 24-byte `#[repr(C, align(8))]` struct with zero heap indirection.
+- **Zero Duplicate Payload Maps**: Secondary index snapshots (`IndexSnapshot`) and float embeddings MUST be extracted zero-copy directly from the memory-mapped `&T::Archived` frame during updates and searches rather than duplicated in auxiliary in-RAM hash maps.
+- **Pooled Scratch Buffers**: Serialization and compression MUST reuse thread-local 64-byte-aligned `AlignedScratchBuf` buffers via `.clear()`.
 
-### RULE-MEM-03: Struct Layout Packing & Size Assertions
-- Order struct fields from largest alignment to smallest alignment (or let `repr(Rust)` optimize while verifying with `const _: () = assert!(std::mem::size_of::<T>() <= LIMIT);`).
-- Every core metadata entry (`RecordLocation`, `RecordHeader`, `WalFrameHeader`, `IndexEntry`) MUST have a compile-time `static_assertions::const_assert_eq!(std::mem::size_of::<...>(), ...)` so accidental struct bloat breaks compilation immediately.
+### RULE-MEM-03: Struct Layout Packing, Code Size & On-Disk Data Density
+- Order struct fields to eliminate alignment padding waste (`IndexSnapshot` uses Struct-of-Arrays packing; `ArchivedOneToOne` uses `InlineId::EMPTY` as the `None` niche).
+- Every core structure (`RecordHeader`, `InlineId`, `PrimaryEntry`, `MmapGuard`) MUST enforce compile-time size assertions.
+- On-disk checkpoints (`primary.idx`), paged B+Tree nodes, HNSW neighbor lists, and WAL frames MUST use compact varint, delta, bit-packed, or scalar-quantized (`SQ8`) encodings to keep disk footprint minimal.
+- Zero external runtime crates are used in production binaries so compiled code size remains `< 500 KiB` with `lto = "fat"` and `strip = "symbols"`.
 
-### RULE-MEM-04: Global Allocator & Strict Resource Ceilings
-- Production binaries and benchmarks MUST use `mimalloc` (`#[global_allocator]`) to minimize allocator fragmentation and multi-threaded lock contention.
-- The engine MUST enforce hard configurable ceilings on:
-  1. `max_active_mmaps` (default: `16,384` regions)
-  2. `max_open_file_descriptors` (default: `4,096` FDs)
-  3. `max_hot_dirty_bytes` (default: `256 MB` before backpressure / immediate flush)
+### RULE-MEM-04: Strict Resource Ceilings & Anti-Memory-Bloat Reclamation
+- Enforce hard, runtime-configurable ceilings on:
+  1. `max_hot_dirty_bytes` (default `64 MiB` — triggers immediate synchronous dirty-batch flush backpressure when reached).
+  2. `PoolBudget::max_mapped_bytes` (default `1 GiB`) and `max_open_files` (default `512`) via 4-way sharded Clock-PRO / Second-Chance eviction.
+  3. `max_connections` (default `100,000`, dynamically tunable at runtime via `set_max_connections`).
+- Transient per-connection request/response buffers (`body_buf`, `out_buf`) MUST be released back to `0` capacity as soon as a large frame completes so idle connections never retain bloated heap buffers (`~88 bytes` per idle connection).
+- `RecordOrdinal`s of deleted records MUST be recycled in $O(1)$ time via a free-list after secondary index cleanup so ordinal bitmaps and tables never bloat monotonically under heavy churn.
 
 ---
 
-## 2. CPU, Cache-Line & SIMD Optimization Rules
+## 2. CPU Efficiency, Anti-CPU-Hogging & SIMD Optimization Rules
 
 ### RULE-CPU-01: Eliminate False Sharing via 64-Byte Cache-Line Alignment
-- Any concurrently mutated structure (striped lock slots, per-shard atomic counters, WAL ring-buffer head/tail pointers, flush queue nodes) MUST be annotated with `#[repr(C, align(64))]` (or `crossbeam_utils::CachePadded<T>`) so independent threads never invalidate each other's L1/L2 CPU cache lines.
+- Any concurrently mutated structure (`PrimaryIndex` shards, `StripedLockTable` stripes, `MmapPool` shards, reactor queues) MUST be wrapped in `#[repr(C, align(64))]` (`CachePadded<T>`) so independent CPU cores never invalidate each other's L1/L2 cache lines.
 
-### RULE-CPU-02: Hardware-Accelerated Hashing & Checksums
-- Never use `std::collections::HashMap` with default SipHash-1-3 on internal keys.
-- Use `hashbrown::HashMap` / `HashTable` with `xxh3` (`xxhash-rust` with AVX2/SSE2/NEON) or `ahash` (AES-NI).
-- All record payloads and WAL frames MUST use 64-bit `XXH3` or hardware-accelerated `CRC32C` instructions.
+### RULE-CPU-02: Hardware-Accelerated Hashing, Checksums & Vector Kernels
+- Use single-multiply Fibonacci / `XXH3-64` hashing (`FastHashMap` / `inline_id_hash64`) instead of SipHash.
+- All record payloads, index checkpoints, and WAL frames MUST use 4-way unrolled `XXH3-64` combined with hardware SSE4.2/ARMv8 `CRC32C` instructions.
+- Vector similarity scoring (`cosine_similarity_f32` and `SQ8` quantized dot-product) MUST use 8-way loop-unrolled SIMD accumulation.
 
-### RULE-CPU-03: Branch Prediction, Inlining & Cold Error Paths
-- Annotate hot accessors (`InlineId::as_bytes`, `RecordRef::get`, `RecordHeader::validate_fast`, shard index calculations) with `#[inline]`.
-- Annotate all error construction, corruption recovery, schema migration, and slow-path fallback functions with `#[cold]` and `#[inline(never)]` so the instruction cache (I-cache) on the fast path stays compact.
-- Use power-of-two shard counts (`N = 64`, `2048`) so modulo arithmetic compiles to a single bitwise mask (`hash & (N - 1)`) instead of a 20+ cycle integer division (`div`).
+### RULE-CPU-03: Zero CPU Hogging & Event-Driven Readiness
+- **No Unbounded Spin Loops**: Worker threads (`ReactorShard`, `GroupCommitWal`, background flusher, Raft replication workers) MUST NEVER spin unboundedly at 100% CPU when idle.
+- Use OS-native readiness polling (`IOCP` / `WSAPoll` on Windows, `epoll` / `kqueue` / `poll` on Unix) or bounded adaptive backoff (`spin_loop` -> `yield_now` -> `Condvar::wait_timeout`) so idle threads consume `0%` CPU.
+- If the OS returns transient descriptor exhaustion (`EMFILE` / `ENFILE`) on `accept()`, back off cleanly rather than busy-spinning.
 
-### RULE-CPU-04: Compiler & Linker Optimization Profiles
-- Workspace `Cargo.toml` release and benchmark profiles MUST enforce:
-  ```toml
-  [profile.release]
-  opt-level = 3
-  lto = "fat"
-  codegen-units = 1
-  panic = "abort"
-  strip = "symbols"
-  ```
-- Support `.cargo/config.toml` `target-cpu=native` builds to unlock AVX2/AVX-512/NEON instructions for SIMD index search and checksumming.
+### RULE-CPU-04: Branch Prediction, Inlining & Compiler Profiles
+- Annotate hot accessors with `#[inline]` and slow/error/recovery paths with `#[cold]` and `#[inline(never)]`.
+- Use power-of-two shard counts (`64`, `2048`) so shard selection compiles to a single bitwise mask (`hash & (N - 1)`).
 
 ---
 
-## 3. `unsafe` Rust, `mmap` & Memory Safety Rules
+## 3. Optimal Time & Space Complexity Rules (`RULE-CPLX-*`)
 
-### RULE-SAFE-01: Strict Isolation of `unsafe` Code
-- `#![forbid(unsafe_code)]` MUST be enabled at the crate root of `storage-index`, `storage-graph`, `storage-wal`, `storage-cli`, and `storage-server`.
-- `unsafe` is permitted **ONLY** in `storage-mmap` (OS virtual memory FFI), `storage-codec` (validated `rkyv::archived_value` zero-copy cast), and `storage-types` (`bytemuck`/`repr(C)` header transmutation), and those crates MUST enable `#![deny(unsafe_op_in_unsafe_fn)]`.
+### RULE-CPLX-01: Asymptotic Time Complexity Mandates
+- **Point Lookups, Writes & Ordinal Recycling**: Strictly **$O(1)$** average time in `PrimaryIndex` (including $O(1)$ sentinel transition `Some(InlineId::EMPTY) -> None` during ordinal release; never linear $O(F)$ free-list scans).
+- **Multi-Tag Bitmap Queries**: **$O(W_{\min} \cdot k)$** by sorting posting lists by word count so the smallest bitmap drives bitwise `AND` intersections using hardware `TZCNT` (`trailing_zeros()`).
+- **Range & Paged B+Tree Queries**: **$O(\log B + |R|)$** using order-preserving integer/IEEE-754 float keys (`sortable_f64_to_i64`, `sortable_u64_to_i64`).
+- **Top-$K$ Exact & ANN Vector Search**:
+  - Exact candidate scoring: **$O(N \cdot D + N + K \log K)$** using linear $O(N)$ Hoare/Floyd-Rivest Quickselect (`select_nth_unstable_by`) instead of $O(N \log N)$ full sorting.
+  - Unfiltered ANN search: **$O(\log N)$** greedy beam search over multi-layer memory-mapped HNSW graphs with `SQ8` quantized vectors.
+- **Relationship Membership Checks**: **$O(\log K)$** binary search directly over sorted `InlineId` slices in `mmap`.
 
-### RULE-SAFE-02: Mandatory `// SAFETY:` Proofs on Every `unsafe` Block
-- Every single `unsafe { ... }` block MUST be preceded by a `// SAFETY:` comment documenting:
-  1. **Pointer Validity & Alignment**: Proof that the byte slice is at least 16-byte / 64-byte aligned and at least `sizeof::<RecordHeader>() + payload_len` bytes long.
-  2. **Lifetime & Pinning Invariant**: Proof that the underlying `Mmap` region cannot be unmapped or truncated while any `RecordRef<'a, T>` guard is alive.
-  3. **No Aliasing Mutation (`&mut` vs `&`)**: Proof that no thread modifies a mapped file in-place while readers hold shared references to that mapping slot.
-
-### RULE-SAFE-03: Never Expose Mutable `mmap` Pointers to Callers
-- Callers **NEVER** receive `&mut T` pointing directly into an active shared `mmap` region.
-- All updates run inside `db.update::<T>(id, |draft: &mut T| ...)` where `draft` is an isolated mutable instance. Only after the closure succeeds, validates invariants, increments `record_version`, updates secondary indexes, and serializes a fresh `rkyv` frame is the new state atomically swapped into visibility.
-
-### RULE-SAFE-04: Validate Once, Read Zero-Cost Forever
-- Newly mapped disk pages or crash-recovered WAL frames MUST pass `XXH3-64` checksum verification and `rkyv::check_archived_root::<T>` bytecheck validation **once** when loaded.
-- Once verified, the `MmapSlot` marks an atomic `VERIFIED` bit so all subsequent reads bypass bytecheck and dereference the root offset directly in $O(1)$ time.
+### RULE-CPLX-02: Asymptotic Space Complexity Mandates
+- Per-record index overhead in RAM must remain strictly bounded (and $O(1)$ when paged to disk).
+- Auxiliary space during point reads must be strictly **$O(1)$ (`0` heap bytes)**.
 
 ---
 
-## 4. Concurrency, Locking & I/O Rules
+## 4. Scaling & Concurrency Rules (Users, Vertical Compute & Horizontal Compute)
 
-### RULE-CONC-01: Never Hold Locks Across Disk I/O
-- Primary index shard locks (`parking_lot::RwLock`) may only be held for pointer swaps or hash table lookups (`< 100 ns`).
-- Disk writes (`WriteFile`/`pwrite`), `fsync`/`FlushFileBuffers`, and file renames MUST execute outside of global or shard-wide locks.
+### RULE-SCALE-01: Million-User Connection Multiplexing & Backpressure
+- Never spawn 1 OS thread (`2 MiB` stack) per client connection. Multiplex connections across a fixed pool of non-blocking `ReactorShard` workers (`~88 bytes` per idle connection).
+- Enforce strict per-connection TCP write backpressure: never read a new request from a socket while its previous `out_buf` response is still draining (`WouldBlock`).
+- Shed excess connections above `max_connections` immediately with `STATUS_OVERLOADED` (`0x03`).
 
-### RULE-CONC-02: Canonical Lock Ordering (Deadlock Freedom by Construction)
-- Whenever an operation locks more than one record (e.g., bidirectional relationship `link(id_a, id_b)` or multi-record `transaction`), per-record write queues MUST be acquired in **strictly ascending lexicographical `InlineId` order** (with tie-breaking by collection ID). Deadlocks are structurally impossible.
+### RULE-SCALE-02: Vertical Compute Scaling (Multi-Core Linear Throughput)
+- Partition all in-memory state across cache-line-aligned shards (`64` index shards, `2,048` lock stripes, sharded `MmapPool`, sharded reactor threads) and use immutable `MmapGuard` / `Arc` frames so readers and writers never block each other.
+- Skip secondary index locks completely during `update` if indexed fields did not change (`IndexSnapshot::diff`).
 
-### RULE-CONC-03: Coalesce Writes & Batch `fsync`
-- Never call `fsync` per individual update when multiple concurrent updates are in flight.
-- The Group-Commit WAL batches all concurrent writer threads waiting during a flush window into a single sequential write + `fsync`.
-- The background record flusher coalesces multiple sequential versions of the same record in RAM into a single disk write.
+### RULE-SCALE-03: Horizontal Compute Scaling (Sharded Cluster & Raft Replication)
+- Partition the keyspace into deterministic virtual shards (`vshards`, e.g., `1,024` hash/range buckets) that can be mapped across physical cluster nodes and migrated online without downtime.
+- Replicate `GroupCommitWal` batches across nodes using leader-based Raft consensus with pipelined append entries and learner/follower read replicas.
 
 ---
 
-## 5. Verification, Benchmarking & Discipline Rules
+## 5. Total Graceful Error Handling & Safety Rules (`RULE-ERR-*` & `RULE-SAFE-*`)
 
-### RULE-TEST-01: Every Subsystem Ships With Unit, Property & Crash Tests
-- No task is complete until it passes:
-  1. Unit tests covering edge cases (empty records, max-size records, corrupted checksums, version conflicts).
-  2. Property-based tests (`proptest`) verifying randomized sequences of `insert`/`update`/`delete`/`link`/`query` against an in-memory reference model.
-  3. Miri / sanitizer checks on all data structures.
+### RULE-ERR-01: Zero Panics, Fallible Allocations & Lock Poison Recovery
+- Production library and server code MUST NEVER call `.unwrap()` or `.expect()` on fallible I/O, network sockets, untrusted bytes, or user parameters.
+- All `Mutex` and `RwLock` acquisitions MUST recover from poisoned locks via `.unwrap_or_else(|poisoned| poisoned.into_inner())` so a panic in a user closure never takes down the engine.
+- Network and dynamic buffer allocations for untrusted sizes MUST use fallible allocation (`Vec::try_reserve_exact`), returning `STATUS_OVERLOADED` / `StorageError::Io(OutOfMemory)` on heap exhaustion instead of aborting the process.
+- Background flush failures (`ENOSPC` / transient I/O errors) MUST keep the dirty record intact in `hot_dirty` and automatically re-enqueue the key into `WriteCoalescer` for retry on the next flush cycle.
 
-### RULE-TEST-02: Benchmark-Driven Optimization Gate
-- Every core subsystem (`InlineId`, `rkyv` codec, `MmapPool`, `PrimaryIndex`, `BTreeIndex`, `RoaringIndex`, `WriteCoalescer`, `GroupCommitWal`) has a dedicated Criterion benchmark tracking `p50`, `p99`, `p99.9` latency, throughput (ops/sec), and bytes allocated per op.
-- Any change that regresses hot-path throughput or latency by `> 3%` or introduces heap allocations on the read path must be redesigned before moving to the next task.
+### RULE-SAFE-01: Strict Isolation of `unsafe` Code & `// SAFETY:` Proofs
+- `#![forbid(unsafe_code)]` is mandatory in `storage-types`, `storage-wal`, `storage-index`, `storage-graph`, `storage-core`, `storage-server`, and `storage-cli`.
+- `unsafe` is permitted ONLY in `storage-codec` and `storage-mmap` with `#![deny(unsafe_op_in_unsafe_fn)]` and `#![deny(clippy::undocumented_unsafe_blocks)]`.
+- Use `ArchivedBool` (`u8` validated `<= 1`) and `ArchivedChar` (`u32` validated via `char::from_u32`) in zero-copy structs so corrupted disk bytes never trigger Rust Undefined Behavior.
+
+### RULE-CONC-01: Canonical Lock Ordering & Lock-Free I/O
+- Never hold primary index shard locks across disk I/O (`WriteFile`/`fsync`).
+- Multi-record mutations (`update_pair_atomic`, `transaction`, `delete_with_policy`) MUST lock keys in strictly ascending canonical `(CollectionId, InlineId)` order (`StripedLockTable::lock_many`) so AB-BA deadlocks are mathematically impossible.
+
+---
+
+## 6. Verification, Benchmarking & Discipline Rules (`RULE-TEST-*`)
+
+### RULE-TEST-01: Mandatory Unit, Corruption, Concurrency & Chaos Crash Tests
+- Every subsystem must ship with unit tests, single-bit flip / torn-frame corruption tests, multi-threaded contention tests, and chaos crash-recovery verification.
+
+### RULE-TEST-02: Benchmark & Footprint Gate
+- Every stage is verified against `cargo run --release -p benches` to guarantee zero hot-read heap allocations (`0.00 Allocs/Op`), sub-microsecond hot reads, and minimal binary/data footprint.
