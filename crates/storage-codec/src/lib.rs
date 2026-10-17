@@ -8,6 +8,7 @@ pub mod archive;
 pub mod checksum;
 pub mod compress;
 pub mod scratch;
+pub mod types;
 
 pub use archive::{
     ArchiveBuilder, ArchivedBytes, ArchivedOption, ArchivedSlice, ArchivedString, RecordCodec,
@@ -16,3 +17,7 @@ pub use archive::{
 pub use checksum::{checksum_payload, crc32c_64, xxh3_64};
 pub use compress::{compress_lz4, decompress_lz4};
 pub use scratch::{AlignedBytes, AlignedScratchBuf, with_thread_scratch};
+pub use types::{
+    ArchivedBool, ArchivedChar, ArchivedI128, ArchivedMap, ArchivedMapEntry, ArchivedPropertyValue,
+    ArchivedStringSlice, ArchivedU128, ArchivedUuid, PropertyValue, PropertyValueRef,
+};

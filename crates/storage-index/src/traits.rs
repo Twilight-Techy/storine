@@ -62,6 +62,24 @@ impl IndexSnapshot {
         }
     }
 
+    /// Indexes an `f64` floating-point field using IEEE-754 order-preserving `i64` encoding.
+    #[inline]
+    pub fn push_f64(&mut self, field_id: u16, value: f64) {
+        self.push_numeric(field_id, crate::btree::sortable_f64_to_i64(value));
+    }
+
+    /// Indexes a `u64` unsigned integer field using order-preserving `i64` encoding.
+    #[inline]
+    pub fn push_u64(&mut self, field_id: u16, value: u64) {
+        self.push_numeric(field_id, crate::btree::sortable_u64_to_i64(value));
+    }
+
+    /// Indexes a boolean field (`false -> 0`, `true -> 1`).
+    #[inline]
+    pub fn push_bool(&mut self, field_id: u16, value: bool) {
+        self.push_numeric(field_id, i64::from(value));
+    }
+
     #[inline]
     pub fn push_tag(&mut self, field_id: u16, tag: InlineId) {
         let n = self.tags_len as usize;

@@ -161,6 +161,44 @@ impl NumericRangeIndex {
         }
         bm
     }
+
+    /// Inserts an `f64` value into `field_id` using IEEE-754 order-preserving `i64` encoding.
+    #[inline]
+    pub fn insert_f64(&self, field_id: u16, value: f64, ord: RecordOrdinal) {
+        self.insert(field_id, sortable_f64_to_i64(value), ord);
+    }
+
+    /// Queries an inclusive `[min, max]` floating-point range on `field_id`.
+    #[inline]
+    pub fn range_f64_bitmap(&self, field_id: u16, min: f64, max: f64) -> CompressedBitmap {
+        let lo = sortable_f64_to_i64(min);
+        let hi = sortable_f64_to_i64(max);
+        if lo <= hi {
+            self.range_bitmap(field_id, lo..=hi)
+        } else {
+            CompressedBitmap::new()
+        }
+    }
+}
+
+/// Bijective IEEE-754 order-preserving conversion from `f64` to `i64` so floating-point numbers
+/// (`-INFINITY`, negative numbers, `-0.0`/`+0.0`, positive numbers, `+INFINITY`) sort identically
+/// in `NumericRangeIndex`'s `BTreeMap<i64, LeafPostingList>`.
+#[inline]
+pub fn sortable_f64_to_i64(val: f64) -> i64 {
+    let norm = if val == 0.0 { 0.0 } else { val };
+    let bits = norm.to_bits() as i64;
+    if bits < 0 {
+        bits ^ 0x7FFF_FFFF_FFFF_FFFF
+    } else {
+        bits
+    }
+}
+
+/// Order-preserving conversion from `u64` (`0..=u64::MAX`) to `i64` (`i64::MIN..=i64::MAX`).
+#[inline]
+pub const fn sortable_u64_to_i64(val: u64) -> i64 {
+    (val ^ (1u64 << 63)) as i64
 }
 
 #[cfg(test)]
@@ -177,5 +215,19 @@ mod tests {
         assert_eq!(hits.len(), 10);
         assert_eq!(hits[0], RecordOrdinal(100));
         assert_eq!(hits[9], RecordOrdinal(109));
+    }
+
+    #[test]
+    fn test_f64_and_u64_order_preserving_range_index() {
+        let idx = NumericRangeIndex::new();
+        idx.insert_f64(2, -100.5, RecordOrdinal(1));
+        idx.insert_f64(2, -0.25, RecordOrdinal(2));
+        idx.insert_f64(2, 0.0, RecordOrdinal(3));
+        idx.insert_f64(2, 42.125, RecordOrdinal(4));
+        idx.insert_f64(2, 999.99, RecordOrdinal(5));
+
+        let bm = idx.range_f64_bitmap(2, -1.0, 50.0);
+        assert_eq!(bm.to_vec(), vec![RecordOrdinal(2), RecordOrdinal(3), RecordOrdinal(4)]);
+        assert!(sortable_u64_to_i64(0) < sortable_u64_to_i64(u64::MAX));
     }
 }
