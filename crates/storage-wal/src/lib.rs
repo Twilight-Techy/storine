@@ -466,6 +466,111 @@ impl GroupCommitWal {
     }
 
     #[inline]
+    pub fn current_lsn(&self) -> u64 {
+        self.next_lsn.load(Ordering::Acquire).saturating_sub(1)
+    }
+
+    #[inline]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Rotates the active WAL into an immutable numbered segment file (`wal_XXXXXX.log`)
+    /// for Point-in-Time Recovery (PITR) archival and resets the active WAL buffer (`TASK-040`, `F-DURA-05`).
+    pub fn rotate_segment(&self) -> Result<PathBuf> {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while guard.flushing {
+            guard = self
+                .cv
+                .wait(guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        guard
+            .writer
+            .flush()
+            .map_err(|e| StorageError::io("flush WAL before rotate", e))?;
+        guard
+            .writer
+            .get_ref()
+            .sync_data()
+            .map_err(|e| StorageError::io("fsync WAL before rotate", e))?;
+
+        let parent = self
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let existing_segs = Self::list_archived_segments(&parent)?;
+        let next_seq = existing_segs.len() + 1;
+        let seg_path = parent.join(format!("wal_{:06}.log", next_seq));
+
+        fs::copy(&self.path, &seg_path)
+            .map_err(|e| StorageError::io("archive rotated WAL segment", e))?;
+
+        let file = guard.writer.get_mut();
+        file.set_len(0)
+            .map_err(|e| StorageError::io("truncate rotated WAL file", e))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| StorageError::io("seek rotated WAL start", e))?;
+        file.sync_data()
+            .map_err(|e| StorageError::io("fsync rotated WAL", e))?;
+
+        Ok(seg_path)
+    }
+
+    /// Lists all archived WAL segment files (`wal_XXXXXX.log`) in `wal_dir` sorted chronologically.
+    pub fn list_archived_segments(wal_dir: &Path) -> Result<Vec<PathBuf>> {
+        if !wal_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut segments = Vec::new();
+        for entry in fs::read_dir(wal_dir).map_err(|e| StorageError::io("read wal_dir", e))? {
+            let entry = entry.map_err(|e| StorageError::io("read wal_dir entry", e))?;
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("wal_") && name.ends_with(".log") {
+                    segments.push(path);
+                }
+            }
+        }
+        segments.sort();
+        Ok(segments)
+    }
+
+    /// Recovers all committed WAL entries across all archived `wal_XXXXXX.log` segments in `wal_dir`
+    /// followed by `active_wal_path` in monotonically increasing LSN order (`TASK-040`, `F-DURA-05`).
+    pub fn recover_all_segments(wal_dir: &Path, active_wal_path: &Path) -> Result<Vec<WalEntry>> {
+        let mut all = Vec::new();
+        for seg in Self::list_archived_segments(wal_dir)? {
+            all.extend(Self::recover_committed(&seg)?);
+        }
+        if active_wal_path.exists() {
+            all.extend(Self::recover_committed(active_wal_path)?);
+        }
+        Ok(all)
+    }
+
+    /// Prunes archived `wal_XXXXXX.log` segments in `wal_dir` whose maximum LSN is strictly less
+    /// than `min_keep_lsn`, preventing unbounded WAL disk consumption (`TASK-040`, `RULE-MEM-04`).
+    pub fn prune_archived_segments_before_lsn(
+        wal_dir: &Path,
+        min_keep_lsn: u64,
+    ) -> Result<usize> {
+        let mut pruned = 0usize;
+        for seg in Self::list_archived_segments(wal_dir)? {
+            let entries = Self::recover_committed(&seg)?;
+            let max_lsn = entries.iter().map(|e| e.lsn).max().unwrap_or(0);
+            if max_lsn < min_keep_lsn && fs::remove_file(&seg).is_ok() {
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
+    }
+
+    #[inline]
     pub fn stats(&self) -> (u64, u64) {
         (
             self.total_batches.load(Ordering::Relaxed),

@@ -7,6 +7,7 @@ use storage_index::{cosine_similarity_f32, CompressedBitmap, Indexable, VectorTo
 use storage_types::{InlineId, RecordOrdinal, Result};
 
 use crate::engine::{RecordRef, StorageEngine};
+use crate::optimizer::{QueryExplainPlan, QueryOptimizer};
 
 /// Fluent query builder combining secondary tag bitmaps, numeric/timestamp B+Tree ranges,
 /// and optional SIMD cosine similarity scoring over AI memory embeddings.
@@ -84,11 +85,30 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
         self
     }
 
+    /// Returns the cost-based `QueryExplainPlan` (`EXPLAIN`) for this query (`TASK-048`, `F-OPT-02`).
+    #[inline]
+    pub fn explain(&self) -> QueryExplainPlan {
+        QueryOptimizer::build_explain_plan(
+            self.engine,
+            self.tag_slice(),
+            self.range_slice(),
+            self.limit,
+        )
+    }
+
     /// Resolves matching `RecordOrdinal`s using secondary index intersections without
     /// touching any record files on disk.
     pub fn resolve_ordinals(&self) -> Vec<RecordOrdinal> {
         let tags = self.tag_slice();
         let ranges = self.range_slice();
+
+        // Cost-Based Short-Circuit (`TASK-048`, `F-OPT-01`): if any tag predicate has 0 cardinality,
+        // return immediately in O(1) without scanning any B+Tree range!
+        for &(field_id, tag) in tags {
+            if self.engine.tag_index().cardinality(field_id, tag) == 0 {
+                return Vec::new();
+            }
+        }
 
         // Fast Path 1: Single range predicate (with or without tag predicates) ->
         // scan B+Tree range into `out` and filter in-place against tag bitmaps (only 1 heap allocation!).

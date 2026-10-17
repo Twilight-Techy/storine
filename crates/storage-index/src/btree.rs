@@ -162,6 +162,23 @@ impl NumericRangeIndex {
         bm
     }
 
+    /// Counts matching `RecordOrdinal`s in `range` on `field_id` with **zero heap allocations** (`TASK-048`, `F-OPT-01`).
+    #[inline]
+    pub fn count_in_range<R: RangeBounds<i64>>(&self, field_id: u16, range: R) -> usize {
+        let guard = self
+            .trees
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(tree) = guard.get(&field_id) else {
+            return 0;
+        };
+        let mut count = 0usize;
+        for (_k, leaf) in tree.range(range) {
+            count += (leaf.inline_len as usize) + leaf.spill.len();
+        }
+        count
+    }
+
     /// Inserts an `f64` value into `field_id` using IEEE-754 order-preserving `i64` encoding.
     #[inline]
     pub fn insert_f64(&self, field_id: u16, value: f64, ord: RecordOrdinal) {
@@ -178,6 +195,27 @@ impl NumericRangeIndex {
         } else {
             CompressedBitmap::new()
         }
+    }
+
+    /// Exports all `(field_id, Vec<(key, RecordOrdinal)>)` entries for paged disk checkpointing (`TASK-034`).
+    pub fn snapshot_all(&self) -> Vec<(u16, Vec<(i64, RecordOrdinal)>)> {
+        let guard = self
+            .trees
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut out = Vec::with_capacity(guard.len());
+        for (&field_id, tree) in guard.iter() {
+            let mut pairs = Vec::new();
+            for (&k, leaf) in tree {
+                let mut ords = Vec::new();
+                leaf.extend_into_vec(&mut ords);
+                for ord in ords {
+                    pairs.push((k, ord));
+                }
+            }
+            out.push((field_id, pairs));
+        }
+        out
     }
 }
 

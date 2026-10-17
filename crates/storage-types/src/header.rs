@@ -32,6 +32,8 @@ impl RecordFlags {
     pub const ACTIVE_SLOT_1: Self = Self(1 << 3);
     /// Record has an active TTL expiration timestamp in `ttl_expires_at_ns`.
     pub const HAS_TTL: Self = Self(1 << 4);
+    /// Payload is encrypted at rest (`TASK-044`, `F-SEC-02`).
+    pub const ENCRYPTED: Self = Self(1 << 5);
 
     #[inline]
     pub const fn contains(self, other: Self) -> bool {

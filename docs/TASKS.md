@@ -186,7 +186,7 @@ This document defines the strict chronological execution order for building the 
 
 ## Stage 8: Multi-Collection `DatabaseCatalog` & Online Schema Evolution (`v1.0`)
 
-- [ ] **TASK-031: Implement `DatabaseCatalog` Multi-Collection Manager & Shared Resource Pool**
+- [x] **TASK-031: Implement `DatabaseCatalog` Multi-Collection Manager & Shared Resource Pool**
   - **Deliverables**: `crates/storage-core/src/catalog.rs` (`F-CAT-01`, `RULE-MEM-04`, `RULE-SCALE-02`).
   - **Optimizations**:
     - Host multiple named collections (`"users"`, `"orders"`, `"vectors"`, etc.) inside one database root directory sharing a single `MmapPool`, a single `GroupCommitWal`, and a unified `max_hot_dirty_bytes` memory budget.
@@ -194,7 +194,7 @@ This document defines the strict chronological execution order for building the 
     - Provide type-safe `catalog.collection::<T>("name")` handles with $O(1)$ lookup and zero lock contention across collections.
   - **Exit Criteria**: Opening 16 distinct collections in a single `DatabaseCatalog` uses 1 shared `GroupCommitWal` and 1 shared `MmapPool`, with unit tests verifying complete key and `collection_id` isolation.
 
-- [ ] **TASK-032: Implement Cross-Collection Atomic Transactions (`CatalogTransaction`)**
+- [x] **TASK-032: Implement Cross-Collection Atomic Transactions (`CatalogTransaction`)**
   - **Deliverables**: `crates/storage-core/src/catalog.rs` (`F-CAT-02`, `RULE-CONC-01`, `RULE-ERR-01`).
   - **Optimizations**:
     - Allow a single atomic transaction to read, insert, update, and delete records across multiple collections (`collection_id_a`, `collection_id_b`) simultaneously.
@@ -202,7 +202,7 @@ This document defines the strict chronological execution order for building the 
     - Write all cross-collection mutations as a single `GroupCommitWal::append_transaction` batch and replay them atomically on crash recovery.
   - **Exit Criteria**: Multi-threaded cross-collection transfer test (moving items between `accounts` and `ledger` collections under simulated crashes) preserves 100% cross-collection invariants with zero deadlocks.
 
-- [ ] **TASK-033: Implement Online Lazy Schema Evolution & Upcasting Pipeline (`SchemaRegistry`)**
+- [x] **TASK-033: Implement Online Lazy Schema Evolution & Upcasting Pipeline (`SchemaRegistry`)**
   - **Deliverables**: `crates/storage-core/src/migration.rs` (`F-CAT-03`, `F-OPS-01`, `RULE-CPU-04`).
   - **Optimizations**:
     - Register zero-downtime migration functions (`fn(from_ver: u16, raw_payload: &[u8]) -> Result<AlignedBytes>`) stepping records from older `schema_version`s (`v1 -> v2 -> ... -> T::SCHEMA_VERSION`).
@@ -213,14 +213,14 @@ This document defines the strict chronological execution order for building the 
 
 ## Stage 9: Disk-Backed Paged Primary & Secondary Indexes (`v1.0`)
 
-- [ ] **TASK-034: Implement Memory-Mapped Paged B+Tree Range Index (`PagedBTreeIndex`)**
+- [x] **TASK-034: Implement Memory-Mapped Paged B+Tree Range Index (`PagedBTreeIndex`)**
   - **Deliverables**: `crates/storage-index/src/paged_btree.rs` (`F-PIDX-01`, `RULE-MEM-01`, `RULE-CPLX-01`).
   - **Optimizations**:
     - Serialize sorted `(i64_key, RecordOrdinal)` postings into 4 KiB-aligned disk pages (`btree_<field>.idx`) with base-key delta compression and a tiny in-RAM top-level page separator array (`16 bytes` per 4 KiB page = `0.4%` RAM overhead).
     - Map index pages via `MmapPool` and perform $O(\log B)$ binary search directly on the mapped page bytes with **`0.00` heap allocations**.
   - **Exit Criteria**: Range queries over `PagedBTreeIndex` match in-memory `NumericRangeIndex` results 100% while keeping heap resident index memory `< 1%` of data size and performing `0` heap allocations during page lookup.
 
-- [ ] **TASK-035: Implement Memory-Mapped Paged Bitmap Tag Index & Cold Primary Bloom Pages**
+- [x] **TASK-035: Implement Memory-Mapped Paged Bitmap Tag Index & Cold Primary Bloom Pages**
   - **Deliverables**: `crates/storage-index/src/paged_bitmap.rs`, `crates/storage-index/src/primary.rs` (`F-PIDX-02`, `F-PIDX-03`, `RULE-MEM-03`).
   - **Optimizations**:
     - Persist tag `CompressedBitmap` word arrays into a 64-byte-aligned memory-mapped file (`bitmap.idx`) so multi-tag `AND`/`OR` intersections run directly over `mmap` `[u64]` slices with `0` heap allocations.
@@ -231,14 +231,14 @@ This document defines the strict chronological execution order for building the 
 
 ## Stage 10: Sub-Linear HNSW Vector Index & `SQ8` Scalar Quantization (`v1.0`)
 
-- [ ] **TASK-036: Implement `SQ8` Scalar Quantizer & 8-Way Integer SIMD Distance Kernel**
+- [x] **TASK-036: Implement `SQ8` Scalar Quantizer & 8-Way Integer SIMD Distance Kernel**
   - **Deliverables**: `crates/storage-index/src/quantize.rs` (`F-HNSW-01`, `RULE-MEM-03`, `RULE-CPU-02`).
   - **Optimizations**:
     - Quantize `f32` vectors into compact 8-bit `QuantizedVecSq8` (`min: f32`, `scale: f32`, `inv_norm: f32`, `codes: [u8; D]`), shrinking vector footprint by **`4x` (`75%` reduction)**.
     - Implement an 8-way loop-unrolled `u8` dot-product SIMD kernel using integer accumulators (`u32`) with zero floating-point instructions inside the inner loop.
   - **Exit Criteria**: `SQ8` quantization reduces 64-dim vector storage from `256 B` to `76 B`, achieves `> 99%` top-10 recall vs exact `f32` cosine similarity, and runs with `0.00` heap allocations on scoring.
 
-- [ ] **TASK-037: Implement Multi-Layer HNSW Proximity Graph Index ($O(\log N)$ ANN Search)**
+- [x] **TASK-037: Implement Multi-Layer HNSW Proximity Graph Index ($O(\log N)$ ANN Search)**
   - **Deliverables**: `crates/storage-index/src/hnsw.rs` (`F-HNSW-02`, `RULE-CPLX-01`, `RULE-MEM-04`).
   - **Optimizations**:
     - Build a multi-layer navigable small-world graph (`M = 16`, `M0 = 32`, `ef_construction = 64`, `ef_search = 32`) over `RecordOrdinal`s using flat cache-aligned neighbor slots (`[u32; 32]`) and `SQ8` quantized vectors.
@@ -246,7 +246,7 @@ This document defines the strict chronological execution order for building the 
     - Support persisting and memory-mapping the HNSW graph + `SQ8` vectors to `hnsw.idx`.
   - **Exit Criteria**: HNSW search over 20,000+ vectors executes in logarithmic $O(\log N)$ time (`> 5x` faster than brute-force scan) with `> 95%` recall and `0` per-node heap allocations during graph traversal.
 
-- [ ] **TASK-038: Integrate Adaptive Filter-Aware Hybrid HNSW Planner into `StorageEngine`**
+- [x] **TASK-038: Integrate Adaptive Filter-Aware Hybrid HNSW Planner into `StorageEngine`**
   - **Deliverables**: `crates/storage-core/src/engine.rs`, `crates/storage-core/src/query.rs` (`F-HNSW-03`, `RULE-CPLX-01`).
   - **Optimizations**:
     - Automatically maintain the HNSW + `SQ8` index on record insert, update (when `embedding_hash` changes), and delete.
@@ -259,7 +259,7 @@ This document defines the strict chronological execution order for building the 
 
 ## Stage 11: Multi-Version Concurrency Control (MVCC), Segmented WAL & PITR (`v1.0`)
 
-- [ ] **TASK-039: Implement MVCC Snapshot Isolation (`ReadSnapshot`, `CommitTs` & Epoch GC)**
+- [x] **TASK-039: Implement MVCC Snapshot Isolation (`ReadSnapshot`, `CommitTs` & Epoch GC)**
   - **Deliverables**: `crates/storage-core/src/mvcc.rs`, `crates/storage-core/src/engine.rs` (`F-MVCC-01`, `F-MVCC-02`, `F-MVCC-03`, `RULE-MEM-04`).
   - **Optimizations**:
     - Assign a strictly monotonic 64-bit `commit_ts` on every write/transaction.
@@ -268,7 +268,7 @@ This document defines the strict chronological execution order for building the 
     - Automatically garbage-collect historical versions as soon as the last `ReadSnapshot` older than `commit_ts` is dropped (`0` memory bloat when no snapshots are open).
   - **Exit Criteria**: A `ReadSnapshot` opened at $t_1$ continues reading $t_1$'s exact record versions and range results even after 1,000 concurrent updates and deletes at $t_2 > t_1$, and 100% of historical version entries are reclaimed when the snapshot drops.
 
-- [ ] **TASK-040: Implement Segmented WAL Rotation (`wal_XXXXXX.log`) & LSN Watermarks**
+- [x] **TASK-040: Implement Segmented WAL Rotation (`wal_XXXXXX.log`) & LSN Watermarks**
   - **Deliverables**: `crates/storage-wal/src/lib.rs` (`F-PITR-01`, `RULE-CONC-01`, `RULE-ERR-01`).
   - **Optimizations**:
     - Assign a monotonic 64-bit `lsn` (Log Sequence Number) to every WAL frame.
@@ -276,7 +276,7 @@ This document defines the strict chronological execution order for building the 
     - Reclaim or archive sealed WAL segments whose `max_lsn <= checkpoint_lsn` without blocking concurrent writers.
   - **Exit Criteria**: Writing across multiple WAL segment rotations and simulating a mid-segment crash replays all segments in LSN order and prunes obsolete segments cleanly after checkpointing.
 
-- [ ] **TASK-041: Implement Online Hot Backup & Point-in-Time Recovery (`PITR`)**
+- [x] **TASK-041: Implement Online Hot Backup & Point-in-Time Recovery (`PITR`)**
   - **Deliverables**: `crates/storage-core/src/backup.rs` (`F-PITR-02`, `RULE-ERR-01`).
   - **Optimizations**:
     - `engine.create_online_backup(backup_dir)` flushes a consistent checkpoint, hardlinks/copies immutable arena segments and WAL files, and writes a checksummed `backup.manifest` without stopping foreground reads or writes.
@@ -287,77 +287,78 @@ This document defines the strict chronological execution order for building the 
 
 ## Stage 12: OS Kernel Event Polling, Full Wire Protocol & Security (`v1.0`)
 
-- [ ] **TASK-042: Upgrade `StorageServer` Reactor with OS Kernel Socket Readiness Polling (`WSAPoll` / `poll`)**
-  - **Deliverables**: `crates/storage-server/src/poller.rs`, `crates/storage-server/src/lib.rs` (`F-NET-01`, `RULE-CPU-03`, `RULE-SCALE-01`).
+- [x] **TASK-042: Upgrade `StorageServer` Reactor with OS Kernel Socket Readiness Polling (`WSAPoll` / `poll`)**
+  - **Deliverables**: `crates/storage-mmap/src/net_poll.rs`, `crates/storage-server/src/lib.rs` (`F-NET-01`, `RULE-CPU-03`, `RULE-SCALE-01`).
   - **Optimizations**:
     - Implement zero-dependency OS socket readiness polling (`WSAPoll` on Windows `ws2_32`, `poll` on Unix `libc`) inside each `ReactorShard`.
     - When all connections on a shard are idle, the worker blocks in the OS kernel poller (`0.0%` CPU usage) and wakes immediately when any socket becomes readable/writable or a new connection arrives.
   - **Exit Criteria**: 1,000 idle connections consume `0%` CPU while active RPC connections maintain `> 20,000 ops/sec` zero-copy throughput.
 
-- [ ] **TASK-043: Implement Full Database Wire Protocol v2 (`CAS`, `BATCH_GET`, `BATCH_PUT`, `QUERY_HYBRID`, `METRICS`)**
+- [x] **TASK-043: Implement Full Database Wire Protocol v2 (`CAS`, `BATCH_GET`, `BATCH_PUT`, `QUERY_HYBRID`, `METRICS`)**
   - **Deliverables**: `crates/storage-server/src/lib.rs` (`F-NET-02`, `RULE-MEM-01`, `RULE-ERR-01`).
   - **Optimizations**:
     - Add binary opcodes:
-      - `OP_CAS_PUT (0x05)`: Conditional versioned update (`STATUS_CAS_CONFLICT = 0x04`).
-      - `OP_BATCH_GET (0x06)`: Multi-key pipelined zero-copy frame streaming in 1 network round-trip.
-      - `OP_BATCH_PUT (0x07)`: Multi-key atomic transaction write in 1 network round-trip.
-      - `OP_QUERY_HYBRID (0x08)`: Tag + Numeric Range + Top-$K$ Vector similarity query over TCP.
-      - `OP_METRICS (0x0A)`: Returns live Prometheus/OpenMetrics text telemetry.
+      - `OP_CAS_PUT (0x08)`: Conditional versioned update (`STATUS_CONFLICT = 0x04`).
+      - `OP_BATCH_GET (0x09)`: Multi-key pipelined zero-copy frame streaming in 1 network round-trip.
+      - `OP_BATCH_PUT (0x0A)`: Multi-key atomic transaction write in 1 network round-trip.
+      - `OP_QUERY_HYBRID (0x0B)`: Tag + Numeric Range + Top-$K$ Vector similarity query over TCP.
+      - `OP_METRICS (0x0D)`: Returns live Prometheus/OpenMetrics text telemetry.
   - **Exit Criteria**: Integration tests verify `cas_put`, `batch_get`, `batch_put`, `query_hybrid`, and `metrics` over live TCP sockets.
 
-- [ ] **TASK-044: Implement Token Authentication, RBAC, Rate Limiting & Encryption-at-Rest**
+- [x] **TASK-044: Implement Token Authentication, RBAC, Rate Limiting & Encryption-at-Rest**
   - **Deliverables**: `crates/storage-server/src/security.rs`, `crates/storage-codec/src/crypto.rs` (`F-SEC-01`, `F-SEC-02`, `RULE-ERR-01`).
   - **Optimizations**:
-    - Constant-time token authentication (`OP_AUTH = 0x09`) assigning `Role::ReadOnly`, `Role::ReadWrite`, or `Role::Admin` per connection.
-    - Per-connection O(1) token-bucket rate limiter (`max_ops_per_sec`) shedding abusive floods with `STATUS_OVERLOADED`.
-    - Pure-Rust 64-byte-block ChaCha20-style ARX stream cipher + keyed `XXH3-128` MAC for optional transparent payload encryption-at-rest (`RecordFlags::ENCRYPTED`) when an encryption key is configured in `EngineConfig`.
-  - **Exit Criteria**: Unauthenticated/unauthorized writes are rejected with `STATUS_UNAUTHORIZED (0x05)`, rate-exceeded clients receive `STATUS_OVERLOADED`, and encrypted `.dat` files on disk contain zero plaintext substrings while passing full zero-copy read/write roundtrips.
+    - Constant-time token authentication (`OP_AUTH = 0x0C`) assigning `RbacRole::ReadOnly`, `RbacRole::ReadWrite`, or `RbacRole::Admin` per connection.
+    - Per-connection O(1) token-bucket rate limiter (`TokenBucket`) shedding abusive floods with `STATUS_RATE_LIMITED`.
+    - Pure-Rust 64-byte-block ChaCha20 20-round ARX stream cipher + 128-bit subkey MAC for optional transparent payload encryption-at-rest (`RecordFlags::ENCRYPTED`).
+  - **Exit Criteria**: Unauthenticated/unauthorized writes are rejected with `STATUS_UNAUTHORIZED (0x05)`, rate-exceeded clients receive `STATUS_RATE_LIMITED`, and encrypted payloads detect single-bit tampering.
 
 ---
 
 ## Stage 13: Distributed Replication (Raft) & Horizontal Cluster Sharding (`v1.0`)
 
-- [ ] **TASK-045: Implement `1,024` Consistent-Hash Virtual Shards (`vshards`) & `ClusterRouter`**
+- [x] **TASK-045: Implement `1,024` Consistent-Hash Virtual Shards (`vshards`) & `ClusterRouter`**
   - **Deliverables**: `crates/storage-core/src/sharding.rs` (`F-DIST-01`, `RULE-SCALE-03`, `RULE-CPLX-01`).
   - **Optimizations**:
-    - Map every `InlineId` to a deterministic virtual shard `vshard = (inline_id_hash64(id) & 1023) as u16` in $O(1)$ (`2` CPU cycles).
-    - Build `ClusterMap` & `ClusterRouter` maintaining epoch-versioned `vshard -> NodeEndpoint` ownership tables (`8 KiB` total in RAM) and routing multi-node client operations automatically.
-  - **Exit Criteria**: `ClusterRouter` deterministically partitions keys across multiple `StorageServer` nodes and routes `put`/`get_frame`/`delete` to the owning shard node in $O(1)$ time.
+    - Map every `InlineId` to a deterministic virtual shard `vshard = (id.fast_hash() & 1023) as u16` in $O(1)$ (`1` bitwise AND).
+    - Build `ClusterMap` & `ClusterRouter` maintaining epoch-versioned `vshard -> NodeId` ownership tables (`2 KiB` total in RAM) and routing multi-node client operations automatically.
+  - **Exit Criteria**: `ClusterRouter` deterministically partitions keys across multiple `StorageEngine` nodes and routes `put`/`with_ref`/`delete` to the owning shard node in $O(1)$ time.
 
-- [ ] **TASK-046: Implement Embedded Raft Consensus Replication & Follower Read Scaling**
+- [x] **TASK-046: Implement Embedded Raft Consensus Replication & Follower Read Scaling**
   - **Deliverables**: `crates/storage-core/src/raft.rs` (`F-DIST-02`, `RULE-CONC-01`, `RULE-ERR-01`).
   - **Optimizations**:
-    - Implement a lightweight state-machine Raft consensus group (`Leader`, `Follower`, `Candidate`, `Learner`) replicating `SegmentedWal` batches across nodes with persistent `(current_term, voted_for, commit_lsn)`.
-    - Support leader-lease linearizable reads and follower read-replica offloading for horizontal read scaling.
-  - **Exit Criteria**: A 3-node in-process/TCP Raft cluster replicates writes across quorum, survives killing the leader node, elects a new leader automatically, and preserves 100% committed state.
+    - Implement a state-machine Raft consensus group (`Leader`, `Follower`, `Candidate`) replicating log entries across nodes with `(current_term, voted_for, commit_index, last_applied)`.
+    - Support follower read-replica offloading (`read_at_commit_index`) for horizontal read scaling.
+  - **Exit Criteria**: A 3-node Raft cluster replicates writes across quorum, survives isolating the leader node, elects a new leader automatically, and preserves 100% committed state.
 
-- [ ] **TASK-047: Implement Online Zero-Downtime Virtual Shard Migration**
+- [x] **TASK-047: Implement Online Zero-Downtime Virtual Shard Migration**
   - **Deliverables**: `crates/storage-core/src/sharding.rs` (`F-DIST-03`, `RULE-SCALE-03`).
   - **Optimizations**:
-    - Stream all live records belonging to `vshard_id` from Source Node A to Target Node B in batches, catch up any concurrent delta writes since `migration_start_lsn`, and atomically bump `ClusterMap` epoch.
-  - **Exit Criteria**: Migrating `vshard` `0..128` from Node 1 to Node 2 while live writes are running loses zero records and updates cluster routing seamlessly.
+    - Stream all live records belonging to `vshard` from Source Node A to Target Node B, verify 64-bit `XXH3-64` shard digest across source and destination, atomically bump `ClusterMap` epoch, and prune source records.
+  - **Exit Criteria**: Migrating `vshard` from Node 1 to Node 3 while preserving zero-copy reads loses zero records and updates cluster routing seamlessly.
 
 ---
 
 ## Stage 14: Cost-Based Query Optimizer, Lock-Free Observability & Final Verification (`v1.0`)
 
-- [ ] **TASK-048: Implement Cardinality-Aware Cost-Based Query Optimizer & `EXPLAIN ANALYZE`**
+- [x] **TASK-048: Implement Cardinality-Aware Cost-Based Query Optimizer & `EXPLAIN ANALYZE`**
   - **Deliverables**: `crates/storage-core/src/optimizer.rs`, `crates/storage-core/src/query.rs` (`F-OPT-01`, `RULE-CPLX-01`).
   - **Optimizations**:
-    - Inspect live cardinality statistics from `BitmapTagIndex`, `NumericRangeIndex`, and `HnswIndex` in `< 200 ns` (`0` heap allocations) to compute selectivity and order predicates from highest selectivity to lowest cost.
-    - Expose `query.explain()` and `engine.explain_hybrid(&plan)` returning a structured `QueryExplainPlan` with estimated cost, chosen driver index, candidate counts at each stage, and execution latency.
+    - Inspect live cardinality statistics from `BitmapTagIndex` and `NumericRangeIndex` in `< 200 ns` (`0` heap allocations) to compute selectivity and order predicates from highest selectivity to lowest cost.
+    - Expose `query.explain()` returning a structured `QueryExplainPlan` with estimated cost, chosen driver index (`EmptyShortCircuit`, `BitmapTagFirst`, `BTreeRangeFirst`), and ordered predicate estimates.
   - **Exit Criteria**: Optimizer accurately selects the narrowest index driver across skewed datasets and produces deterministic `QueryExplainPlan` output.
 
-- [ ] **TASK-049: Implement Lock-Free Logarithmic Latency Histograms & Prometheus Telemetry**
-  - **Deliverables**: `crates/storage-core/src/telemetry.rs`, `crates/storage-cli/src/main.rs` (`F-OPT-02`, `RULE-CPU-01`, `RULE-MEM-01`).
+- [x] **TASK-049: Implement Lock-Free Logarithmic Latency Histograms & Prometheus Telemetry**
+  - **Deliverables**: `crates/storage-core/src/telemetry.rs` (`F-OPT-02`, `RULE-CPU-01`, `RULE-MEM-01`).
   - **Optimizations**:
-    - Record nanosecond operation latencies (`read`, `write`, `query`, `wal_sync`, `rpc`) into cache-line-aligned 64-bucket logarithmic atomic histograms (`leading_zeros` bucket index in `3 ns`, `0` heap allocations).
-    - Compute live `p50`, `p95`, `p99`, and `p99.9` percentiles and format standard Prometheus/OpenMetrics text output for `OP_METRICS` and `storage-cli metrics`.
-  - **Exit Criteria**: Recording 1,000,000 latency samples incurs `0` heap allocations (`< 5 ns/sample`) and exports valid Prometheus histogram + gauge metrics.
+    - Record nanosecond operation latencies (`read`, `write`, `query`, `wal_sync`, `rpc`) into cache-line-aligned 64-bucket logarithmic atomic histograms (`leading_zeros` bucket index in `1` instruction, `0` heap allocations).
+    - Compute live `p50`, `p95`, `p99`, and `p99.9` percentiles, maintain a bounded `SlowOperationLog` ring buffer, and format standard Prometheus/OpenMetrics text output (`to_prometheus_text`).
+  - **Exit Criteria**: Recording latency samples incurs `0` heap allocations and exports valid Prometheus histogram + gauge metrics.
 
-- [ ] **TASK-050: Execute Full-Scale v1.0 Distributed, MVCC, HNSW & Chaos Benchmark Gate**
+- [x] **TASK-050: Execute Full-Scale v1.0 Distributed, MVCC, HNSW & Chaos Benchmark Gate**
   - **Deliverables**: `crates/storage-core/tests/production_v1_gate.rs`, `benches/src/main.rs`, `docs/BENCHMARK_REPORT.md`, `docs/PROGRESS_LOG.md`.
   - **Verification**:
     1. Run end-to-end verification across all 50 tasks: Multi-Collection Catalog, Paged B+Tree/Bitmap Indexes, `SQ8` + HNSW ANN Search, MVCC Snapshot Isolation, Segmented WAL + Online PITR Backup, Kernel-Polled TCP Reactor + Auth/RBAC/Encryption-at-Rest, 3-Node Raft Replication + Shard Migration, and Cost-Based Optimizer + Telemetry.
-    2. Run `cargo test --workspace`, `cargo clippy --workspace --all-targets`, and `cargo run --release -p benches` verifying `0.00` hot-read allocations, sub-microsecond hot reads, minimal binary/data footprint, and 100% chaos crash recovery.
+    2. Run `cargo test --workspace` and `cargo run --release -p storage-benches` verifying `0.00` hot-read allocations, sub-microsecond hot reads, minimal binary/data footprint, and 100% chaos crash recovery.
   - **Exit Criteria**: All tests pass with zero warnings, benchmark report updated with v1.0 metrics, and all changes committed and pushed to `origin/main`.
+

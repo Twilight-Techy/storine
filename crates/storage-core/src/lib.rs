@@ -12,16 +12,39 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
+pub mod backup;
+pub mod catalog;
 pub mod engine;
+pub mod migration;
 pub mod model;
+pub mod mvcc;
+pub mod optimizer;
 pub mod query;
+pub mod raft;
+pub mod sharding;
+pub mod telemetry;
 pub mod write_queue;
 
+pub use backup::{
+    archive_wal_for_pitr, create_online_backup, restore_point_in_time, BackupManifest,
+};
+pub use catalog::{CatalogTransaction, CollectionMeta, DatabaseCatalog, ErasedCollectionEngine};
 pub use engine::{
     EngineConfig, EngineStats, RecordRef, StorageEngine, StorageLayoutMode, TransactionBatch,
 };
+pub use migration::SchemaRegistry;
 pub use model::{
     AgentObjectRecord, ArchivedAgentObjectRecord, FIELD_PRIMARY_TAG, FIELD_SCORE, FIELD_TIMESTAMP,
 };
+pub use mvcc::{CommitTs, MvccManager, ReadSnapshot, VersionChainNode};
+pub use optimizer::{AccessPathKind, PredicateCostEstimate, QueryExplainPlan, QueryOptimizer};
 pub use query::QueryBuilder;
+pub use raft::{
+    AppendEntriesReq, AppendEntriesResp, RaftLogEntry, RaftNode, RaftReplicationGroup, RaftRole,
+    RequestVoteReq, RequestVoteResp,
+};
+pub use sharding::{
+    vshard_for_id, ClusterMap, ClusterRouter, NodeId, ShardMigrationReceipt, VIRTUAL_SHARD_COUNT,
+};
+pub use telemetry::{LatencyHistogram, SlowOpEntry, SlowOperationLog};
 pub use write_queue::{MultiRecordLockGuard, RecordLockGuard, StripedLockTable};

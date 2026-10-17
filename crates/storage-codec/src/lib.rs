@@ -7,6 +7,7 @@
 pub mod archive;
 pub mod checksum;
 pub mod compress;
+pub mod crypto;
 pub mod scratch;
 pub mod types;
 
@@ -16,6 +17,10 @@ pub use archive::{
 };
 pub use checksum::{checksum_payload, crc32c_64, xxh3_64};
 pub use compress::{compress_lz4, decompress_lz4};
+pub use crypto::{
+    chacha20_xor_in_place, decrypt_payload_aead, derive_record_nonce, encrypt_payload_aead,
+    AEAD_TAG_LEN,
+};
 pub use scratch::{AlignedBytes, AlignedScratchBuf, with_thread_scratch};
 pub use types::{
     ArchivedBool, ArchivedChar, ArchivedI128, ArchivedMap, ArchivedMapEntry, ArchivedPropertyValue,

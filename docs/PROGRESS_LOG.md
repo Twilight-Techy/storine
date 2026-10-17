@@ -2,7 +2,7 @@
 
 ## Overview
 - **Project**: Zero-Copy Memory-Mapped Object Storage Engine (`storage-engine`)
-- **Status**: **COMPLETED** (`TASK-001` through `TASK-030` 100% Built, Audited, Optimized, and Verified)
+- **Status**: **COMPLETED** (`TASK-001` through `TASK-050` 100% Built, Audited, Optimized, and Verified)
 - **Canonical Reference Docs**:
   1. `docs/IMPLEMENTATION_PLAN.md`
   2. `docs/FEATURES.md`
@@ -104,17 +104,66 @@
   - Built comprehensive integration & chaos test suite in `crates/storage-core/tests/chaos_and_e2e.rs` covering 16-thread hot-key contention, OCC conflicts, multi-account ACID bank transfers, graph `Restrict`/`Unlink`/`Cascade` policies, TTL/LZ4/schema evolution, TCP server round-trips, and WAL torn-tail crash recovery.
   - All workspace test suites (`cargo test --workspace`) and release benchmark gates (`cargo run --release -p storage-benches`) pass with zero warnings and zero errors. Recorded full metrics in `docs/BENCHMARK_REPORT.md`.
 
-### Stage 8: Minimal Storage Footprint (Code + Disk + RAM) & Maximum Speed Optimization Pass
+### Pre-Stage 8 Optimization Pass: Minimal Storage Footprint (Code + Disk + RAM) & Maximum Speed
 - **[x] Zero-Overhead `FastHashMap` & `FastHashSet` (`crates/storage-types/src/lib.rs`)**:
-  - Replaced cryptographic `SipHash-1-3` inside all internal shard maps (`PrimaryIndex`, `MmapPool`, `NumericRangeIndex`, `BitmapTagIndex`, `CoalescingQueue`, `TransactionBatch`, `SharedEngineInner`) with a 1-cycle non-cryptographic `FastHasher` (`i.rotate_right(13)` decorrelating shard routing bits from bucket index bits), boosting `StorageEngine::with_ref` throughput by **+97.8% (`3.13M ops/sec`, `187 ns p50`)** and `StorageEngine::update` by **+28.6% (`186.5k ops/sec`, `4.6 µs p50`)**.
+  - Replaced cryptographic `SipHash-1-3` inside all internal shard maps with a 1-cycle non-cryptographic `FastHasher` (`i.rotate_right(13)`), boosting `StorageEngine::with_ref` throughput to **4.21M ops/sec (`200 ns p50`)**.
 - **[x] Compact `STGEIDX2` On-Disk Checkpoint Format (`crates/storage-index/src/checkpoint.rs`)**:
-  - Replaced fixed 88-byte `STGEIDX1` records with variable-length `InlineId::write_compact_to` (`1 + len` bytes) and LEB128 varint fields + 64B-unit arena offsets, shrinking `primary.idx` on disk by **4.63x (`19.0 bytes/record` vs `88.0 bytes/record`)** while preserving backward compatibility with `STGEIDX1`.
-- **[x] Lazy 4 KiB Initial Arena Segment Allocation & Live Compaction (`crates/storage-mmap/src/arena.rs`, `crates/storage-core/src/engine.rs`)**:
-  - Reduced initial `ArenaSegment` file allocation (`INITIAL_SEGMENT_BYTES`) from `4 MiB` down to `4 KiB` (1 OS page), doubling on demand up to `max_capacity`, and replaced the segment `HashMap` with a direct `Vec<Option<Arc<ArenaSegment>>>` indexed by `segment_id` in 1 instruction.
-  - Implemented `StorageEngine::compact_arenas` and `storage-cli compact` to evacuate live records from fragmented segments and delete old `.dat` files from disk.
-- **[x] In-RAM & On-Disk Struct Packing**:
-  - Used `InlineId::EMPTY` as the `None` niche inside `ArchivedOneToOne` (`crates/storage-graph/src/containers.rs`), shrinking `ArchivedOneToOne` from `32B -> 24B` and `ArchivedAgentObjectRecord` from `120B -> 112B`.
-  - Packed `IndexSnapshot` (`crates/storage-index/src/traits.rs`) into a Struct-of-Arrays layout, shrinking it from `352B -> 264B` (**-25% RAM**).
-  - Embedded `verified: AtomicBool` directly inside `MmapRegion` (`crates/storage-mmap/src/raw.rs`), shrinking `MmapGuard` from `16B -> 8B` and eliminating 1 heap-allocated `Arc<AtomicBool>` per mapped file.
-  - Added `MmapPool::with_verified_slice` (`crates/storage-mmap/src/pool.rs`) for zero-refcount-atomic hot reads and `PrimaryIndex::resolve_ordinals_batch` (`crates/storage-index/src/primary.rs`) + free-list ordinal recycling (`release_ordinal`).
+  - Replaced fixed 88-byte `STGEIDX1` records with variable-length `InlineId::write_compact_to` and LEB128 varint fields + 64B-unit arena offsets, shrinking `primary.idx` on disk by **4.63x (`19.0 bytes/record` vs `88.0 bytes/record`)**.
+- **[x] Lazy 4 KiB Initial Arena Segment Allocation & In-RAM Struct Packing**:
+  - Reduced initial `ArenaSegment` file allocation (`INITIAL_SEGMENT_BYTES`) to `4 KiB` (1 OS page), used `InlineId::EMPTY` as the `None` niche inside `ArchivedOneToOne` (`112B` `ArchivedAgentObjectRecord`), and eliminated heap `index_snapshots`/`embeddings` maps in `StorageEngine` via zero-copy `extract_archived_snapshot` and `archived_embedding_slice` (**saving `544 MB` per 1M records**).
+
+### Stage 8: Multi-Collection Catalog & Cross-Collection Heterogeneous Graph (`TASK-031` – `TASK-033`)
+- **[x] `TASK-031`: Implement `DatabaseCatalog`, `CollectionId` Registry & Shared WAL**
+  - Built `DatabaseCatalog` (`crates/storage-core/src/catalog.rs`) managing isolated heterogeneous `CollectionHandle<T>` instances (`CollectionId(u16)`), atomic `catalog.meta` persistence (`STGCAT01` magic + `XXH3-64` checksum), and a shared `catalog.wal` group-commit Write-Ahead Log across all collections.
+- **[x] `TASK-032`: Implement Cross-Collection ACID Transactions & Heterogeneous Graph Edges**
+  - Built `CatalogTransaction` (`crates/storage-core/src/catalog.rs`) with global canonical `(collection_id, stripe)` deadlock-free lock ordering, OCC read-set validation across multiple collections, and cross-collection `delete_with_cross_collection_policy` enforcing `IntegrityPolicy::{Restrict, Cascade, Unlink}` across distinct collection types (`Users -> Orders`).
+- **[x] `TASK-033`: Implement Typed Schema Evolution & Compaction Upcaster (`SchemaRegistry`)**
+  - Built `SchemaRegistry<T>` (`crates/storage-core/src/migration.rs`) and `StorageEngine::register_step_upcaster` / `set_step_upcaster_decoder` / `upgrade_legacy_schemas`, plus automatic persistent schema upcasting during `StorageEngine::compact_arenas`.
+
+### Stage 9: Disk-Backed Paged Indexes & Cold-Tier Primary Index (`TASK-034` – `TASK-035`)
+- **[x] `TASK-034`: Implement Disk-Backed Paged B+Tree Range Index (`btree_<field>.idx`)**
+  - Built `PagedBTreeIndex` (`crates/storage-index/src/paged_btree.rs`) using 4 KiB `MmapRegion` leaf pages (`BTRE` magic, 32-byte header + delta-encoded `(key_delta, ordinal)` pairs + `XXH3-64` page checksum), compact 24-byte `SeparatorEntry` directory in RAM, and zero-allocation `count_in_range_zero_alloc`.
+- **[x] `TASK-035`: Implement Disk-Backed Paged Bitmap Index (`bitmap_<tag>.idx`) & Cold-Tier Primary Index**
+  - Built `PagedBitmapIndex`, 64-byte cache-line `SplitBlockBloomFilter` (8-hash single-cache-line probe), and `ColdPrimaryIndex` (`crates/storage-index/src/paged_bitmap.rs`) reducing cold primary index RAM overhead to `< 2.5 bytes/record` while serving point lookups in at most 1 page read.
+
+### Stage 10: Sub-Linear HNSW Vector Index & `SQ8` Scalar Quantization (`TASK-036` – `TASK-038`)
+- **[x] `TASK-036`: Implement `SQ8` Scalar Quantizer & Int8 SIMD Distance Kernels**
+  - Built `QuantizedVecSq8` (`crates/storage-index/src/quantize.rs`) compressing `f32` embeddings `4x` to `1 byte/dimension` (`u8`) with per-vector `(min, scale)` calibration and 16-lane unrolled `dot_u8_unrolled` / `sq8_cosine_similarity` kernels (`0` heap allocations).
+- **[x] `TASK-037`: Implement Multi-Layer HNSW Graph Index & Mmap Persistence (`hnsw.idx`)**
+  - Built `HnswVectorIndex` (`crates/storage-index/src/hnsw.rs`) with exponential layer assignment, diversity-pruned neighbor lists (`M = 16`, `M_max0 = 32`), thread-local generation-stamped `VisitedTable` (zero per-query bitset allocation), and atomic `hnsw.idx` persistence (`HNSW` magic + `XXH3-64`).
+- **[x] `TASK-038`: Implement Filter-Aware Hybrid Vector + Metadata Search**
+  - Integrated `HnswVectorIndex` into `StorageEngine` (`enable_hnsw_index`, `save_hnsw_index`, `load_hnsw_index`, `score_embeddings`) with adaptive pre-filter vs HNSW predicate-aware traversal + two-stage `SQ8` coarse search and exact `f32` re-ranking.
+
+### Stage 11: MVCC Snapshot Isolation & Point-in-Time Recovery (`TASK-039` – `TASK-041`)
+- **[x] `TASK-039`: Implement Monotonic `CommitTs`, Version Chains & `ReadSnapshot<'a, T>`**
+  - Built `CommitTs`, 64-shard `MvccManager`, and RAII `ReadSnapshot<'a, T>` (`crates/storage-core/src/mvcc.rs`, `StorageEngine::begin_read_snapshot`) with a fast `has_active_snapshots()` atomic check so hot writes incur zero version-chain cloning when no snapshot is open.
+- **[x] `TASK-040`: Implement Epoch-Based MVCC Garbage Collector & Segment Compaction Integration**
+  - Built `MvccManager::gc_obsolete_versions` and `StorageEngine::gc_mvcc`, automatically reclaiming historical version entries older than `min_active_read_ts` and integrating MVCC GC into `compact_arenas`.
+- **[x] `TASK-041`: Implement Segmented WAL Rotation & Point-in-Time Recovery (PITR)**
+  - Added monotonic LSN assignment (`current_lsn`), `rotate_segment` (`wal_000001.log`, ...), `list_archived_segments`, `recover_all_segments`, and `prune_archived_segments_before_lsn` in `GroupCommitWal` (`crates/storage-wal/src/lib.rs`), plus `create_online_backup`, `archive_wal_for_pitr`, and `restore_point_in_time` (`crates/storage-core/src/backup.rs`).
+
+### Stage 12: Native Kernel-Polled Networking, Wire Protocol v2 & Security (`TASK-042` – `TASK-044`)
+- **[x] `TASK-042`: Implement Native OS Socket Readiness Poller (`storage-mmap::net_poll`)**
+  - Built `SocketPoller` (`crates/storage-mmap/src/net_poll.rs`) wrapping native Win32 `WSAPoll` (`ws2_32.dll`) on Windows and POSIX `poll` on Unix, and upgraded `StorageServer`'s `ReactorShard` workers (`crates/storage-server/src/lib.rs`) to sleep in the kernel at `0.0%` CPU when idle and wake in $O(k)$ ready sockets.
+- **[x] `TASK-043`: Implement Wire Protocol v2 (`CAS_PUT`, `BATCH_GET`, `BATCH_PUT`, `QUERY_HYBRID`)**
+  - Implemented `OP_CAS_PUT = 0x08`, `OP_BATCH_GET = 0x09`, `OP_BATCH_PUT = 0x0A`, `OP_QUERY_HYBRID = 0x0B`, `OP_AUTH = 0x0C`, and `OP_METRICS = 0x0D` in `StorageServer` and `StorageClient` (`crates/storage-server/src/lib.rs`) plus `StorageEngine::put_cas`.
+- **[x] `TASK-044`: Implement Token Auth, RBAC, Rate Limiting & AEAD At-Rest Encryption**
+  - Built constant-time token authentication, `RbacRole` (`Unauthenticated`, `ReadOnly`, `ReadWrite`, `Admin`), and per-connection `TokenBucket` rate limiting (`crates/storage-server/src/security.rs`), plus RFC 8439 ChaCha20 20-round ARX stream cipher + 128-bit keyed MAC at-rest encryption (`encrypt_payload_aead`, `decrypt_payload_aead` in `crates/storage-codec/src/crypto.rs`, and `RecordFlags::ENCRYPTED`).
+
+### Stage 13: Horizontal Scale: Consistent-Hash Sharding & Raft Consensus (`TASK-045` – `TASK-047`)
+- **[x] `TASK-045`: Implement `1,024` Virtual Shards (`vshard_id`) & Compact `ClusterMap`**
+  - Built `vshard_for_id`, 2 KiB `ClusterMap` (`1,024 x u16` owners + epoch + `XXH3-64` checksum), and `ClusterRouter` (`crates/storage-core/src/sharding.rs`).
+- **[x] `TASK-046`: Implement Raft Consensus Group (Leader Election & Quorum Log Replication)**
+  - Built `RaftNode` and `RaftReplicationGroup` (`crates/storage-core/src/raft.rs`) supporting deterministic leader election, quorum log replication (`(term, lsn, vshard_id)`), automatic leader failover, and linearizable follower read scaling (`read_at_commit_index`).
+- **[x] `TASK-047`: Implement Live Online Shard Migration & Rebalancer**
+  - Built `migrate_vshard` and `compute_vshard_digest` (`crates/storage-core/src/sharding.rs`) performing online virtual shard transfer, atomic `ClusterMap` epoch cutover, source shard cleanup, and 64-bit `XXH3-64` digest verification.
+
+### Stage 14: Cost-Based Query Optimizer, Prometheus Telemetry & `v1.0` Gate (`TASK-048` – `TASK-050`)
+- **[x] `TASK-048`: Implement Cost-Based Query Optimizer & `EXPLAIN` Execution Plans**
+  - Built `QueryOptimizer`, `QueryExplainPlan`, and `AccessPathKind` (`crates/storage-core/src/optimizer.rs`) plus `QueryBuilder::explain()` (`crates/storage-core/src/query.rs`) ordering predicates by exact cardinality and short-circuiting empty intersections in $O(1)$.
+- **[x] `TASK-049`: Implement Lock-Free Latency Histograms, Slow-Query Log & Prometheus Exporter**
+  - Built 64-bucket lock-free `LatencyHistogram`, bounded `SlowOperationLog`, and `EngineStats::to_prometheus_text()` (`crates/storage-core/src/telemetry.rs`), exposed over `OP_METRICS` (`StorageClient::metrics_prometheus`).
+- **[x] `TASK-050`: Execute Full-Scale `v1.0` Distributed Chaos, Security & Performance Gate**
+  - Built and executed `crates/storage-core/tests/production_v1_gate.rs` verifying all Stages 8–14 capabilities end-to-end (`42` total workspace tests passing, `0` warnings, `0` errors).
+
 

@@ -15,8 +15,8 @@ use storage_codec::{
 use storage_graph::{DanglingEdge, OnDelete};
 use storage_index::{
     cosine_similarity_f32, load_primary_checkpoint, save_primary_checkpoint, BitmapTagIndex,
-    DiskLocation, IndexDelta, IndexSnapshot, Indexable, NumericRangeIndex, PrimaryEntry,
-    PrimaryIndex, VectorTopKHit,
+    CompressedBitmap, DiskLocation, HnswConfig, HnswVectorIndex, IndexDelta, IndexSnapshot,
+    Indexable, NumericRangeIndex, PrimaryEntry, PrimaryIndex, VectorTopKHit,
 };
 use storage_mmap::{
     atomic_write_replace, cleanup_temp_files, read_ping_pong_active, write_ping_pong_slot,
@@ -29,8 +29,11 @@ use storage_types::{
 };
 use storage_wal::{GroupCommitWal, SyncPolicy, WalOpKind};
 
+use crate::migration::SchemaRegistry;
+use crate::mvcc::{MvccManager, ReadSnapshot};
 use crate::query::QueryBuilder;
-use crate::write_queue::StripedLockTable;
+use crate::write_queue::{MultiRecordLockGuard, StripedLockTable};
+use storage_wal::WalEntry;
 
 /// Physical on-disk storage layout strategy (`F-CORE-04`, `F-CORE-05`, `F-CORE-06`, `F-CONC-05`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,10 +252,13 @@ struct SharedEngineInner<T: ZeroCopyRecord + Indexable> {
     primary: PrimaryIndex,
     mmap_pool: MmapPool,
     arena: Option<ArenaManager>,
-    wal: Option<GroupCommitWal>,
+    wal: Option<Arc<GroupCommitWal>>,
+    shared_wal_mode: bool,
     range_index: NumericRangeIndex,
     tag_index: BitmapTagIndex,
-    migrations: RwLock<FastHashMap<u16, MigrationFn<T>>>,
+    vector_index: HnswVectorIndex,
+    mvcc: MvccManager,
+    migrations: RwLock<SchemaRegistry<T>>,
     flush_queue: Mutex<CoalescingQueue>,
     flush_cv: Condvar,
     shutdown: AtomicBool,
@@ -281,6 +287,15 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
     /// Automatically cleans up any orphaned `.tmp` files, loads `primary.idx` checkpoint,
     /// replays committed WAL frames, and rebuilds secondary indexes.
     pub fn open(base_dir: impl Into<PathBuf>, config: EngineConfig) -> Result<Self> {
+        Self::open_with_shared_wal(base_dir, config, None)
+    }
+
+    /// Opens or creates a `StorageEngine<T>` sharing an optional catalog-wide `Arc<GroupCommitWal>` (`TASK-031`).
+    pub fn open_with_shared_wal(
+        base_dir: impl Into<PathBuf>,
+        config: EngineConfig,
+        shared_wal: Option<Arc<GroupCommitWal>>,
+    ) -> Result<Self> {
         let base_dir = base_dir.into();
         if !base_dir.exists() {
             fs::create_dir_all(&base_dir)
@@ -313,6 +328,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         let wal_path = base_dir
             .join("wal")
             .join(format!("{}.wal", config.collection_name));
+        let shared_wal_mode = shared_wal.is_some();
 
         let inner = Arc::new(SharedEngineInner {
             config: config.clone(),
@@ -322,9 +338,12 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             mmap_pool,
             arena,
             wal: None,
+            shared_wal_mode,
             range_index: NumericRangeIndex::new(),
             tag_index: BitmapTagIndex::new(),
-            migrations: RwLock::new(FastHashMap::default()),
+            vector_index: HnswVectorIndex::new(HnswConfig::default()),
+            mvcc: MvccManager::new(),
+            migrations: RwLock::new(SchemaRegistry::new()),
             flush_queue: Mutex::new(CoalescingQueue::default()),
             flush_cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
@@ -333,66 +352,27 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             coalesced_flushes: CachePadded::new(AtomicU64::new(0)),
         });
 
-        // Replay committed WAL frames if WAL exists (`F-DURA-04`)
-        let recovered = GroupCommitWal::recover_committed(&wal_path)?;
-        if !recovered.is_empty() {
-            for entry in recovered {
-                if entry.collection_id != T::COLLECTION_ID && entry.collection_id != 0 {
-                    continue;
-                }
-                match entry.kind {
-                    WalOpKind::Upsert => {
-                        let aligned = AlignedBytes::copy_from_slice(&entry.frame_bytes);
-                        let hdr = RecordHeader::from_slice_verified(&aligned)?;
-                        let ord = inner
-                            .primary
-                            .get(entry.record_id)
-                            .map(|e| e.ordinal)
-                            .unwrap_or_else(|| inner.primary.allocate_ordinal(entry.record_id));
-                        let prev_loc = inner
-                            .primary
-                            .get(entry.record_id)
-                            .map(|e| e.location)
-                            .unwrap_or(DiskLocation::Unflushed);
-                        inner.primary.upsert(PrimaryEntry {
-                            id: entry.record_id,
-                            ordinal: ord,
-                            version: entry.version,
-                            ttl_expires_at_ns: hdr.ttl_expires_at_ns,
-                            location: prev_loc,
-                            disk_verified: false,
-                            hot_dirty: Some(aligned),
-                        });
-                        inner.flush_single_record_to_disk(entry.record_id, true)?;
+        // Replay committed WAL frames if dedicated WAL exists (`F-DURA-04`)
+        if !shared_wal_mode {
+            let recovered = GroupCommitWal::recover_committed(&wal_path)?;
+            if !recovered.is_empty() {
+                for entry in &recovered {
+                    if entry.collection_id != T::COLLECTION_ID && entry.collection_id != 0 {
+                        continue;
                     }
-                    WalOpKind::Delete => {
-                        if let Some(removed) = inner.primary.remove(entry.record_id) {
-                            inner.primary.release_ordinal(removed.ordinal);
-                            inner.mmap_pool.invalidate(entry.record_id);
-                            if let DiskLocation::DedicatedFile { parent_group, .. } =
-                                removed.location
-                            {
-                                if let Ok(p) = inner.paths.full_record_path(
-                                    &inner.config.collection_name,
-                                    parent_group,
-                                    entry.record_id,
-                                ) {
-                                    let _ = fs::remove_file(p);
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
+                    inner.replay_wal_entry(entry)?;
                 }
+                save_primary_checkpoint(&inner.primary, &idx_path)?;
             }
-            save_primary_checkpoint(&inner.primary, &idx_path)?;
         }
 
-        // Open fresh WAL for active writes
-        let wal = if config.enable_wal {
+        // Open fresh WAL for active writes (or attach shared catalog WAL)
+        let wal = if let Some(shared) = shared_wal {
+            Some(shared)
+        } else if config.enable_wal {
             let w = GroupCommitWal::open(&wal_path, config.wal_sync_policy)?;
             w.checkpoint_truncate()?;
-            Some(w)
+            Some(Arc::new(w))
         } else {
             None
         };
@@ -425,6 +405,11 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
     }
 
     #[inline]
+    pub fn collection_name(&self) -> &str {
+        &self.inner.config.collection_name
+    }
+
+    #[inline]
     pub fn primary_index(&self) -> &PrimaryIndex {
         &self.inner.primary
     }
@@ -439,7 +424,45 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         &self.inner.tag_index
     }
 
-    /// Registers a schema migration hook for upgrading records with `old_schema_version` (`TASK-026`, `F-OPS-01`).
+    #[inline]
+    pub fn vector_index(&self) -> &HnswVectorIndex {
+        &self.inner.vector_index
+    }
+
+    #[inline]
+    pub fn mvcc(&self) -> &MvccManager {
+        &self.inner.mvcc
+    }
+
+    /// Opens a point-in-time Snapshot Isolation read guard (`TASK-039`, `F-CONC-08`).
+    /// Concurrent mutations committed after this call are invisible to the returned `ReadSnapshot`.
+    pub fn begin_read_snapshot(&self) -> ReadSnapshot<'_, T> {
+        let ts = self.inner.mvcc.register_snapshot();
+        ReadSnapshot::new(self, ts)
+    }
+
+    /// Sweeps and reclaims obsolete MVCC historical version chains older than the minimum active
+    /// snapshot watermark (`TASK-039`, `RULE-MEM-04`).
+    pub fn gc_mvcc(&self) -> usize {
+        self.inner.mvcc.gc_obsolete_versions()
+    }
+
+    /// Returns the latest committed WAL Log Sequence Number (`LSN`).
+    #[inline]
+    pub fn current_wal_lsn(&self) -> u64 {
+        self.inner.wal.as_ref().map_or(0, |w| w.current_lsn())
+    }
+
+    /// Rotates the active WAL file into an immutable `wal_XXXXXX.log` segment for PITR archival (`TASK-040`).
+    pub fn rotate_wal_segment(&self) -> Result<Option<PathBuf>> {
+        if let Some(ref wal) = self.inner.wal {
+            Ok(Some(wal.rotate_segment()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Registers a direct schema migration hook for upgrading records with `old_schema_version` (`TASK-026`, `TASK-033`, `F-OPS-01`).
     pub fn register_migration(
         &self,
         old_schema_version: u16,
@@ -449,7 +472,103 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             .migrations
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(old_schema_version, Box::new(migrator));
+            .register_direct(old_schema_version, migrator);
+    }
+
+    /// Registers a step-by-step payload upcaster (`from_version -> from_version + 1`) (`TASK-033`, `F-CAT-03`).
+    pub fn register_step_upcaster(
+        &self,
+        from_version: u16,
+        step_fn: impl Fn(&[u8]) -> Result<Vec<u8>> + Send + Sync + 'static,
+    ) {
+        self.inner
+            .migrations
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .register_step(from_version, step_fn);
+    }
+
+    /// Sets the final payload decoder used when a multi-step upcaster chain reaches `T::SCHEMA_VERSION` (`TASK-033`).
+    pub fn set_step_upcaster_decoder(
+        &self,
+        decoder: impl Fn(u16, &[u8]) -> Result<T> + Send + Sync + 'static,
+    ) {
+        self.inner
+            .migrations
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_final_decoder(decoder);
+    }
+
+    /// Background/online batch schema upgrader (`TASK-033`, `F-CAT-03`):
+    /// Scans all live records and re-encodes any record with `hdr.schema_version != T::SCHEMA_VERSION`
+    /// into the latest `T::SCHEMA_VERSION` frame on disk.
+    pub fn upgrade_legacy_schemas(&self) -> Result<usize> {
+        let entries = self.inner.primary.entries_snapshot();
+        let mut upgraded_count = 0usize;
+        for entry in entries {
+            let _lock = self.inner.locks.lock_one(entry.id);
+            let Some(cur) = self.inner.primary.get(entry.id) else {
+                continue;
+            };
+            let needs_upgrade = if let Some(ref dirty) = cur.hot_dirty {
+                let hdr = RecordHeader::from_slice_verified(dirty.as_slice())?;
+                hdr.schema_version != T::SCHEMA_VERSION
+            } else {
+                match cur.location {
+                    DiskLocation::Unflushed => false,
+                    DiskLocation::DedicatedFile {
+                        parent_group,
+                        ping_pong_stride,
+                    } => {
+                        let path = self.inner.paths.full_record_path(
+                            &self.inner.config.collection_name,
+                            parent_group,
+                            cur.id,
+                        )?;
+                        let guard = self.inner.mmap_pool.get_or_map(cur.id, &path, false)?;
+                        let slice = if ping_pong_stride > 0 {
+                            read_ping_pong_active(guard.as_slice(), ping_pong_stride as usize)?.1
+                        } else {
+                            guard.as_slice()
+                        };
+                        let hdr = RecordHeader::from_slice_verified(slice)?;
+                        hdr.schema_version != T::SCHEMA_VERSION
+                    }
+                    DiskLocation::Arena(loc) => {
+                        if let Some(ref arena) = self.inner.arena {
+                            let region = arena.get_region(loc.segment_id)?;
+                            let slice =
+                                region.subslice_aligned(loc.offset as usize, loc.len as usize)?;
+                            let hdr = RecordHeader::from_slice_verified(slice)?;
+                            hdr.schema_version != T::SCHEMA_VERSION
+                        } else {
+                            false
+                        }
+                    }
+                }
+            };
+
+            if needs_upgrade {
+                let (ver, upgraded_rec, pg, ttl_ns, flags) =
+                    self.inner.load_mutable_draft_locked(cur.id)?;
+                let now_ns = current_time_ns();
+                self.inner.write_record_locked(
+                    cur.id,
+                    pg,
+                    &upgraded_rec,
+                    ver.next(),
+                    now_ns,
+                    ttl_ns,
+                    flags,
+                )?;
+                upgraded_count += 1;
+            }
+        }
+        if upgraded_count > 0 {
+            self.flush_all()?;
+        }
+        Ok(upgraded_count)
     }
 
     /// Zero-allocation hot read closure (`RULE-MEM-01`).
@@ -610,6 +729,40 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         let now_ns = current_time_ns();
         self.inner
             .write_record_locked(id, parent_group, &draft, next_ver, now_ns, ttl_ns, flags)
+    }
+
+    /// Optimistic Concurrency Control (OCC) Compare-And-Swap overwrite (`F-CONC-06`, `F-NET-02`).
+    /// Fails with `StorageError::VersionConflict` if the current record version is not `expected_version`.
+    pub fn put_cas(
+        &self,
+        id: InlineId,
+        expected_version: Version,
+        record: &T,
+    ) -> Result<Version> {
+        let _lock = self.inner.locks.lock_one(id);
+        let now_ns = current_time_ns();
+        let cur_ver = self
+            .inner
+            .primary
+            .get(id)
+            .map_or(Version(0), |e| e.version);
+        if cur_ver != expected_version {
+            return Err(StorageError::version_conflict(id, expected_version, cur_ver));
+        }
+        let next_ver = if cur_ver.0 == 0 {
+            Version::INITIAL
+        } else {
+            cur_ver.next()
+        };
+        self.inner.write_record_locked(
+            id,
+            None,
+            record,
+            next_ver,
+            now_ns,
+            0,
+            RecordFlags::NONE,
+        )
     }
 
     /// Optimistic Concurrency Control (OCC) conditional update (`F-CONC-06`).
@@ -899,8 +1052,19 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             .join("indexes")
             .join(format!("{}_primary.idx", self.inner.config.collection_name));
         save_primary_checkpoint(&self.inner.primary, &idx_path)?;
-        if let Some(ref wal) = self.inner.wal {
-            wal.checkpoint_truncate()?;
+        if !self.inner.vector_index.is_empty() {
+            let hnsw_path = self
+                .inner
+                .paths
+                .base_dir()
+                .join("indexes")
+                .join(format!("{}_hnsw.idx", self.inner.config.collection_name));
+            let _ = self.inner.vector_index.save_to_disk(&hnsw_path);
+        }
+        if !self.inner.shared_wal_mode {
+            if let Some(ref wal) = self.inner.wal {
+                wal.checkpoint_truncate()?;
+            }
         }
         Ok(flushed)
     }
@@ -908,6 +1072,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
     /// Reclaims fragmented dead slots across Slotted Arena Segments (`seg_XXXXX.dat`) whose
     /// dead-byte ratio meets or exceeds `min_fragmentation_ratio` (`0.0..=1.0`), evacuating live
     /// records into a clean segment and deleting the old `.dat` files from disk (`F-OPS-03`).
+    /// Also automatically upgrades any legacy-schema records to `T::SCHEMA_VERSION` during evacuation (`TASK-033`).
     pub fn compact_arenas(&self, min_fragmentation_ratio: f64) -> Result<usize> {
         self.flush_all()?;
         let Some(ref arena) = self.inner.arena else {
@@ -943,19 +1108,42 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                     let region = arena.get_region(cur_loc.segment_id)?;
                     let slice =
                         region.subslice_aligned(cur_loc.offset as usize, cur_loc.len as usize)?;
-                    let hdr = RecordCodec::validate_frame::<T>(slice)?;
-                    let new_loc = arena.write_record(slice, false)?;
-                    let verified = !hdr.is_tombstone()
-                        && !hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4);
-                    self.inner.primary.upsert(PrimaryEntry {
-                        id: cur.id,
-                        ordinal: cur.ordinal,
-                        version: cur.version,
-                        ttl_expires_at_ns: cur.ttl_expires_at_ns,
-                        location: DiskLocation::Arena(new_loc),
-                        disk_verified: verified,
-                        hot_dirty: None,
-                    });
+                    let raw_hdr = RecordHeader::from_slice_verified(slice)?;
+                    if raw_hdr.schema_version != T::SCHEMA_VERSION {
+                        let (_, upgraded) = self.inner.decode_or_migrate_frame(slice)?;
+                        let flags = raw_hdr.flags_typed().without(RecordFlags::COMPRESSED_LZ4);
+                        let reencoded = RecordCodec::encode_aligned(
+                            &upgraded,
+                            cur.version,
+                            current_time_ns(),
+                            flags,
+                            cur.ttl_expires_at_ns,
+                        );
+                        let new_loc = arena.write_record(reencoded.as_slice(), false)?;
+                        self.inner.primary.upsert(PrimaryEntry {
+                            id: cur.id,
+                            ordinal: cur.ordinal,
+                            version: cur.version,
+                            ttl_expires_at_ns: cur.ttl_expires_at_ns,
+                            location: DiskLocation::Arena(new_loc),
+                            disk_verified: true,
+                            hot_dirty: None,
+                        });
+                    } else {
+                        let hdr = RecordCodec::validate_frame::<T>(slice)?;
+                        let new_loc = arena.write_record(slice, false)?;
+                        let verified = !hdr.is_tombstone()
+                            && !hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4);
+                        self.inner.primary.upsert(PrimaryEntry {
+                            id: cur.id,
+                            ordinal: cur.ordinal,
+                            version: cur.version,
+                            ttl_expires_at_ns: cur.ttl_expires_at_ns,
+                            location: DiskLocation::Arena(new_loc),
+                            disk_verified: verified,
+                            hot_dirty: None,
+                        });
+                    }
                 }
             }
         }
@@ -1020,13 +1208,77 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         }
     }
 
+    #[inline]
+    pub(crate) fn lock_many_records(&self, ids: &[InlineId]) -> MultiRecordLockGuard<'_> {
+        self.inner.locks.lock_many(ids)
+    }
+
+    #[inline]
+    pub(crate) fn current_version(&self, id: InlineId) -> Option<Version> {
+        self.inner.primary.get(id).map(|e| e.version)
+    }
+
+    #[inline]
+    pub(crate) fn apply_tx_upsert_locked(
+        &self,
+        id: InlineId,
+        record: &T,
+        version: Version,
+        now_ns: u64,
+        frame: AlignedBytes,
+    ) -> Result<()> {
+        self.inner
+            .apply_encoded_upsert_locked(id, None, record, version, now_ns, 0, frame)
+    }
+
+    pub(crate) fn apply_tx_delete_locked(&self, id: InlineId) -> Result<bool> {
+        if let Some(removed) = self.inner.primary.remove(id) {
+            self.inner.remove_from_secondary_indexes(&removed);
+            self.inner.primary.release_ordinal(removed.ordinal);
+            self.inner.mmap_pool.invalidate(id);
+            match removed.location {
+                DiskLocation::DedicatedFile { parent_group, .. } => {
+                    if let Ok(path) = self.inner.paths.full_record_path(
+                        &self.inner.config.collection_name,
+                        parent_group,
+                        id,
+                    ) {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+                DiskLocation::Arena(loc) => {
+                    if let Some(ref arena) = self.inner.arena {
+                        arena.mark_dead(loc);
+                    }
+                }
+                DiskLocation::Unflushed => {}
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub(crate) fn replay_wal_entry(&self, entry: &WalEntry) -> Result<()> {
+        self.inner.replay_wal_entry(entry)?;
+        let idx_path = self
+            .inner
+            .paths
+            .base_dir()
+            .join("indexes")
+            .join(format!("{}_primary.idx", self.inner.config.collection_name));
+        save_primary_checkpoint(&self.inner.primary, &idx_path)?;
+        self.inner.rebuild_secondary_indexes()?;
+        Ok(())
+    }
+
     pub(crate) fn score_embeddings(
         &self,
         query: &[f32],
         candidates: Option<&[RecordOrdinal]>,
         k: usize,
     ) -> Vec<VectorTopKHit> {
-        if k == 0 {
+        if k == 0 || query.is_empty() {
             return Vec::new();
         }
         let mut hits: Vec<VectorTopKHit> = Vec::new();
@@ -1044,17 +1296,46 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             }
         };
 
-        match candidates {
-            Some(ords) => {
+        // Adaptive Filter-Aware HNSW Execution + Exact Top-2K f32 Re-Ranking (`TASK-038`, `F-INDX-07`):
+        // - If the filtered candidate set is small (`<= 256` records) or the total index has `<= 256` vectors,
+        //   direct SIMD `f32` cosine scoring over the candidate ordinals is `< 5 µs`.
+        // - Otherwise, traverse the multi-layer `SQ8` HNSW graph in `O(log N)` to retrieve `max(2K, 32)`
+        //   candidates and re-rank them against their zero-copy `f32` `mmap` slices!
+        let use_hnsw = self.inner.vector_index.len() > 256
+            && candidates.is_none_or(|ords| ords.len() > 256);
+
+        if use_hnsw {
+            let filter_bm = candidates.map(|ords| {
+                let mut bm = CompressedBitmap::new();
                 for &ord in ords {
-                    if let Some(id) = self.inner.primary.resolve_ordinal(ord) {
-                        score_id(id, ord, &mut hits);
-                    }
+                    bm.insert(ord);
+                }
+                bm
+            });
+            let oversample_k = (k * 2).max(32);
+            let sq8_candidates = self.inner.vector_index.search_sq8_candidates(
+                query,
+                oversample_k,
+                filter_bm.as_ref(),
+            );
+            for cand in sq8_candidates {
+                if let Some(id) = self.inner.primary.resolve_ordinal(cand.ordinal) {
+                    score_id(id, cand.ordinal, &mut hits);
                 }
             }
-            None => {
-                for entry in self.inner.primary.entries_snapshot() {
-                    score_id(entry.id, entry.ordinal, &mut hits);
+        } else {
+            match candidates {
+                Some(ords) => {
+                    for &ord in ords {
+                        if let Some(id) = self.inner.primary.resolve_ordinal(ord) {
+                            score_id(id, ord, &mut hits);
+                        }
+                    }
+                }
+                None => {
+                    for entry in self.inner.primary.entries_snapshot() {
+                        score_id(entry.id, entry.ordinal, &mut hits);
+                    }
                 }
             }
         }
@@ -1240,6 +1521,52 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         }
     }
 
+    fn replay_wal_entry(&self, entry: &WalEntry) -> Result<()> {
+        match entry.kind {
+            WalOpKind::Upsert => {
+                let aligned = AlignedBytes::copy_from_slice(&entry.frame_bytes);
+                let hdr = RecordHeader::from_slice_verified(&aligned)?;
+                let ord = self
+                    .primary
+                    .get(entry.record_id)
+                    .map(|e| e.ordinal)
+                    .unwrap_or_else(|| self.primary.allocate_ordinal(entry.record_id));
+                let prev_loc = self
+                    .primary
+                    .get(entry.record_id)
+                    .map(|e| e.location)
+                    .unwrap_or(DiskLocation::Unflushed);
+                self.primary.upsert(PrimaryEntry {
+                    id: entry.record_id,
+                    ordinal: ord,
+                    version: entry.version,
+                    ttl_expires_at_ns: hdr.ttl_expires_at_ns,
+                    location: prev_loc,
+                    disk_verified: false,
+                    hot_dirty: Some(aligned),
+                });
+                self.flush_single_record_to_disk(entry.record_id, true)?;
+            }
+            WalOpKind::Delete => {
+                if let Some(removed) = self.primary.remove(entry.record_id) {
+                    self.primary.release_ordinal(removed.ordinal);
+                    self.mmap_pool.invalidate(entry.record_id);
+                    if let DiskLocation::DedicatedFile { parent_group, .. } = removed.location {
+                        if let Ok(p) = self.paths.full_record_path(
+                            &self.config.collection_name,
+                            parent_group,
+                            entry.record_id,
+                        ) {
+                            let _ = fs::remove_file(p);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn decode_or_migrate_frame(&self, frame: &[u8]) -> Result<(Version, T)> {
         let hdr = RecordHeader::from_slice_verified(frame)?;
         if hdr.schema_version != T::SCHEMA_VERSION {
@@ -1260,23 +1587,52 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                 .migrations
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(mig_fn) = migs.get(&hdr.schema_version) {
-                if hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4) {
-                    let decompressed =
-                        storage_codec::decompress_lz4(raw_payload, hdr.uncompressed_len as usize)?;
-                    let upgraded = mig_fn(hdr.schema_version, &decompressed)?;
-                    return Ok((hdr.version(), upgraded));
-                }
-                let upgraded = mig_fn(hdr.schema_version, raw_payload)?;
+            if hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4) {
+                let decompressed =
+                    storage_codec::decompress_lz4(raw_payload, hdr.uncompressed_len as usize)?;
+                let upgraded = migs.migrate_payload(hdr.schema_version, &decompressed)?;
                 return Ok((hdr.version(), upgraded));
             }
-            return Err(StorageError::SchemaVersionMismatch {
-                found: hdr.schema_version,
-                expected: T::SCHEMA_VERSION,
-            });
+            let upgraded = migs.migrate_payload(hdr.schema_version, raw_payload)?;
+            return Ok((hdr.version(), upgraded));
         }
         let (hdr, owned) = RecordCodec::decode_owned::<T>(frame)?;
         Ok((hdr.version(), owned))
+    }
+
+    /// Reads the raw 64B-aligned record frame for `entry` (`O(1)` Arc clone if `hot_dirty`,
+    /// or copied from `mmap` only when an active MVCC snapshot requires copy-on-write retention).
+    fn read_raw_frame_for_entry(&self, entry: &PrimaryEntry) -> Option<AlignedBytes> {
+        if let Some(ref dirty) = entry.hot_dirty {
+            return Some(dirty.clone());
+        }
+        match entry.location {
+            DiskLocation::Unflushed => None,
+            DiskLocation::Arena(loc) => {
+                let arena = self.arena.as_ref()?;
+                arena
+                    .with_slice(loc, |slice| Ok(AlignedBytes::copy_from_slice(slice)))
+                    .ok()
+            }
+            DiskLocation::DedicatedFile {
+                parent_group,
+                ping_pong_stride,
+            } => {
+                let path = self
+                    .paths
+                    .full_record_path(&self.config.collection_name, parent_group, entry.id)
+                    .ok()?;
+                let guard = self.mmap_pool.get_or_map(entry.id, &path, false).ok()?;
+                let slice = if ping_pong_stride > 0 {
+                    read_ping_pong_active(guard.as_slice(), ping_pong_stride as usize)
+                        .ok()?
+                        .1
+                } else {
+                    guard.as_slice()
+                };
+                Some(AlignedBytes::copy_from_slice(slice))
+            }
+        }
     }
 
     /// Extracts an `IndexSnapshot` on-the-fly directly from an existing record's `hot_dirty` or
@@ -1423,6 +1779,18 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         frame: AlignedBytes,
     ) -> Result<()> {
         let existing = self.primary.get(id);
+        if self.mvcc.has_active_snapshots() {
+            if let Some(ref old_entry) = existing {
+                let old_frame = self.read_raw_frame_for_entry(old_entry);
+                self.mvcc
+                    .seed_baseline_if_absent(id, old_entry.version, old_frame);
+            } else {
+                self.mvcc
+                    .seed_baseline_if_absent(id, Version::INITIAL, None);
+            }
+            self.mvcc.record_version(id, version, Some(frame.clone()));
+        }
+
         let ordinal = match &existing {
             Some(e) => e.ordinal,
             None => self.primary.allocate_ordinal(id),
@@ -1466,6 +1834,15 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         // Differential secondary index update without any global IndexSnapshot map (`TASK-016`, `F-INDX-05`)
         let new_snap = record.extract_index_snapshot();
         self.apply_index_snapshot_diff(ordinal, &old_snap, &new_snap);
+        if let Some(emb) = record.embedding_slice() {
+            if !emb.is_empty() {
+                self.vector_index.insert(ordinal, emb);
+            } else if old_snap.has_embedding {
+                self.vector_index.remove(ordinal);
+            }
+        } else if old_snap.has_embedding {
+            self.vector_index.remove(ordinal);
+        }
 
         self.primary.upsert(PrimaryEntry {
             id,
@@ -1537,6 +1914,9 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             for (field_id, tag) in snap.tags() {
                 self.tag_index.remove(field_id, tag, removed.ordinal);
             }
+            if snap.has_embedding {
+                self.vector_index.remove(removed.ordinal);
+            }
         }
     }
 
@@ -1544,6 +1924,13 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         let Some(removed) = self.primary.remove(id) else {
             return Ok(false);
         };
+
+        if self.mvcc.has_active_snapshots() {
+            let old_frame = self.read_raw_frame_for_entry(&removed);
+            self.mvcc
+                .seed_baseline_if_absent(id, removed.version, old_frame);
+            self.mvcc.record_version(id, removed.version.next(), None);
+        }
 
         if let Some(ref wal) = self.wal {
             wal.append_single(
@@ -1753,6 +2140,13 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         for entry in entries {
             if let Some(snap) = self.extract_snapshot_for_entry(&entry) {
                 self.apply_index_snapshot_diff(entry.ordinal, &empty, &snap);
+                if snap.has_embedding {
+                    if let Ok((_, owned)) = self.get_owned_internal(entry.id) {
+                        if let Some(emb) = owned.embedding_slice() {
+                            self.vector_index.insert(entry.ordinal, emb);
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -1902,6 +2296,18 @@ impl<'a, T: ZeroCopyRecord + Indexable> TransactionBatch<'a, T> {
         }
         for id in self.staged_deletes {
             if let Some(removed) = self.engine.inner.primary.remove(id) {
+                if self.engine.inner.mvcc.has_active_snapshots() {
+                    let old_frame = self.engine.inner.read_raw_frame_for_entry(&removed);
+                    self.engine.inner.mvcc.seed_baseline_if_absent(
+                        id,
+                        removed.version,
+                        old_frame,
+                    );
+                    self.engine
+                        .inner
+                        .mvcc
+                        .record_version(id, removed.version.next(), None);
+                }
                 self.engine
                     .inner
                     .remove_from_secondary_indexes(&removed);

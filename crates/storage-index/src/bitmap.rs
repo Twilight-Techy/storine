@@ -190,6 +190,24 @@ impl CompressedBitmap {
         self.collect_into(&mut out);
         out
     }
+
+    #[inline]
+    pub fn chunks_slice(&self) -> &[(u32, [u64; 64])] {
+        &self.chunks
+    }
+
+    #[inline]
+    pub fn from_raw_chunks(chunks: Vec<(u32, [u64; 64])>) -> Self {
+        let cardinality = chunks
+            .iter()
+            .flat_map(|(_, words)| words.iter())
+            .map(|w| w.count_ones() as usize)
+            .sum();
+        Self {
+            chunks,
+            cardinality,
+        }
+    }
 }
 
 /// Concurrent secondary tag/equality index mapping `(field_id, tag_value) -> CompressedBitmap`.
@@ -233,6 +251,25 @@ impl BitmapTagIndex {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.get(&(field_id, tag)).cloned().unwrap_or_default()
+    }
+
+    /// Returns the exact cardinality of `(field_id, tag)` in $O(1)$ time with **zero heap allocations** (`TASK-048`, `F-OPT-01`).
+    #[inline]
+    pub fn cardinality(&self, field_id: u16, tag: InlineId) -> usize {
+        let guard = self
+            .map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.get(&(field_id, tag)).map_or(0, |bm| bm.len())
+    }
+
+    /// Exports all `((field_id, tag), CompressedBitmap)` pairs for paged disk checkpointing (`TASK-035`).
+    pub fn snapshot_all(&self) -> Vec<((u16, InlineId), CompressedBitmap)> {
+        let guard = self
+            .map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.iter().map(|(&k, v)| (k, v.clone())).collect()
     }
 
     /// Intersects multiple `(field_id, tag)` predicates in ascending cardinality order
