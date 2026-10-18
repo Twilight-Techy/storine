@@ -91,7 +91,7 @@ pub fn run_latency_bench(
     mut op: impl FnMut(usize),
 ) -> BenchmarkMetrics {
     // Warmup & calibrate whether single op is faster than OS QPC tick (~100ns)
-    let warmup_n = iterations.min(256).max(16);
+    let warmup_n = iterations.clamp(16, 256);
     let t_warm = Instant::now();
     for i in 0..warmup_n {
         op(i);

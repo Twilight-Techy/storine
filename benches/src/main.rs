@@ -87,13 +87,15 @@ fn main() -> storage_types::Result<()> {
     ));
 
     // 5. StorageEngine Warm Zero-Copy Read (`with_ref` -> 0 heap allocations!) & Coalesced Writes
-    let mut cfg = EngineConfig::default();
-    cfg.layout_mode = StorageLayoutMode::AdaptiveArena {
-        arena_threshold_bytes: 4096,
-        segment_capacity: 16 * 1024 * 1024,
+    let cfg = EngineConfig {
+        layout_mode: StorageLayoutMode::AdaptiveArena {
+            arena_threshold_bytes: 4096,
+            segment_capacity: 16 * 1024 * 1024,
+        },
+        wal_sync_policy: SyncPolicy::AsyncMemoryFirst,
+        background_flush: true,
+        ..EngineConfig::default()
     };
-    cfg.wal_sync_policy = SyncPolicy::AsyncMemoryFirst;
-    cfg.background_flush = true;
 
     let engine = Arc::new(StorageEngine::<AgentObjectRecord>::open(&bench_dir, cfg)?);
 
@@ -101,7 +103,7 @@ fn main() -> storage_types::Result<()> {
     let mut keys = Vec::with_capacity(2_000);
     for i in 0..2_000 {
         let k = InlineId::new(&format!("rec_{i:06}")).unwrap();
-        let mut r = AgentObjectRecord::new(k, "Memory Node", 1_700_000_000 + (i as i64), i as i64);
+        let mut r = AgentObjectRecord::new(k, "Memory Node", 1_700_000_000 + i64::from(i), i64::from(i));
         r.tags.push(if i % 2 == 0 {
             InlineId::from_static("even")
         } else {

@@ -100,7 +100,7 @@ impl IndexSnapshot {
         }
         let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ (slice.len() as u64);
         for &v in slice {
-            h = (h ^ (v.to_bits() as u64)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            h = (h ^ u64::from(v.to_bits())).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             h ^= h >> 31;
         }
         self.has_embedding = true;

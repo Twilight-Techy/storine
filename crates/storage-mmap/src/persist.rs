@@ -124,6 +124,7 @@ pub fn write_ping_pong_slot(
 
     let mut file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)
@@ -238,13 +239,10 @@ pub fn cleanup_temp_files(root: &Path) -> Result<usize> {
                 stack.push(path);
             } else if path
                 .extension()
-                .and_then(|e| e.to_str())
-                .map_or(false, |ext| ext == "tmp")
-            {
-                if fs::remove_file(&path).is_ok() {
+                .and_then(|e| e.to_str()) == Some("tmp")
+                && fs::remove_file(&path).is_ok() {
                     removed += 1;
                 }
-            }
         }
     }
     Ok(removed)
@@ -271,6 +269,7 @@ impl DirectoryLock {
         }
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(lock_path)

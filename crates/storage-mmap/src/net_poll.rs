@@ -141,6 +141,6 @@ impl SocketPoller {
     pub fn is_ready(&self, idx: usize) -> bool {
         self.entries
             .get(idx)
-            .map_or(false, |e| e.revents != 0)
+            .is_some_and(|e| e.revents != 0)
     }
 }

@@ -133,7 +133,7 @@ impl MmapRegion {
 
         // SAFETY: `mapping_handle` was just created and validated non-zero; we map `len` bytes read-only.
         let view_ptr = unsafe { MapViewOfFile(mapping_handle, FILE_MAP_READ, 0, 0, len) };
-        let Some(ptr) = NonNull::new(view_ptr as *mut u8) else {
+        let Some(ptr) = NonNull::new(view_ptr.cast::<u8>()) else {
             let err = std::io::Error::last_os_error();
             // SAFETY: `mapping_handle` is a valid handle that must be closed on error.
             unsafe {

@@ -185,7 +185,7 @@ impl HnswVectorIndex {
     /// Deterministic geometric level assignment for `ord` (`P(level >= l) = (1/m)^l`, max 6 layers).
     #[inline]
     fn assign_layer(ord: u32) -> usize {
-        let mut h = (ord as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut h = u64::from(ord).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         h ^= h >> 30;
         h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
         let tz = h.trailing_zeros() as usize;

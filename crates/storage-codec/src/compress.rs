@@ -151,7 +151,7 @@ pub fn decompress_lz4(input: &[u8], expected_uncompressed_len: usize) -> Result<
             }
         }
 
-        if pos.checked_add(lit_len).map_or(true, |end| end > body.len()) {
+        if pos.checked_add(lit_len).is_none_or(|end| end > body.len()) {
             return Err(StorageError::invalid_archive(
                 "literal run exceeds compressed input bounds",
             ));
@@ -159,7 +159,7 @@ pub fn decompress_lz4(input: &[u8], expected_uncompressed_len: usize) -> Result<
         if out
             .len()
             .checked_add(lit_len)
-            .map_or(true, |end| end > expected_uncompressed_len)
+            .is_none_or(|end| end > expected_uncompressed_len)
         {
             return Err(StorageError::invalid_archive(
                 "decompressed literals exceed expected output length",
@@ -207,7 +207,7 @@ pub fn decompress_lz4(input: &[u8], expected_uncompressed_len: usize) -> Result<
         if out
             .len()
             .checked_add(match_len)
-            .map_or(true, |end| end > expected_uncompressed_len)
+            .is_none_or(|end| end > expected_uncompressed_len)
         {
             return Err(StorageError::invalid_archive(
                 "decompressed match exceeds expected output length",

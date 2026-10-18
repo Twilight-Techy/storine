@@ -36,6 +36,7 @@ impl RbacRole {
 
 /// Server-wide authentication, RBAC, and rate-limiting policy (`TASK-044`).
 #[derive(Clone, Debug)]
+#[derive(Default)]
 pub struct SecurityConfig {
     /// When `true`, connections start as `RbacRole::Unauthenticated` and must send `OP_AUTH` first.
     /// When `false` (default), connections start as `RbacRole::Admin` for zero-config compatibility.
@@ -47,16 +48,6 @@ pub struct SecurityConfig {
     tokens: HashMap<String, RbacRole>,
 }
 
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            require_auth: false,
-            rate_limit_rps: 0,
-            rate_limit_burst: 0,
-            tokens: HashMap::new(),
-        }
-    }
-}
 
 impl SecurityConfig {
     #[inline]
@@ -122,11 +113,11 @@ pub struct TokenBucket {
 impl TokenBucket {
     #[inline]
     pub fn new(rate_rps: u32, burst: u32) -> Self {
-        let burst_milli = (burst as u64).saturating_mul(1_000);
+        let burst_milli = u64::from(burst).saturating_mul(1_000);
         Self {
             tokens_milli: burst_milli,
             burst_milli,
-            rate_per_sec: rate_rps as u64,
+            rate_per_sec: u64::from(rate_rps),
             last_refill: Instant::now(),
         }
     }
@@ -147,7 +138,7 @@ impl TokenBucket {
                 self.last_refill = now;
             }
         }
-        let needed_milli = (cost as u64).saturating_mul(1_000);
+        let needed_milli = u64::from(cost).saturating_mul(1_000);
         if self.tokens_milli >= needed_milli {
             self.tokens_milli -= needed_milli;
             true

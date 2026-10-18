@@ -81,7 +81,7 @@ impl core::hash::Hasher for FastHasher {
     fn write(&mut self, bytes: &[u8]) {
         let mut h = self.0 ^ 0x9E37_79B1_85EB_CA87;
         for &b in bytes {
-            h = (h ^ (b as u64)).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+            h = (h ^ u64::from(b)).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
         }
         self.0 = h ^ (h >> 29);
     }
@@ -100,7 +100,7 @@ impl core::hash::Hasher for FastHasher {
 
     #[inline]
     fn write_u32(&mut self, i: u32) {
-        let m = (i as u64).wrapping_mul(0x9E37_79B1_85EB_CA87);
+        let m = u64::from(i).wrapping_mul(0x9E37_79B1_85EB_CA87);
         self.0 = if self.0 == 0 {
             m ^ (m >> 29)
         } else {
@@ -110,7 +110,7 @@ impl core::hash::Hasher for FastHasher {
 
     #[inline]
     fn write_u16(&mut self, i: u16) {
-        self.write_u32(i as u32);
+        self.write_u32(u32::from(i));
     }
 }
 

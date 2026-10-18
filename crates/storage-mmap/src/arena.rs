@@ -126,6 +126,7 @@ impl ArenaSegment {
         }
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)
@@ -225,7 +226,7 @@ impl ArenaSegment {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if w.free_slots
             .get(&(aligned_len as u32))
-            .map_or(false, |list| !list.is_empty())
+            .is_some_and(|list| !list.is_empty())
         {
             return true;
         }
@@ -291,7 +292,7 @@ impl ArenaSegment {
             .get_mut(&(aligned_len as u32))
             .and_then(|slots| slots.pop())
         {
-            write_all_at(&w.file, frame, reused_offset as u64)
+            write_all_at(&w.file, frame, u64::from(reused_offset))
                 .map_err(|e| StorageError::io("write frame to recycled arena slot", e))?;
             w.dead_bytes = w.dead_bytes.saturating_sub(aligned_len);
             if sync_data {

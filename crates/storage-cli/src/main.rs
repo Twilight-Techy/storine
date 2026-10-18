@@ -177,10 +177,12 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
                 })?,
                 None => 0.5,
             };
-            let mut cfg = EngineConfig::default();
-            cfg.layout_mode = StorageLayoutMode::AdaptiveArena {
-                arena_threshold_bytes: 4096,
-                segment_capacity: 8 * 1024 * 1024,
+            let cfg = EngineConfig {
+                layout_mode: StorageLayoutMode::AdaptiveArena {
+                    arena_threshold_bytes: 4096,
+                    segment_capacity: 8 * 1024 * 1024,
+                },
+                ..EngineConfig::default()
             };
             let engine = StorageEngine::<AgentObjectRecord>::open(db_dir, cfg)?;
             let removed = engine.compact_arenas(min_ratio)?;
@@ -209,12 +211,14 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
                 })?,
                 None => 5_000,
             };
-            let mut cfg = EngineConfig::default();
-            cfg.layout_mode = StorageLayoutMode::AdaptiveArena {
-                arena_threshold_bytes: 4096,
-                segment_capacity: 8 * 1024 * 1024,
+            let cfg = EngineConfig {
+                layout_mode: StorageLayoutMode::AdaptiveArena {
+                    arena_threshold_bytes: 4096,
+                    segment_capacity: 8 * 1024 * 1024,
+                },
+                wal_sync_policy: storage_wal::SyncPolicy::AsyncMemoryFirst,
+                ..EngineConfig::default()
             };
-            cfg.wal_sync_policy = storage_wal::SyncPolicy::AsyncMemoryFirst;
             let engine = StorageEngine::<AgentObjectRecord>::open(db_dir, cfg)?;
             let mut keys = Vec::with_capacity(count);
             for i in 0..count {

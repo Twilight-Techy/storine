@@ -16,6 +16,7 @@ pub fn checksum_payload(bytes: &[u8]) -> u64 {
 
 /// High-speed 64-bit `XXH3` / XXH64-family wide-stripe hash with 128-bit multiply-fold mixing.
 #[inline]
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub fn xxh3_64(bytes: &[u8]) -> u64 {
     let len = bytes.len();
     let mut h: u64;
@@ -84,7 +85,7 @@ fn finalize_tail(mut h: u64, mut rem: &[u8]) -> u64 {
         rem = &rem[8..];
     }
     if rem.len() >= 4 {
-        let k1 = u32::from_le_bytes(rem[0..4].try_into().unwrap()) as u64;
+        let k1 = u64::from(u32::from_le_bytes(rem[0..4].try_into().unwrap()));
         h ^= k1.wrapping_mul(PRIME1);
         h = h
             .rotate_left(23)
@@ -93,7 +94,7 @@ fn finalize_tail(mut h: u64, mut rem: &[u8]) -> u64 {
         rem = &rem[4..];
     }
     for &b in rem {
-        h ^= (b as u64).wrapping_mul(PRIME5);
+        h ^= u64::from(b).wrapping_mul(PRIME5);
         h = h.rotate_left(11).wrapping_mul(PRIME1);
     }
     avalanche(h)
@@ -126,6 +127,7 @@ pub fn crc32c_64(bytes: &[u8]) -> u64 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
 #[inline]
+#[allow(clippy::chunks_exact_to_as_chunks)]
 unsafe fn crc32c_sse42_dual(bytes: &[u8]) -> u64 {
     use core::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
 
@@ -142,8 +144,8 @@ unsafe fn crc32c_sse42_dual(bytes: &[u8]) -> u64 {
     }
 
     for &b in chunks.remainder() {
-        crc_lo = _mm_crc32_u8(crc_lo as u32, b) as u64;
-        crc_hi = _mm_crc32_u8(crc_hi as u32, b.wrapping_mul(17)) as u64;
+        crc_lo = u64::from(_mm_crc32_u8(crc_lo as u32, b));
+        crc_hi = u64::from(_mm_crc32_u8(crc_hi as u32, b.wrapping_mul(17)));
     }
 
     ((!crc_hi) << 32) | ((!crc_lo) & 0xFFFF_FFFF)
@@ -158,7 +160,7 @@ fn crc32c_software_dual(bytes: &[u8]) -> u64 {
         crc_lo = crc32c_step(crc_lo, b);
         crc_hi = crc32c_step(crc_hi, b.wrapping_mul(17));
     }
-    ((!crc_hi as u64) << 32) | (!crc_lo as u64)
+    (u64::from(!crc_hi) << 32) | u64::from(!crc_lo)
 }
 
 #[allow(dead_code)]

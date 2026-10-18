@@ -200,6 +200,7 @@ impl NumericRangeIndex {
     /// - Seeks directly to `cursor.sort_key` in $O(\log N)$ time using `BTreeMap::range`.
     /// - Applies `filter_fn(ord)` before counting toward `offset`, `limit`, and `total_matched`.
     /// - Returns `(Vec<(sort_key, RecordOrdinal)>, total_matched)`.
+    #[allow(clippy::too_many_arguments)]
     pub fn range_collect_paginated<F: Fn(RecordOrdinal) -> bool>(
         &self,
         field_id: u16,
@@ -359,7 +360,7 @@ impl NumericRangeIndex {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut bm = CompressedBitmap::new();
         if let Some(tree) = guard.get(&field_id) {
-            for (_k, leaf) in tree.iter() {
+            for leaf in tree.values() {
                 leaf.insert_into_bitmap(&mut bm);
             }
         }

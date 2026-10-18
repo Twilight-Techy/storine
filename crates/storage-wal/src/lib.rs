@@ -129,6 +129,7 @@ impl GroupCommitWal {
 
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)
@@ -308,6 +309,7 @@ impl GroupCommitWal {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[inline]
     fn write_single_frame_locked(
         writer: &mut BufWriter<File>,

@@ -64,7 +64,7 @@ fn read_varint(buf: &[u8], cursor: &mut usize) -> Result<u64> {
             .get(*cursor)
             .ok_or_else(|| StorageError::corrupted_header("truncated varint in checkpoint"))?;
         *cursor += 1;
-        let low = (byte & 0x7F) as u64;
+        let low = u64::from(byte & 0x7F);
         if shift == 63 && low > 1 {
             return Err(StorageError::corrupted_header("varint overflow in checkpoint"));
         }

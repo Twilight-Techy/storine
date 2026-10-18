@@ -346,14 +346,14 @@ impl PropertyValue {
             }
             Self::Text(ref s) => {
                 let arch = builder.write_str(s);
-                slots[0] = arch.offset as u64;
-                slots[1] = arch.len as u64;
+                slots[0] = u64::from(arch.offset);
+                slots[1] = u64::from(arch.len);
                 TAG_TEXT
             }
             Self::Bytes(ref b) => {
                 let arch = builder.write_bytes(b);
-                slots[0] = arch.offset as u64;
-                slots[1] = arch.len as u64;
+                slots[0] = u64::from(arch.offset);
+                slots[1] = u64::from(arch.len);
                 TAG_BYTES
             }
         };
@@ -415,7 +415,7 @@ impl ArchivedPropertyValue {
             TAG_UINT64 => PropertyValueRef::UInt64(self.slots[0]),
             TAG_FLOAT64 => PropertyValueRef::Float64(f64::from_bits(self.slots[0])),
             TAG_INT128 => {
-                let u = (self.slots[0] as u128) | ((self.slots[1] as u128) << 64);
+                let u = u128::from(self.slots[0]) | (u128::from(self.slots[1]) << 64);
                 PropertyValueRef::Int128(u as i128)
             }
             TAG_TIMESTAMP_NS => PropertyValueRef::TimestampNs(self.slots[0] as i64),

@@ -264,7 +264,7 @@ impl<A: Copy> ArchivedSlice<A> {
         // SAFETY: `validate` verified alignment and bounds of `start..start + len * size_of::<A>()`
         // inside the 64-byte-aligned payload buffer.
         unsafe {
-            let ptr = payload.as_ptr().add(start) as *const A;
+            let ptr = payload.as_ptr().add(start).cast::<A>();
             core::slice::from_raw_parts(ptr, self.len as usize)
         }
     }
@@ -362,7 +362,7 @@ impl<'a> ArchiveBuilder<'a> {
         let byte_len = core::mem::size_of_val(items);
         // SAFETY: `A: Copy` is written into a properly aligned region of the same endianness.
         let raw_bytes =
-            unsafe { core::slice::from_raw_parts(items.as_ptr() as *const u8, byte_len) };
+            unsafe { core::slice::from_raw_parts(items.as_ptr().cast::<u8>(), byte_len) };
         let abs_off = self.buf.extend_from_slice(raw_bytes);
         let rel_off = (abs_off - self.payload_base) as u32;
         ArchivedSlice {
@@ -378,7 +378,7 @@ impl<'a> ArchiveBuilder<'a> {
         self.buf.align_to(align);
         let size = core::mem::size_of::<R>();
         // SAFETY: `R: Copy` is a `#[repr(C)]` archived root struct.
-        let raw_bytes = unsafe { core::slice::from_raw_parts(root as *const R as *const u8, size) };
+        let raw_bytes = unsafe { core::slice::from_raw_parts((root as *const R).cast::<u8>(), size) };
         let abs_off = self.buf.extend_from_slice(raw_bytes);
         (abs_off - self.payload_base) as u32
     }
@@ -695,7 +695,7 @@ impl RecordCodec {
             ));
         }
         // SAFETY: Bounds and alignment of `root_off..root_end` within `payload` were just verified.
-        let root_ref = unsafe { &*(payload.as_ptr().add(root_off) as *const T::Archived) };
+        let root_ref = unsafe { &*payload.as_ptr().add(root_off).cast::<T::Archived>() };
         T::validate_archived(root_ref, payload)
     }
 
@@ -727,7 +727,7 @@ impl RecordCodec {
             let aligned = AlignedBytes::copy_from_slice(&decompressed);
             let slice = aligned.as_slice();
             // SAFETY: Validated in `validate_frame`.
-            let root = unsafe { &*(slice.as_ptr().add(hdr.root_offset as usize) as *const T::Archived) };
+            let root = unsafe { &*slice.as_ptr().add(hdr.root_offset as usize).cast::<T::Archived>() };
             let owned = T::unarchive(root, slice)?;
             Ok((hdr, owned))
         } else {
@@ -750,7 +750,7 @@ impl RecordCodec {
             let header = RecordHeader::from_aligned_unchecked(frame);
             let payload_end = HEADER_SIZE + (header.payload_len as usize);
             let payload = frame.get_unchecked(HEADER_SIZE..payload_end);
-            let root = &*(payload.as_ptr().add(header.root_offset as usize) as *const T::Archived);
+            let root = &*payload.as_ptr().add(header.root_offset as usize).cast::<T::Archived>();
             RecordView {
                 header,
                 payload,

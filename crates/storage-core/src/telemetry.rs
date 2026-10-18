@@ -51,11 +51,7 @@ impl LatencyHistogram {
     #[inline]
     pub fn mean_ns(&self) -> u64 {
         let c = self.total_samples();
-        if c == 0 {
-            0
-        } else {
-            self.sum_ns.load(Ordering::Relaxed) / c
-        }
+        self.sum_ns.load(Ordering::Relaxed).checked_div(c).unwrap_or(0)
     }
 
     /// Estimates the latency in nanoseconds at `quantile` (e.g., `0.50`, `0.99`, `0.999`).

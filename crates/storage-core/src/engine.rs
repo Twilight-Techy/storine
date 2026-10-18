@@ -37,10 +37,11 @@ use crate::write_queue::{MultiRecordLockGuard, StripedLockTable};
 use storage_wal::WalEntry;
 
 /// Physical on-disk storage layout strategy (`F-CORE-04`, `F-CORE-05`, `F-CORE-06`, `F-CONC-05`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum StorageLayoutMode {
     /// Each record is stored in its own sharded `.rec` file (with optional parent folder grouping)
     /// and updated via atomic `.tmp` + rename replacement.
+    #[default]
     DedicatedFiles,
     /// Each record file pre-allocates 2 slots (`[Slot 0 | Slot 1]`) of `slot_stride` bytes and alternates
     /// between them without temporary files or directory rename syscalls.
@@ -53,11 +54,6 @@ pub enum StorageLayoutMode {
     },
 }
 
-impl Default for StorageLayoutMode {
-    fn default() -> Self {
-        Self::DedicatedFiles
-    }
-}
 
 /// Configuration for `StorageEngine<T>`.
 #[derive(Clone, Debug)]
@@ -1046,11 +1042,10 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         let entries = self.inner.primary.entries_snapshot();
         let mut expired_count = 0usize;
         for entry in entries {
-            if entry.ttl_expires_at_ns > 0 && now_ns >= entry.ttl_expires_at_ns {
-                if self.delete(entry.id)? {
+            if entry.ttl_expires_at_ns > 0 && now_ns >= entry.ttl_expires_at_ns
+                && self.delete(entry.id)? {
                     expired_count += 1;
                 }
-            }
         }
         Ok(expired_count)
     }

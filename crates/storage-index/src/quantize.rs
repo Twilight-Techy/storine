@@ -87,7 +87,7 @@ impl QuantizedVecSq8 {
     pub fn dequantize(&self) -> Vec<f32> {
         self.codes
             .iter()
-            .map(|&q| self.offset + self.scale * (q as f32))
+            .map(|&q| self.offset + self.scale * f32::from(q))
             .collect()
     }
 

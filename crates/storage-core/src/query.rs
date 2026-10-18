@@ -67,6 +67,7 @@ pub struct QueryBuilder<'a, T: ZeroCopyRecord + Indexable> {
     range_predicates: [(u16, RangeInclusive<i64>); 4],
     extra_include_bm: Option<CompressedBitmap>,
     extra_exclude_bm: Option<CompressedBitmap>,
+    #[allow(clippy::type_complexity)]
     view_predicate: Option<Box<dyn Fn(&RecordView<'_, T>) -> bool + 'a>>,
     order: SortOrder,
     offset: usize,
@@ -562,10 +563,7 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
             let Some(id) = self.engine.primary_index().resolve_ordinal(ord) else {
                 return false;
             };
-            match self.engine.with_ref(id, |view| pred(&view)) {
-                Ok(matched) => matched,
-                Err(_) => false,
-            }
+            self.engine.with_ref(id, |view| pred(&view)).unwrap_or_default()
         } else {
             true
         }
@@ -627,7 +625,7 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
                 Some(prev) => prev.intersect(&r_bm),
                 None => r_bm,
             });
-            if candidate_bm.as_ref().map_or(false, |b| b.is_empty()) {
+            if candidate_bm.as_ref().is_some_and(|b| b.is_empty()) {
                 return Vec::new();
             }
         }
@@ -665,6 +663,7 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
 
         // Stack-build slice references for any_tag_clauses
         let mut any_groups: [(u16, &[InlineId]); 2] = [(0, &[]), (0, &[])];
+        #[allow(clippy::needless_range_loop)]
         for i in 0..self.any_tag_len {
             let c = &self.any_tag_clauses[i];
             if c.len == 0 {
@@ -755,7 +754,7 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
                 Some(prev) => prev.intersect(&bm),
                 None => bm,
             });
-            if candidate_bm.as_ref().map_or(false, |b| b.is_empty()) {
+            if candidate_bm.as_ref().is_some_and(|b| b.is_empty()) {
                 return (Vec::new(), 0);
             }
         }
@@ -769,7 +768,7 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
                 Some(prev) => prev.intersect(&u_bm),
                 None => u_bm,
             });
-            if candidate_bm.as_ref().map_or(false, |b| b.is_empty()) {
+            if candidate_bm.as_ref().is_some_and(|b| b.is_empty()) {
                 return (Vec::new(), 0);
             }
         }
@@ -783,7 +782,7 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
                 Some(prev) => prev.intersect(&r_bm),
                 None => r_bm,
             });
-            if candidate_bm.as_ref().map_or(false, |b| b.is_empty()) {
+            if candidate_bm.as_ref().is_some_and(|b| b.is_empty()) {
                 return (Vec::new(), 0);
             }
         }

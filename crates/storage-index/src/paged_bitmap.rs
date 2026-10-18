@@ -413,8 +413,8 @@ impl SplitBlockBloomFilter {
         let h = id.fast_hash();
         let block_idx = ((h >> 32) as usize) & (self.blocks.len() - 1);
         let block = &mut self.blocks[block_idx];
-        for i in 0..8 {
-            let bit = ((h.wrapping_mul(BLOOM_SALTS[i])) >> 58) as u32;
+        for (i, &salt) in BLOOM_SALTS.iter().enumerate() {
+            let bit = ((h.wrapping_mul(salt)) >> 58) as u32;
             block.words[i] |= 1u64 << bit;
         }
     }
@@ -428,8 +428,8 @@ impl SplitBlockBloomFilter {
         let h = id.fast_hash();
         let block_idx = ((h >> 32) as usize) & (self.blocks.len() - 1);
         let block = &self.blocks[block_idx];
-        for i in 0..8 {
-            let bit = ((h.wrapping_mul(BLOOM_SALTS[i])) >> 58) as u32;
+        for (i, &salt) in BLOOM_SALTS.iter().enumerate() {
+            let bit = ((h.wrapping_mul(salt)) >> 58) as u32;
             if (block.words[i] & (1u64 << bit)) == 0 {
                 return false;
             }

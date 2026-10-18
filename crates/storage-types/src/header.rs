@@ -269,7 +269,7 @@ impl RecordHeader {
         debug_assert!(bytes.len() >= HEADER_SIZE);
         debug_assert!((bytes.as_ptr() as usize) & (HEADER_SIZE - 1) == 0);
         // SAFETY: Caller guarantees 64-byte alignment and length >= 64 on a verified buffer.
-        unsafe { &*(bytes.as_ptr() as *const Self) }
+        unsafe { &*bytes.as_ptr().cast::<Self>() }
     }
 }
 

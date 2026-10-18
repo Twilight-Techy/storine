@@ -13,6 +13,7 @@ pub struct VectorTopKHit {
 /// Computes the dot product of two `f32` slices using 8-way unrolled accumulators
 /// that auto-vectorize cleanly to AVX2 / AVX-512 / NEON instructions under `target-cpu=native`.
 #[inline]
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub fn dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len().min(b.len());
     let a = &a[..n];
@@ -50,6 +51,7 @@ pub fn dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
 
 /// Computes the cosine similarity in `[-1.0, 1.0]` between `a` and `b` in a single 4-way unrolled pass.
 #[inline]
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len().min(b.len());
     if n == 0 {
