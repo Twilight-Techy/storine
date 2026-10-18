@@ -156,9 +156,10 @@ impl MmapRegion {
     #[cfg(windows)]
     fn platform_advise(&self, offset: usize, len: usize, advice: Advice) {
         if advice == Advice::WillNeed {
-            // SAFETY: `self.ptr.as_ptr().add(offset)` is within `0..self.len`.
+            // SAFETY: `offset` was bounds-checked by caller; `self.ptr.as_ptr().add(offset)` stays within `0..self.len`.
+            let va = unsafe { self.ptr.as_ptr().add(offset) as *const core::ffi::c_void };
             let entry = Win32MemoryRangeEntry {
-                virtual_address: unsafe { self.ptr.as_ptr().add(offset) as *const core::ffi::c_void },
+                virtual_address: va,
                 number_of_bytes: len,
             };
             // SAFETY: `GetCurrentProcess()` returns the pseudo-handle `-1`, and `entry` points to

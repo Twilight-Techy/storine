@@ -731,6 +731,7 @@ impl RecordCodec {
             let owned = T::unarchive(root, slice)?;
             Ok((hdr, owned))
         } else {
+            // SAFETY: `validate_frame::<T>` succeeded above, satisfying `decode_unchecked` preconditions.
             let view = unsafe { Self::decode_unchecked::<T>(frame) };
             let owned = view.to_owned_record()?;
             Ok((hdr, owned))

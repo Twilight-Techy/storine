@@ -967,6 +967,15 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
                 return ConnStep::Progress;
             };
             let dest_path = Path::new(dest_path_str);
+            // SECURITY: Reject path traversal attempts (`RULE-SAFE-01`).
+            // Disallow `..` components and paths that could escape the expected backup directory.
+            let has_traversal = dest_path.components().any(|c| {
+                matches!(c, std::path::Component::ParentDir)
+            });
+            if has_traversal {
+                let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"backup path must not contain '..' components");
+                return ConnStep::Progress;
+            }
             match create_online_backup(engine, dest_path) {
                 Ok(manifest) => {
                     let msg = format!(

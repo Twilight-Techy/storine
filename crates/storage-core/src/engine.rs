@@ -606,6 +606,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                 // SAFETY: `dirty` was produced by `RecordCodec::encode_aligned` and is 64B-aligned.
                 let hdr = unsafe { RecordHeader::from_aligned_unchecked(slice) };
                 if !hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4) {
+                    // SAFETY: `dirty` was produced by `encode_aligned`; header validated above.
                     let view = unsafe { RecordCodec::decode_unchecked::<T>(slice) };
                     let cb = f_opt.take().expect("f_opt consumed once");
                     return Some(Ok(cb(view)));
@@ -1727,6 +1728,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             // SAFETY: `frame` is 64B-aligned and already validated for `T`.
             let hdr = unsafe { RecordHeader::from_aligned_unchecked(frame) };
             if !hdr.is_tombstone() && !hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4) {
+                // SAFETY: `already_verified` guarantees `frame` passed `validate_frame::<T>`.
                 let view = unsafe { RecordCodec::decode_unchecked::<T>(frame) };
                 return T::extract_archived_snapshot(view.archived(), view.payload());
             }
@@ -1757,9 +1759,10 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         };
         let (ver, owned) = if let Some(ref dirty) = entry.hot_dirty {
             let slice = dirty.as_slice();
+            // SAFETY: `dirty` was produced by `encode_aligned` and is 64B-aligned.
             let hdr = unsafe { RecordHeader::from_aligned_unchecked(slice) };
             if !hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4) {
-                // Fast path: `dirty` was encoded in memory at `T::SCHEMA_VERSION` and is 64B-aligned
+                // SAFETY: `dirty` was encoded in memory by `encode_aligned` at `T::SCHEMA_VERSION`; 64B-aligned.
                 let view = unsafe { RecordCodec::decode_unchecked::<T>(slice) };
                 (entry.version, view.to_owned_record()?)
             } else {

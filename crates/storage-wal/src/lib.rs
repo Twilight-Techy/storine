@@ -275,7 +275,7 @@ impl GroupCommitWal {
             if !guard.flushing {
                 // Become the Group-Commit Leader for all currently queued writers
                 guard.flushing = true;
-                let drained: Vec<PendingBatchItem> = guard.queue.drain(..).collect();
+                let drained: Vec<PendingBatchItem> = std::mem::take(&mut guard.queue);
                 let max_lsn = drained
                     .iter()
                     .map(|it| it.assigned_lsn)
