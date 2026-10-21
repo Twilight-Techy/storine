@@ -1,8 +1,14 @@
 //! Zero-copy relative-offset archive system (`TASK-006`, `F-CORE-01`, `F-DURA-05`, `RULE-SAFE-04`).
 //!
-//! Provides `ZeroCopyRecord`, `ArchivedString`, `ArchivedBytes`, `ArchivedSlice<T>`, and
-//! `ArchivedOption<T>` so on-disk `.rec` / `.seg` memory-mapped bytes can be dereferenced
-//! directly as `&T::Archived` with **zero heap allocations** and **zero copies**.
+//! Provides `ZeroCopyRecord`, `ArchivedString`, `ArchivedBytes`, and `ArchivedSlice<T>` so
+//! on-disk `.rec` / `.seg` memory-mapped bytes can be dereferenced directly as `&T::Archived`
+//! with **zero heap allocations** and **zero copies**.
+//!
+//! Soundness model: every type that is reinterpreted from raw bytes must implement the
+//! `unsafe` marker trait [`ArchivePod`] (any bit pattern valid, no padding, no pointers).
+//! All safe accessors (`as_str`, `as_slice`, ...) are bounds-checked, so they never cause
+//! Undefined Behavior even on unvalidated or corrupted payloads; validation (`validate`) is
+//! what guarantees that they return the *intended* data.
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -14,8 +20,81 @@ use crate::checksum::checksum_payload;
 use crate::compress::{compress_lz4, decompress_lz4};
 use crate::scratch::{with_thread_scratch, AlignedBytes, AlignedScratchBuf};
 
+/// Marker for plain-old-data types that may be reinterpreted directly from archived bytes.
+///
+/// # Safety
+/// Implementors must guarantee that:
+/// - every possible bit pattern of `size_of::<Self>()` bytes is a valid value of `Self`
+///   (so no `bool`, `char`, enums, references, or `NonNull`/`NonZero*` fields);
+/// - the type has no padding bytes (they would be read as uninitialized memory when archiving);
+/// - the type has a stable layout (`#[repr(C)]` / `#[repr(transparent)]` or a primitive);
+/// - the type contains no pointers or interior mutability.
+pub unsafe trait ArchivePod: Copy + Send + Sync + 'static {
+    /// Returns the all-zero value (valid for every `ArchivePod` type by its contract).
+    #[inline]
+    fn zeroed() -> Self {
+        // SAFETY: `ArchivePod` guarantees every bit pattern, including all zeros, is valid.
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+/// Safely implements [`ArchivePod`] for a plain struct by proving its contract at compile time,
+/// so record crates can stay `#![forbid(unsafe_code)]`:
+///
+/// - every listed field has exactly the listed type (type-checked against the real field),
+/// - every field type is itself `ArchivePod`,
+/// - fields are laid out back-to-back in the listed order starting at offset 0 and the struct
+///   size equals the sum of the field sizes (so there is no padding anywhere).
+///
+/// All fields must be listed, in declaration order:
+/// `impl_archive_pod!(ArchivedUser { id: InlineId, score: i64, name: ArchivedString });`
+#[macro_export]
+macro_rules! impl_archive_pod {
+    ($ty:ty { $($field:ident : $fty:ty),+ $(,)? }) => {
+        const _: () = {
+            let mut expected = 0usize;
+            $(
+                assert!(
+                    ::core::mem::offset_of!($ty, $field) == expected,
+                    "impl_archive_pod!: padding or reordered field before this field"
+                );
+                expected += ::core::mem::size_of::<$fty>();
+            )+
+            assert!(
+                ::core::mem::size_of::<$ty>() == expected,
+                "impl_archive_pod!: trailing padding or unlisted fields"
+            );
+        };
+        const _: fn(&$ty) = |v: &$ty| {
+            fn assert_pod<P: $crate::ArchivePod>(_: &P) {}
+            $( assert_pod::<$fty>(&v.$field); )+
+        };
+        // SAFETY: the compile-time checks above prove the struct consists solely of the listed
+        // `ArchivePod` fields packed without padding, so every bit pattern is a valid value.
+        unsafe impl $crate::ArchivePod for $ty {}
+    };
+}
+
+macro_rules! impl_archive_pod_primitive {
+    ($($t:ty),* $(,)?) => {
+        $(
+            // SAFETY: primitive integer / float types accept every bit pattern and have no padding.
+            unsafe impl ArchivePod for $t {}
+        )*
+    };
+}
+impl_archive_pod_primitive!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64);
+
+// SAFETY: an array of pod elements has no padding between elements and accepts any bit pattern.
+unsafe impl<A: ArchivePod, const N: usize> ArchivePod for [A; N] {}
+
+// SAFETY: `InlineId` is `#[repr(C, align(8))]` with a `u8` + `[u8; 23]` (24 bytes, no padding);
+// every accessor tolerates arbitrary bytes (lengths are clamped and UTF-8 is re-checked).
+unsafe impl ArchivePod for InlineId {}
+
 /// Relative-offset UTF-8 string stored inside an archived payload (`8 bytes`, `#[repr(C)]`).
-/// Resolves to `&str` in 1 instruction directly from the `mmap` page with zero heap allocation.
+/// Resolves to `&str` directly from the `mmap` page with zero heap allocation (bounds plus an
+/// ASCII / UTF-8 check per call, so hostile bytes can never produce an invalid `&str`).
 #[repr(C, align(4))]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct ArchivedString {
@@ -58,21 +137,27 @@ impl ArchivedString {
         Ok(())
     }
 
-    /// Zero-copy string access on a verified payload buffer (`0` allocations, bounds-checked safe slice).
+    /// Zero-copy string access (`0` allocations).
+    ///
+    /// Bounds and UTF-8 are checked on every call, so this is safe on any payload; it returns
+    /// `""` when the reference is out of bounds or not valid UTF-8 (both rejected by `validate`).
     #[inline]
     pub fn as_str<'a>(&self, payload: &'a [u8]) -> &'a str {
         if self.len == 0 {
             return "";
         }
         let start = self.offset as usize;
-        let end = start + (self.len as usize);
-        debug_assert!(end <= payload.len());
-        // SAFETY: `ArchivedString::validate` is executed once upon mapping/loading before any
-        // `RecordView` is constructed, proving both slice bounds and UTF-8 validity.
-        unsafe {
-            let bytes = payload.get_unchecked(start..end);
-            core::str::from_utf8_unchecked(bytes)
+        let Some(end) = start.checked_add(self.len as usize) else {
+            return "";
+        };
+        let Some(bytes) = payload.get(start..end) else {
+            return "";
+        };
+        if is_ascii_fast(bytes) {
+            // SAFETY: ASCII bytes (all `< 0x80`, checked word-at-a-time above) are valid UTF-8.
+            return unsafe { core::str::from_utf8_unchecked(bytes) };
         }
+        core::str::from_utf8(bytes).unwrap_or("")
     }
 
     /// Zero-copy equality check against `expected` (`TASK-057`).
@@ -155,16 +240,17 @@ impl ArchivedBytes {
         Ok(())
     }
 
+    /// Zero-copy byte access; returns `&[]` when the reference is out of bounds.
     #[inline]
     pub fn as_slice<'a>(&self, payload: &'a [u8]) -> &'a [u8] {
         if self.len == 0 {
             return &[];
         }
         let start = self.offset as usize;
-        let end = start + (self.len as usize);
-        debug_assert!(end <= payload.len());
-        // SAFETY: Validated once during archive verification (`ArchivedBytes::validate`).
-        unsafe { payload.get_unchecked(start..end) }
+        let Some(end) = start.checked_add(self.len as usize) else {
+            return &[];
+        };
+        payload.get(start..end).unwrap_or(&[])
     }
 }
 
@@ -203,7 +289,14 @@ impl<A> fmt::Debug for ArchivedSlice<A> {
     }
 }
 
-impl<A: Copy> ArchivedSlice<A> {
+// SAFETY: `ArchivedString` is two `u32`s (8 bytes, no padding); every bit pattern is valid.
+unsafe impl ArchivePod for ArchivedString {}
+// SAFETY: `ArchivedBytes` is two `u32`s (8 bytes, no padding); every bit pattern is valid.
+unsafe impl ArchivePod for ArchivedBytes {}
+// SAFETY: `ArchivedSlice` is two `u32`s plus a zero-sized marker (8 bytes, no padding).
+unsafe impl<A: ArchivePod> ArchivePod for ArchivedSlice<A> {}
+
+impl<A: ArchivePod> ArchivedSlice<A> {
     pub const EMPTY: Self = Self {
         offset: 0,
         len: 0,
@@ -253,62 +346,31 @@ impl<A: Copy> ArchivedSlice<A> {
         Ok(())
     }
 
-    /// Returns a zero-copy slice `&'a [A]` pointing directly into the verified `payload`.
+    /// Returns a zero-copy slice `&'a [A]` pointing directly into `payload`.
+    ///
+    /// Bounds and alignment are checked on every call (a few integer ops), returning `&[]`
+    /// when they do not hold, so this is safe even on unvalidated payloads.
     #[inline]
     pub fn as_slice<'a>(&self, payload: &'a [u8]) -> &'a [A] {
         if self.len == 0 {
             return &[];
         }
         let start = self.offset as usize;
-        debug_assert!(start + (self.len as usize) * core::mem::size_of::<A>() <= payload.len());
-        // SAFETY: `validate` verified alignment and bounds of `start..start + len * size_of::<A>()`
-        // inside the 64-byte-aligned payload buffer.
-        unsafe {
-            let ptr = payload.as_ptr().add(start).cast::<A>();
-            core::slice::from_raw_parts(ptr, self.len as usize)
+        let Some(byte_len) = (self.len as usize).checked_mul(core::mem::size_of::<A>()) else {
+            return &[];
+        };
+        let Some(end) = start.checked_add(byte_len) else {
+            return &[];
+        };
+        let Some(bytes) = payload.get(start..end) else {
+            return &[];
+        };
+        if (bytes.as_ptr() as usize) & (core::mem::align_of::<A>() - 1) != 0 {
+            return &[];
         }
-    }
-}
-
-/// Fixed-layout `#[repr(C)]` optional value for zero-copy archived structs.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct ArchivedOption<A> {
-    pub is_some: u8,
-    pub value: A,
-}
-
-impl<A: Copy + Default> ArchivedOption<A> {
-    #[inline]
-    pub fn from_option(opt: Option<A>) -> Self {
-        match opt {
-            Some(v) => Self {
-                is_some: 1,
-                value: v,
-            },
-            None => Self {
-                is_some: 0,
-                value: A::default(),
-            },
-        }
-    }
-
-    #[inline]
-    pub const fn as_option(&self) -> Option<&A> {
-        if self.is_some != 0 {
-            Some(&self.value)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    pub const fn to_option(self) -> Option<A> {
-        if self.is_some != 0 {
-            Some(self.value)
-        } else {
-            None
-        }
+        // SAFETY: `bytes` covers exactly `len * size_of::<A>()` in-bounds bytes, its start is
+        // aligned for `A` (checked above), and `A: ArchivePod` accepts every bit pattern.
+        unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast::<A>(), self.len as usize) }
     }
 }
 
@@ -353,14 +415,14 @@ impl<'a> ArchiveBuilder<'a> {
     }
 
     #[inline]
-    pub fn write_slice<A: Copy>(&mut self, items: &[A]) -> ArchivedSlice<A> {
+    pub fn write_slice<A: ArchivePod>(&mut self, items: &[A]) -> ArchivedSlice<A> {
         if items.is_empty() {
             return ArchivedSlice::EMPTY;
         }
         let align = core::mem::align_of::<A>();
         self.buf.align_to(align);
         let byte_len = core::mem::size_of_val(items);
-        // SAFETY: `A: Copy` is written into a properly aligned region of the same endianness.
+        // SAFETY: `A: ArchivePod` has no padding, so all `byte_len` bytes are initialized.
         let raw_bytes =
             unsafe { core::slice::from_raw_parts(items.as_ptr().cast::<u8>(), byte_len) };
         let abs_off = self.buf.extend_from_slice(raw_bytes);
@@ -373,11 +435,11 @@ impl<'a> ArchiveBuilder<'a> {
     }
 
     #[inline]
-    pub fn write_root<R: Copy>(&mut self, root: &R) -> u32 {
+    pub fn write_root<R: ArchivePod>(&mut self, root: &R) -> u32 {
         let align = core::mem::align_of::<R>().max(8);
         self.buf.align_to(align);
         let size = core::mem::size_of::<R>();
-        // SAFETY: `R: Copy` is a `#[repr(C)]` archived root struct.
+        // SAFETY: `R: ArchivePod` has no padding, so all `size` bytes are initialized.
         let raw_bytes = unsafe { core::slice::from_raw_parts((root as *const R).cast::<u8>(), size) };
         let abs_off = self.buf.extend_from_slice(raw_bytes);
         (abs_off - self.payload_base) as u32
@@ -391,7 +453,9 @@ impl<'a> ArchiveBuilder<'a> {
 /// from `mmap` pages without heap allocations).
 pub trait ZeroCopyRecord: Sized + Clone + Send + Sync + 'static {
     /// Fixed-size `#[repr(C)]` archived root representation mapped directly in virtual memory.
-    type Archived: Copy + fmt::Debug + Send + Sync + 'static;
+    ///
+    /// Must implement [`ArchivePod`] (stable layout, no padding, every bit pattern valid).
+    type Archived: ArchivePod + fmt::Debug;
 
     /// Current schema version of this record type.
     const SCHEMA_VERSION: u16 = 1;
@@ -493,7 +557,7 @@ impl<'a, T: ZeroCopyRecord> RecordView<'a, T> {
 
     /// Resolves an `ArchivedSlice<A>` field directly to `&'a [A]` with zero allocation.
     #[inline]
-    pub fn get_slice<A: Copy>(&self, field: &ArchivedSlice<A>) -> &'a [A] {
+    pub fn get_slice<A: ArchivePod>(&self, field: &ArchivedSlice<A>) -> &'a [A] {
         field.as_slice(self.payload)
     }
 
@@ -621,14 +685,27 @@ impl RecordCodec {
     ///
     /// Called once when a `.rec` or `.seg` region is first mapped from disk.
     pub fn validate_frame<T: ZeroCopyRecord>(frame: &[u8]) -> Result<RecordHeader> {
+        Self::validate_frame_inner::<T>(frame).map(|(hdr, _)| hdr)
+    }
+
+    /// [`Self::validate_frame`] that also returns the 64-byte-aligned decompressed payload of a
+    /// compressed frame, so callers decode the exact buffer that was validated (and decompress once).
+    fn validate_frame_inner<T: ZeroCopyRecord>(
+        frame: &[u8],
+    ) -> Result<(RecordHeader, Option<AlignedBytes>)> {
         if ((frame.as_ptr() as usize) & (HEADER_SIZE - 1)) != 0 {
             return Err(StorageError::corrupted_header(
                 "record frame buffer is not 64-byte aligned",
             ));
         }
         let hdr = RecordHeader::from_slice_verified(frame)?;
+        if hdr.flags_typed().contains(RecordFlags::ENCRYPTED) {
+            return Err(StorageError::invalid_archive(
+                "encrypted frame must be decrypted (RecordCodec::decrypt_frame) before decoding",
+            ));
+        }
         if hdr.is_tombstone() {
-            return Ok(hdr);
+            return Ok((hdr, None));
         }
         if hdr.collection_id != T::COLLECTION_ID {
             return Err(StorageError::invalid_archive(
@@ -658,12 +735,13 @@ impl RecordCodec {
 
         if hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4) {
             let decompressed = decompress_lz4(payload, hdr.uncompressed_len as usize)?;
-            let aligned = AlignedBytes::copy_from_slice(&decompressed);
+            let aligned = AlignedBytes::try_copy_from_slice(&decompressed)?;
             Self::validate_payload_layout::<T>(aligned.as_slice(), hdr.root_offset)?;
+            Ok((hdr, Some(aligned)))
         } else {
             Self::validate_payload_layout::<T>(payload, hdr.root_offset)?;
+            Ok((hdr, None))
         }
-        Ok(hdr)
     }
 
     #[inline]
@@ -694,7 +772,8 @@ impl RecordCodec {
                 "runtime address of T::Archived is unaligned",
             ));
         }
-        // SAFETY: Bounds and alignment of `root_off..root_end` within `payload` were just verified.
+        // SAFETY: Bounds and alignment of `root_off..root_end` within `payload` were just verified,
+        // and `T::Archived: ArchivePod` accepts any bit pattern.
         let root_ref = unsafe { &*payload.as_ptr().add(root_off).cast::<T::Archived>() };
         T::validate_archived(root_ref, payload)
     }
@@ -720,21 +799,234 @@ impl RecordCodec {
 
     /// Decompresses or decodes any frame (including cold LZ4-compressed frames) into an owned `T`.
     pub fn decode_owned<T: ZeroCopyRecord>(frame: &[u8]) -> Result<(RecordHeader, T)> {
-        let hdr = Self::validate_frame::<T>(frame)?;
-        let payload = &frame[HEADER_SIZE..HEADER_SIZE + (hdr.payload_len as usize)];
-        if hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4) {
-            let decompressed = decompress_lz4(payload, hdr.uncompressed_len as usize)?;
-            let aligned = AlignedBytes::copy_from_slice(&decompressed);
-            let slice = aligned.as_slice();
-            // SAFETY: Validated in `validate_frame`.
-            let root = unsafe { &*slice.as_ptr().add(hdr.root_offset as usize).cast::<T::Archived>() };
-            let owned = T::unarchive(root, slice)?;
-            Ok((hdr, owned))
-        } else {
-            // SAFETY: `validate_frame::<T>` succeeded above, satisfying `decode_unchecked` preconditions.
-            let view = unsafe { Self::decode_unchecked::<T>(frame) };
-            let owned = view.to_owned_record()?;
-            Ok((hdr, owned))
+        let (hdr, decompressed) = Self::validate_frame_inner::<T>(frame)?;
+        if hdr.is_tombstone() {
+            return Err(StorageError::corrupted_header(
+                "cannot decode tombstone frame as active record",
+            ));
+        }
+        let owned = match decompressed {
+            Some(aligned) => {
+                let slice = aligned.as_slice();
+                let root = Self::checked_root::<T>(slice, hdr.root_offset)?;
+                T::unarchive(root, slice)?
+            }
+            None => Self::decode_fast::<T>(frame)?.to_owned_record()?,
+        };
+        Ok((hdr, owned))
+    }
+
+    /// Bounds- and alignment-checked `&T::Archived` at `root_offset` inside `payload`.
+    #[inline]
+    fn checked_root<T: ZeroCopyRecord>(payload: &[u8], root_offset: u32) -> Result<&T::Archived> {
+        let root_off = root_offset as usize;
+        let root_bytes = root_off
+            .checked_add(core::mem::size_of::<T::Archived>())
+            .and_then(|end| payload.get(root_off..end))
+            .ok_or_else(|| StorageError::invalid_archive("T::Archived extends past payload end"))?;
+        if (root_bytes.as_ptr() as usize) & (core::mem::align_of::<T::Archived>() - 1) != 0 {
+            return Err(StorageError::invalid_archive(
+                "runtime address of T::Archived is unaligned",
+            ));
+        }
+        // SAFETY: `root_bytes` covers exactly `size_of::<T::Archived>()` in-bounds bytes at an
+        // address aligned for `T::Archived`, and `T::Archived: ArchivePod` accepts any bit pattern.
+        Ok(unsafe { &*root_bytes.as_ptr().cast::<T::Archived>() })
+    }
+
+    /// Returns a reference to the 64-byte header at the start of `frame`.
+    ///
+    /// Checks length and 64-byte alignment only (O(1)); the header checksum is NOT verified.
+    #[inline]
+    pub fn header_ref(frame: &[u8]) -> Result<&RecordHeader> {
+        if frame.len() < HEADER_SIZE || (frame.as_ptr() as usize) & (HEADER_SIZE - 1) != 0 {
+            return Err(StorageError::corrupted_header(
+                "record frame shorter than 64 bytes or not 64-byte aligned",
+            ));
+        }
+        // SAFETY: `frame` holds at least 64 bytes at a 64-byte-aligned address, and
+        // `RecordHeader` is `#[repr(C, align(64))]` over integers only (64 bytes, no padding),
+        // so every bit pattern is a valid value.
+        Ok(unsafe { &*frame.as_ptr().cast::<RecordHeader>() })
+    }
+
+    /// Safe O(1) zero-copy decode for frames that were validated earlier (`RULE-SAFE-04`).
+    ///
+    /// Skips the payload checksum and `T::validate_archived` (done once by `validate_frame`),
+    /// but checks everything memory safety depends on: header alignment and length, payload
+    /// bounds, root bounds and alignment, collection/schema identity, and that the frame is not
+    /// compressed or a tombstone. Because `T::Archived: ArchivePod` and every archive accessor is
+    /// bounds-checked, a view over unexpected bytes can return wrong data but never cause UB.
+    #[inline]
+    pub fn decode_fast<T: ZeroCopyRecord>(frame: &[u8]) -> Result<RecordView<'_, T>> {
+        let header = Self::header_ref(frame)?;
+        // One mask test: tombstones, compressed and encrypted frames are not zero-copy readable.
+        if header.flags
+            & (RecordFlags::TOMBSTONE.0 | RecordFlags::COMPRESSED_LZ4.0 | RecordFlags::ENCRYPTED.0)
+            != 0
+        {
+            return Err(StorageError::invalid_archive(
+                "compressed, encrypted or tombstone record must be read via decode_owned",
+            ));
+        }
+        if header.collection_id != T::COLLECTION_ID || header.schema_version != T::SCHEMA_VERSION {
+            return Err(StorageError::SchemaVersionMismatch {
+                found: header.schema_version,
+                expected: T::SCHEMA_VERSION,
+            });
+        }
+        let payload = HEADER_SIZE
+            .checked_add(header.payload_len as usize)
+            .and_then(|end| frame.get(HEADER_SIZE..end))
+            .ok_or_else(|| StorageError::corrupted_header("frame truncated before payload_len"))?;
+        let root_off = header.root_offset as usize;
+        let root_bytes = root_off
+            .checked_add(core::mem::size_of::<T::Archived>())
+            .and_then(|end| payload.get(root_off..end))
+            .ok_or_else(|| StorageError::invalid_archive("T::Archived extends past payload end"))?;
+        if (root_bytes.as_ptr() as usize) & (core::mem::align_of::<T::Archived>() - 1) != 0 {
+            return Err(StorageError::invalid_archive(
+                "runtime address of T::Archived is unaligned",
+            ));
+        }
+        // SAFETY: `root_bytes` covers exactly `size_of::<T::Archived>()` in-bounds bytes at an
+        // address aligned for `T::Archived`, and `T::Archived: ArchivePod` accepts any bit pattern.
+        let root = unsafe { &*root_bytes.as_ptr().cast::<T::Archived>() };
+        Ok(RecordView {
+            header,
+            payload,
+            root,
+        })
+    }
+
+    /// Encrypts `frame` for record `id` at rest (`F-SEC-02`): the payload becomes
+    /// `[12 B nonce | ChaCha20 ciphertext | 16 B Poly1305 tag]`, the header gains
+    /// `RecordFlags::ENCRYPTED`, and the authenticated data binds the ciphertext to `id` and to
+    /// every header field that is not recomputed on decryption (schema, version, timestamps, TTL,
+    /// flags, root offset, lengths), so frames cannot be swapped between records or have their
+    /// metadata edited without detection.
+    pub fn encrypt_frame(
+        key: &crate::crypto::EncryptionKey,
+        id: InlineId,
+        frame: &[u8],
+    ) -> Result<AlignedBytes> {
+        let hdr = RecordHeader::from_slice_verified(frame)?;
+        if hdr.flags_typed().contains(RecordFlags::ENCRYPTED) {
+            return Err(StorageError::invalid_archive("frame is already encrypted"));
+        }
+        let payload = HEADER_SIZE
+            .checked_add(hdr.payload_len as usize)
+            .and_then(|end| frame.get(HEADER_SIZE..end))
+            .ok_or_else(|| StorageError::corrupted_header("frame truncated before payload_len"))?;
+        let aad = frame_aad(&hdr, id);
+        let sealed = crate::crypto::seal(key.bytes(), &aad, payload);
+        let sealed_len = u32::try_from(sealed.len())
+            .map_err(|_| StorageError::invalid_archive("encrypted payload exceeds u32"))?;
+        let enc_hdr = RecordHeader::new(
+            hdr.schema_version,
+            Version(hdr.record_version),
+            hdr.updated_at_ns,
+            checksum_payload(&sealed),
+            sealed_len,
+            hdr.uncompressed_len,
+            hdr.root_offset,
+            hdr.flags_typed().with(RecordFlags::ENCRYPTED),
+            hdr.collection_id,
+            hdr.ttl_expires_at_ns,
+        );
+        let mut out = Vec::new();
+        out.try_reserve_exact(HEADER_SIZE + sealed.len())
+            .map_err(|_| StorageError::resource_exhausted("heap memory (encrypted frame)"))?;
+        out.extend_from_slice(&enc_hdr.to_bytes());
+        out.extend_from_slice(&sealed);
+        AlignedBytes::try_copy_from_slice(&out)
+    }
+
+    /// Authenticates and decrypts a frame produced by [`Self::encrypt_frame`] for record `id`,
+    /// returning the original plaintext frame (validate it with [`Self::validate_frame`] before
+    /// zero-copy use). Fails on a wrong key, a wrong `id`, or any modified byte.
+    pub fn decrypt_frame(
+        key: &crate::crypto::EncryptionKey,
+        id: InlineId,
+        frame: &[u8],
+    ) -> Result<AlignedBytes> {
+        let hdr = RecordHeader::from_slice_verified(frame)?;
+        if !hdr.flags_typed().contains(RecordFlags::ENCRYPTED) {
+            return Err(StorageError::invalid_archive("frame is not encrypted"));
+        }
+        let sealed = HEADER_SIZE
+            .checked_add(hdr.payload_len as usize)
+            .and_then(|end| frame.get(HEADER_SIZE..end))
+            .ok_or_else(|| StorageError::corrupted_header("frame truncated before payload_len"))?;
+        let plain_flags = hdr.flags_typed().without(RecordFlags::ENCRYPTED);
+        let plain_hdr_for_aad = RecordHeader { flags: plain_flags.0, ..hdr };
+        let aad = frame_aad(&plain_hdr_for_aad, id);
+        let payload = crate::crypto::open(key.bytes(), &aad, sealed)?;
+        let payload_len = u32::try_from(payload.len())
+            .map_err(|_| StorageError::invalid_archive("decrypted payload exceeds u32"))?;
+        let plain_hdr = RecordHeader::new(
+            hdr.schema_version,
+            Version(hdr.record_version),
+            hdr.updated_at_ns,
+            checksum_payload(&payload),
+            payload_len,
+            hdr.uncompressed_len,
+            hdr.root_offset,
+            plain_flags,
+            hdr.collection_id,
+            hdr.ttl_expires_at_ns,
+        );
+        let mut out = Vec::new();
+        out.try_reserve_exact(HEADER_SIZE + payload.len())
+            .map_err(|_| StorageError::resource_exhausted("heap memory (decrypted frame)"))?;
+        out.extend_from_slice(&plain_hdr.to_bytes());
+        out.extend_from_slice(&payload);
+        AlignedBytes::try_copy_from_slice(&out)
+    }
+
+    /// `true` if `frame`'s header carries `RecordFlags::ENCRYPTED` (no other validation).
+    #[inline]
+    pub fn is_encrypted(frame: &[u8]) -> bool {
+        Self::header_ref(frame).is_ok_and(|h| h.flags_typed().contains(RecordFlags::ENCRYPTED))
+    }
+
+    /// Like [`Self::decode_fast`], but never fails: when `frame` does not decode (only possible if
+    /// previously validated bytes were modified underneath us), returns an all-zero view backed by
+    /// a shared static page (no per-call storage).
+    #[inline]
+    pub fn decode_fast_or<T: ZeroCopyRecord>(frame: &[u8]) -> RecordView<'_, T> {
+        match Self::decode_fast::<T>(frame) {
+            Ok(view) => view,
+            Err(_) => Self::zeroed_view::<T>(),
+        }
+    }
+
+    /// All-zero view over [`ZERO_PAGE`]: header bytes `0..64`, root at payload offset 0.
+    #[cold]
+    fn zeroed_view<T: ZeroCopyRecord>() -> RecordView<'static, T> {
+        const {
+            assert!(
+                core::mem::size_of::<T::Archived>() <= ZERO_PAGE_LEN - HEADER_SIZE
+                    && core::mem::align_of::<T::Archived>() <= HEADER_SIZE,
+                "T::Archived must fit in ZERO_PAGE (<= 4032 bytes, align <= 64)"
+            );
+        }
+        let page: &'static [u8] = &ZERO_PAGE.0;
+        let root_bytes = &page[HEADER_SIZE..HEADER_SIZE + core::mem::size_of::<T::Archived>()];
+        // SAFETY: `ZERO_PAGE` is 64-byte aligned and 4096 bytes long, so bytes `0..64` are a
+        // 64-aligned `RecordHeader` and `root_bytes` (offset 64, at most 4032 bytes, alignment
+        // <= 64 by the const assertion) is in bounds and aligned for `T::Archived`. Both types
+        // are plain-old-data for which all-zero bytes are a valid value.
+        let (header, root) = unsafe {
+            (
+                &*page.as_ptr().cast::<RecordHeader>(),
+                &*root_bytes.as_ptr().cast::<T::Archived>(),
+            )
+        };
+        RecordView {
+            header,
+            payload: &[],
+            root,
         }
     }
 
@@ -747,7 +1039,7 @@ impl RecordCodec {
     pub unsafe fn decode_unchecked<T: ZeroCopyRecord>(frame: &[u8]) -> RecordView<'_, T> {
         // SAFETY: Caller guarantees `frame` passed `validate_frame::<T>`.
         unsafe {
-            let header = RecordHeader::from_aligned_unchecked(frame);
+            let header = &*frame.as_ptr().cast::<RecordHeader>();
             let payload_end = HEADER_SIZE + (header.payload_len as usize);
             let payload = frame.get_unchecked(HEADER_SIZE..payload_end);
             let root = &*payload.as_ptr().add(header.root_offset as usize).cast::<T::Archived>();
@@ -758,6 +1050,58 @@ impl RecordCodec {
             }
         }
     }
+}
+
+/// Authenticated data of an encrypted frame: the record id plus every plaintext-frame header
+/// field that decryption does not recompute (`flags` must be the plaintext flags).
+fn frame_aad(hdr: &RecordHeader, id: InlineId) -> [u8; 62] {
+    let mut aad = [0u8; 62];
+    aad[0..24].copy_from_slice(&id.to_raw_bytes());
+    aad[24..26].copy_from_slice(&hdr.collection_id.to_le_bytes());
+    aad[26..28].copy_from_slice(&hdr.schema_version.to_le_bytes());
+    aad[28..30].copy_from_slice(&hdr.flags.to_le_bytes());
+    aad[30..38].copy_from_slice(&hdr.record_version.to_le_bytes());
+    aad[38..46].copy_from_slice(&hdr.updated_at_ns.to_le_bytes());
+    aad[46..50].copy_from_slice(&hdr.uncompressed_len.to_le_bytes());
+    aad[50..54].copy_from_slice(&hdr.root_offset.to_le_bytes());
+    aad[54..62].copy_from_slice(&hdr.ttl_expires_at_ns.to_le_bytes());
+    aad
+}
+
+/// Length of [`ZERO_PAGE`]: the largest archived root a zeroed fallback view can cover is
+/// `ZERO_PAGE_LEN - HEADER_SIZE` bytes (enforced at compile time in [`RecordCodec::decode_fast_or`]).
+const ZERO_PAGE_LEN: usize = 4096;
+
+/// A shared, 64-byte-aligned all-zero page backing the infallible fallback view of
+/// [`RecordCodec::decode_fast_or`] without any per-call or per-`RecordRef` storage.
+#[repr(C, align(64))]
+struct ZeroPage([u8; ZERO_PAGE_LEN]);
+
+static ZERO_PAGE: ZeroPage = ZeroPage([0; ZERO_PAGE_LEN]);
+
+/// Branch-light ASCII check for short strings (`RULE-CPU-01`): ORs 8-byte words (the last one
+/// overlapping) and tests the high bit once. About 3x faster than `<[u8]>::is_ascii` for the
+/// 8..64-byte strings typical of record fields.
+#[inline(always)]
+fn is_ascii_fast(bytes: &[u8]) -> bool {
+    #[inline(always)]
+    fn word(bytes: &[u8], at: usize) -> u64 {
+        match bytes.get(at..at + 8) {
+            Some(w) => u64::from_ne_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]]),
+            None => u64::MAX,
+        }
+    }
+    let n = bytes.len();
+    if n < 8 {
+        return bytes.iter().fold(0u8, |acc, &b| acc | b) < 0x80;
+    }
+    let mut acc = word(bytes, n - 8);
+    let mut i = 0;
+    while i + 8 < n {
+        acc |= word(bytes, i);
+        i += 8;
+    }
+    acc & 0x8080_8080_8080_8080 == 0
 }
 
 // Built-in implementation of ZeroCopyRecord for InlineId so simple key-only records work out of the box
@@ -785,6 +1129,19 @@ impl ZeroCopyRecord for InlineId {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_is_ascii_fast_matches_std_for_every_length_and_position() {
+        for len in 0..80usize {
+            let clean = vec![b'a'; len];
+            assert!(is_ascii_fast(&clean), "len {len}");
+            for bad in 0..len {
+                let mut b = clean.clone();
+                b[bad] = 0x80;
+                assert_eq!(is_ascii_fast(&b), b.is_ascii(), "len {len} bad {bad}");
+            }
+        }
+    }
+
     #[derive(Clone, Debug, PartialEq)]
     struct SampleUser {
         id: InlineId,
@@ -800,9 +1157,19 @@ mod tests {
         id: InlineId,
         score: u64,
         age: u32,
+        _pad: u32,
         name: ArchivedString,
         tags: ArchivedSlice<InlineId>,
     }
+
+    crate::impl_archive_pod!(ArchivedSampleUser {
+        id: InlineId,
+        score: u64,
+        age: u32,
+        _pad: u32,
+        name: ArchivedString,
+        tags: ArchivedSlice<InlineId>,
+    });
 
     impl ZeroCopyRecord for SampleUser {
         type Archived = ArchivedSampleUser;
@@ -814,6 +1181,7 @@ mod tests {
                 id: self.id,
                 score: self.score,
                 age: self.age,
+                _pad: 0,
                 name,
                 tags,
             }
@@ -838,6 +1206,199 @@ mod tests {
                 tags: root.tags.as_slice(payload).to_vec(),
             })
         }
+    }
+
+    use storage_types::testing::SweepRng;
+
+    /// Exercises every decoder entry point on `frame`; must never panic (`RULE-ERR-01`).
+    fn decode_all(frame: &[u8]) {
+        let _ = RecordCodec::validate_frame::<SampleUser>(frame);
+        let _ = RecordCodec::decode_owned::<SampleUser>(frame);
+        let _ = RecordCodec::header_ref(frame);
+        let _ = RecordCodec::decode_fast::<SampleUser>(frame);
+        let view = RecordCodec::decode_fast_or::<SampleUser>(frame);
+        let _ = view.get_str(&view.name).len();
+        let _ = view.get_slice(&view.tags).len();
+        let _ = view.to_owned_record();
+        let key = crate::crypto::EncryptionKey::from_bytes([1u8; 32]);
+        let id = InlineId::new("user:hostile").unwrap();
+        let _ = RecordCodec::encrypt_frame(&key, id, frame);
+        let _ = RecordCodec::decrypt_frame(&key, id, frame);
+    }
+
+    #[test]
+    fn test_hostile_frames_never_panic() {
+        let user = SampleUser {
+            id: InlineId::new("user:hostile").unwrap(),
+            age: 33,
+            score: 99,
+            name: "a fairly long name, repeated: ".repeat(20),
+            tags: (0..12).map(|i| InlineId::new(&format!("tag_{i}")).unwrap()).collect(),
+        };
+        let mut rng = SweepRng::new(0x9E37_79B9_7F4A_7C15);
+        for flags in [RecordFlags::NONE, RecordFlags::COMPRESSED_LZ4] {
+            let frame = RecordCodec::encode_aligned(&user, Version(3), 77, flags, 0);
+            let hdr = *RecordCodec::header_ref(&frame).unwrap();
+            let payload = frame.as_slice()[HEADER_SIZE..].to_vec();
+
+            // 0. Hostile encrypted frames: truncations and mutations must fail authentication.
+            let key = crate::crypto::EncryptionKey::from_bytes([1u8; 32]);
+            let enc = RecordCodec::encrypt_frame(&key, user.id, &frame).unwrap();
+            for cut in (0..enc.len()).step_by(7) {
+                decode_all(&enc.as_slice()[..cut]);
+            }
+            for _ in 0..500 {
+                let mut bad = enc.as_slice().to_vec();
+                rng.mutate(&mut bad);
+                let bad = AlignedBytes::copy_from_slice(&bad);
+                if bad.as_slice() != enc.as_slice() {
+                    assert!(RecordCodec::decrypt_frame(&key, user.id, &bad).is_err());
+                }
+            }
+
+            // 1. Every truncation, and an unaligned copy.
+            for cut in 0..=frame.len() {
+                decode_all(&frame.as_slice()[..cut]);
+            }
+            let mut unaligned = vec![0u8; frame.len() + 1];
+            unaligned[1..].copy_from_slice(&frame);
+            decode_all(&unaligned[1..]);
+
+            // 2. Raw bit flips anywhere (normally stopped by the checksums).
+            for _ in 0..500 {
+                let mut bad = frame.as_slice().to_vec();
+                rng.mutate(&mut bad);
+                decode_all(&AlignedBytes::copy_from_slice(&bad));
+            }
+
+            // 3. Crafted frames: hostile payload *and* header fields with valid checksums, so the
+            //    structural validators (not just the checksums) are exercised.
+            for _ in 0..4_000 {
+                let mut p = payload.clone();
+                rng.mutate(&mut p);
+                if rng.below(4) == 0 {
+                    p.truncate(rng.below(p.len() + 1));
+                }
+                let flag_bits = if rng.below(8) == 0 { rng.next_u64() as u16 } else { hdr.flags };
+                let forged = RecordHeader::new(
+                    hdr.schema_version,
+                    Version(hdr.record_version),
+                    hdr.updated_at_ns,
+                    checksum_payload(&p),
+                    rng.edge_u32(p.len() as u32),
+                    rng.edge_u32(hdr.uncompressed_len),
+                    rng.edge_u32(hdr.root_offset),
+                    RecordFlags(flag_bits),
+                    hdr.collection_id,
+                    0,
+                );
+                let mut f = forged.to_bytes().to_vec();
+                f.extend_from_slice(&p);
+                decode_all(&AlignedBytes::copy_from_slice(&f));
+            }
+        }
+    }
+
+    #[test]
+    fn test_hostile_lz4_never_panics_or_overallocates() {
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8 ^ (i / 97) as u8).collect();
+        let good = compress_lz4(&data);
+        assert_eq!(decompress_lz4(&good, data.len()).unwrap(), data);
+        // A 3-byte input claiming 256 MiB must be rejected before any allocation.
+        assert!(decompress_lz4(&[0x01, 0xF0, 0x00], storage_types::MAX_PAYLOAD_SIZE as usize).is_err());
+        let mut rng = SweepRng::new(42);
+        for _ in 0..5_000 {
+            let mut bad = good.clone();
+            rng.mutate(&mut bad);
+            bad.truncate(rng.below(bad.len() + 1));
+            let claimed = match rng.below(3) {
+                0 => data.len(),
+                1 => rng.below(1 << 20),
+                _ => rng.edge_u32(data.len() as u32) as usize,
+            };
+            let _ = decompress_lz4(&bad, claimed);
+        }
+    }
+
+    #[test]
+    fn test_frame_encryption_roundtrip_and_tamper_detection() {
+        use crate::crypto::EncryptionKey;
+        let key = EncryptionKey::from_bytes([7u8; 32]);
+        let id = InlineId::new("secret_user").unwrap();
+        let user = SampleUser {
+            id,
+            age: 41,
+            score: 9_001,
+            name: "a confidential name".to_string(),
+            tags: vec![InlineId::new("vip").unwrap()],
+        };
+        for flags in [RecordFlags::NONE, RecordFlags::COMPRESSED_LZ4] {
+            let plain = RecordCodec::encode_aligned(&user, Version(3), 77, flags, 123);
+            let enc = RecordCodec::encrypt_frame(&key, id, &plain).unwrap();
+            assert!(RecordCodec::is_encrypted(&enc));
+            // The plaintext is not visible in the ciphertext.
+            assert!(!enc.windows(12).any(|w| w == b"confidential"));
+            // Plaintext decoders refuse encrypted frames instead of misreading them.
+            assert!(RecordCodec::validate_frame::<SampleUser>(&enc).is_err());
+            assert!(RecordCodec::decode_fast::<SampleUser>(&enc).is_err());
+            assert!(RecordCodec::decode_owned::<SampleUser>(&enc).is_err());
+            // Round trip restores the exact frame.
+            let dec = RecordCodec::decrypt_frame(&key, id, &enc).unwrap();
+            assert_eq!(dec.as_slice(), plain.as_slice());
+            assert_eq!(RecordCodec::decode_owned::<SampleUser>(&dec).unwrap().1, user);
+            // Fresh nonce per encryption.
+            let enc2 = RecordCodec::encrypt_frame(&key, id, &plain).unwrap();
+            assert_ne!(enc.as_slice(), enc2.as_slice());
+            // Wrong key, wrong record id (frame swap), tampered ciphertext all fail.
+            assert!(RecordCodec::decrypt_frame(&EncryptionKey::from_bytes([8u8; 32]), id, &enc).is_err());
+            assert!(RecordCodec::decrypt_frame(&key, InlineId::new("other").unwrap(), &enc).is_err());
+            let mut bad = enc.as_slice().to_vec();
+            let last = bad.len() - 20;
+            bad[last] ^= 1;
+            assert!(RecordCodec::decrypt_frame(&key, id, &AlignedBytes::copy_from_slice(&bad)).is_err());
+            // Editing an authenticated header field (TTL) with a re-sealed header checksum fails.
+            let h = *RecordCodec::header_ref(&enc).unwrap();
+            let forged = RecordHeader::new(
+                h.schema_version,
+                Version(h.record_version),
+                h.updated_at_ns,
+                h.payload_checksum,
+                h.payload_len,
+                h.uncompressed_len,
+                h.root_offset,
+                h.flags_typed(),
+                h.collection_id,
+                1, // expire the record
+            );
+            let mut f = forged.to_bytes().to_vec();
+            f.extend_from_slice(&enc.as_slice()[HEADER_SIZE..]);
+            assert!(RecordCodec::decrypt_frame(&key, id, &AlignedBytes::copy_from_slice(&f)).is_err());
+        }
+    }
+
+    #[test]
+    fn test_decode_fast_is_safe_on_corrupted_frames() {
+        let user = SampleUser {
+            id: InlineId::new("u").unwrap(),
+            age: 1,
+            score: 2,
+            name: "n".to_string(),
+            tags: vec![InlineId::new("t").unwrap()],
+        };
+        let frame = RecordCodec::encode_aligned(&user, Version(1), 1, RecordFlags::NONE, 0);
+        assert_eq!(RecordCodec::decode_fast::<SampleUser>(&frame).unwrap().score, 2);
+
+        // Corrupt payload_len / root_offset: decode must fail cleanly, never read out of bounds.
+        for (off, val) in [(32usize, u32::MAX), (40usize, 10_000u32)] {
+            let mut bad = frame.as_slice().to_vec();
+            bad[off..off + 4].copy_from_slice(&val.to_le_bytes());
+            let aligned = AlignedBytes::copy_from_slice(&bad);
+            assert!(RecordCodec::decode_fast::<SampleUser>(&aligned).is_err());
+            assert_eq!(RecordCodec::decode_fast_or::<SampleUser>(&aligned).score, 0);
+        }
+        // Garbage string offsets resolve to "" instead of UB.
+        let s = ArchivedString { offset: u32::MAX - 2, len: 100 };
+        assert_eq!(s.as_str(&[1, 2, 3]), "");
     }
 
     #[test]

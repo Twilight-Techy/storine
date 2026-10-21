@@ -2,6 +2,7 @@
 name = "storage-codec"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Zero-copy relative-pointer archive codec, SIMD XXH3-64 & CRC32C checksums, and LZ4/dictionary compression"

@@ -2,6 +2,7 @@
 name = "storage-server"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "High-throughput zero-copy length-prefixed binary protocol TCP server and client for the storage engine"

@@ -8,7 +8,29 @@
 use std::collections::BTreeMap;
 use storage_types::{InlineId, Result, StorageError};
 
-use crate::archive::{ArchiveBuilder, ArchivedBytes, ArchivedSlice, ArchivedString};
+use crate::archive::{ArchiveBuilder, ArchivePod, ArchivedBytes, ArchivedSlice, ArchivedString};
+
+// SAFETY: (this note covers every impl below) each type is `#[repr(C)]`/`#[repr(transparent)]` over integers or
+// other `ArchivePod` types with no implicit padding, and accepts every bit pattern (validity
+// constraints such as `ArchivedBool <= 1` or valid `char` codepoints are checked by `validate`
+// and tolerated by every accessor).
+unsafe impl ArchivePod for ArchivedBool {}
+// SAFETY: see above (`u32`).
+unsafe impl ArchivePod for ArchivedChar {}
+// SAFETY: see above (two `u64`).
+unsafe impl ArchivePod for ArchivedU128 {}
+// SAFETY: see above (two `u64`).
+unsafe impl ArchivePod for ArchivedI128 {}
+// SAFETY: see above (`[u8; 16]`).
+unsafe impl ArchivePod for ArchivedUuid {}
+// SAFETY: see above (one `ArchivedSlice`).
+unsafe impl ArchivePod for ArchivedStringSlice {}
+// SAFETY: see above (`u8` tag + explicit `[u8; 7]` pad + `[u64; 3]` = 32 bytes).
+unsafe impl ArchivePod for ArchivedPropertyValue {}
+// SAFETY: see above (8-byte `ArchivedString` + 32-byte value at offset 8 = 40 bytes).
+unsafe impl ArchivePod for ArchivedMapEntry {}
+// SAFETY: see above (one `ArchivedSlice`).
+unsafe impl ArchivePod for ArchivedMap {}
 
 /// Memory-safe zero-copy boolean (`#[repr(transparent)]`, 1 byte).
 ///
@@ -333,15 +355,15 @@ impl PropertyValue {
                 TAG_TIMESTAMP_NS
             }
             Self::Uuid(bytes) => {
-                slots[0] = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                slots[1] = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+                slots[0] = storage_types::wire::read_u64_le(&bytes, 0);
+                slots[1] = storage_types::wire::read_u64_le(&bytes, 8);
                 TAG_UUID
             }
             Self::Id(id) => {
                 let raw = id.to_raw_bytes();
-                slots[0] = u64::from_le_bytes(raw[0..8].try_into().unwrap());
-                slots[1] = u64::from_le_bytes(raw[8..16].try_into().unwrap());
-                slots[2] = u64::from_le_bytes(raw[16..24].try_into().unwrap());
+                slots[0] = storage_types::wire::read_u64_le(&raw, 0);
+                slots[1] = storage_types::wire::read_u64_le(&raw, 8);
+                slots[2] = storage_types::wire::read_u64_le(&raw, 16);
                 TAG_INLINE_ID
             }
             Self::Text(ref s) => {

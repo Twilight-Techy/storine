@@ -1,5 +1,7 @@
 # StorageEngine End-to-End Benchmark, Footprint & Zero-Allocation Verification Report (`TASK-030` & `TASK-050` `v1.0` Gate)
 
+> **Note (2026-10-20 audit):** Sections 1–4 are the historical `TASK-030` / `TASK-050` results. All engine benchmarks run with `SyncPolicy::AsyncMemoryFirst` (no `fsync` per write), so write latencies are memory-first numbers. The checksum is an XXH64-family 4-lane hash combined with a dual-lane CRC32C (not reference XXH3). The TCP `GET` row counts client-side allocations. The `RecordView` row uses `unsafe decode_unchecked`; safe engine reads use `decode_fast`. See **Section 5** for the post-audit re-verification.
+
 ## 1. Build & Hardware Profile
 - **Compiler Profile**: `release` (`opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`, `-C target-cpu=native`)
 - **Platform**: Windows (`x86_64-pc-windows-msvc`), Native Win32 `CreateFileMappingW` / `MapViewOfFile` / `PrefetchVirtualMemory` + `WSAPoll` (`ws2_32.dll`) + Hardware SSE4.2 CRC32C Intrinsics
@@ -62,3 +64,41 @@
   - **On-Disk I/O, Slot Recycling, WAL Compression & Incremental Checkpoints (`TASK-051`–`TASK-054`)**: Single-syscall positional `write_all_at` + lazy superblock fast-forward recovery, $O(1)$ 64B size-class dead-slot reuse (`reclaim_dead_slot`), transparent LZ4 WAL frame compression (`>= 1 KiB`), and incremental $O(\Delta)$ `STGEDLT2` delta checkpoints (`primary.idx.delta`).
   - **Engine-Level Set Filtering, Bidirectional Sorting & Keyset/Offset Pagination (`TASK-055`–`TASK-056`)**: 64-bit `POPCNT`-accelerated bitmap `AND NOT` / `OR` windowing (`filter_not_tag`, `filter_any_tag`), bidirectional `SortOrder::{Asc, Desc}` B+Tree range scans, $O(\log N)$ `KeysetCursor` + `offset`/`limit` pagination (`QueryPage<T>`), zero-copy `execute_page_filtered_with` (`|archived: &T::Archived|`), and paginated `OP_QUERY_HYBRID` TCP RPC.
   - **Full Filtering Coverage (`TASK-057`–`TASK-058`)**: $O(\log N)$ relational operators (`filter_eq`, `filter_ne`, `filter_gt`, `filter_gte`, `filter_lt`, `filter_lte`, `filter_not_range`, `filter_in_i64`), prefix/key-set matchers (`filter_tag_prefix`, `filter_id_prefix`, `filter_ids`, `filter_not_ids`), field existence checks (`filter_has_tag_field`, `filter_missing_tag_field`, `filter_has_numeric_field`, `filter_missing_numeric_field`), hybrid graph neighborhood filtering (`filter_within_bfs`), zero-allocation `ArchivedString` / `RecordView` string matchers, and composable `.filter(|view: &RecordView<'_, T>| -> bool)` across all terminal query and vector search methods.
+
+---
+
+## 5. Post-Audit Re-Verification (`TASK-067` – `TASK-079`, 2026-10-20)
+
+Command: `cargo run --release -p storage-benches`. The development machine carried ~50% background CPU load from other applications during this session, so single runs varied by up to 4x even for untouched pure-CPU code (`InlineId` hash 1–6 ns, checksum 1.6–3.2 µs). Baseline (`4a004ec`) and candidate were therefore compared with **interleaved A/B runs** of a direct-timing probe (millions of iterations per operation, 3 pairs), which is the authoritative comparison below.
+
+### 5.1 Zero-Allocation & Footprint Gates (all pass)
+
+| Gate | Result |
+| :--- | :--- |
+| `with_ref` / `get_ref` / `RecordView` read allocations | **`0.00` / op** |
+| `update` / secondary index / TCP `GET` (client) allocations | `5.00` / `1.00` / `3.00` per op (unchanged from baseline) |
+| `ArchivedAgentObjectRecord` / `PrimaryEntry` / `IndexSnapshot` / `MmapGuard` | `112 B` / `96 B` / `264 B` / `8 B` (unchanged) |
+| `primary.idx` | `19.0 B/record` after Stage 19; `20.9 B/record` after `TASK-082` (checkpoint v3 stores each ordinal) |
+| Write coalescing | `70.7–71.1%` physical write reduction (unchanged) |
+
+### 5.2 Interleaved A/B Latency (median of 3 pairs, ns/op)
+
+| Operation | Baseline `4a004ec` | After audit | Notes |
+| :--- | ---: | ---: | :--- |
+| `RecordView` decode + `get_str` (23-byte title) | `4.3` | `10.7` | Baseline `as_str` used `get_unchecked` + `from_utf8_unchecked`, which was UB on hostile offsets. Now bounds + UTF-8 checked per call (overlapping-word ASCII fast path, ~3x faster than `<[u8]>::is_ascii`). |
+| `decode_unchecked` vs `decode_fast_or` (per decode) | `2.2–3.5` | `5.1–11.9` | Safe O(1) header, bounds, alignment and identity checks on every `RecordRef` deref. |
+| `with_ref` (hot, in-RAM frame) | `328` | `271` | Parity (within noise). |
+| `with_ref` (flushed, arena mmap) | `296` | `292` | Parity. |
+| `get_ref` (flushed, arena mmap) | `427` | `533` | Within run-to-run noise (pairs: `513/533`, `317/370`, `427/624`); the only code difference on this path is the safe `decode_fast` (+3–8 ns). `RecordRef` no longer carries a 176-byte zeroed fallback (shared static zero page instead). |
+| `update` (32 hot keys) | `27.7 µs` | `30.2 µs` | Parity within noise. |
+
+Two regressions found by this gate were fixed before sign-off: the per-call `is_ascii` cost in `ArchivedString::as_str` (replaced by an overlapping-word check) and a 176-byte per-`RecordRef` zeroed fallback (replaced by a static zero page). Earlier in the audit, `AsyncMemoryFirst` per-write flush syscalls were also replaced by buffering plus background flushing.
+
+### 5.3 Binary Size
+
+| Binary (Windows x86_64, release) | Baseline `4a004ec` | After audit |
+| :--- | ---: | ---: |
+| `storage-server` | `516.0 KiB` | `582.0 KiB` |
+| `storage-cli` | `537.5 KiB` | `582.0 KiB` |
+
+The earlier `370.5 KiB` figure was stale; the baseline already exceeded the `RULE-MEM-03` budget (`< 500 KiB`). Linker-map attribution of the `+59 KiB` `.text` growth: `storage-server` `+32 KiB` (header-stage admission, admin job pool, Raft RPC wiring, environment security config), `std` `+15 KiB` (threads and mpsc channels for the admin pool), WAL `+3.5 KiB`, mmap `+7 KiB`, index `+5 KiB`. Open item: bring the binaries back under budget without sacrificing hot-path speed (`opt-level` must stay `3`).

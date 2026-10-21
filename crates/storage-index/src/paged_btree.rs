@@ -1,31 +1,61 @@
-//! Disk-Backed 4 KiB Paged B+Tree Range Index (`TASK-034`, `F-INDX-06`, `RULE-MEM-01`, `RULE-DATA-03`).
+//! Disk-Backed 4 KiB Paged Range Index (`TASK-034`, `TASK-083`, `F-PIDX-01`, `RULE-MEM-01`,
+//! `RULE-MEM-03`, `RULE-CONC-01`).
 //!
-//! Stores sorted `(key: i64, RecordOrdinal)` pairs in 4096-byte (4 KiB) disk pages mapped via
-//! `MmapRegion`. Only a compact separator directory (`SeparatorEntry`: 24 bytes per 4 KiB page)
-//! resides in RAM for cold pages, keeping RAM usage `< 2.5 MiB` for 10M+ indexed entries while
-//! executing $O(\log P + \log B)$ binary searches directly over OS page-cached `mmap` slices.
+//! A sorted run of 4 KiB leaf pages (a static single-level B+Tree) with an in-RAM separator
+//! directory (`SeparatorEntry`, 24 bytes per page), plus small in-RAM deltas. RAM is
+//! `O(pages + delta)`, independent of the number of indexed entries.
+//!
+//! ## Visibility
+//! Every entry lives in exactly one of three disjoint sources:
+//! - the immutable, memory-mapped **base** generation file (minus tombstones);
+//! - the **frozen** delta being merged into the next base by a running checkpoint;
+//! - the **hot** delta receiving writes.
+//!
+//! `insert` / `remove` keep the sources disjoint, so counts, bitmaps and paginated scans never
+//! double count.
+//!
+//! ## Checkpoints
+//! A checkpoint freezes the hot delta (`O(1)`, under the lock), then — without holding any lock —
+//! stream-merges the base pages with the frozen delta into a new generation file using `O(page)`
+//! extra memory, writes an atomic manifest naming that generation, and finally swaps it in under
+//! a brief lock. Readers and writers are never blocked by checkpoint I/O.
+//!
+//! ## Files
+//! - `<path>`: 32-byte manifest `magic | version | generation | stamp | checksum`.
+//! - `<path>.<generation as 16 hex digits>`: 4 KiB header page followed by the leaf pages.
+//!
+//! Generation files are never overwritten (a mapped file cannot be replaced on Windows); stale
+//! ones are deleted after the swap and at open.
 
-use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::ops::{Bound, RangeBounds};
-use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
 
 use storage_codec::checksum_payload;
-use storage_mmap::{atomic_write_replace, MmapRegion};
+use storage_mmap::MmapRegion;
+use storage_types::wire::{read_u32_le, read_u64_le};
 use storage_types::{FastHashMap, FastHashSet, RecordOrdinal, Result, StorageError};
 
 use crate::bitmap::CompressedBitmap;
-use crate::btree::{sortable_f64_to_i64, NumericRangeIndex};
+use crate::btree::{sortable_f64_to_i64, KeysetCursor, NumericRangeIndex, SortOrder};
+use crate::paged_files::{
+    generation_path, map_path_read_only, publish_generation, read_manifest,
+    remove_stale_generations, temp_generation_path, write_manifest,
+};
 
 /// Physical page size for disk-backed B+Tree leaf pages (4 KiB).
 pub const BTREE_PAGE_SIZE: usize = 4096;
 const BTREE_PAGE_MAGIC: u32 = 0x4254_4C50; // "BTLP"
 const BTREE_FILE_MAGIC: u32 = 0x4254_4958; // "BTIX"
+const BTREE_MANIFEST_MAGIC: u32 = 0x4254_4D46; // "BTMF"
 const PAGE_HEADER_SIZE: usize = 32;
 /// Maximum `(delta_key_i64, RecordOrdinal)` entries per 4 KiB leaf page:
 /// `(4096 - 32) / 12 = 338` entries per page.
 pub const MAX_ENTRIES_PER_LEAF_PAGE: usize = (BTREE_PAGE_SIZE - PAGE_HEADER_SIZE) / 12;
+
+type Tombstones = FastHashSet<(u16, i64, RecordOrdinal)>;
 
 /// In-memory separator entry pointing to a 4 KiB leaf page on disk (`24` bytes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,22 +67,250 @@ pub struct SeparatorEntry {
     pub max_key: i64,
 }
 
-#[derive(Default)]
-struct PagedBTreeState {
-    /// Compact in-memory separator directory grouped by `field_id`, sorted by `min_key`.
+/// One immutable on-disk generation: the mapped file and its separator directory.
+struct BaseGeneration {
+    mmap: MmapRegion,
+    /// Per field, sorted by `(min_key, page_index)`; pages of a field are contiguous and sorted.
     separators: FastHashMap<u16, Vec<SeparatorEntry>>,
-    /// Memory-mapped `btree.idx` file containing contiguous 4 KiB leaf pages after a 4 KiB file header.
-    mmap: Option<MmapRegion>,
-    /// Mutable hot delta buffer for newly inserted `(field_id, key, ord)` triples since last checkpoint.
-    hot_added: NumericRangeIndex,
-    /// Tombstone set of `(field_id, key, ord)` removed since last checkpoint.
-    hot_removed: FastHashSet<(u16, i64, RecordOrdinal)>,
+    path: PathBuf,
 }
 
-/// Disk-backed 4 KiB Paged B+Tree Range Index (`TASK-034`, `F-INDX-06`).
+impl BaseGeneration {
+    #[inline]
+    fn page<'a>(&'a self, sep: &SeparatorEntry) -> Option<&'a [u8]> {
+        let off = (sep.page_index as usize + 1) * BTREE_PAGE_SIZE;
+        self.mmap.as_slice().get(off..off + BTREE_PAGE_SIZE)
+    }
+
+    /// `true` if the base holds `(field, key, ord)` (ignoring tombstones). `O(log P + log B)`.
+    fn contains(&self, field: u16, key: i64, ord: RecordOrdinal) -> bool {
+        let Some(seps) = self.separators.get(&field) else {
+            return false;
+        };
+        let start = seps.partition_point(|s| s.max_key < key);
+        for sep in &seps[start..] {
+            if sep.min_key > key {
+                break;
+            }
+            let Some(page) = self.page(sep) else {
+                continue;
+            };
+            let count = sep.entry_count as usize;
+            let mut idx = lower_bound_in_page(page, sep.min_key, count, key);
+            while idx < count && read_delta_key_at(page, sep.min_key, idx) == key {
+                if read_ordinal_at(page, count, idx) == ord {
+                    return true;
+                }
+                idx += 1;
+            }
+        }
+        false
+    }
+
+    /// Calls `f(key, ord)` for every base entry of `field` within `[lo, hi]` in `order`, stopping
+    /// early when `f` returns `false`.
+    fn scan(
+        &self,
+        field: u16,
+        lo: i64,
+        hi: i64,
+        order: SortOrder,
+        mut f: impl FnMut(i64, RecordOrdinal) -> bool,
+    ) {
+        let Some(seps) = self.separators.get(&field) else {
+            return;
+        };
+        let start = seps.partition_point(|s| s.max_key < lo);
+        let end = seps.partition_point(|s| s.min_key <= hi);
+        if start >= end {
+            return;
+        }
+        let window = &seps[start..end];
+        let mut visit = |sep: &SeparatorEntry, idx: usize, page: &[u8]| -> Option<bool> {
+            let count = sep.entry_count as usize;
+            let key = read_delta_key_at(page, sep.min_key, idx);
+            if key < lo || key > hi {
+                return None;
+            }
+            Some(f(key, read_ordinal_at(page, count, idx)))
+        };
+        match order {
+            SortOrder::Asc => {
+                for sep in window {
+                    let Some(page) = self.page(sep) else { continue };
+                    let count = sep.entry_count as usize;
+                    let first = if lo <= sep.min_key {
+                        0
+                    } else {
+                        lower_bound_in_page(page, sep.min_key, count, lo)
+                    };
+                    for idx in first..count {
+                        match visit(sep, idx, page) {
+                            Some(true) => {}
+                            Some(false) => return,
+                            None if read_delta_key_at(page, sep.min_key, idx) > hi => break,
+                            None => {}
+                        }
+                    }
+                }
+            }
+            SortOrder::Desc => {
+                for sep in window.iter().rev() {
+                    let Some(page) = self.page(sep) else { continue };
+                    let count = sep.entry_count as usize;
+                    let past = if hi >= sep.max_key {
+                        count
+                    } else {
+                        lower_bound_in_page(page, sep.min_key, count, hi.saturating_add(1))
+                    };
+                    for idx in (0..past).rev() {
+                        match visit(sep, idx, page) {
+                            Some(true) => {}
+                            Some(false) => return,
+                            None if read_delta_key_at(page, sep.min_key, idx) < lo => break,
+                            None => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Delta being merged into the next generation by a running checkpoint.
+/// In-progress checkpoint returned by `begin_checkpoint` (holds the checkpoint lock).
+pub struct PendingBTreeCheckpoint<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
+    frozen: Arc<FrozenDelta>,
+    base: Option<Arc<BaseGeneration>>,
+    generation: u64,
+}
+
+impl core::fmt::Debug for PendingBTreeCheckpoint<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PendingBTreeCheckpoint")
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+#[derive(Default)]
+struct FrozenDelta {
+    hot: NumericRangeIndex,
+    removed: Tombstones,
+}
+
+#[derive(Default)]
+struct PagedBTreeState {
+    base: Option<Arc<BaseGeneration>>,
+    frozen: Option<Arc<FrozenDelta>>,
+    /// Entries visible in neither `base` nor `frozen` (inserted since the last freeze).
+    hot: NumericRangeIndex,
+    /// Tombstones for entries of `base` or `frozen.hot` removed since the last freeze.
+    removed: Tombstones,
+    generation: u64,
+    stamp: u64,
+}
+
+impl PagedBTreeState {
+    /// `true` if `e` is visible through `base` or `frozen`, ignoring `self.removed`.
+    fn in_persistent(&self, field: u16, key: i64, ord: RecordOrdinal) -> bool {
+        let frozen_removed = self
+            .frozen
+            .as_ref()
+            .is_some_and(|f| f.removed.contains(&(field, key, ord)));
+        let in_base = !frozen_removed
+            && self
+                .base
+                .as_ref()
+                .is_some_and(|b| b.contains(field, key, ord));
+        in_base
+            || self
+                .frozen
+                .as_ref()
+                .is_some_and(|f| f.hot.contains(field, key, ord))
+    }
+
+    #[inline]
+    fn base_visible(&self, field: u16, key: i64, ord: RecordOrdinal) -> bool {
+        let e = (field, key, ord);
+        !self.removed.contains(&e)
+            && !self.frozen.as_ref().is_some_and(|f| f.removed.contains(&e))
+    }
+
+    /// Visible `(key, ord)` pairs of the two in-RAM sources within `[lo, hi]`, ascending.
+    fn delta_pairs(&self, field: u16, lo: i64, hi: i64) -> Vec<(i64, RecordOrdinal)> {
+        let mut out = self.hot.range_pairs(field, lo, hi);
+        if let Some(ref frozen) = self.frozen {
+            let frozen_pairs: Vec<(i64, RecordOrdinal)> = frozen
+                .hot
+                .range_pairs(field, lo, hi)
+                .into_iter()
+                .filter(|&(k, o)| !self.removed.contains(&(field, k, o)))
+                .collect();
+            if !frozen_pairs.is_empty() {
+                out.extend(frozen_pairs);
+                out.sort_unstable();
+            }
+        }
+        out
+    }
+
+    /// Streams every visible entry of `field` in `[lo, hi]` in `order` (sources merged).
+    fn for_each_visible(
+        &self,
+        field: u16,
+        lo: i64,
+        hi: i64,
+        order: SortOrder,
+        mut f: impl FnMut(i64, RecordOrdinal) -> bool,
+    ) {
+        let mut delta = self.delta_pairs(field, lo, hi);
+        if order == SortOrder::Desc {
+            delta.reverse();
+        }
+        let before = |a: (i64, RecordOrdinal), b: (i64, RecordOrdinal)| match order {
+            SortOrder::Asc => a < b,
+            SortOrder::Desc => a > b,
+        };
+        let mut di = 0usize;
+        let mut stopped = false;
+        if let Some(ref base) = self.base {
+            base.scan(field, lo, hi, order, |k, o| {
+                if !self.base_visible(field, k, o) {
+                    return true;
+                }
+                while di < delta.len() && before(delta[di], (k, o)) {
+                    if !f(delta[di].0, delta[di].1) {
+                        stopped = true;
+                        return false;
+                    }
+                    di += 1;
+                }
+                if !f(k, o) {
+                    stopped = true;
+                    return false;
+                }
+                true
+            });
+        }
+        if stopped {
+            return;
+        }
+        for &(k, o) in &delta[di..] {
+            if !f(k, o) {
+                return;
+            }
+        }
+    }
+}
+
+/// Disk-backed 4 KiB Paged B+Tree Range Index (`TASK-034`, `TASK-083`, `F-PIDX-01`).
 pub struct PagedBTreeIndex {
     path: PathBuf,
     state: RwLock<PagedBTreeState>,
+    /// Serializes checkpoints (never held together with `state` across I/O).
+    checkpoint_lock: Mutex<()>,
 }
 
 impl core::fmt::Debug for PagedBTreeIndex {
@@ -65,54 +323,76 @@ impl core::fmt::Debug for PagedBTreeIndex {
 }
 
 impl PagedBTreeIndex {
-    /// Opens or creates a disk-backed `PagedBTreeIndex` at `path`.
+    /// Opens (or creates) the index whose manifest is `path`. Corrupted files are an error so
+    /// the caller can decide to rebuild; stale generation files are removed.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let mut state = PagedBTreeState::default();
-        if path.exists() {
-            let meta = fs::metadata(&path).map_err(|e| StorageError::io("stat btree.idx", e))?;
-            if meta.len() >= BTREE_PAGE_SIZE as u64 {
-                let mmap = map_path_read_only(&path)?;
-                load_separators_from_mmap(&mmap, &mut state.separators)?;
-                state.mmap = Some(mmap);
-            }
+        if let Some((generation, stamp)) = read_manifest(&path, BTREE_MANIFEST_MAGIC)? {
+            let data_path = generation_path(&path, generation);
+            let mmap = map_path_read_only(&data_path)?;
+            let mut separators = FastHashMap::default();
+            load_separators_from_mmap(&mmap, &mut separators)?;
+            state.base = Some(Arc::new(BaseGeneration {
+                mmap,
+                separators,
+                path: data_path,
+            }));
+            state.generation = generation;
+            state.stamp = stamp;
         }
+        remove_stale_generations(&path, state.base.as_ref().map(|b| b.path.as_path()));
         Ok(Self {
             path,
             state: RwLock::new(state),
+            checkpoint_lock: Mutex::new(()),
         })
+    }
+
+    #[inline]
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, PagedBTreeState> {
+        self.state.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[inline]
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, PagedBTreeState> {
+        self.state.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Caller-defined stamp recorded by the last checkpoint (`0` if never checkpointed). The
+    /// engine stores its checkpoint identity here to prove the index matches the records.
+    pub fn stamp(&self) -> u64 {
+        self.read().stamp
     }
 
     /// Returns the exact RAM footprint (in bytes) of the in-memory page separator directory.
     pub fn separator_memory_bytes(&self) -> usize {
-        let guard = self
-            .state
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard
-            .separators
-            .values()
-            .map(|v| v.len() * core::mem::size_of::<SeparatorEntry>())
-            .sum()
+        self.read().base.as_ref().map_or(0, |b| {
+            b.separators
+                .values()
+                .map(|v| v.len() * core::mem::size_of::<SeparatorEntry>())
+                .sum()
+        })
     }
 
     /// Returns the total number of 4 KiB leaf pages currently mapped on disk.
     pub fn page_count(&self) -> usize {
-        let guard = self
-            .state
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.separators.values().map(|v| v.len()).sum()
+        self.read()
+            .base
+            .as_ref()
+            .map_or(0, |b| b.separators.values().map(Vec::len).sum())
     }
 
-    /// Inserts `(field_id, value, ord)` into the hot delta layer.
+    /// Inserts `(field_id, value, ord)` (idempotent).
     pub fn insert(&self, field_id: u16, value: i64, ord: RecordOrdinal) {
-        let mut guard = self
-            .state
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.hot_removed.remove(&(field_id, value, ord));
-        guard.hot_added.insert(field_id, value, ord);
+        let mut st = self.write();
+        if st.removed.remove(&(field_id, value, ord)) {
+            return; // visible again through base / frozen
+        }
+        if st.in_persistent(field_id, value, ord) {
+            return; // already visible
+        }
+        st.hot.insert(field_id, value, ord);
     }
 
     /// Inserts an `f64` value using IEEE-754 order-preserving encoding.
@@ -121,51 +401,26 @@ impl PagedBTreeIndex {
         self.insert(field_id, sortable_f64_to_i64(value), ord);
     }
 
-    /// Removes `(field_id, value, ord)` from the index.
+    /// Removes `(field_id, value, ord)` (no-op if absent).
     pub fn remove(&self, field_id: u16, value: i64, ord: RecordOrdinal) {
-        let mut guard = self
-            .state
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.hot_added.remove(field_id, value, ord);
-        guard.hot_removed.insert((field_id, value, ord));
+        let mut st = self.write();
+        if st.hot.contains(field_id, value, ord) {
+            st.hot.remove(field_id, value, ord);
+        } else if st.in_persistent(field_id, value, ord) {
+            st.removed.insert((field_id, value, ord));
+        }
     }
 
-    /// Executes an $O(\log P + \log B)$ range scan over the 4 KiB mmap leaf pages and hot delta buffer,
-    /// returning a `CompressedBitmap` of matching `RecordOrdinal`s.
-    pub fn range_bitmap<R: RangeBounds<i64>>(
-        &self,
-        field_id: u16,
-        range: R,
-    ) -> CompressedBitmap {
+    /// Returns a `CompressedBitmap` of every ordinal matching `range` on `field_id`.
+    pub fn range_bitmap<R: RangeBounds<i64>>(&self, field_id: u16, range: R) -> CompressedBitmap {
         let (lo, hi) = normalize_bounds(&range);
-        if lo > hi {
-            return CompressedBitmap::new();
-        }
-
-        let guard = self
-            .state
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut bm = guard.hot_added.range_bitmap(field_id, lo..=hi);
-
-        if let (Some(ref mmap), Some(seps)) = (&guard.mmap, guard.separators.get(&field_id)) {
-            let file_slice = mmap.as_slice();
-            // Binary search for the first page whose `max_key >= lo`
-            let start_idx = seps.partition_point(|s| s.max_key < lo);
-            for sep in &seps[start_idx..] {
-                if sep.min_key > hi {
-                    break;
-                }
-                scan_leaf_page_into_bitmap(
-                    file_slice,
-                    sep,
-                    lo,
-                    hi,
-                    &guard.hot_removed,
-                    &mut bm,
-                );
-            }
+        let mut bm = CompressedBitmap::new();
+        if lo <= hi {
+            self.read()
+                .for_each_visible(field_id, lo, hi, SortOrder::Asc, |_, ord| {
+                    bm.insert(ord);
+                    true
+                });
         }
         bm
     }
@@ -182,131 +437,371 @@ impl PagedBTreeIndex {
         }
     }
 
-    /// Zero-allocation point/range existence check directly over the 4 KiB mmap leaf pages (`0` heap allocations!).
-    pub fn count_in_range_zero_alloc(&self, field_id: u16, lo: i64, hi: i64) -> usize {
-        if lo > hi {
-            return 0;
+    /// Ordinals with `field_id == value`. `O(log P + log B + matches)`.
+    #[inline]
+    pub fn eq_bitmap(&self, field_id: u16, value: i64) -> CompressedBitmap {
+        self.range_bitmap(field_id, value..=value)
+    }
+
+    /// Ordinals with `field_id IN values`.
+    pub fn in_values_bitmap(&self, field_id: u16, values: &[i64]) -> CompressedBitmap {
+        let st = self.read();
+        let mut bm = CompressedBitmap::new();
+        for &v in values {
+            st.for_each_visible(field_id, v, v, SortOrder::Asc, |_, ord| {
+                bm.insert(ord);
+                true
+            });
         }
-        let guard = self
-            .state
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(ref mmap) = guard.mmap else {
-            return 0;
-        };
-        let Some(seps) = guard.separators.get(&field_id) else {
-            return 0;
-        };
-        let file_slice = mmap.as_slice();
-        let start_idx = seps.partition_point(|s| s.max_key < lo);
+        bm
+    }
+
+    /// Ordinals with any value on `field_id` (`IS NOT NULL`).
+    #[inline]
+    pub fn all_on_field_bitmap(&self, field_id: u16) -> CompressedBitmap {
+        self.range_bitmap(field_id, ..)
+    }
+
+    /// Number of entries in `range` on `field_id` with zero heap allocations for the base pages.
+    pub fn count_in_range<R: RangeBounds<i64>>(&self, field_id: u16, range: R) -> usize {
+        let (lo, hi) = normalize_bounds(&range);
         let mut count = 0usize;
-        for sep in &seps[start_idx..] {
-            if sep.min_key > hi {
-                break;
-            }
-            count += count_leaf_page_entries(file_slice, sep, lo, hi, &guard.hot_removed);
+        if lo <= hi {
+            self.read()
+                .for_each_visible(field_id, lo, hi, SortOrder::Asc, |_, _| {
+                    count += 1;
+                    true
+                });
         }
         count
     }
 
-    /// Compacts all existing 4 KiB disk pages and hot delta mutations into a fresh, tightly packed
-    /// 4 KiB-paged `btree.idx` file on disk and maps it via `MmapRegion`.
-    pub fn checkpoint_to_disk(&self) -> Result<usize> {
-        let mut guard = self
-            .state
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        // Merge all live `(field_id -> BTreeMap<i64, Vec<RecordOrdinal>>)` entries
-        let mut merged: BTreeMap<u16, BTreeMap<i64, Vec<RecordOrdinal>>> = BTreeMap::new();
-
-        if let Some(ref mmap) = guard.mmap {
-            let file_slice = mmap.as_slice();
-            for (&field_id, seps) in &guard.separators {
-                let tree = merged.entry(field_id).or_default();
-                for sep in seps {
-                    decode_leaf_page_into_tree(file_slice, sep, &guard.hot_removed, tree)?;
-                }
-            }
+    /// Inclusive-range alias of [`Self::count_in_range`].
+    #[inline]
+    pub fn count_in_range_zero_alloc(&self, field_id: u16, lo: i64, hi: i64) -> usize {
+        if lo > hi {
+            return 0;
         }
-
-        // Merge hot_added entries
-        let hot_snapshot = guard.hot_added.snapshot_all();
-        for (field_id, pairs) in hot_snapshot {
-            let tree = merged.entry(field_id).or_default();
-            for (k, ord) in pairs {
-                if !guard.hot_removed.contains(&(field_id, k, ord)) {
-                    let list = tree.entry(k).or_default();
-                    if let Err(pos) = list.binary_search(&ord) {
-                        list.insert(pos, ord);
-                    }
-                }
-            }
-        }
-
-        // Release old mmap before replacing file on Windows
-        guard.mmap = None;
-
-        // Build 4 KiB leaf pages
-        let mut pages_buf: Vec<u8> = Vec::new();
-        let mut new_separators: FastHashMap<u16, Vec<SeparatorEntry>> = FastHashMap::default();
-        let mut page_index = 0u32;
-
-        for (field_id, tree) in merged {
-            let mut cur_entries: Vec<(i64, RecordOrdinal)> =
-                Vec::with_capacity(MAX_ENTRIES_PER_LEAF_PAGE);
-            for (k, ords) in tree {
-                for ord in ords {
-                    cur_entries.push((k, ord));
-                    if cur_entries.len() == MAX_ENTRIES_PER_LEAF_PAGE {
-                        let sep = write_leaf_page(&mut pages_buf, field_id, page_index, &cur_entries);
-                        new_separators.entry(field_id).or_default().push(sep);
-                        page_index += 1;
-                        cur_entries.clear();
-                    }
-                }
-            }
-            if !cur_entries.is_empty() {
-                let sep = write_leaf_page(&mut pages_buf, field_id, page_index, &cur_entries);
-                new_separators.entry(field_id).or_default().push(sep);
-                page_index += 1;
-            }
-        }
-
-        // Write 4 KiB file header page followed by all 4 KiB leaf pages
-        let mut full_file = Vec::with_capacity(BTREE_PAGE_SIZE + pages_buf.len());
-        full_file.resize(BTREE_PAGE_SIZE, 0u8);
-        full_file[0..4].copy_from_slice(&BTREE_FILE_MAGIC.to_le_bytes());
-        full_file[4..8].copy_from_slice(&page_index.to_le_bytes());
-        let hdr_crc = checksum_payload(&full_file[0..8]);
-        full_file[8..16].copy_from_slice(&hdr_crc.to_le_bytes());
-        full_file.extend_from_slice(&pages_buf);
-
-        if let Some(parent) = self.path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| StorageError::io("create paged btree dir", e))?;
-            }
-        }
-        atomic_write_replace(&self.path, &full_file, true)?;
-
-        let new_mmap = map_path_read_only(&self.path)?;
-        guard.mmap = Some(new_mmap);
-        guard.separators = new_separators;
-        guard.hot_added = NumericRangeIndex::new();
-        guard.hot_removed.clear();
-
-        Ok(page_index as usize)
+        self.count_in_range(field_id, lo..=hi)
     }
-}
 
-fn map_path_read_only(path: &Path) -> Result<MmapRegion> {
-    let file = fs::File::open(path).map_err(|e| StorageError::io("open index file for mmap", e))?;
-    let len = file
-        .metadata()
-        .map_err(|e| StorageError::io("stat index file for mmap", e))?
-        .len() as usize;
-    MmapRegion::map_read_only(&file, len)
+    /// Paginated, direction-aware, keyset-cursor-seekable range scan with exactly the semantics of
+    /// [`NumericRangeIndex::range_collect_paginated`]. Streams the base pages, so a page of results
+    /// costs `O(offset + limit)` plus the (small) in-RAM delta of the range.
+    #[allow(clippy::too_many_arguments)]
+    pub fn range_collect_paginated<F: Fn(RecordOrdinal) -> bool>(
+        &self,
+        field_id: u16,
+        min_inclusive: i64,
+        max_inclusive: i64,
+        order: SortOrder,
+        cursor: Option<KeysetCursor>,
+        offset: usize,
+        limit: Option<usize>,
+        filter_fn: F,
+    ) -> (Vec<(i64, RecordOrdinal)>, usize) {
+        if min_inclusive > max_inclusive {
+            return (Vec::new(), 0);
+        }
+        let (lo, hi) = match (order, cursor.and_then(|c| c.sort_key)) {
+            (SortOrder::Asc, Some(ck)) if ck > min_inclusive => (ck, max_inclusive),
+            (SortOrder::Desc, Some(ck)) if ck < max_inclusive => (min_inclusive, ck),
+            _ => (min_inclusive, max_inclusive),
+        };
+        if lo > hi {
+            return (Vec::new(), 0);
+        }
+        let max_items = limit.unwrap_or(usize::MAX);
+        let mut out = Vec::with_capacity(max_items.min(256));
+        let mut total_matched = 0usize;
+        let mut skipped = 0usize;
+        self.read().for_each_visible(field_id, lo, hi, order, |k, ord| {
+            if let Some(cur) = cursor {
+                let past_cursor = match (order, cur.sort_key) {
+                    (SortOrder::Asc, Some(ck)) => !(k == ck && ord <= cur.ordinal),
+                    (SortOrder::Desc, Some(ck)) => !(k == ck && ord >= cur.ordinal),
+                    (SortOrder::Asc, None) => ord > cur.ordinal,
+                    (SortOrder::Desc, None) => ord < cur.ordinal,
+                };
+                if !past_cursor {
+                    return true;
+                }
+            }
+            if !filter_fn(ord) {
+                return true;
+            }
+            total_matched += 1;
+            if skipped < offset {
+                skipped += 1;
+            } else if out.len() < max_items {
+                out.push((k, ord));
+            }
+            true
+        });
+        (out, total_matched)
+    }
+
+    /// Ordinals matching `range` on `field_id` in ascending key order (at most `limit`).
+    pub fn range_collect<R: RangeBounds<i64>>(
+        &self,
+        field_id: u16,
+        range: R,
+        limit: Option<usize>,
+    ) -> Vec<RecordOrdinal> {
+        let (lo, hi) = normalize_bounds(&range);
+        let max = limit.unwrap_or(usize::MAX);
+        let mut out = Vec::with_capacity(max.min(512));
+        if lo <= hi && max > 0 {
+            self.read().for_each_visible(field_id, lo, hi, SortOrder::Asc, |_, ord| {
+                out.push(ord);
+                out.len() < max
+            });
+        }
+        out
+    }
+
+    /// Checkpoints with the current stamp unchanged. Returns the number of leaf pages written.
+    #[inline]
+    pub fn checkpoint_to_disk(&self) -> Result<usize> {
+        let stamp = self.stamp();
+        self.checkpoint_with_stamp(stamp)
+    }
+
+    /// Merges the base and the delta into a new generation file tagged with `stamp`.
+    ///
+    /// Only the freeze and the final swap take the state lock (`O(1)` each); the stream merge and
+    /// all I/O run without it, so concurrent reads and writes proceed. Extra memory is `O(page)`
+    /// plus the separator directory being built. On error the frozen delta is folded back, so no
+    /// write is lost and a later checkpoint can retry.
+    pub fn checkpoint_with_stamp(&self, stamp: u64) -> Result<usize> {
+        let pending = self.begin_checkpoint();
+        self.finish_checkpoint(pending, stamp)
+    }
+
+    /// Freezes the current delta (`O(1)`, brief state lock). Pair with
+    /// [`Self::finish_checkpoint`]; the returned token serializes checkpoints. Callers that need a
+    /// consistent cut across several structures freeze them all while their writers are paused.
+    pub fn begin_checkpoint(&self) -> PendingBTreeCheckpoint<'_> {
+        let guard = self
+            .checkpoint_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut st = self.write();
+        let frozen = Arc::new(FrozenDelta {
+            hot: core::mem::take(&mut st.hot),
+            removed: core::mem::take(&mut st.removed),
+        });
+        st.frozen = Some(Arc::clone(&frozen));
+        PendingBTreeCheckpoint {
+            _guard: guard,
+            frozen,
+            base: st.base.clone(),
+            generation: st.generation + 1,
+        }
+    }
+
+    /// Writes and publishes the generation frozen by [`Self::begin_checkpoint`] (no state lock is
+    /// held during I/O). Returns the number of pages written. On error the frozen delta is
+    /// folded back, so no write is lost.
+    pub fn finish_checkpoint(&self, pending: PendingBTreeCheckpoint<'_>, stamp: u64) -> Result<usize> {
+        let PendingBTreeCheckpoint {
+            _guard,
+            frozen,
+            base,
+            generation,
+        } = pending;
+        match self.write_generation(&frozen, base.as_deref(), generation, stamp) {
+            Ok((new_base, written)) => {
+                let old = {
+                    let mut st = self.write();
+                    st.frozen = None;
+                    st.generation = generation;
+                    st.stamp = stamp;
+                    st.base.replace(Arc::new(new_base))
+                };
+                drop(base);
+                if let Some(old) = old {
+                    let old_path = old.path.clone();
+                    drop(old);
+                    // Best effort: a leftover generation is removed at the next open.
+                    let _ = fs::remove_file(old_path);
+                }
+                Ok(written)
+            }
+            Err(e) => {
+                self.unfreeze(&frozen);
+                Err(e)
+            }
+        }
+    }
+
+    /// Drops every entry and publishes an empty generation tagged with `stamp` (used before a
+    /// rebuild from the records).
+    pub fn clear_with_stamp(&self, stamp: u64) -> Result<()> {
+        let _one_at_a_time = self
+            .checkpoint_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (old, generation) = {
+            let mut st = self.write();
+            st.hot = Default::default();
+            st.removed = Default::default();
+            st.frozen = None;
+            (st.base.take(), st.generation + 1)
+        };
+        let (new_base, _) = self.write_generation(&FrozenDelta::default(), None, generation, stamp)?;
+        {
+            let mut st = self.write();
+            st.generation = generation;
+            st.stamp = stamp;
+            st.base = Some(Arc::new(new_base));
+        }
+        if let Some(old) = old {
+            let old_path = old.path.clone();
+            drop(old);
+            let _ = fs::remove_file(old_path);
+        }
+        Ok(())
+    }
+
+    /// Folds a frozen delta back into the live state after a failed checkpoint, preserving the
+    /// disjoint-sources invariant.
+    fn unfreeze(&self, frozen: &FrozenDelta) {
+        let mut st = self.write();
+        st.frozen = None;
+        for (field, pairs) in frozen.hot.snapshot_all() {
+            for (k, o) in pairs {
+                if !st.removed.remove(&(field, k, o)) {
+                    st.hot.insert(field, k, o);
+                }
+            }
+        }
+        for &(field, k, o) in &frozen.removed {
+            if st.hot.contains(field, k, o) {
+                // Re-inserted after the freeze while hidden in the base: visible via base again.
+                st.hot.remove(field, k, o);
+            } else {
+                st.removed.insert((field, k, o));
+            }
+        }
+    }
+
+    /// Streams `(base - frozen.removed) ∪ frozen.hot` into generation file `generation`, then
+    /// writes the manifest. Returns the mapped new generation and its page count.
+    fn write_generation(
+        &self,
+        frozen: &FrozenDelta,
+        base: Option<&BaseGeneration>,
+        generation: u64,
+        stamp: u64,
+    ) -> Result<(BaseGeneration, usize)> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(|e| StorageError::io("create paged btree dir", e))?;
+        }
+        let data_path = generation_path(&self.path, generation);
+        let tmp_path = temp_generation_path(&self.path, generation);
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| StorageError::io("create btree generation file", e))?;
+        let mut writer = BufWriter::with_capacity(16 * BTREE_PAGE_SIZE, file);
+        writer
+            .write_all(&[0u8; BTREE_PAGE_SIZE])
+            .map_err(|e| StorageError::io("write btree header placeholder", e))?;
+
+        let mut fields: Vec<u16> = base
+            .map(|b| b.separators.keys().copied().collect())
+            .unwrap_or_default();
+        let hot = frozen.hot.snapshot_all();
+        fields.extend(hot.iter().map(|(f, _)| *f));
+        fields.sort_unstable();
+        fields.dedup();
+
+        let mut separators: FastHashMap<u16, Vec<SeparatorEntry>> = FastHashMap::default();
+        let mut page_buf = vec![0u8; BTREE_PAGE_SIZE];
+        let mut pending: Vec<(i64, RecordOrdinal)> = Vec::with_capacity(MAX_ENTRIES_PER_LEAF_PAGE);
+        let mut page_index = 0u32;
+        let mut io_err: Option<std::io::Error> = None;
+
+        for field in fields {
+            let mut delta: Vec<(i64, RecordOrdinal)> = hot
+                .iter()
+                .find(|(f, _)| *f == field)
+                .map(|(_, pairs)| pairs.clone())
+                .unwrap_or_default();
+            delta.sort_unstable();
+            let mut emit = |k: i64, o: RecordOrdinal, pending: &mut Vec<(i64, RecordOrdinal)>| {
+                pending.push((k, o));
+                if pending.len() == MAX_ENTRIES_PER_LEAF_PAGE && io_err.is_none() {
+                    let sep = encode_leaf_page(&mut page_buf, field, page_index, pending);
+                    if let Err(e) = writer.write_all(&page_buf) {
+                        io_err = Some(e);
+                    }
+                    separators.entry(field).or_default().push(sep);
+                    page_index += 1;
+                    pending.clear();
+                }
+            };
+            let mut di = 0usize;
+            if let Some(b) = base {
+                b.scan(field, i64::MIN, i64::MAX, SortOrder::Asc, |k, o| {
+                    if frozen.removed.contains(&(field, k, o)) {
+                        return true;
+                    }
+                    while di < delta.len() && delta[di] < (k, o) {
+                        emit(delta[di].0, delta[di].1, &mut pending);
+                        di += 1;
+                    }
+                    emit(k, o, &mut pending);
+                    true
+                });
+            }
+            for &(k, o) in &delta[di..] {
+                emit(k, o, &mut pending);
+            }
+            if !pending.is_empty() && io_err.is_none() {
+                let sep = encode_leaf_page(&mut page_buf, field, page_index, &pending);
+                if let Err(e) = writer.write_all(&page_buf) {
+                    io_err = Some(e);
+                }
+                separators.entry(field).or_default().push(sep);
+                page_index += 1;
+                pending.clear();
+            }
+            if let Some(e) = io_err.take() {
+                return Err(StorageError::io("write btree leaf page", e));
+            }
+        }
+
+        let mut file = writer
+            .into_inner()
+            .map_err(|e| StorageError::io("flush btree generation file", e.into_error()))?;
+        let mut header = [0u8; 16];
+        header[0..4].copy_from_slice(&BTREE_FILE_MAGIC.to_le_bytes());
+        header[4..8].copy_from_slice(&page_index.to_le_bytes());
+        let hdr_crc = checksum_payload(&header[0..8]);
+        header[8..16].copy_from_slice(&hdr_crc.to_le_bytes());
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.write_all(&header))
+            .and_then(|()| file.sync_all())
+            .map_err(|e| StorageError::io("finalize btree generation file", e))?;
+        drop(file);
+        publish_generation(&tmp_path, &data_path)?;
+        // The manifest's atomic replace also fsyncs the directory, covering the rename above.
+        write_manifest(&self.path, BTREE_MANIFEST_MAGIC, generation, stamp)?;
+
+        let mmap = map_path_read_only(&data_path)?;
+        Ok((
+            BaseGeneration {
+                mmap,
+                separators,
+                path: data_path,
+            },
+            page_index as usize,
+        ))
+    }
 }
 
 fn normalize_bounds<R: RangeBounds<i64>>(range: &R) -> (i64, i64) {
@@ -323,39 +818,49 @@ fn normalize_bounds<R: RangeBounds<i64>>(range: &R) -> (i64, i64) {
     (lo, hi)
 }
 
-/// Encodes a 4 KiB leaf page with delta-encoded keys (`delta = key - min_key`) and `RecordOrdinal`s.
+/// Checksum of a leaf page covering its header (`[0..24]`: magic, field id, entry count, min / max
+/// key) and its body (`[32..]`), i.e. every byte except the stored checksum at `[24..32]`, so a
+/// flipped bit in a separator key can never silently change range results.
+#[inline]
+pub(crate) fn page_crc(page: &[u8]) -> u64 {
+    let header = page.get(..24).unwrap_or_default();
+    let body = page.get(PAGE_HEADER_SIZE..).unwrap_or_default();
+    checksum_payload(body) ^ checksum_payload(header).rotate_left(29)
+}
+
+/// Encodes a 4 KiB leaf page (overwriting all of `page`) with delta-encoded keys
+/// (`delta = key - min_key`) and `RecordOrdinal`s. `entries` must be non-empty, sorted, and at
+/// most [`MAX_ENTRIES_PER_LEAF_PAGE`] long.
+///
 /// Layout of 4 KiB page:
 /// - `[0..4]`: `BTREE_PAGE_MAGIC` (`u32`)
 /// - `[4..6]`: `field_id` (`u16`)
 /// - `[6..8]`: `entry_count` (`u16`)
 /// - `[8..16]`: `min_key` (`i64`)
 /// - `[16..24]`: `max_key` (`i64`)
-/// - `[24..32]`: `crc64` (`u64`)
+/// - `[24..32]`: `crc64` (`u64`) over the whole page except this field (see [`page_crc`])
 /// - `[32..32 + count * 8]`: sorted array of `delta_key: i64` (`key.wrapping_sub(min_key)`)
 /// - `[32 + count * 8 .. 32 + count * 12]`: parallel array of `RecordOrdinal` (`u32`)
-fn write_leaf_page(
-    out: &mut Vec<u8>,
+fn encode_leaf_page(
+    page: &mut [u8],
     field_id: u16,
     page_index: u32,
     entries: &[(i64, RecordOrdinal)],
 ) -> SeparatorEntry {
-    let start_len = out.len();
-    out.resize(start_len + BTREE_PAGE_SIZE, 0u8);
-    let page = &mut out[start_len..start_len + BTREE_PAGE_SIZE];
-
-    let count = entries.len() as u16;
-    let min_key = entries[0].0;
-    let max_key = entries[entries.len() - 1].0;
+    page.fill(0);
+    let count = entries.len().min(MAX_ENTRIES_PER_LEAF_PAGE);
+    let entries = &entries[..count];
+    let min_key = entries.first().map_or(0, |e| e.0);
+    let max_key = entries.last().map_or(0, |e| e.0);
 
     page[0..4].copy_from_slice(&BTREE_PAGE_MAGIC.to_le_bytes());
     page[4..6].copy_from_slice(&field_id.to_le_bytes());
-    page[6..8].copy_from_slice(&count.to_le_bytes());
+    page[6..8].copy_from_slice(&(count as u16).to_le_bytes());
     page[8..16].copy_from_slice(&min_key.to_le_bytes());
     page[16..24].copy_from_slice(&max_key.to_le_bytes());
 
     let keys_off = PAGE_HEADER_SIZE;
-    let ords_off = PAGE_HEADER_SIZE + entries.len() * 8;
-
+    let ords_off = PAGE_HEADER_SIZE + count * 8;
     for (i, &(k, ord)) in entries.iter().enumerate() {
         let delta = k.wrapping_sub(min_key);
         let k_pos = keys_off + i * 8;
@@ -364,43 +869,28 @@ fn write_leaf_page(
         page[o_pos..o_pos + 4].copy_from_slice(&ord.0.to_le_bytes());
     }
 
-    let crc = checksum_payload(&page[PAGE_HEADER_SIZE..]);
+    let crc = page_crc(page);
     page[24..32].copy_from_slice(&crc.to_le_bytes());
 
     SeparatorEntry {
         field_id,
-        entry_count: count,
+        entry_count: count as u16,
         page_index,
         min_key,
         max_key,
     }
 }
 
+/// Reads key `idx` of a validated page (`idx < entry_count <= 338` keeps every offset in bounds).
 #[inline]
 fn read_delta_key_at(page: &[u8], min_key: i64, idx: usize) -> i64 {
     let pos = PAGE_HEADER_SIZE + idx * 8;
-    let delta = i64::from_le_bytes([
-        page[pos],
-        page[pos + 1],
-        page[pos + 2],
-        page[pos + 3],
-        page[pos + 4],
-        page[pos + 5],
-        page[pos + 6],
-        page[pos + 7],
-    ]);
-    min_key.wrapping_add(delta)
+    min_key.wrapping_add(read_u64_le(page, pos) as i64)
 }
 
 #[inline]
 fn read_ordinal_at(page: &[u8], count: usize, idx: usize) -> RecordOrdinal {
-    let pos = PAGE_HEADER_SIZE + count * 8 + idx * 4;
-    RecordOrdinal(u32::from_le_bytes([
-        page[pos],
-        page[pos + 1],
-        page[pos + 2],
-        page[pos + 3],
-    ]))
+    RecordOrdinal(read_u32_le(page, PAGE_HEADER_SIZE + count * 8 + idx * 4))
 }
 
 /// Binary searches `[0..count)` inside a 4 KiB leaf page for the first index where `key >= target`.
@@ -419,98 +909,7 @@ fn lower_bound_in_page(page: &[u8], min_key: i64, count: usize, target: i64) -> 
     left
 }
 
-fn scan_leaf_page_into_bitmap(
-    file_slice: &[u8],
-    sep: &SeparatorEntry,
-    lo: i64,
-    hi: i64,
-    removed: &FastHashSet<(u16, i64, RecordOrdinal)>,
-    bm: &mut CompressedBitmap,
-) {
-    let page_off = (sep.page_index as usize + 1) * BTREE_PAGE_SIZE;
-    let Some(page) = file_slice.get(page_off..page_off + BTREE_PAGE_SIZE) else {
-        return;
-    };
-    let count = sep.entry_count as usize;
-    let start = if lo <= sep.min_key {
-        0
-    } else {
-        lower_bound_in_page(page, sep.min_key, count, lo)
-    };
-    for idx in start..count {
-        let key = read_delta_key_at(page, sep.min_key, idx);
-        if key > hi {
-            break;
-        }
-        let ord = read_ordinal_at(page, count, idx);
-        if !removed.contains(&(sep.field_id, key, ord)) {
-            bm.insert(ord);
-        }
-    }
-}
-
-fn count_leaf_page_entries(
-    file_slice: &[u8],
-    sep: &SeparatorEntry,
-    lo: i64,
-    hi: i64,
-    removed: &FastHashSet<(u16, i64, RecordOrdinal)>,
-) -> usize {
-    let page_off = (sep.page_index as usize + 1) * BTREE_PAGE_SIZE;
-    let Some(page) = file_slice.get(page_off..page_off + BTREE_PAGE_SIZE) else {
-        return 0;
-    };
-    let count = sep.entry_count as usize;
-    let start = if lo <= sep.min_key {
-        0
-    } else {
-        lower_bound_in_page(page, sep.min_key, count, lo)
-    };
-    let mut matched = 0usize;
-    for idx in start..count {
-        let key = read_delta_key_at(page, sep.min_key, idx);
-        if key > hi {
-            break;
-        }
-        let ord = read_ordinal_at(page, count, idx);
-        if !removed.contains(&(sep.field_id, key, ord)) {
-            matched += 1;
-        }
-    }
-    matched
-}
-
-fn decode_leaf_page_into_tree(
-    file_slice: &[u8],
-    sep: &SeparatorEntry,
-    removed: &FastHashSet<(u16, i64, RecordOrdinal)>,
-    tree: &mut BTreeMap<i64, Vec<RecordOrdinal>>,
-) -> Result<()> {
-    let page_off = (sep.page_index as usize + 1) * BTREE_PAGE_SIZE;
-    let page = file_slice
-        .get(page_off..page_off + BTREE_PAGE_SIZE)
-        .ok_or_else(|| StorageError::corrupted_header("paged btree leaf out of bounds"))?;
-    let expected_crc = u64::from_le_bytes([
-        page[24], page[25], page[26], page[27], page[28], page[29], page[30], page[31],
-    ]);
-    let actual_crc = checksum_payload(&page[PAGE_HEADER_SIZE..]);
-    if actual_crc != expected_crc {
-        return Err(StorageError::checksum_mismatch(expected_crc, actual_crc));
-    }
-    let count = sep.entry_count as usize;
-    for idx in 0..count {
-        let key = read_delta_key_at(page, sep.min_key, idx);
-        let ord = read_ordinal_at(page, count, idx);
-        if !removed.contains(&(sep.field_id, key, ord)) {
-            let list = tree.entry(key).or_default();
-            if let Err(pos) = list.binary_search(&ord) {
-                list.insert(pos, ord);
-            }
-        }
-    }
-    Ok(())
-}
-
+/// Validates every page once at open (`RULE-SAFE-04`) and builds the separator directory.
 fn load_separators_from_mmap(
     mmap: &MmapRegion,
     out: &mut FastHashMap<u16, Vec<SeparatorEntry>>,
@@ -519,19 +918,14 @@ fn load_separators_from_mmap(
     if slice.len() < BTREE_PAGE_SIZE {
         return Err(StorageError::corrupted_header("btree.idx smaller than 4 KiB"));
     }
-    let magic = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
-    if magic != BTREE_FILE_MAGIC {
+    if read_u32_le(slice, 0) != BTREE_FILE_MAGIC {
         return Err(StorageError::corrupted_header("btree.idx invalid file magic"));
     }
-    let page_count = u32::from_le_bytes([slice[4], slice[5], slice[6], slice[7]]);
-    let expected_crc = u64::from_le_bytes([
-        slice[8], slice[9], slice[10], slice[11], slice[12], slice[13], slice[14], slice[15],
-    ]);
-    if checksum_payload(&slice[0..8]) != expected_crc {
-        return Err(StorageError::checksum_mismatch(
-            expected_crc,
-            checksum_payload(&slice[0..8]),
-        ));
+    let page_count = read_u32_le(slice, 4);
+    let expected_crc = read_u64_le(slice, 8);
+    let actual_crc = checksum_payload(&slice[0..8]);
+    if actual_crc != expected_crc {
+        return Err(StorageError::checksum_mismatch(expected_crc, actual_crc));
     }
 
     for page_idx in 0..page_count {
@@ -539,19 +933,40 @@ fn load_separators_from_mmap(
         let page = slice
             .get(off..off + BTREE_PAGE_SIZE)
             .ok_or_else(|| StorageError::corrupted_header("btree.idx truncated leaf page"))?;
-        let p_magic = u32::from_le_bytes([page[0], page[1], page[2], page[3]]);
-        if p_magic != BTREE_PAGE_MAGIC {
+        if read_u32_le(page, 0) != BTREE_PAGE_MAGIC {
             return Err(StorageError::corrupted_header("btree.idx invalid leaf magic"));
         }
         let field_id = u16::from_le_bytes([page[4], page[5]]);
         let entry_count = u16::from_le_bytes([page[6], page[7]]);
-        let min_key = i64::from_le_bytes([
-            page[8], page[9], page[10], page[11], page[12], page[13], page[14], page[15],
-        ]);
-        let max_key = i64::from_le_bytes([
-            page[16], page[17], page[18], page[19], page[20], page[21], page[22], page[23],
-        ]);
-        out.entry(field_id).or_default().push(SeparatorEntry {
+        if entry_count == 0 || entry_count as usize > MAX_ENTRIES_PER_LEAF_PAGE {
+            return Err(StorageError::corrupted_header(
+                "btree.idx leaf entry count out of range",
+            ));
+        }
+        if page_crc(page) != read_u64_le(page, 24) {
+            return Err(StorageError::corrupted_header("btree.idx leaf page checksum mismatch"));
+        }
+        let min_key = read_u64_le(page, 8) as i64;
+        let max_key = read_u64_le(page, 16) as i64;
+        // Keys must be sorted inside the page and bounded by the header (scans rely on it).
+        let count = entry_count as usize;
+        let mut prev: Option<(i64, RecordOrdinal)> = None;
+        for idx in 0..count {
+            let e = (read_delta_key_at(page, min_key, idx), read_ordinal_at(page, count, idx));
+            if e.0 < min_key || e.0 > max_key || prev.is_some_and(|p| p >= e) {
+                return Err(StorageError::corrupted_header("btree.idx leaf entries out of order"));
+            }
+            prev = Some(e);
+        }
+        let seps = out.entry(field_id).or_default();
+        if seps.last().is_some_and(|last: &SeparatorEntry| {
+            last.max_key > min_key || last.page_index + 1 != page_idx
+        }) {
+            return Err(StorageError::corrupted_header(
+                "btree.idx pages of a field are not contiguous and sorted",
+            ));
+        }
+        seps.push(SeparatorEntry {
             field_id,
             entry_count,
             page_index: page_idx,
@@ -566,34 +981,140 @@ fn load_separators_from_mmap(
 mod tests {
     use super::*;
 
+    fn temp_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("storine_paged_btree_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("btree.idx")
+    }
+
     #[test]
     fn test_paged_btree_4kb_checkpoint_and_zero_alloc_range_scan() -> Result<()> {
-        let path = std::env::temp_dir().join("storine_test_paged_btree.idx");
-        let _ = fs::remove_file(&path);
-
+        let path = temp_path("basic");
         let btree = PagedBTreeIndex::open(&path)?;
-        // Insert 2,000 entries across multiple 4 KiB pages (338 entries per 4 KiB page -> 6 pages)
+        // 2,000 entries across multiple 4 KiB pages (338 entries per page -> 6 pages)
         for i in 0..2_000i64 {
             btree.insert(1, 10_000 + i * 10, RecordOrdinal(i as u32));
         }
-
-        let pages = btree.checkpoint_to_disk()?;
+        let pages = btree.checkpoint_with_stamp(7)?;
         assert_eq!(pages, 6);
         assert!(btree.separator_memory_bytes() <= 6 * 24);
 
-        // Re-open from disk and run zero-alloc range count + bitmap range query
         let reopened = PagedBTreeIndex::open(&path)?;
         assert_eq!(reopened.page_count(), 6);
-
-        let count = reopened.count_in_range_zero_alloc(1, 15_000, 15_990);
-        assert_eq!(count, 100);
-
+        assert_eq!(reopened.stamp(), 7);
+        assert_eq!(reopened.count_in_range_zero_alloc(1, 15_000, 15_990), 100);
         let bm = reopened.range_bitmap(1, 15_000..=15_090);
         assert_eq!(bm.len(), 10);
         assert!(bm.contains(RecordOrdinal(500)));
         assert!(bm.contains(RecordOrdinal(509)));
+        Ok(())
+    }
 
-        let _ = fs::remove_file(&path);
+    /// The paged index answers every query exactly like the in-memory index across inserts,
+    /// removes, re-inserts, duplicate keys and multiple checkpoints (including one interleaved
+    /// with writes between freeze and swap is exercised by the engine tests).
+    #[test]
+    fn test_paged_btree_matches_in_memory_index_through_checkpoints() -> Result<()> {
+        use storage_types::testing::SweepRng;
+        let path = temp_path("parity");
+        let paged = PagedBTreeIndex::open(&path)?;
+        let mem = NumericRangeIndex::new();
+        let mut rng = SweepRng::new(5);
+        let check = |paged: &PagedBTreeIndex, mem: &NumericRangeIndex, rng: &mut SweepRng| {
+            for field in 1..=2u16 {
+                let a = rng.below(400) as i64 - 50;
+                let b = a + rng.below(200) as i64;
+                assert_eq!(paged.range_bitmap(field, a..=b).to_vec(), mem.range_bitmap(field, a..=b).to_vec());
+                assert_eq!(paged.count_in_range(field, a..=b), mem.count_in_range(field, a..=b));
+                assert_eq!(paged.eq_bitmap(field, a).to_vec(), mem.eq_bitmap(field, a).to_vec());
+                assert_eq!(
+                    paged.in_values_bitmap(field, &[a, b, a + 3]).to_vec(),
+                    mem.in_values_bitmap(field, &[a, b, a + 3]).to_vec()
+                );
+                assert_eq!(paged.all_on_field_bitmap(field).to_vec(), mem.all_on_field_bitmap(field).to_vec());
+                assert_eq!(paged.range_collect(field, a..=b, Some(17)), mem.range_collect(field, a..=b, Some(17)));
+                for order in [SortOrder::Asc, SortOrder::Desc] {
+                    let cursor = (rng.below(3) == 0).then(|| {
+                        KeysetCursor::from_key_and_ordinal(a + 20, RecordOrdinal(rng.below(300) as u32))
+                    });
+                    let off = rng.below(5);
+                    let lim = Some(1 + rng.below(40));
+                    let even = |o: RecordOrdinal| o.0 % 2 == 0;
+                    assert_eq!(
+                        paged.range_collect_paginated(field, a, b, order, cursor, off, lim, even),
+                        mem.range_collect_paginated(field, a, b, order, cursor, off, lim, even),
+                        "field {field} [{a}, {b}] {order:?} cursor {cursor:?}"
+                    );
+                }
+            }
+        };
+        for round in 0..6 {
+            for _ in 0..1_500 {
+                let field = 1 + rng.below(2) as u16;
+                let key = rng.below(300) as i64; // many duplicate keys
+                let ord = RecordOrdinal(rng.below(400) as u32);
+                if rng.below(3) == 0 {
+                    paged.remove(field, key, ord);
+                    mem.remove(field, key, ord);
+                } else {
+                    paged.insert(field, key, ord);
+                    mem.insert(field, key, ord);
+                }
+            }
+            check(&paged, &mem, &mut rng);
+            if round % 2 == 1 {
+                paged.checkpoint_with_stamp(round)?;
+                check(&paged, &mem, &mut rng);
+            }
+        }
+        drop(paged);
+        let reopened = PagedBTreeIndex::open(&path)?;
+        check(&reopened, &mem, &mut rng);
+        Ok(())
+    }
+
+    #[test]
+    fn test_paged_btree_checkpoint_never_blocks_writers_and_keeps_concurrent_writes() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let path = temp_path("concurrent");
+        let idx = Arc::new(PagedBTreeIndex::open(&path)?);
+        for i in 0..50_000u32 {
+            idx.insert(1, i64::from(i), RecordOrdinal(i));
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let idx = Arc::clone(&idx);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut n = 0u32;
+                while !stop.load(Ordering::Relaxed) && n < 200_000 {
+                    idx.insert(2, i64::from(n), RecordOrdinal(n));
+                    idx.remove(1, i64::from(n), RecordOrdinal(n));
+                    n += 1;
+                }
+                n
+            })
+        };
+        for stamp in 1..=4 {
+            idx.checkpoint_with_stamp(stamp)?;
+        }
+        stop.store(true, Ordering::Relaxed);
+        let n = writer.join().unwrap_or(0);
+        assert_eq!(idx.count_in_range(2, ..), n as usize);
+        assert_eq!(idx.count_in_range(1, ..), 50_000usize.saturating_sub(n as usize));
+        idx.checkpoint_with_stamp(5)?;
+        drop(idx);
+        let reopened = PagedBTreeIndex::open(&path)?;
+        assert_eq!(reopened.count_in_range(2, ..), n as usize);
+        // Exactly one generation file remains.
+        let dir = path.parent().unwrap();
+        let gens = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("btree.idx."))
+            .count();
+        assert_eq!(gens, 1);
         Ok(())
     }
 }

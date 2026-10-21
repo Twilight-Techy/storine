@@ -1,8 +1,9 @@
 //! Roaring-style 64-bit word chunked Compressed Bitmap Index (`TASK-018`, `F-INDX-04`).
 //!
-//! Stores dense `RecordOrdinal` sets in sorted 4096-bit (64 x `u64` = 512B cache-aligned) containers
-//! or compact sorted `u16` arrays when sparse (`< 32` bits set in a 4096-bit block), supporting
-//! hardware-vectorized 64-bit bitwise `AND`, `OR`, and `AND NOT` intersections in sub-microseconds.
+//! Stores `RecordOrdinal` sets as a sorted array of 4096-bit chunks (64 x `u64` = 512 B each),
+//! supporting 64-bit-word bitwise `AND`, `OR`, and `AND NOT` intersections. Every non-empty chunk
+//! costs 512 B regardless of how many bits it holds (there is no sparse array container), so very
+//! sparse posting lists over a wide ordinal range use more memory than a Roaring bitmap would.
 
 use std::sync::RwLock;
 use storage_types::{FastHashMap, InlineId, RecordOrdinal};
@@ -300,7 +301,10 @@ impl CompressedBitmap {
         }
 
         // Cursor-filtered path (`after_ordinal == Some(cursor)`)
-        let cursor = after_ordinal.unwrap().0;
+        let Some(RecordOrdinal(cursor)) = after_ordinal else {
+            // Unreachable: the `after_ordinal.is_none()` branch above already returned.
+            return (Vec::new(), 0);
+        };
         let mut out = Vec::with_capacity(max_items.min(self.cardinality));
         let mut total_matched = 0usize;
         let mut skipped = 0usize;
@@ -493,6 +497,26 @@ impl BitmapTagIndex {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.get(&(field_id, tag)).map_or(0, |bm| bm.len())
+    }
+
+    /// `true` if `(field_id, tag)` holds `ord`.
+    pub fn contains(&self, field_id: u16, tag: InlineId, ord: RecordOrdinal) -> bool {
+        self.map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&(field_id, tag))
+            .is_some_and(|bm| bm.contains(ord))
+    }
+
+    /// Every `(field_id, tag)` key currently holding a non-empty bitmap.
+    pub fn keys(&self) -> Vec<(u16, InlineId)> {
+        self.map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(_, bm)| !bm.is_empty())
+            .map(|(&k, _)| k)
+            .collect()
     }
 
     /// Exports all `((field_id, tag), CompressedBitmap)` pairs for paged disk checkpointing (`TASK-035`).

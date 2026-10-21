@@ -84,10 +84,19 @@ extern "system" {
 }
 
 #[cfg(unix)]
-fn platform_atomic_rename(src: &Path, dst: &Path, _write_through: bool) -> Result<()> {
+fn platform_atomic_rename(src: &Path, dst: &Path, write_through: bool) -> Result<()> {
     if let Err(e) = fs::rename(src, dst) {
         let _ = fs::remove_file(src);
         return Err(StorageError::io("rename atomic replace", e));
+    }
+    if write_through {
+        // A rename is only durable once the containing directory entry is synced.
+        if let Some(parent) = dst.parent() {
+            let dir = fs::File::open(parent)
+                .map_err(|e| StorageError::io("open parent directory for fsync", e))?;
+            dir.sync_all()
+                .map_err(|e| StorageError::io("fsync parent directory after rename", e))?;
+        }
     }
     Ok(())
 }

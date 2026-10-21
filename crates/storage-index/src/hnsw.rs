@@ -1,5 +1,5 @@
 //! Multi-Layer HNSW (Hierarchical Navigable Small World) Vector Index with `SQ8` Scalar Quantization
-//! and Generation-Stamped Visited Tracking (`TASK-037`, `F-INDX-07`, `RULE-ALGO-01`, `RULE-MEM-02`).
+//! and Generation-Stamped Visited Tracking (`TASK-037`, `F-INDX-07`, `RULE-CPLX-01`, `RULE-MEM-02`).
 //!
 //! Achieves $O(\log N)$ sub-millisecond Approximate Nearest Neighbor (ANN) vector search with
 //! `4x` reduced RAM footprint via `QuantizedVecSq8` codes and `hnsw.idx` disk persistence.
@@ -8,11 +8,12 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Mutex, RwLock};
 
 use storage_codec::checksum_payload;
 use storage_mmap::atomic_write_replace;
-use storage_types::{RecordOrdinal, Result, StorageError};
+use storage_types::{FastHashSet, RecordOrdinal, Result, StorageError};
 
 use crate::bitmap::CompressedBitmap;
 use crate::quantize::{sq8_cosine_similarity, QuantizedVecSq8};
@@ -50,6 +51,24 @@ struct HnswNode {
     /// Adjacency lists per layer (`layers[0]` is base layer `0`, up to `layers[max_node_layer]`).
     layers: Vec<Vec<u32>>,
     deleted: bool,
+    /// Number of base-layer links pointing at this node. Link eviction never removes a node's
+    /// last inbound edge, so every node stays reachable by search (derived, not persisted).
+    inbound0: u32,
+}
+
+#[inline]
+fn inbound0_of(g: &HnswGraphState, ord: u32) -> u32 {
+    g.nodes
+        .get(ord as usize)
+        .and_then(Option::as_ref)
+        .map_or(0, |n| n.inbound0)
+}
+
+#[inline]
+fn adjust_inbound0(g: &mut HnswGraphState, ord: u32, delta: i32) {
+    if let Some(Some(n)) = g.nodes.get_mut(ord as usize) {
+        n.inbound0 = n.inbound0.saturating_add_signed(delta);
+    }
 }
 
 /// Generation-stamped visited array (`RULE-MEM-02`):
@@ -73,14 +92,16 @@ impl VisitedTable {
         self.current_gen
     }
 
+    /// Returns `true` the first time `idx` is seen in this generation; out-of-range ids
+    /// (from a corrupted graph) are reported as already visited and skipped.
     #[inline]
     fn mark_visited(&mut self, idx: u32, gen: u32) -> bool {
-        let i = idx as usize;
-        if self.stamp[i] == gen {
-            false
-        } else {
-            self.stamp[i] = gen;
-            true
+        match self.stamp.get_mut(idx as usize) {
+            Some(slot) if *slot != gen => {
+                *slot = gen;
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -143,6 +164,8 @@ pub struct HnswVectorIndex {
     config: HnswConfig,
     graph: RwLock<HnswGraphState>,
     visited_pool: Mutex<VisitedTable>,
+    /// Bumped on every mutation, so persistence can skip saving an unchanged graph.
+    generation: AtomicU64,
 }
 
 impl core::fmt::Debug for HnswVectorIndex {
@@ -166,6 +189,7 @@ impl HnswVectorIndex {
             config,
             graph: RwLock::new(HnswGraphState::default()),
             visited_pool: Mutex::new(VisitedTable::default()),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -182,6 +206,44 @@ impl HnswVectorIndex {
         self.len() == 0
     }
 
+    /// Mutation counter: equal values mean the graph did not change in between.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(AtomicOrdering::Relaxed)
+    }
+
+    /// `true` if `ord` is live and stores exactly the `SQ8` quantization of `vec` (quantization is
+    /// deterministic, so an unchanged embedding always matches). Used to reconcile a persisted
+    /// graph with the records without rebuilding it.
+    pub fn vector_matches(&self, ord: RecordOrdinal, vec: &[f32]) -> bool {
+        let q = QuantizedVecSq8::quantize(vec);
+        let g = self
+            .graph
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        g.dim == vec.len()
+            && g
+                .nodes
+                .get(ord.as_usize())
+                .and_then(Option::as_ref)
+                .is_some_and(|n| !n.deleted && n.quantized == q)
+    }
+
+    /// Ordinals of every live (non-deleted) vector, ascending. `O(#vectors)`, independent of how
+    /// many records without embeddings the collection holds.
+    pub fn live_ordinals(&self) -> Vec<RecordOrdinal> {
+        let g = self
+            .graph
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        g.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.as_ref().is_some_and(|n| !n.deleted))
+            .map(|(ord, _)| RecordOrdinal(ord as u32))
+            .collect()
+    }
+
     /// Deterministic geometric level assignment for `ord` (`P(level >= l) = (1/m)^l`, max 6 layers).
     #[inline]
     fn assign_layer(ord: u32) -> usize {
@@ -194,6 +256,7 @@ impl HnswVectorIndex {
 
     /// Inserts or updates a vector embedding for `ord` in the multi-layer HNSW graph (`O(log N)`).
     pub fn insert(&self, ord: RecordOrdinal, vec: &[f32]) {
+        self.generation.fetch_add(1, AtomicOrdering::Relaxed);
         if vec.is_empty() {
             self.remove(ord);
             return;
@@ -219,6 +282,14 @@ impl HnswVectorIndex {
         }
 
         let was_live = g.nodes[idx].as_ref().is_some_and(|n| !n.deleted);
+        // Updating an existing node: its inbound links (from other nodes) remain; its old
+        // base-layer out-links are replaced below.
+        let old_inbound0 = g.nodes[idx].as_ref().map_or(0, |n| n.inbound0);
+        let old_out0: Vec<u32> = g.nodes[idx]
+            .as_ref()
+            .and_then(|n| n.layers.first().cloned())
+            .unwrap_or_default();
+        let mut added_inbound0 = 0u32;
         let mut layers = Vec::with_capacity(node_layer + 1);
         for l in 0..=node_layer {
             let cap = if l == 0 {
@@ -234,6 +305,7 @@ impl HnswVectorIndex {
                 quantized: q_vec,
                 layers,
                 deleted: false,
+                inbound0: 0,
             });
             g.entry_point = Some(node_id);
             g.max_layer = node_layer;
@@ -251,8 +323,10 @@ impl HnswVectorIndex {
             return;
         }
 
-        let mut cur_score = g.nodes[cur_ep as usize]
-            .as_ref()
+        let mut cur_score = g
+            .nodes
+            .get(cur_ep as usize)
+            .and_then(|n| n.as_ref())
             .map_or(-1.0, |ep_node| sq8_cosine_similarity(&q_vec, &ep_node.quantized));
 
         // 1. Greedy descent from `g.max_layer` down to `node_layer + 1`
@@ -260,7 +334,7 @@ impl HnswVectorIndex {
             for l in ((node_layer + 1)..=g.max_layer).rev() {
                 loop {
                     let mut improved = false;
-                    if let Some(ep_node) = g.nodes[cur_ep as usize].as_ref() {
+                    if let Some(ep_node) = g.nodes.get(cur_ep as usize).and_then(|n| n.as_ref()) {
                         if let Some(neighbors) = ep_node.layers.get(l) {
                             for &nb in neighbors {
                                 if let Some(nb_node) = g.nodes.get(nb as usize).and_then(|x| x.as_ref()) {
@@ -314,6 +388,8 @@ impl HnswVectorIndex {
                 .collect();
 
             layers[l] = selected.clone();
+            let nearest = selected.first().copied();
+            let mut reverse_links = 0usize;
 
             // Add reverse edges with degree-bound pruning
             for nb in selected {
@@ -321,9 +397,15 @@ impl HnswVectorIndex {
                     if nb_node.layers.len() <= l {
                         nb_node.layers.resize_with(l + 1, Vec::new);
                     }
-                    if !nb_node.layers[l].contains(&node_id) {
+                    if nb_node.layers[l].contains(&node_id) {
+                        reverse_links += 1;
+                    } else {
                         if nb_node.layers[l].len() < max_links {
                             nb_node.layers[l].push(node_id);
+                            reverse_links += 1;
+                            if l == 0 {
+                                added_inbound0 += 1;
+                            }
                         } else {
                             // Replace the weakest neighbor if `node_id` is closer
                             let nb_q = nb_node.quantized.clone();
@@ -332,6 +414,10 @@ impl HnswVectorIndex {
                             let mut worst_sim = f32::INFINITY;
                             let existing_nbs = nb_node.layers[l].clone();
                             for (i, &other_id) in existing_nbs.iter().enumerate() {
+                                // Never evict a node's last base-layer inbound edge.
+                                if l == 0 && inbound0_of(&g, other_id) <= 1 {
+                                    continue;
+                                }
                                 let sim = g
                                     .nodes
                                     .get(other_id as usize)
@@ -343,21 +429,64 @@ impl HnswVectorIndex {
                                 }
                             }
                             if new_sim > worst_sim {
+                                let mut evicted = None;
                                 if let Some(Some(nb_node_mut)) = g.nodes.get_mut(nb as usize) {
+                                    evicted = nb_node_mut.layers[l].get(worst_idx).copied();
                                     nb_node_mut.layers[l][worst_idx] = node_id;
+                                    reverse_links += 1;
+                                }
+                                if l == 0 {
+                                    added_inbound0 += 1;
+                                    if let Some(ev) = evicted {
+                                        adjust_inbound0(&mut g, ev, -1);
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+
+            // Connectivity guarantee: a node dissimilar to everything (an outlier) can be rejected
+            // by every full neighbor list, leaving it with no inbound edge and unreachable by any
+            // search — even an exact-match query. Force one inbound edge on the base layer from
+            // its nearest neighbor (replacing that neighbor's weakest link).
+            if l == 0 && reverse_links == 0 {
+                if let Some(nb) = nearest {
+                    force_reverse_link(&mut g, nb, node_id);
+                    added_inbound0 += 1;
+                }
+            }
         }
         drop(vis);
+
+        // Base-layer out-link accounting. A target this node used to link to keeps the link if
+        // it was that target's only inbound edge (it would otherwise become unreachable).
+        let mut out0 = layers.first().cloned().unwrap_or_default();
+        for &old in &old_out0 {
+            if out0.contains(&old) || old == node_id {
+                continue;
+            }
+            if inbound0_of(&g, old) <= 1 {
+                out0.push(old);
+            } else {
+                adjust_inbound0(&mut g, old, -1);
+            }
+        }
+        for &t in &out0 {
+            if !old_out0.contains(&t) {
+                adjust_inbound0(&mut g, t, 1);
+            }
+        }
+        if let Some(base) = layers.first_mut() {
+            *base = out0;
+        }
 
         g.nodes[idx] = Some(HnswNode {
             quantized: q_vec,
             layers,
             deleted: false,
+            inbound0: old_inbound0 + added_inbound0,
         });
         if node_layer > g.max_layer {
             g.max_layer = node_layer;
@@ -370,6 +499,7 @@ impl HnswVectorIndex {
 
     /// Marks `ord` as deleted in the HNSW graph.
     pub fn remove(&self, ord: RecordOrdinal) {
+        self.generation.fetch_add(1, AtomicOrdering::Relaxed);
         let mut g = self
             .graph
             .write()
@@ -406,15 +536,17 @@ impl HnswVectorIndex {
         }
 
         let q_query = QuantizedVecSq8::quantize(query);
-        let mut cur_score = g.nodes[cur_ep as usize]
-            .as_ref()
+        let mut cur_score = g
+            .nodes
+            .get(cur_ep as usize)
+            .and_then(|n| n.as_ref())
             .map_or(-1.0, |ep_node| sq8_cosine_similarity(&q_query, &ep_node.quantized));
 
         // 1. Greedy descent from `max_layer` down to layer `1`
         for l in (1..=g.max_layer).rev() {
             loop {
                 let mut improved = false;
-                if let Some(ep_node) = g.nodes[cur_ep as usize].as_ref() {
+                if let Some(ep_node) = g.nodes.get(cur_ep as usize).and_then(|n| n.as_ref()) {
                     if let Some(neighbors) = ep_node.layers.get(l) {
                         for &nb in neighbors {
                             if let Some(nb_node) = g.nodes.get(nb as usize).and_then(|x| x.as_ref()) {
@@ -465,9 +597,9 @@ impl HnswVectorIndex {
         // Fallback if a highly selective filter pruned the HNSW neighborhood
         if hits.len() < k {
             if let Some(bm) = filter_bitmap {
-                let mut seen: Vec<u32> = hits.iter().map(|h| h.ordinal.0).collect();
+                let mut seen: FastHashSet<u32> = hits.iter().map(|h| h.ordinal.0).collect();
                 for ord in bm.to_vec() {
-                    if seen.contains(&ord.0) {
+                    if !seen.insert(ord.0) {
                         continue;
                     }
                     if let Some(Some(node)) = g.nodes.get(ord.0 as usize) {
@@ -477,7 +609,6 @@ impl HnswVectorIndex {
                                 ordinal: ord,
                                 score: s,
                             });
-                            seen.push(ord.0);
                         }
                     }
                 }
@@ -536,6 +667,9 @@ impl HnswVectorIndex {
     }
 
     /// Loads a persisted `HnswVectorIndex` from `path` (`hnsw.idx`).
+    ///
+    /// Every length, count and neighbor id is bounds-checked, so a corrupted or crafted file is
+    /// rejected with an error instead of panicking or over-allocating.
     pub fn load_from_disk(path: &Path, config: HnswConfig) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::new(config));
@@ -557,70 +691,101 @@ impl HnswVectorIndex {
             return Err(StorageError::checksum_mismatch(expected_crc, actual_crc));
         }
 
-        let entry_raw = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-        let max_layer =
-            u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
-        let live_count =
-            u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
-        let dim = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]) as usize;
-        let nodes_len =
-            u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]) as usize;
+        let truncated = || StorageError::corrupted_header("hnsw.idx truncated record");
+        let read_u32 = |off: &mut usize| -> Result<u32> {
+            let b = payload.get(*off..*off + 4).ok_or_else(truncated)?;
+            *off += 4;
+            Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
 
-        let mut off = 20usize;
+        let mut off = 0usize;
+        let entry_raw = read_u32(&mut off)?;
+        let max_layer = read_u32(&mut off)? as usize;
+        let live_count = read_u32(&mut off)? as usize;
+        let dim = read_u32(&mut off)? as usize;
+        let nodes_len = read_u32(&mut off)? as usize;
+        // Each node needs at least one status byte: reject counts the file cannot hold.
+        if nodes_len > payload.len() || max_layer > 64 || dim > payload.len() {
+            return Err(StorageError::corrupted_header("hnsw.idx header counts exceed file size"));
+        }
+
         let mut nodes = Vec::with_capacity(nodes_len);
-
+        let mut live_seen = 0usize;
         for _ in 0..nodes_len {
-            let status = *payload
-                .get(off)
-                .ok_or_else(|| StorageError::corrupted_header("hnsw node status EOF"))?;
+            let status = *payload.get(off).ok_or_else(truncated)?;
             off += 1;
             if status == 0 {
                 nodes.push(None);
                 continue;
             }
+            if status > 2 {
+                return Err(StorageError::corrupted_header("hnsw.idx invalid node status"));
+            }
             off += 4; // skip ordinal u32
-            let quantized = QuantizedVecSq8::read_from(&payload[off..], dim)
-                .ok_or_else(|| StorageError::corrupted_header("hnsw quantized vec EOF"))?;
+            let quantized = payload
+                .get(off..)
+                .and_then(|rest| QuantizedVecSq8::read_from(rest, dim))
+                .ok_or_else(truncated)?;
             off += 16 + dim;
-            let num_layers = u32::from_le_bytes([
-                payload[off],
-                payload[off + 1],
-                payload[off + 2],
-                payload[off + 3],
-            ]) as usize;
-            off += 4;
+            let num_layers = read_u32(&mut off)? as usize;
+            if num_layers > max_layer + 1 {
+                return Err(StorageError::corrupted_header("hnsw.idx node layer count out of range"));
+            }
             let mut layers = Vec::with_capacity(num_layers);
             for _ in 0..num_layers {
-                let link_count = u32::from_le_bytes([
-                    payload[off],
-                    payload[off + 1],
-                    payload[off + 2],
-                    payload[off + 3],
-                ]) as usize;
-                off += 4;
+                let link_count = read_u32(&mut off)? as usize;
+                if link_count > (payload.len() - off.min(payload.len())) / 4 {
+                    return Err(truncated());
+                }
                 let mut links = Vec::with_capacity(link_count);
                 for _ in 0..link_count {
-                    let nb = u32::from_le_bytes([
-                        payload[off],
-                        payload[off + 1],
-                        payload[off + 2],
-                        payload[off + 3],
-                    ]);
-                    off += 4;
+                    let nb = read_u32(&mut off)?;
+                    if nb as usize >= nodes_len {
+                        return Err(StorageError::corrupted_header("hnsw.idx neighbor id out of range"));
+                    }
                     links.push(nb);
                 }
                 layers.push(links);
+            }
+            if status == 1 {
+                live_seen += 1;
             }
             nodes.push(Some(HnswNode {
                 quantized,
                 layers,
                 deleted: status == 2,
+                inbound0: 0,
             }));
+        }
+
+        // Derive base-layer inbound degrees (not persisted).
+        let mut inbound = vec![0u32; nodes.len()];
+        for node in nodes.iter().flatten() {
+            for &t in node.layers.first().map_or(&[][..], Vec::as_slice) {
+                if let Some(c) = inbound.get_mut(t as usize) {
+                    *c = c.saturating_add(1);
+                }
+            }
+        }
+        for (node, count) in nodes.iter_mut().zip(inbound) {
+            if let Some(n) = node.as_mut() {
+                n.inbound0 = count;
+            }
+        }
+
+        let entry_point = (entry_raw != u32::MAX).then_some(entry_raw);
+        if let Some(ep) = entry_point {
+            if !nodes.get(ep as usize).is_some_and(Option::is_some) {
+                return Err(StorageError::corrupted_header("hnsw.idx entry point is not a node"));
+            }
+        }
+        if live_seen != live_count {
+            return Err(StorageError::corrupted_header("hnsw.idx live count mismatch"));
         }
 
         let state = HnswGraphState {
             nodes,
-            entry_point: (entry_raw != u32::MAX).then_some(entry_raw),
+            entry_point,
             max_layer,
             live_count,
             dim,
@@ -630,7 +795,62 @@ impl HnswVectorIndex {
             config,
             graph: RwLock::new(state),
             visited_pool: Mutex::new(VisitedTable::default()),
+            generation: AtomicU64::new(0),
         })
+    }
+}
+
+/// Inserts `node_id` into `nb`'s base-layer link list (see the connectivity guarantee in
+/// [`HnswVectorIndex::insert`]): replaces the least similar link whose target has another inbound
+/// edge, or appends (one link over the degree bound) when every target depends on its link.
+fn force_reverse_link(g: &mut HnswGraphState, nb: u32, node_id: u32) {
+    let Some(nb_q) = g
+        .nodes
+        .get(nb as usize)
+        .and_then(Option::as_ref)
+        .map(|n| n.quantized.clone())
+    else {
+        return;
+    };
+    let links: Vec<u32> = g
+        .nodes
+        .get(nb as usize)
+        .and_then(Option::as_ref)
+        .and_then(|n| n.layers.first())
+        .cloned()
+        .unwrap_or_default();
+    let evictable = links
+        .iter()
+        .enumerate()
+        .filter(|&(_, &other)| inbound0_of(g, other) > 1)
+        .map(|(i, &other)| {
+            let sim = g
+                .nodes
+                .get(other as usize)
+                .and_then(Option::as_ref)
+                .map_or(-1.0, |o| sq8_cosine_similarity(&nb_q, &o.quantized));
+            (i, other, sim)
+        })
+        .min_by(|a, b| a.2.total_cmp(&b.2));
+    let mut evicted = None;
+    if let Some(Some(nb_node)) = g.nodes.get_mut(nb as usize) {
+        if nb_node.layers.is_empty() {
+            nb_node.layers.push(Vec::new());
+        }
+        if let Some(base) = nb_node.layers.first_mut() {
+            match evictable {
+                Some((i, other, _)) => {
+                    if let Some(slot) = base.get_mut(i) {
+                        *slot = node_id;
+                        evicted = Some(other);
+                    }
+                }
+                None => base.push(node_id),
+            }
+        }
+    }
+    if let Some(ev) = evicted {
+        adjust_inbound0(g, ev, -1);
     }
 }
 
@@ -732,6 +952,39 @@ mod tests {
         assert_eq!(loaded.len(), 500);
         let hits2 = loaded.search_sq8_candidates(&query, 5, None);
         assert!(hits2.iter().any(|h| h.ordinal == RecordOrdinal(250)));
+
+        let _ = fs::remove_file(&path);
+        Ok(())
+    }
+
+    #[test]
+    fn test_crafted_hnsw_file_is_rejected_not_panicking() -> Result<()> {
+        let path = std::env::temp_dir().join(format!("storine_test_hnsw_crafted_{}.idx", std::process::id()));
+        let hnsw = HnswVectorIndex::new(HnswConfig::default());
+        for i in 0..20u32 {
+            hnsw.insert(RecordOrdinal(i), &[i as f32, 1.0, 0.5, 0.25]);
+        }
+        hnsw.save_to_disk(&path)?;
+        let original = fs::read(&path).map_err(|e| StorageError::io("read", e))?;
+
+        let reseal = |mut payload: Vec<u8>| {
+            let crc = checksum_payload(&payload);
+            let mut full = Vec::new();
+            full.extend_from_slice(&HNSW_MAGIC.to_le_bytes());
+            full.extend_from_slice(&crc.to_le_bytes());
+            full.append(&mut payload);
+            full
+        };
+        // Huge node count with a valid checksum.
+        let mut payload = original[12..].to_vec();
+        payload[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        fs::write(&path, reseal(payload)).map_err(|e| StorageError::io("write", e))?;
+        assert!(HnswVectorIndex::load_from_disk(&path, HnswConfig::default()).is_err());
+
+        // Truncated payload with a valid checksum.
+        let payload = original[12..original.len() - 7].to_vec();
+        fs::write(&path, reseal(payload)).map_err(|e| StorageError::io("write", e))?;
+        assert!(HnswVectorIndex::load_from_disk(&path, HnswConfig::default()).is_err());
 
         let _ = fs::remove_file(&path);
         Ok(())

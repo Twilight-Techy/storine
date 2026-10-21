@@ -84,7 +84,7 @@ impl QueryOptimizer {
             });
         }
 
-        // Order predicates from most selective (smallest cardinality) to least selective (`RULE-COMPLEXITY-01`)
+        // Order predicates from most selective (smallest cardinality) to least selective (`RULE-CPLX-01`)
         preds.sort_by_key(|p| p.estimated_cardinality);
 
         if preds[0].estimated_cardinality == 0 {

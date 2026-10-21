@@ -5,7 +5,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use storage_types::{FastHashMap, RecordHeader, Result, StorageError, HEADER_SIZE};
 
@@ -94,6 +94,9 @@ struct SegmentWriter {
     dead_bytes: usize,
     /// Recycled dead slots bucketed by 64B-aligned size class (`aligned_len -> Vec<offset>`) (`TASK-052`).
     free_slots: FastHashMap<u32, Vec<u32>>,
+    /// Mappings replaced by segment growth that may still be held by readers. They alias the
+    /// same file pages, so in-place slot reuse is only allowed once all of them are gone.
+    retired_regions: Vec<Weak<MmapRegion>>,
 }
 
 /// A single memory-mapped Arena Segment file (`seg_XXXXX.dat`).
@@ -112,6 +115,23 @@ impl Drop for ArenaSegment {
                 let _ = write_all_at(&w.file, &(w.write_head as u64).to_le_bytes(), 12);
                 w.persisted_head = w.write_head;
             }
+        }
+    }
+}
+
+impl Drop for ArenaManager {
+    fn drop(&mut self) {
+        let pending = self
+            .pending_removals
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Drop all segment handles first so the files are no longer mapped by this manager.
+        self.segments
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        for p in pending.drain(..) {
+            let _ = fs::remove_file(p);
         }
     }
 }
@@ -167,7 +187,7 @@ impl ArenaSegment {
                     "invalid arena segment superblock magic",
                 ));
             }
-            let persisted_head = u64::from_le_bytes(sb[12..20].try_into().unwrap()) as usize;
+            let persisted_head = storage_types::wire::read_u64_le(&sb, 12) as usize;
             let mut cursor = persisted_head
                 .clamp(HEADER_SIZE, cap)
                 .next_multiple_of(HEADER_SIZE);
@@ -211,6 +231,7 @@ impl ArenaSegment {
                 max_capacity: max_capacity.max(capacity),
                 dead_bytes: 0,
                 free_slots: FastHashMap::default(),
+                retired_regions: Vec::new(),
             }),
             region: RwLock::new(region),
         })
@@ -286,25 +307,42 @@ impl ArenaSegment {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // Fast Path (`TASK-052`): Reuse a recycled dead slot of the same 64B size class in-place!
-        if let Some(reused_offset) = w
+        // Fast Path (`TASK-052`): Reuse a recycled dead slot of the same 64B size class in-place,
+        // but ONLY while no reader can observe the overwrite: the region write lock excludes
+        // in-lock readers (`with_slice`), and the Arc strong counts prove no `RecordRef` (or a
+        // retired pre-growth mapping) still borrows the mapped pages.
+        if w
             .free_slots
-            .get_mut(&(aligned_len as u32))
-            .and_then(|slots| slots.pop())
+            .get(&(aligned_len as u32))
+            .is_some_and(|slots| !slots.is_empty())
         {
-            write_all_at(&w.file, frame, u64::from(reused_offset))
-                .map_err(|e| StorageError::io("write frame to recycled arena slot", e))?;
-            w.dead_bytes = w.dead_bytes.saturating_sub(aligned_len);
-            if sync_data {
-                w.file
-                    .sync_data()
-                    .map_err(|e| StorageError::io("fsync arena segment", e))?;
+            w.retired_regions.retain(|weak| weak.strong_count() > 0);
+            let region_guard = self
+                .region
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if w.retired_regions.is_empty() && Arc::strong_count(&region_guard) == 1 {
+                if let Some(reused_offset) = w
+                    .free_slots
+                    .get_mut(&(aligned_len as u32))
+                    .and_then(|slots| slots.pop())
+                {
+                    write_all_at(&w.file, frame, u64::from(reused_offset))
+                        .map_err(|e| StorageError::io("write frame to recycled arena slot", e))?;
+                    drop(region_guard);
+                    w.dead_bytes = w.dead_bytes.saturating_sub(aligned_len);
+                    if sync_data {
+                        w.file
+                            .sync_data()
+                            .map_err(|e| StorageError::io("fsync arena segment", e))?;
+                    }
+                    return Ok(ArenaLocation {
+                        segment_id: self.segment_id,
+                        offset: reused_offset,
+                        len: frame.len() as u32,
+                    });
+                }
             }
-            return Ok(ArenaLocation {
-                segment_id: self.segment_id,
-                offset: reused_offset,
-                len: frame.len() as u32,
-            });
         }
 
         let offset = w.write_head;
@@ -323,10 +361,15 @@ impl ArenaSegment {
             w.capacity = new_cap;
             w.max_capacity = w.max_capacity.max(new_cap);
             let new_region = Arc::new(MmapRegion::map_read_only(&w.file, w.capacity)?);
-            *self
-                .region
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = new_region;
+            let old_region = core::mem::replace(
+                &mut *self
+                    .region
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                new_region,
+            );
+            w.retired_regions.push(Arc::downgrade(&old_region));
+            drop(old_region);
             grew_capacity = true;
         }
 
@@ -356,6 +399,23 @@ impl ArenaSegment {
             offset: offset as u32,
             len: frame.len() as u32,
         })
+    }
+
+    /// Writes the current `write_head` into the superblock and `fsync`s the segment file.
+    pub fn sync(&self) -> Result<()> {
+        let mut w = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if w.write_head != w.persisted_head {
+            write_all_at(&w.file, &(w.write_head as u64).to_le_bytes(), 12)
+                .map_err(|e| StorageError::io("update arena superblock head", e))?;
+            w.persisted_head = w.write_head;
+            w.unsynced_appends = 0;
+        }
+        w.file
+            .sync_data()
+            .map_err(|e| StorageError::io("fsync arena segment", e))
     }
 
     #[inline]
@@ -399,17 +459,19 @@ impl ArenaSegment {
 /// indexed by `segment_id` for $O(1)$ 1-cycle read lookups without `HashMap` hashing.
 #[derive(Debug)]
 pub struct ArenaManager {
-    base_dir: PathBuf,
+    seg_dir: PathBuf,
     segment_capacity: usize,
+    /// Segment files whose deletion failed (e.g. still memory-mapped by a reader on Windows).
+    pending_removals: Mutex<Vec<PathBuf>>,
     /// Dense table indexed directly by `segment_id as usize` (index 0 unused).
     segments: RwLock<Vec<Option<Arc<ArenaSegment>>>>,
     active_segment_id: Mutex<u32>,
 }
 
 impl ArenaManager {
-    pub fn open(base_dir: impl Into<PathBuf>, segment_capacity: usize) -> Result<Self> {
-        let base_dir = base_dir.into();
-        let seg_dir = base_dir.join("segments");
+    /// Opens (or creates) the arena whose `seg_XXXXX.dat` files live directly in `seg_dir`.
+    pub fn open(seg_dir: impl Into<PathBuf>, segment_capacity: usize) -> Result<Self> {
+        let seg_dir = seg_dir.into();
         if !seg_dir.exists() {
             fs::create_dir_all(&seg_dir)
                 .map_err(|e| StorageError::io("create segments directory", e))?;
@@ -449,8 +511,9 @@ impl ArenaManager {
         }
 
         Ok(Self {
-            base_dir,
+            seg_dir,
             segment_capacity,
+            pending_removals: Mutex::new(Vec::new()),
             segments: RwLock::new(table),
             active_segment_id: Mutex::new(max_id),
         })
@@ -482,10 +545,7 @@ impl ArenaManager {
         // Roll over to a new segment
         *active_id += 1;
         let new_id = *active_id;
-        let path = self
-            .base_dir
-            .join("segments")
-            .join(format!("seg_{new_id:05}.dat"));
+        let path = self.seg_dir.join(format!("seg_{new_id:05}.dat"));
         let new_seg =
             ArenaSegment::open_or_create(new_id, path, self.segment_capacity.max(aligned_len * 2))?;
         let loc = new_seg.append_frame(frame, sync_data)?;
@@ -584,10 +644,7 @@ impl ArenaManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *active_id += 1;
         let new_id = *active_id;
-        let path = self
-            .base_dir
-            .join("segments")
-            .join(format!("seg_{new_id:05}.dat"));
+        let path = self.seg_dir.join(format!("seg_{new_id:05}.dat"));
         let new_seg = ArenaSegment::open_or_create(new_id, path, self.segment_capacity)?;
         let mut segs = self
             .segments
@@ -613,11 +670,53 @@ impl ArenaManager {
         if let Some(seg) = removed {
             let path = seg.path.clone();
             drop(seg);
-            let _ = fs::remove_file(path);
+            let mut pending = self
+                .pending_removals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.push(path);
+            // Retry every pending deletion; files still mapped by readers (Windows) stay queued.
+            pending.retain(|p| fs::remove_file(p).is_err() && p.exists());
             true
         } else {
             false
         }
+    }
+
+    /// Persists every segment's superblock head and `fsync`s all segment files, so frames
+    /// appended without per-write sync are durable before a WAL checkpoint truncation.
+    pub fn sync_all(&self) -> Result<()> {
+        let segs: Vec<Arc<ArenaSegment>> = self
+            .segments
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
+        for seg in segs {
+            seg.sync()?;
+        }
+        Ok(())
+    }
+
+    /// Returns the ids of all currently open segments.
+    pub fn segment_ids(&self) -> Vec<u32> {
+        self.segments
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .flatten()
+            .map(|s| s.segment_id)
+            .collect()
+    }
+
+    /// Returns the id of the segment currently receiving appends.
+    pub fn active_segment_id(&self) -> u32 {
+        *self
+            .active_segment_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn segment_count(&self) -> usize {
@@ -634,6 +733,57 @@ impl ArenaManager {
 mod tests {
     use super::*;
     use storage_types::{RecordFlags, Version};
+
+    #[test]
+    fn test_hostile_segment_files_never_panic() {
+        use storage_types::testing::SweepRng;
+        let dir = std::env::temp_dir().join(format!("storage_arena_hostile_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let seg_path = dir.join("seg_00001.dat");
+        let mut frames = Vec::new();
+        {
+            let seg = ArenaSegment::open_or_create(1, seg_path.clone(), 256 * 1024).unwrap();
+            for i in 0..40u32 {
+                let payload = vec![i as u8; 64 + (i as usize % 5) * 64];
+                let hdr = RecordHeader::new(
+                    1,
+                    Version(u64::from(i) + 1),
+                    1,
+                    7,
+                    payload.len() as u32,
+                    payload.len() as u32,
+                    0,
+                    RecordFlags::NONE,
+                    1,
+                    0,
+                );
+                let mut frame = hdr.to_bytes().to_vec();
+                frame.extend_from_slice(&payload);
+                frames.push(seg.append_frame(&frame, false).unwrap());
+            }
+            seg.sync().unwrap();
+        }
+        let good = fs::read(&seg_path).unwrap();
+        let mut rng = SweepRng::new(31);
+        for round in 0..300 {
+            let bytes = if round < 30 {
+                good[..good.len() * round / 30].to_vec()
+            } else {
+                rng.hostile_copy(&good)
+            };
+            fs::write(&seg_path, &bytes).unwrap();
+            if let Ok(seg) = ArenaSegment::open_or_create(1, seg_path.clone(), 256 * 1024) {
+                let region = seg.mapped_region();
+                for loc in &frames {
+                    let _ = region.subslice_aligned(loc.offset as usize, loc.len as usize);
+                }
+                let _ = seg.append_frame(&good[64..256.min(good.len())], false);
+                seg.reclaim_dead_slot(frames[3].offset, frames[3].len);
+                let _ = (seg.live_bytes(), seg.dead_bytes(), seg.fragmentation_ratio());
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_arena_positional_write_fast_forward_recovery_and_slot_reuse() {
@@ -685,6 +835,28 @@ mod tests {
         let l3 = reopened.append_frame(&frame, false).unwrap();
         assert_eq!(l3.offset, loc1.offset + 128);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_slot_reuse_is_blocked_while_a_reader_holds_the_mapping() {
+        let dir = std::env::temp_dir().join(format!("storage_arena_reuse_guard_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let seg = ArenaSegment::open_or_create(1, dir.join("seg_00001.dat"), 64 * 1024).unwrap();
+        let frame = vec![0x11u8; 128];
+        let l1 = seg.append_frame(&frame, false).unwrap();
+        seg.reclaim_dead_slot(l1.offset, l1.len);
+
+        // A reader (e.g. an outstanding `RecordRef`) still holds the mapping: no in-place reuse.
+        let reader = seg.mapped_region();
+        let l2 = seg.append_frame(&frame, false).unwrap();
+        assert_ne!(l2.offset, l1.offset, "slot must not be overwritten under a live reader");
+        drop(reader);
+
+        // Once the reader is gone, the recycled slot is reused.
+        let l3 = seg.append_frame(&frame, false).unwrap();
+        assert_eq!(l3.offset, l1.offset);
+        drop(seg);
         let _ = fs::remove_dir_all(&dir);
     }
 }

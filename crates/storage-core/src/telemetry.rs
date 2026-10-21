@@ -43,6 +43,17 @@ impl LatencyHistogram {
         self.sum_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
+    /// Adds every sample of `other` into `self` (used to merge per-worker histograms for export).
+    pub fn merge_from(&self, other: &Self) {
+        for (dst, src) in self.buckets.iter().zip(other.buckets.iter()) {
+            dst.fetch_add(src.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        self.count
+            .fetch_add(other.count.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.sum_ns
+            .fetch_add(other.sum_ns.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
     #[inline]
     pub fn total_samples(&self) -> u64 {
         self.count.load(Ordering::Relaxed)
@@ -101,6 +112,20 @@ impl SlowOperationLog {
             capacity: cap,
             entries: Mutex::new(VecDeque::with_capacity(cap)),
         }
+    }
+
+    /// Changes the slowness threshold at runtime.
+    pub fn set_threshold_ns(&self, threshold_ns: u64) {
+        self.threshold_ns.store(threshold_ns, Ordering::Relaxed);
+    }
+
+    /// Number of slow operations currently retained (at most the capacity).
+    pub fn len(&self) -> usize {
+        self.entries.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     #[inline]

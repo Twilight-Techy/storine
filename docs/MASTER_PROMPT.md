@@ -42,4 +42,4 @@ Before commencing each task (`TASK-001` through `TASK-050`), consult and align w
    - Audit all new and modified code for functional gaps, edge-case bugs, race conditions, deadlocks, memory bloat, CPU spin hazards, and security vulnerabilities (path traversal, integer overflow, unaligned pointer casts, torn reads/writes, unauthorized access, and DoS vectors).
    - Fix every single finding immediately before advancing.
 4. **Verification & Logging**:
-   - Run `cargo test` and `cargo clippy` (plus `cargo run --release -p benches` when touching hot paths), mark the task `[x]` in `docs/TASKS.md`, and record the complete implementation, complexity, footprint, and security audit report in `docs/PROGRESS_LOG.md`.
+   - Run `cargo test` and `cargo clippy` (plus `cargo run --release -p storage-benches` when touching hot paths), mark the task `[x]` in `docs/TASKS.md`, and record the complete implementation, complexity, footprint, and security audit report in `docs/PROGRESS_LOG.md`.

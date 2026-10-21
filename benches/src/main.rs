@@ -34,8 +34,8 @@ fn main() -> storage_types::Result<()> {
     let mut results = Vec::new();
 
     // 2. InlineId creation + 3-register fast_hash (0 allocs)
-    let id_a = InlineId::new("user:123456789").unwrap();
-    let id_b = InlineId::new("user:123456789").unwrap();
+    let id_a = InlineId::new("user:123456789")?;
+    let id_b = InlineId::new("user:123456789")?;
     assert_zero_alloc("InlineId equality & fast_hash", || {
         assert_eq!(id_a, id_b);
         core::hint::black_box(id_a.fast_hash());
@@ -56,10 +56,10 @@ fn main() -> storage_types::Result<()> {
     ));
 
     // 4. Zero-Copy RecordCodec encode (pooled TLS scratch) & unchecked read (0 allocs)
-    let sample_id = InlineId::new("agent_skyla").unwrap();
-    let mut sample = AgentObjectRecord::new(sample_id, "Skyla Core Memory State", 1_700_000_000, 950);
-    sample.tags.push(InlineId::new("ai").unwrap());
-    sample.tags.push(InlineId::new("memory").unwrap());
+    let sample_id = InlineId::new("agent_core")?;
+    let mut sample = AgentObjectRecord::new(sample_id, "Core Memory State", 1_700_000_000, 950);
+    sample.tags.push(InlineId::new("ai")?);
+    sample.tags.push(InlineId::new("memory")?);
     sample.embedding = vec![0.125f32; 64];
 
     let encoded_frame =
@@ -70,7 +70,7 @@ fn main() -> storage_types::Result<()> {
         // SAFETY: `encoded_frame` was just validated above.
         let view = unsafe { RecordCodec::decode_unchecked::<AgentObjectRecord>(&encoded_frame) };
         assert_eq!(view.score, 950);
-        assert_eq!(view.get_str(&view.title), "Skyla Core Memory State");
+        assert_eq!(view.get_str(&view.title), "Core Memory State");
         assert_eq!(view.get_slice(&view.tags).len(), 2);
     });
 
@@ -97,12 +97,12 @@ fn main() -> storage_types::Result<()> {
         ..EngineConfig::default()
     };
 
-    let engine = Arc::new(StorageEngine::<AgentObjectRecord>::open(&bench_dir, cfg)?);
+    let engine = Arc::new(StorageEngine::<AgentObjectRecord>::open(&bench_dir, cfg.clone())?);
 
     // Pre-populate 2,000 records
     let mut keys = Vec::with_capacity(2_000);
     for i in 0..2_000 {
-        let k = InlineId::new(&format!("rec_{i:06}")).unwrap();
+        let k = InlineId::new(&format!("rec_{i:06}"))?;
         let mut r = AgentObjectRecord::new(k, "Memory Node", 1_700_000_000 + i64::from(i), i64::from(i));
         r.tags.push(if i % 2 == 0 {
             InlineId::from_static("even")
@@ -159,6 +159,44 @@ fn main() -> storage_types::Result<()> {
             core::hint::black_box(r.score);
         },
     ));
+
+    // Encryption at rest (`F-SEC-02`): warm reads are served from the decrypted-frame cache with
+    // zero allocations; with no cache budget every read decrypts (the cold-read cost).
+    for (label, cache_bytes) in [
+        ("StorageEngine::with_ref (Encrypted, warm cache)", 64 * 1024 * 1024),
+        ("StorageEngine::with_ref (Encrypted, cold decrypt)", 0),
+    ] {
+        let enc_dir = std::env::temp_dir().join(format!("storage_engine_bench_enc_{cache_bytes}"));
+        let _ = fs::remove_dir_all(&enc_dir);
+        let enc_engine = StorageEngine::<AgentObjectRecord>::open(
+            &enc_dir,
+            EngineConfig {
+                encryption_key: Some(storage_codec::EncryptionKey::from_bytes([0x42; 32])),
+                decrypted_cache_bytes: cache_bytes,
+                ..cfg.clone()
+            },
+        )?;
+        for (i, &k) in keys.iter().enumerate() {
+            let r = AgentObjectRecord::new(k, "Memory Node", 1_700_000_000 + i as i64, i as i64);
+            enc_engine.put(k, &r)?;
+        }
+        enc_engine.flush_all()?;
+        if cache_bytes > 0 {
+            for &k in &keys {
+                let _ = enc_engine.with_ref(k, |v| v.score);
+            }
+            assert_zero_alloc("StorageEngine::with_ref encrypted warm read", || {
+                let score = enc_engine.with_ref(target_key, |view| view.score).unwrap();
+                assert_eq!(score, 42);
+            });
+        }
+        results.push(run_latency_bench(label, 20_000, |i| {
+            let k = keys[i % keys.len()];
+            let _ = enc_engine.with_ref(k, |view| core::hint::black_box(view.score));
+        }));
+        drop(enc_engine);
+        let _ = fs::remove_dir_all(&enc_dir);
+    }
 
     // Hot-key burst updates to measure Write Coalescing
     results.push(run_latency_bench(

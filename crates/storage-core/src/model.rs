@@ -2,7 +2,7 @@
 //! for AI agent memory, knowledge graphs, hierarchical documents, and CLI/Server operations.
 
 use storage_codec::{
-    ArchiveBuilder, ArchivedBytes, ArchivedSlice, ArchivedString, ZeroCopyRecord,
+    impl_archive_pod, ArchiveBuilder, ArchivedBytes, ArchivedSlice, ArchivedString, ZeroCopyRecord,
 };
 use storage_graph::{
     ArchivedManyToMany, ArchivedOneToMany, ArchivedOneToOne, ManyToMany, OneToMany, OneToOne,
@@ -46,6 +46,21 @@ pub struct ArchivedAgentObjectRecord {
     pub peers: ArchivedManyToMany<AgentObjectRecord>,
     pub embedding: ArchivedSlice<f32>,
 }
+
+// Compile-time proof of the `ArchivePod` contract (no padding, all fields pod; 112 bytes).
+impl_archive_pod!(ArchivedAgentObjectRecord {
+    id: InlineId,
+    timestamp: i64,
+    score: i64,
+    title: ArchivedString,
+    body: ArchivedBytes,
+    tags: ArchivedSlice<InlineId>,
+    parent: ArchivedOneToOne<AgentObjectRecord>,
+    children: ArchivedOneToMany<AgentObjectRecord>,
+    peers: ArchivedManyToMany<AgentObjectRecord>,
+    embedding: ArchivedSlice<f32>,
+});
+const _: () = assert!(core::mem::size_of::<ArchivedAgentObjectRecord>() == 112);
 
 impl AgentObjectRecord {
     pub fn new(id: InlineId, title: impl Into<String>, timestamp: i64, score: i64) -> Self {
@@ -136,9 +151,9 @@ impl ZeroCopyRecord for AgentObjectRecord {
             title: root.title.as_str(payload).to_owned(),
             body: root.body.as_slice(payload).to_vec(),
             tags: root.tags.as_slice(payload).to_vec(),
-            parent: root.parent.unarchive(),
-            children: root.children.unarchive(payload),
-            peers: root.peers.unarchive(payload),
+            parent: OneToOne::from_archived(&root.parent),
+            children: OneToMany::from_archived(&root.children, payload),
+            peers: ManyToMany::from_archived(&root.peers, payload),
             embedding: root.embedding.as_slice(payload).to_vec(),
         })
     }

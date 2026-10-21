@@ -99,10 +99,39 @@
 - `#![forbid(unsafe_code)]` is mandatory in `storage-types`, `storage-wal`, `storage-index`, `storage-graph`, `storage-core`, `storage-server`, and `storage-cli`.
 - `unsafe` is permitted ONLY in `storage-codec` and `storage-mmap` with `#![deny(unsafe_op_in_unsafe_fn)]` and `#![deny(clippy::undocumented_unsafe_blocks)]`.
 - Use `ArchivedBool` (`u8` validated `<= 1`) and `ArchivedChar` (`u32` validated via `char::from_u32`) in zero-copy structs so corrupted disk bytes never trigger Rust Undefined Behavior.
+- **Archived types are plain-old-data (`ArchivePod`)**: every `ZeroCopyRecord::Archived` type MUST implement the `unsafe` marker trait `storage_codec::ArchivePod` (any bit pattern is a valid value, no padding, no pointers). Crates under `forbid(unsafe_code)` implement it only through `storage_codec::impl_archive_pod!`, which proves at compile time (via `offset_of!` / `size_of!`) that the listed fields are themselves `ArchivePod` and cover the struct with no padding; a hand-written `unsafe impl` is never allowed outside `storage-codec` and `storage-mmap`.
+- **No safe API may reach UB on hostile bytes**: every safe accessor over archived bytes (`ArchivedString::as_str`, `ArchivedSlice::as_slice`, `RecordCodec::decode_fast`) bounds-, alignment- and UTF-8-checks its input, returning an empty / zeroed value instead of panicking. `RecordCodec::decode_unchecked` stays an `unsafe fn` (benchmarks only).
+
+### RULE-SAFE-02: Lifetime-Bound Mapped Memory
+- Every view into mapped memory (`RecordView<'a, T>`, `RecordRef<T>`, `MmapGuard`) MUST keep its `Arc<MmapRegion>` (or `hot_dirty` frame) alive for as long as the view exists. An arena slot may be reused in place only when no reader holds its region (`Arc::strong_count == 1`) and no retired region is alive; otherwise the write goes to fresh space.
+
+### RULE-SAFE-03: Controlled Mutation
+- Records change only through engine APIs (`put`, `update`, `cas_update`, `transaction`, `delete_with_policy`) that hold the record's stripe lock and the MVCC writer gate, log the change to the WAL **before** publishing it, bump the `Version`, and apply the differential index update. Multi-record changes (deletes with cascades, transactions) are written as one atomic WAL transaction.
+
+### RULE-SAFE-04: Validate Once, Read in O(1)
+- Untrusted bytes (disk pages, WAL frames, network frames) pass `RecordCodec::validate_frame::<T>` (checksums + `T::validate_archived`) exactly once when first mapped or loaded; the result is cached (`MmapRegion::verified`, `PrimaryEntry::disk_verified`). Subsequent hot reads use the safe O(1) `RecordCodec::decode_fast` (header, bounds, alignment and identity checks only). If previously validated bytes change underneath a `RecordRef`, `decode_fast_or` returns an all-zero view (backed by a static page), never UB.
+
+### RULE-SAFE-05: Build- and Platform-Independent On-Disk Formats
+- Every on-disk and wire encoding (checksums, varints, archive layouts, WAL frames) MUST produce identical bytes regardless of compile flags (`target-cpu`, `target-feature`), OS, or CPU. Hardware-accelerated paths (SSE4.2 `crc32`) MUST be bit-identical to their portable fallbacks and are selected at runtime when not enabled at compile time. Every such encoding ships a golden-value test that pins the format.
+
+### RULE-SAFE-06: Network Exposure, Admission & Path Confinement
+- An unauthenticated server (`SecurityConfig::require_auth = false`) MUST refuse to bind a non-loopback address.
+- Role checks, body-size limits and rate limits are applied at the request-header stage, **before** any body bytes are allocated or read.
+- Client-supplied paths (e.g. `OP_ADMIN_BACKUP` names) are confined to an operator-configured root (`backup_root`): only plain relative components are accepted, and admin backups are disabled when no root is configured. Backup and restore destinations must be fresh (empty or absent) and outside the database directory; existing data is never deleted.
+
+### RULE-SAFE-07: Encryption at Rest Without Downgrade
+- With `EngineConfig::encryption_key` set, every record frame written to disk or the WAL is sealed (AEAD bound to the record id and header metadata), and any plaintext record frame read back is rejected, never trusted. Plaintext lives only in RAM (`hot_dirty`, MVCC history, the bounded decrypted-frame cache). Key material is never logged and is zeroed on drop.
 
 ### RULE-CONC-01: Canonical Lock Ordering & Lock-Free I/O
 - Never hold primary index shard locks across disk I/O (`WriteFile`/`fsync`).
 - Multi-record mutations (`update_pair_atomic`, `transaction`, `delete_with_policy`) MUST lock keys in strictly ascending canonical `(CollectionId, InlineId)` order (`StripedLockTable::lock_many`) so AB-BA deadlocks are mathematically impossible.
+- Whole-engine operations (`flush_all`, `checkpoint`, snapshots / backups) take every stripe via `StripedLockTable::lock_all` (ascending order) or use `barrier()`; no other lock may be held while doing so.
+
+### RULE-CONC-02: Cross-Collection Lock Ordering
+- `DatabaseCatalog` transactions group touched keys by `CollectionId` in ascending order and lock each collection's stripes in ascending `(collection_id, stripe_index)` order, so cross-collection transactions can never deadlock with each other or with single-collection writes.
+
+### RULE-CONC-03: Group-Commit WAL Ordering & Fail-Stop
+- WAL LSNs are assigned under the WAL lock, so file order equals LSN order. A writer is acknowledged only after the batch containing its frames is durable under the configured `SyncPolicy`. After any WAL write or `fsync` error the WAL fails stop (every later append returns an error) rather than acknowledging writes whose durability is unknown.
 
 ---
 
@@ -110,6 +139,8 @@
 
 ### RULE-TEST-01: Mandatory Unit, Corruption, Concurrency & Chaos Crash Tests
 - Every subsystem must ship with unit tests, single-bit flip / torn-frame corruption tests, multi-threaded contention tests, and chaos crash-recovery verification.
+- Crash recovery is verified with a real process kill (`test_process_kill_crash_recovery_preserves_every_acknowledged_write` aborts a child writer mid-stream), not only by dropping the engine in-process.
+- Performance comparisons on shared or loaded machines MUST interleave baseline and candidate runs (A/B/A/B) instead of comparing single runs.
 
 ### RULE-TEST-02: Benchmark & Footprint Gate
-- Every stage is verified against `cargo run --release -p benches` to guarantee zero hot-read heap allocations (`0.00 Allocs/Op`), sub-microsecond hot reads, and minimal binary/data footprint.
+- Every stage is verified against `cargo run --release -p storage-benches` to guarantee zero hot-read heap allocations (`0.00 Allocs/Op`), sub-microsecond hot reads, and minimal binary/data footprint.

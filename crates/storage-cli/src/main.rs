@@ -51,9 +51,12 @@ fn print_usage() {
          \x20 restore-pitr <backup_dir> <restore_dir> <ts_ns>   Restore database to a nanosecond timestamp\n\
          \x20 remote-health <addr>                              Health check a remote StorageServer\n\
          \x20 remote-compact <addr>                             Trigger remote arena compaction (admin)\n\
-         \x20 remote-backup <addr> <dest_path>                  Trigger remote online backup (admin)\n\
+         \x20 remote-backup <addr> <backup_name>                Trigger remote backup under the server's backup root (admin)\n\
          \x20 remote-checkpoint <addr>                          Trigger remote incremental checkpoint (admin)\n\
-         \x20 remote-metrics <addr>                             Scrape Prometheus metrics from remote server"
+         \x20 remote-metrics <addr>                             Scrape Prometheus metrics from remote server\n\
+         \n\
+         Remote commands authenticate with the STORAGE_TOKEN environment variable when set.\n\
+         backup / archive-wal / restore-pitr enable WAL archiving (required for PITR)."
     );
 }
 
@@ -259,7 +262,7 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
             }
             let db_dir = &args[1];
             let backup_dir = Path::new(&args[2]);
-            let engine = StorageEngine::<AgentObjectRecord>::open(db_dir, EngineConfig::default())?;
+            let engine = StorageEngine::<AgentObjectRecord>::open(db_dir, pitr_config())?;
             let manifest = create_online_backup(&engine, backup_dir)?;
             println!(
                 "Online backup created at {:?}\n  Collection : {}\n  Base LSN   : {}\n  Files      : {}",
@@ -276,7 +279,7 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
             }
             let db_dir = &args[1];
             let backup_dir = Path::new(&args[2]);
-            let engine = StorageEngine::<AgentObjectRecord>::open(db_dir, EngineConfig::default())?;
+            let engine = StorageEngine::<AgentObjectRecord>::open(db_dir, pitr_config())?;
             let archived = archive_wal_for_pitr(&engine, backup_dir)?;
             println!("Archived {archived} WAL segment(s) to {:?}/wal_pitr", backup_dir);
             Ok(())
@@ -298,7 +301,7 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
             let engine = restore_point_in_time::<AgentObjectRecord>(
                 backup_dir,
                 restore_dir,
-                EngineConfig::default(),
+                pitr_config(),
                 target_ts_ns,
             )?;
             let st = engine.stats();
@@ -310,14 +313,14 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
         }
         "remote-health" => {
             let addr = parse_addr(args.get(1))?;
-            let mut client = StorageClient::connect(addr)?;
+            let mut client = connect_remote(addr)?;
             let health = client.health()?;
             println!("{health}");
             Ok(())
         }
         "remote-compact" => {
             let addr = parse_addr(args.get(1))?;
-            let mut client = StorageClient::connect(addr)?;
+            let mut client = connect_remote(addr)?;
             let msg = client.admin_compact()?;
             println!("{msg}");
             Ok(())
@@ -331,21 +334,21 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
             }
             let addr = parse_addr(Some(&args[1]))?;
             let dest_path = &args[2];
-            let mut client = StorageClient::connect(addr)?;
+            let mut client = connect_remote(addr)?;
             let msg = client.admin_backup(dest_path)?;
             println!("{msg}");
             Ok(())
         }
         "remote-checkpoint" => {
             let addr = parse_addr(args.get(1))?;
-            let mut client = StorageClient::connect(addr)?;
+            let mut client = connect_remote(addr)?;
             let msg = client.admin_checkpoint()?;
             println!("{msg}");
             Ok(())
         }
         "remote-metrics" => {
             let addr = parse_addr(args.get(1))?;
-            let mut client = StorageClient::connect(addr)?;
+            let mut client = connect_remote(addr)?;
             let metrics = client.scrape_metrics()?;
             print!("{metrics}");
             Ok(())
@@ -354,6 +357,23 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
             print_usage();
             Err(storage_types::StorageError::invalid_key("unknown CLI command"))
         }
+    }
+}
+
+/// Connects to a remote server, authenticating with `STORAGE_TOKEN` when it is set.
+fn connect_remote(addr: SocketAddr) -> storage_types::Result<StorageClient> {
+    let mut client = StorageClient::connect(addr)?;
+    if let Ok(token) = env::var("STORAGE_TOKEN") {
+        client.authenticate(&token)?;
+    }
+    Ok(client)
+}
+
+/// Engine configuration with WAL archiving enabled (needed by backup / PITR commands).
+fn pitr_config() -> EngineConfig {
+    EngineConfig {
+        wal_archive: true,
+        ..EngineConfig::default()
     }
 }
 

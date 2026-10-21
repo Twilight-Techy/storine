@@ -9,11 +9,12 @@
 //! - Explicit `1:1`, `1:N`, `M:N` relationships with deadlock-free linking and `Restrict`/`Cascade`/`Unlink` integrity
 //! - Multi-record OCC transactions, schema evolution, TTL expiration, and consistent snapshots
 
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
 pub mod backup;
 pub mod catalog;
+mod decrypt_cache;
 pub mod engine;
 pub mod migration;
 pub mod model;
@@ -30,6 +31,7 @@ pub use backup::{
 };
 pub use catalog::{CatalogTransaction, CollectionMeta, DatabaseCatalog, ErasedCollectionEngine};
 pub use engine::{
+    IndexTier,
     EngineConfig, EngineStats, RecordRef, StorageEngine, StorageLayoutMode, TransactionBatch,
 };
 pub use migration::SchemaRegistry;

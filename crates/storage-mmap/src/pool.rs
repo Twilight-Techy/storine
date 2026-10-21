@@ -116,13 +116,7 @@ impl core::fmt::Debug for MmapPool {
 
 impl MmapPool {
     pub fn new(config: MmapPoolConfig) -> Self {
-        let shards_vec: Vec<CachePadded<RwLock<PoolShard>>> = (0..POOL_SHARDS)
-            .map(|_| CachePadded::new(RwLock::new(PoolShard::default())))
-            .collect();
-        let shards = shards_vec
-            .into_boxed_slice()
-            .try_into()
-            .unwrap_or_else(|_| unreachable!());
+        let shards = CachePadded::boxed_array(|| RwLock::new(PoolShard::default()));
 
         Self {
             config: MmapPoolConfig {

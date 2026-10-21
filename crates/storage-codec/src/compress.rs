@@ -29,7 +29,7 @@ pub fn compress_lz4(input: &[u8]) -> Vec<u8> {
     let mut ip = 0usize;
 
     while ip < match_limit {
-        let seq = u32::from_le_bytes(input[ip..ip + 4].try_into().unwrap());
+        let seq = storage_types::wire::read_u32_le(input, ip);
         let h = ((seq.wrapping_mul(2_654_435_761)) >> (32 - HASH_LOG)) as usize;
         let ref_pos = hash_table[h] as usize;
         hash_table[h] = ip as u32;
@@ -92,6 +92,10 @@ fn write_len_bytes(out: &mut Vec<u8>, mut rem: usize) {
     out.push(rem as u8);
 }
 
+/// Upper bound on output bytes produced per compressed input byte (`255` per length-extension
+/// byte, rounded up to cover the token's own literal / match nibbles).
+const MAX_EXPANSION_PER_BYTE: usize = 256;
+
 /// Decompresses an LZ4-encoded slice into a buffer of exact `expected_uncompressed_len` bytes.
 /// Protects against decompression bombs and out-of-bounds match offsets.
 pub fn decompress_lz4(input: &[u8], expected_uncompressed_len: usize) -> Result<Vec<u8>> {
@@ -117,7 +121,11 @@ pub fn decompress_lz4(input: &[u8], expected_uncompressed_len: usize) -> Result<
                 "raw block length mismatch during decompression",
             ));
         }
-        return Ok(body.to_vec());
+        let mut raw = Vec::new();
+        raw.try_reserve_exact(body.len())
+            .map_err(|_| StorageError::resource_exhausted("heap memory (raw block)"))?;
+        raw.extend_from_slice(body);
+        return Ok(raw);
     }
     if mode != 0x01 {
         return Err(StorageError::invalid_archive(
@@ -125,7 +133,16 @@ pub fn decompress_lz4(input: &[u8], expected_uncompressed_len: usize) -> Result<
         ));
     }
 
-    let mut out = Vec::with_capacity(expected_uncompressed_len);
+    // Every compressed byte yields at most 255 output bytes (a `255` length-extension byte), so a
+    // claimed length beyond that is a decompression bomb: reject it before allocating anything.
+    if expected_uncompressed_len > body.len().saturating_mul(MAX_EXPANSION_PER_BYTE) {
+        return Err(StorageError::invalid_archive(
+            "claimed decompressed length is impossible for the compressed input size",
+        ));
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(expected_uncompressed_len)
+        .map_err(|_| StorageError::resource_exhausted("heap memory (LZ4 output)"))?;
     let mut pos = 0usize;
 
     while pos < body.len() {

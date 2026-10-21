@@ -2,7 +2,7 @@
 
 ## Overview
 - **Project**: Zero-Copy Memory-Mapped Object Storage Engine (`storage-engine`)
-- **Status**: **COMPLETED** (`TASK-001` through `TASK-050` 100% Built, Audited, Optimized, and Verified)
+- **Status**: `TASK-001` through `TASK-079` complete. The 2026-10-20 full-project audit (Stage 19) fixed the soundness, durability and security findings listed below. Open items are tracked at the end of Stage 19 and in `docs/FEATURES.md` §7.
 - **Canonical Reference Docs**:
   1. `docs/IMPLEMENTATION_PLAN.md`
   2. `docs/FEATURES.md`
@@ -200,3 +200,133 @@
 - **[x] `TASK-063`: Implement TCP Raft Consensus & Shard Migration RPCs (`OP_RAFT_VOTE`, `OP_RAFT_APPEND`, `OP_MIGRATE_VSHARD`)**
   - Added opcodes `0x0E`–`0x10` with full wire serialization round-trip for `RequestVoteReq`/`RequestVoteResp`, `AppendEntriesReq`/`AppendEntriesResp`, and virtual shard record import via `OP_MIGRATE_VSHARD`; added corresponding `StorageClient` methods (`raft_vote`, `raft_append`, `migrate_vshard`).
   - **Exit Criteria**: `test_tcp_raft_admin_health_and_shard_migration_rpcs` verifies all 7 new RPCs including RBAC enforcement, Raft wire round-trip, shard import, and admin backup/compact/checkpoint (`46` total workspace tests passing, `0` failures).
+
+### Stage 18 (continued): Full-System Verification & Lint Hygiene (`TASK-064` – `TASK-066`)
+- **[x] `TASK-064`**: Full-system integration test (`crates/storage-server/tests/full_system_e2e.rs`) covering all 24 feature categories.
+- **[x] `TASK-065`**: SAFETY comments, path traversal guard, `mem::take` optimization.
+- **[x] `TASK-066`**: Zero Clippy warnings across all crates.
+
+### Stage 19: Full-Project Audit Remediation (`TASK-067` – `TASK-079`, 2026-10-20)
+
+A line-by-line review of every crate against `RULES.md` found that several earlier "verified" claims did not hold in code. The per-task protocol was applied to each fix: consult the 6 docs, implement, audit, test, clippy, benchmark gate, log.
+
+#### Security & Correctness Audit Findings (all fixed)
+
+| # | Severity | Finding | Fix (task) |
+| :--- | :--- | :--- | :--- |
+| 1 | **Critical** | Safe APIs could reach Undefined Behavior on hostile or corrupted bytes. `ArchivedString::as_str` used `get_unchecked` + `from_utf8_unchecked`; `RecordRef::view` / `Deref` and engine reads used `decode_unchecked`; `storage-types` had unchecked casts; `storage-graph` / `storage-core` had dropped `forbid(unsafe_code)`. | `ArchivePod` + `impl_archive_pod!` (compile-time layout proof), safe O(1) `decode_fast`, checked accessors, archived relations moved into codec, `forbid(unsafe_code)` restored (`TASK-067`) |
+| 2 | **Critical** | Checksums depended on build flags: the SSE4.2 and software `CRC32C` paths were different algorithms, so every database written by the default `target-cpu=native` build would read as corrupted on a portable build or another CPU architecture. | Bit-identical portable path, runtime CPU detection, golden-value format pin (`TASK-077`) |
+| 3 | **Critical** | WAL could acknowledge writes out of order or after an I/O error. LSNs were assigned outside the lock, recovery rewrote the file, and checkpoints could reuse LSNs / txn ids. | WAL rebuilt: LSN under lock, sequence tickets, fail-stop, atomic `.next` + rename truncation, monotonic markers (`TASK-068`) |
+| 4 | **High** | Acknowledged writes could be lost on crash. `flush_all` raced concurrent writers, WAL truncation ran before replayed state was durable, and multi-record deletes were not atomic. | Barrier-based `flush_all`, replay-then-truncate, single atomic WAL transaction for deletes, MVCC writer gate. Verified by a real process-kill test (`TASK-069`) |
+| 5 | **High** | Use-after-reuse: arena slots could be overwritten in place while a reader still held a view into them. | Slot reuse gated on `strong_count == 1` and no live retired regions (`TASK-070`) |
+| 6 | **High** | An unauthenticated server could bind any address; `OP_ADMIN_BACKUP` accepted arbitrary client paths and could delete existing directories; request bodies were allocated before role / size / rate checks. | Loopback-only without auth, `backup_root` confinement plus fresh-destination rule, header-stage admission (`TASK-075`, `TASK-073`) |
+| 7 | **High** | Crafted index files could panic or index out of bounds (HNSW loader, paged B+Tree `entry_count`, missing page CRC checks). | Bounds-checked loaders, CRC validation, crafted-file tests (`TASK-071`) |
+| 8 | **High** | "AEAD" used an ad-hoc MAC, not Poly1305; nonce reuse was possible. | Real RFC 8439 ChaCha20-Poly1305 with RFC test vectors and a unique-nonce generator (`TASK-076`) |
+| 9 | **Medium** | Raft granted votes and accepted entries even when persisting them failed (`let _ = save_to_disk(..)`), so a crash could lead to two votes in one term; the whole state, including the log, was rewritten on every change. | `RaftStorage`, vote / term / log-matching rules, `apply_committed` (`TASK-074`) |
+| 10 | **Medium** | Vshards used the same low hash bits as in-node shards (skewed placement). Migration did not freeze writers and had no rollback. | High-bit vshards, freeze + write gate + rollback (`TASK-074`) |
+| 11 | **Medium** | Unconstrained queries returned nothing; exclusion and window interactions were wrong; `top_k` applied pagination windows. | Query fixes plus tests (`TASK-072`) |
+| 12 | **Medium** | Backups had no LSN consistency point; PITR silently lost history because the WAL was truncated without archiving. | LSN-tagged snapshots under `lock_all`; PITR requires `wal_archive` (`TASK-073`) |
+| 13 | **Low** | Docs overstated reality: wrong API in the README quick start, wrong CLI argument order, nonexistent `SyncMode`, "XXH3" naming, stale binary size, unwired features presented as integrated, undefined rule / feature IDs cited in code. | Documentation corrected, verified-status section, MSRV declared (`TASK-079`) |
+
+#### Complexity & Footprint
+- All hot paths keep their asymptotic bounds: O(1) point reads (`decode_fast` adds a constant number of comparisons), O(len) UTF-8 validation per `as_str` call, O(1) amortized WAL append per frame.
+- `RecordRef<T>` shrank by 176 bytes (shared static zero page instead of an embedded zeroed fallback). Portable `CRC32C` uses a single 1 KiB compile-time table.
+- In-RAM and on-disk record and index footprints are unchanged (`112 B` archived root, `96 B` `PrimaryEntry`, `19.0 B/record` `primary.idx`).
+
+#### Verification
+- `cargo test --workspace`: **68 passed, 0 failed** (21 new tests, including a real process-kill crash test, RFC 8439 vectors, a checksum golden-format pin and crafted-file loaders).
+- `cargo clippy --workspace --all-targets`: **0 warnings** with `target-cpu=native`, and **0 warnings** with portable `target-cpu=x86-64`.
+- `cargo run --release -p storage-benches`: all zero-allocation gates pass. Interleaved A/B against `4a004ec` shows `with_ref` / `get_ref` / `update` at parity within noise. The sound `get_str` costs ~6 ns more than the UB-capable baseline. Details in `docs/BENCHMARK_REPORT.md` §5.
+
+#### Open Items (not fixed in Stage 19)
+- **Binary size**: `storage-server` is `582 KiB` (baseline `516 KiB`), above the `RULE-MEM-03` `< 500 KiB` budget. The baseline already exceeded it.
+- **Unwired features**: engine-level encryption at rest (`F-SEC-02`), paged / cold indexes (`F-PIDX-*`) and `hnsw.idx` persistence exist as tested components but are not used by `StorageEngine` (`docs/FEATURES.md` §7).
+
+### Stage 20: Panic-Freedom, Master-Prompt Audit & Feature Wiring (`TASK-080` – )
+
+#### `TASK-080`: Panic-Free Production Code & Hostile-Input Sweeps
+- **Implementation**: checked capacity math in `scratch.rs` (`aligned_cap`, `layout_for`, `alloc_failed`), fallible `AlignedBytes::try_copy_from_slice`, `CachePadded::boxed_array`, compile-time `InlineId` constants (`NO_KEY`, `TXN_COMMIT_ID`, `CHECKPOINT_ID`), and the shared `storage_types::testing::SweepRng` generator (`#[doc(hidden)]`, stripped by LTO).
+- **Audit findings fixed**:
+
+  | Severity | Finding | Fix |
+  | :--- | :--- | :--- |
+  | **Critical** | `decode_owned` on a crafted tombstone frame panicked and called `decode_unchecked` on an unvalidated root (UB from safe code) | Reject tombstones; validate and decode the same buffer |
+  | **High** | `decompress_lz4` allocated up to 256 MiB for a 3-byte input (memory amplification; abort on OOM) | Reject expansion > 256x input before allocating; `try_reserve_exact` |
+  | **High** | `bitmap.idx` directory allocated `chunk_count` entries straight from the file; bitmap blocks had no checksum | v2 format (`BMX2`): blocks checksum, bounded counts, block-index / chunk-order validation |
+  | **Medium** | `btree.idx` leaf CRC excluded the page header (min / max key, field id, count) | `page_crc` covers every byte except the CRC field |
+  | **Low** | Network / disk-sourced buffers used aborting allocation | `try_copy_from_slice` at every untrusted site |
+
+- **Remaining panic-capable sites**: compile-time `const` assertions only, plus `debug_assert!` (debug builds). Slice indexing on validated buffers remains (`~670` sites); untrusted entry points are proven panic-free by the sweeps rather than by rewriting every index, which would add branches on hot paths.
+- **Complexity / footprint**: unchanged asymptotics; `bitmap.idx` open now verifies the block region once, O(file).
+- **Verification**: `cargo test --workspace` **81 passed / 0 failed**; `cargo clippy --workspace --all-targets` **0 warnings** (native and `target-cpu=x86-64`); `cargo run --release -p storage-benches` all zero-allocation gates pass, latencies within the noise ranges recorded in `BENCHMARK_REPORT.md` §5.
+
+#### `TASK-081`: Master-Prompt Audit (whole codebase)
+
+| # | Pillar | Finding | Fix |
+| :--- | :--- | :--- | :--- |
+| 1 | Vertical scaling | `total_reads` / `total_writes`: one atomic RMW per read / write shared by every core (cache line bounces on every read) | `StripedCounter` (64 padded per-thread slots, summed on `stats()`) |
+| 2 | CPU / false sharing | `PrimaryIndex` ordinal-table `RwLock` shared a cache line with the `shards` pointer read by every lookup | `CachePadded` |
+| 3 | Complexity | Unfiltered top-K with `<= 256` vectors cloned **every** primary entry (`O(N)` allocation per query, independent of how few records have embeddings) | `HnswVectorIndex::live_ordinals` (`O(#vectors)`) |
+| 4 | Complexity | `sweep_expired` cloned every primary entry | Walks the TTL ordinal bitmap (`O(#TTL records)`), expiry re-checked under the stripe lock |
+| 5 | DoS / scaling | Accept thread did a blocking 5 ms write per rejected over-limit connection (a flood capped accepts for everyone) | Single non-blocking write |
+| 6 | CPU hogging | Reactor workers with any connection woke every 25 ms and re-registered every socket, even when all were idle; `stop()` could lose its condvar wake-up | Per-shard loopback self-wake socket in the poll set → infinite poll timeout when idle; new connections, admin-job completion and shutdown write to it; `stop()` notifies under the lock |
+| 7 | Memory bloat | Raft log (with full record frames) was never compacted: unbounded RAM and disk | Raft §7 compaction with persisted `snapshot_index` / `snapshot_term`; engine WAL `sync_to_disk` before discarding; loader skips covered entries (crash-safe ordering); lagging followers get an explicit "snapshot required" error |
+| 8 | Observability gap | `LatencyHistogram` / `SlowOperationLog` were never recorded; `/metrics` had no latency | Per-shard read / write RPC histograms (no cross-core contention), merged on export; slow-op log (`StorageServer::slow_operations`, 10 ms default) |
+
+- **Complexity / footprint**: top-K and TTL sweeps went from O(N) with full copies to O(#vectors) / O(#TTL records). Raft memory is bounded by `RAFT_COMPACT_THRESHOLD + RAFT_RETAIN_TAIL` entries. `StripedCounter` costs 4 KiB per counter. Each reactor shard holds 2 extra loopback sockets.
+- **Verification**: `cargo test --workspace` **83 passed / 0 failed**; clippy **0 warnings** (native and portable); benchmark gate: all zero-allocation gates pass. `with_ref` reached `112 ns` p50 / `5.9 M ops/s` (best on this machine), `update` `3.0 µs` p50. Other latencies are within the documented noise ranges (the machine stayed heavily loaded).
+- **Still open**: `WSAPoll` / `poll` keep each wake-up `O(connections per shard)` in the kernel (`epoll` / IOCP needed for `O(active)`). `InstallSnapshot` for followers behind the compaction point (reseed from a backup today). Release binary size above the `RULE-MEM-03` budget.
+
+#### `TASK-082`: HNSW Persistence via Stable Ordinals
+- **Implementation**:
+  - Checkpoint v3: each entry's ordinal is stored as a varint and restored exactly.
+  - `HnswVectorIndex`: `generation`, `vector_matches`, `live_ordinals`; tracked base-layer inbound degrees.
+  - Engine: `hnsw_path`, `hnsw_saved_generation`, reconciliation at open, save at checkpoint.
+- **Bugs found and fixed**:
+  1. Delta-frame replay order (deletes now applied before upserts): a re-created key was deleted on replay.
+  2. Unreachable outlier vectors in HNSW (connectivity invariant).
+  3. Reactor wake latency under an untimed wait (hybrid poll policy).
+- **Complexity / footprint**:
+  - Open cost with a current `hnsw.idx`: from `O(N)` HNSW insertions (`O(N log N · ef · D)`) down to `O(N · D)` comparisons.
+  - Checkpoint: `O(V)` graph write only when the graph changed.
+  - `primary.idx` grows by about `1.9 B/record` for the ordinal varint (`19.0 -> 20.9 B/record` in the benchmark): the price of stable ordinals, which ordinal-keyed persisted indexes require.
+- **Verification**: `86` tests passing, `0` clippy warnings. On a quiet run of the benchmark gate, all allocation gates passed; `get_ref` `225 ns`, `update` `2.8 µs` (`267 k ops/s`), secondary index `5.9 µs`. TCP GET was at parity with the previous poll policy in interleaved A/B runs.
+
+#### `TASK-083`: Paged Secondary-Index Tier
+- **Audit of the existing paged indexes**:
+  - `checkpoint_to_disk` decoded every posting into a `BTreeMap` and built the whole file in RAM (an `O(N)` spike at every checkpoint, defeating paging).
+  - It held the index write lock across the entire disk write (blocking every query and index update, a `RULE-CONC-01` violation).
+  - `PagedBitmapIndex` did the same.
+  - About 8 of the 14 query operations used by the query engine were missing.
+- **Design**:
+  - Disjoint base / frozen / hot sources keep counts and merges exact.
+  - Freeze in `O(1)`; stream-merge without locks; generation files behind an atomic manifest (a mapped file cannot be replaced on Windows).
+  - Stamps prove that the indexes and the primary checkpoint come from the same checkpoint.
+  - Reuse requires a clean shutdown: an empty WAL proves no write raced the last checkpoint. A crash forces a rebuild, the same cost the memory tier pays on every open.
+  - The WAL is synced before index generations are published, so a write lost under `AsyncMemoryFirst` can never leave postings behind.
+- **Rejected alternative**: a consistent cut under `lock_all` would pause writers for an `O(N)` primary snapshot. Snapshot-then-freeze without the WAL-replay rule would leave ghost postings for records inserted between snapshot and freeze, because replay reallocates their ordinals.
+- **Complexity / footprint**:
+  - Paged-tier RAM = separator directories (`24 B` / 4 KiB page) + tag directory (`8 B` per non-empty 4096-ordinal chunk) + delta since the last checkpoint.
+  - Checkpoint memory `O(page)`.
+  - Paginated scans `O(offset + limit)` plus the delta range.
+  - Memory-tier dispatch overhead measured at parity, interleaved in-process: direct `4.8–6.3 µs` vs tiered `4.9–5.1 µs` per query; `89–97 ns` per insert+remove in both.
+- **Verification**: `91` tests passing, `0` warnings (native and portable). Benchmark gate: allocation gates pass. Whole-engine latencies sat within load noise (the untouched `InlineId` hash ran at 2x its usual time); the isolated dispatch benchmark above is the authoritative comparison.
+- **Still open**: cold primary tier (`F-PIDX-03`). The ordinal table and primary hash map remain `O(N)` RAM; tiering them needs a paged ordinal table.
+
+#### `TASK-084`: Encryption at Rest
+- **Design**:
+  - Records stay plaintext in RAM (`hot_dirty`, MVCC history, decrypted cache) and are sealed only on their way to disk or the WAL.
+  - A zero-copy read cannot work on ciphertext, so the first read of a version decrypts into a 64-byte-aligned buffer cached by `(id, version)`. Later reads are an `Arc` bump: RULE-MEM-01 holds for warm reads.
+  - Cache memory is bounded (`decrypted_cache_bytes`, random replacement per shard, so hits take only a read lock).
+- **Security properties**:
+  - AEAD with fresh nonces.
+  - Authenticated header metadata and record id (no frame swaps, no TTL or version edits).
+  - Tampering yields errors, never altered data.
+  - No downgrade: plaintext frames are rejected once a key is configured.
+  - Key material is zeroed on drop and never printed.
+- **Not encrypted (documented)**: record ids and locations in `primary.idx`, indexed tag / numeric values in the secondary-index files, quantized vectors in `hnsw.idx`, and the WAL frame headers (ids and versions).
+- **Benchmark gate**:
+  - Encrypted warm `with_ref` `268 ns` p50, `0.00` allocs/op (plaintext `with_ref` `300 ns` in the same run).
+  - Cold decrypt-per-read `2.9 µs`, `6` allocs.
+  - The gate caught one regression in this task: an extra WAL body copy on the unencrypted write path (`update` `5.00 -> 6.00` allocs/op). Fixed by borrowing the frame unless it must be sealed; back to `5.00`.
+- **Verification**: `95` tests passing, `0` clippy warnings (native and portable).

@@ -1,5 +1,5 @@
 //! `SQ8` 8-Bit Scalar Vector Quantization & 8-Way Unrolled Integer SIMD Kernels
-//! (`TASK-036`, `F-INDX-07`, `RULE-CPU-02`, `RULE-DATA-02`).
+//! (`TASK-036`, `F-INDX-07`, `RULE-CPU-02`, `RULE-MEM-03`).
 //!
 //! Compresses `f32` embedding vectors by `4x` (`4 bytes/dim -> 1 byte/dim`) via affine min-max
 //! quantization:

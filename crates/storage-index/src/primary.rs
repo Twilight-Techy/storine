@@ -5,7 +5,7 @@ use std::sync::RwLock;
 
 use storage_codec::AlignedBytes;
 use storage_mmap::ArenaLocation;
-use storage_types::{CachePadded, FastHashMap, InlineId, RecordOrdinal, Version};
+use storage_types::{CachePadded, FastHashMap, InlineId, RecordOrdinal, Result, StorageError, Version};
 
 const PRIMARY_SHARDS: usize = 64;
 const SHARD_MASK: usize = PRIMARY_SHARDS - 1;
@@ -34,7 +34,7 @@ pub struct PrimaryEntry {
     pub location: DiskLocation,
     /// `true` only once the on-disk frame at `location` has been fully validated for the
     /// engine's record type, is uncompressed, and matches the current schema. Hot read paths
-    /// may only use `decode_unchecked` on arena bytes when this is set (`RULE-SAFE-04`).
+    /// only use the O(1) `RecordCodec::decode_fast` on arena bytes when this is set (`RULE-SAFE-04`).
     pub disk_verified: bool,
     /// When `Some`, holds the latest 64-byte-aligned serialized frame in memory waiting for
     /// background coalesced disk flush. Readers immediately read this zero-copy buffer!
@@ -57,7 +57,9 @@ struct OrdinalTable {
 /// 64-shard concurrent Primary Key Index (`InlineId <-> RecordOrdinal`).
 pub struct PrimaryIndex {
     shards: Box<[CachePadded<RwLock<PrimaryShard>>; PRIMARY_SHARDS]>,
-    ordinals: RwLock<OrdinalTable>,
+    /// Cache-line padded: its lock word changes on every ordinal resolve / allocate, and must
+    /// not share a line with the read-mostly `shards` pointer used by every lookup (`RULE-CPU-01`).
+    ordinals: CachePadded<RwLock<OrdinalTable>>,
     live_count: CachePadded<AtomicUsize>,
     hot_dirty_bytes: CachePadded<AtomicUsize>,
 }
@@ -79,17 +81,11 @@ impl Default for PrimaryIndex {
 
 impl PrimaryIndex {
     pub fn new() -> Self {
-        let shards_vec: Vec<CachePadded<RwLock<PrimaryShard>>> = (0..PRIMARY_SHARDS)
-            .map(|_| CachePadded::new(RwLock::new(PrimaryShard::default())))
-            .collect();
-        let shards = shards_vec
-            .into_boxed_slice()
-            .try_into()
-            .unwrap_or_else(|_| unreachable!());
+        let shards = CachePadded::boxed_array(|| RwLock::new(PrimaryShard::default()));
 
         Self {
             shards,
-            ordinals: RwLock::new(OrdinalTable::default()),
+            ordinals: CachePadded::new(RwLock::new(OrdinalTable::default())),
             live_count: CachePadded::new(AtomicUsize::new(0)),
             hot_dirty_bytes: CachePadded::new(AtomicUsize::new(0)),
         }
@@ -240,32 +236,34 @@ impl PrimaryIndex {
         prev
     }
 
-    /// Atomically updates `location` and clears `hot_dirty` ONLY IF the record's current version
-    /// still matches `flushed_version` (if a newer write arrived while the background flusher was
-    /// writing to disk, `hot_dirty` keeps the newer version!).
+    /// Publishes a completed flush: updates `location` and clears `hot_dirty`, but ONLY IF the
+    /// record still exists at `flushed_version`. Returns `false` when the flush is stale (the
+    /// record was rewritten or deleted meanwhile), in which case nothing is changed and the
+    /// caller must discard the location it just wrote.
     pub fn complete_background_flush(
         &self,
         id: InlineId,
         flushed_version: Version,
         new_location: DiskLocation,
         disk_verified: bool,
-    ) -> Option<DiskLocation> {
+    ) -> bool {
         let s_idx = Self::shard_idx(id);
         let mut shard = self.shards[s_idx]
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let entry = shard.by_id.get_mut(&id)?;
-        let prev_loc = entry.location;
+        let Some(entry) = shard.by_id.get_mut(&id) else {
+            return false;
+        };
+        if entry.version != flushed_version {
+            return false;
+        }
         entry.location = new_location;
         entry.disk_verified = disk_verified;
-
-        if entry.version == flushed_version {
-            if let Some(removed_buf) = entry.hot_dirty.take() {
-                self.hot_dirty_bytes
-                    .fetch_sub(removed_buf.len(), Ordering::Relaxed);
-            }
+        if let Some(removed_buf) = entry.hot_dirty.take() {
+            self.hot_dirty_bytes
+                .fetch_sub(removed_buf.len(), Ordering::Relaxed);
         }
-        Some(prev_loc)
+        true
     }
 
     /// Marks the on-disk frame of `id` as validated, but only if it is still at `location`.
@@ -461,6 +459,82 @@ impl PrimaryIndex {
     /// Restores an entry loaded from a checkpoint on startup. A fresh dense ordinal is always
     /// allocated (the on-disk checkpoint never dictates ordinal values, so a corrupted or
     /// malicious `primary.idx` cannot force a huge ordinal-table allocation).
+    /// Restores `entry` at exactly `entry.ordinal` (checkpoint format v3), so ordinal-keyed
+    /// structures persisted alongside the checkpoint (HNSW graph, paged indexes) stay valid across
+    /// restarts. Call [`Self::finish_restore`] once every base and delta entry is loaded.
+    ///
+    /// An entry without an ordinal, or one whose ordinal is held by a different record (an
+    /// inconsistent checkpoint), gets a fresh ordinal instead; ordinal-keyed indexes are
+    /// reconciled against the records afterwards, so this only costs rebuild work.
+    pub fn restore_entry_at(&self, mut entry: PrimaryEntry) -> Result<()> {
+        let want = entry.ordinal;
+        if want == RecordOrdinal::INVALID {
+            self.restore_entry(entry);
+            return Ok(());
+        }
+        let existing = self.with_entry(entry.id, |e| e.ordinal);
+        let placed = {
+            let mut table = self
+                .ordinals
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let idx = want.as_usize();
+            let held_by_other = table
+                .ids
+                .get(idx)
+                .copied()
+                .flatten()
+                .is_some_and(|owner| owner != entry.id);
+            if held_by_other {
+                false
+            } else {
+                if idx >= table.ids.len() {
+                    let additional = idx + 1 - table.ids.len();
+                    table
+                        .ids
+                        .try_reserve(additional)
+                        .map_err(|_| StorageError::resource_exhausted("ordinal table memory"))?;
+                    table.ids.resize(idx + 1, None);
+                }
+                if let Some(old) = existing.filter(|&old| old != want) {
+                    if let Some(slot) = table.ids.get_mut(old.as_usize()) {
+                        *slot = None;
+                    }
+                }
+                if let Some(slot) = table.ids.get_mut(idx) {
+                    *slot = Some(entry.id);
+                }
+                true
+            }
+        };
+        if !placed {
+            entry.ordinal = match existing {
+                Some(ord) => ord,
+                None => self.allocate_ordinal(entry.id),
+            };
+        }
+        self.upsert(entry);
+        Ok(())
+    }
+
+    /// Rebuilds the ordinal free list from the table's holes after a restore placed ordinals
+    /// out of order. Lowest ordinals are reused first.
+    pub fn finish_restore(&self) {
+        let mut table = self
+            .ordinals
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let free: Vec<u32> = table
+            .ids
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, slot)| slot.is_none())
+            .map(|(i, _)| i as u32)
+            .collect();
+        table.free = free;
+    }
+
     pub fn restore_entry(&self, mut entry: PrimaryEntry) {
         if let Some(existing) = self.with_entry(entry.id, |e| e.ordinal) {
             entry.ordinal = existing;

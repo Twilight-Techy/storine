@@ -463,3 +463,143 @@ This document defines the strict chronological execution order for building the 
   - Add `StorageClient` methods: `raft_vote()`, `raft_append()`, `migrate_vshard()`.
   - **Exit Criteria**: `test_tcp_raft_admin_health_and_shard_migration_rpcs` validates Raft wire round-trip, shard import lands records in engine, RBAC enforcement (`46` total workspace tests, `0` failures).
 
+## Stage 18 (continued): Full-System Verification & Lint Hygiene (`TASK-064` – `TASK-066`)
+
+*(Back-filled from commit history: `dd2e165`, `8752747`, `4a004ec`.)*
+
+- [x] **TASK-064: Comprehensive Full-System Integration Test Covering All 24 Feature Categories**
+  - `crates/storage-server/tests/full_system_e2e.rs`.
+- [x] **TASK-065: Master Prompt Audit Fixes (SAFETY Comments, Path Traversal Guard, `mem::take` Optimization)**
+- [x] **TASK-066: Clean Clippy Workspace (Zero Warnings Across All 9 Crates)**
+
+
+## Stage 19: Full-Project Audit Remediation — Soundness, Durability, Security & Documentation Accuracy (`TASK-067` – `TASK-079`)
+
+- [x] **TASK-067: Eliminate Undefined-Behavior-Capable `unsafe` & Restore `forbid(unsafe_code)` Everywhere Required (`RULE-SAFE-01`, `RULE-SAFE-04`)**
+  - **Deliverables**: `storage-codec` (`archive.rs`, `types.rs`, `relations.rs`), `storage-types` (`id.rs`, `header.rs`, `wire.rs`), `storage-graph`, `storage-core/src/model.rs`.
+  - Add the `unsafe trait ArchivePod` (all bit patterns valid, no padding) and the `impl_archive_pod!` macro, which proves layout at compile time so record crates stay `forbid(unsafe_code)`.
+  - Add safe O(1) `RecordCodec::decode_fast` / `decode_fast_or` / `header_ref`. Make `ArchivedString::as_str` and `ArchivedSlice::as_slice` bounds-, alignment- and UTF-8-checked.
+  - Move the archived relationship types into `storage-codec::relations` (sorted-order validation) so `storage-graph` is `forbid(unsafe_code)` again. Replace every `try_into().unwrap()` byte read with the `storage_types::wire` readers.
+  - **Exit Criteria**: `test_decode_fast_is_safe_on_corrupted_frames`; no `unsafe` outside `storage-codec` / `storage-mmap`.
+
+- [x] **TASK-068: Rebuild `GroupCommitWal` Ordering, Durability & Recovery (`RULE-CONC-03`)**
+  - Assign LSNs under the lock, use per-submission sequence tickets, and fail stop after I/O errors. Keep LSNs and txn ids monotonic via checkpoint markers. `checkpoint_truncate_before` writes `.next` and renames it atomically (archiving removed frames when `wal_archive` is set).
+  - `recover_committed` never mutates the file. `AsyncMemoryFirst` buffers and is flushed by the background flusher (`flush_buffered`).
+  - **Exit Criteria**: torn-tail, txn-restart, checkpoint-archive, concurrent-durability and async-buffering tests.
+
+- [x] **TASK-069: Engine Crash Consistency — Flush Barrier, Replay-Then-Truncate, Atomic Deletes & MVCC Writer Gate (`RULE-SAFE-03`, `RULE-CONC-01`)**
+  - `StripedLockTable::barrier` / `lock_all`. `flush_all` = cutoff, barrier, drain, `checkpoint_and_truncate`. Open replays the WAL (validating or migrating frames) and then truncates.
+  - `delete_with_policy` logs one atomic WAL transaction before removing anything. Add the MVCC `writer_guard` gate and `forget` / `has_chain`; the TTL ordinal bitmap; and `data_sync` mirroring the WAL policy.
+  - **Exit Criteria**: `test_process_kill_crash_recovery_preserves_every_acknowledged_write` (child process aborted mid-stream; 3 layouts x 2 rounds).
+
+- [x] **TASK-070: Arena & Mmap Lifetime Safety (`RULE-SAFE-02`)**
+  - Reuse a freed slot only when the region `Arc::strong_count == 1` and no retired regions are alive. Add per-collection `segments/<stem>` directories (with legacy migration), deferred `pending_removals`, `sync_all`, and parent-directory `fsync` after renames on Unix.
+  - **Exit Criteria**: `test_slot_reuse_is_blocked_while_a_reader_holds_the_mapping`.
+
+- [x] **TASK-071: Index & Loader Hardening Against Corrupted / Crafted Files**
+  - `PagedBTreeIndex` validates `entry_count` and page CRCs. `PagedBitmapIndex` keys `hot_removed` by `(field, tag)`. The HNSW loader is bounds-checked, with safe visited marking. `PrimaryIndex::complete_background_flush` applies only on a version match. B+Tree posting lists keep the inline-smallest invariant.
+  - **Exit Criteria**: `test_crafted_hnsw_file_is_rejected_not_panicking`, `test_duplicate_key_postings_stay_sorted_for_keyset_pagination`.
+
+- [x] **TASK-072: Query Correctness — Unconstrained Queries, Exclusions, Windows & `top_k`**
+  - `exclusion()`, `check_extra`, `check_view` and `window_with_view`. Unconstrained queries return every live record. `top_k_similar` ignores pagination windows.
+
+- [x] **TASK-073: Consistent Backups & Point-in-Time Recovery (`RULE-SAFE-06`)**
+  - Snapshots record their WAL LSN under `lock_all`. `archive_wal_for_pitr` requires `EngineConfig::wal_archive`. Restore replays the LSN-ordered prefix into a fresh destination; existing data is never deleted.
+  - **Exit Criteria**: `test_pitr_requires_wal_archive`.
+
+- [x] **TASK-074: Raft Safety & Sharding Correctness**
+  - `RaftStorage` (meta plus append-only log). `RaftNode::new -> Result`. Vote / term / log-matching safety rules, `apply_committed`, and per-follower `next_index`.
+  - High-bit `vshard_for_id`. `migrate_vshard` freezes the shard behind the MVCC write gate and rolls back on failure.
+  - **Exit Criteria**: `test_raft_vote_safety_rules`; 20,000-key vshard distribution test.
+
+- [x] **TASK-075: Server Security & Admission Control (`RULE-SAFE-06`, `F-SEC-01`, `F-SEC-03`, `F-SEC-04`)**
+  - Role, body-limit and rate-limit checks happen at the header stage, before any allocation. Unauthenticated servers bind loopback only. `backup_root` confinement. An admin job pool (max 2 concurrent jobs, results delivered over mpsc). Raft RPCs are served by an optional `RaftNode` (Admin only). Client-side bounds checks.
+  - `storage-server` binary: `STORAGE_AUTH_TOKENS`, `STORAGE_BACKUP_ROOT`, `STORAGE_RATE_LIMIT`, `STORAGE_MAX_CONNECTIONS`. `storage-cli`: `STORAGE_TOKEN`.
+  - **Exit Criteria**: `test_header_stage_admission_and_hostile_inputs`, `test_backup_path_resolution_rejects_escapes`, `test_token_auth_and_role_parse`.
+
+- [x] **TASK-076: Real RFC 8439 ChaCha20-Poly1305 AEAD Primitives (`F-SEC-02`, primitives only)**
+  - Real Poly1305 tag (replacing the previous ad-hoc 128-bit MAC), `aead_seal` / `aead_open` with AAD, and `generate_unique_nonce`.
+  - **Exit Criteria**: `test_chacha20_block_rfc8439_vector`, `test_poly1305_rfc8439_vector`, `test_aead_rfc8439_vector`, `test_seal_open_and_tamper_detection`.
+
+- [x] **TASK-077: Build-Independent Checksum Format (`RULE-SAFE-05`)**
+  - The SSE4.2 and portable `CRC32C` paths produced different checksums, so databases written by `target-cpu=native` builds were unreadable by portable builds and on other architectures. The portable path is now a bit-identical table-driven implementation, and hardware is detected at runtime when not enabled at compile time.
+  - **Exit Criteria**: `test_checksum_format_is_identical_on_every_code_path` (golden values), `test_crc32c_table_matches_standard_check_value`. Zero warnings with and without `target-cpu=native`.
+
+- [x] **TASK-078: Benchmark Gate & Hot-Path Regression Fixes (`RULE-TEST-02`, `RULE-MEM-01`)**
+  - Interleaved A/B gate against `4a004ec`. Fixes: overlapping-word ASCII fast path in `ArchivedString::as_str`; shared static zero page instead of a 176-byte per-`RecordRef` fallback; `AsyncMemoryFirst` buffering.
+  - **Exit Criteria**: `0.00` allocs/op on every hot read; `with_ref` / `get_ref` / `update` at parity within noise (`docs/BENCHMARK_REPORT.md` §5).
+
+- [x] **TASK-079: Documentation Accuracy & MSRV**
+  - Correct README (compile-checked examples, CLI argument order, auth configuration, `SyncPolicy` names, benchmark caveats, binary size), FEATURES (verified status section, definitions for feature IDs referenced in code), RULES (`ArchivePod` model, `RULE-SAFE-02` – `06`, `RULE-CONC-02` / `03`), CONTRIBUTING and BENCHMARK_REPORT.
+  - Declare `rust-version = "1.82"` workspace-wide.
+
+## Stage 20: Panic-Freedom, Master-Prompt Audit & Feature Wiring (`TASK-080` – )
+
+- [x] **TASK-080: Panic-Free Production Code & Hostile-Input Sweeps for Every Decoder (`RULE-ERR-01`, `RULE-TEST-01`)**
+  - *(Continues the last request of the previous Gemini/Antigravity session: "refactor the ~110 `try_into().unwrap()` sites to truly infallible patterns".)* Those sites were already replaced by `storage_types::wire` readers in Stage 19. The remaining panic paths are now removed: `AlignedBytes` / `AlignedScratchBuf` capacity math (checked; `Layout` can no longer be invalid), `CachePadded::boxed_array` for the four shard tables (no `unreachable!()`), and production `InlineId::from_static` calls moved into `const` items (an invalid literal is a compile error). Only compile-time `const` assertions and one `debug_assert!` remain.
+  - Add `AlignedBytes::try_copy_from_slice` (returns `ResourceExhausted`) and use it for every network-, disk- and decompression-sourced buffer.
+  - **Bugs found and fixed by the sweeps**:
+    - `RecordCodec::decode_owned` panicked, and reached `decode_unchecked` on an unvalidated root (UB), for crafted tombstone frames. It now rejects tombstones and decompresses once.
+    - `decompress_lz4` preallocated the claimed size (up to 256 MiB) for a 3-byte input. Impossible expansion ratios are now rejected and the allocation is fallible.
+    - `PagedBitmapIndex` allocated per an untrusted chunk count and left bitmap blocks unchecksummed. The new v2 format adds a blocks checksum, bounded counts, block-index and chunk-order validation.
+    - `PagedBTreeIndex` leaf checksums did not cover the page header (separator keys). `page_crc` now covers the whole page.
+  - **Exit Criteria**: hostile-input sweeps (truncation, raw corruption, and re-sealed corruption with valid checksums) for record frames, LZ4, `InlineId` / `RecordHeader`, WAL files and forged WAL frames, primary checkpoints and deltas, HNSW, paged B+Tree, paged bitmap, arena segments, Raft wire messages, `ClusterMap`, backup manifests, whole-database corruption (open + full read-back), and every server opcode (all reactor workers still answer). `81` tests passing, `0` warnings (native and portable).
+
+- [x] **TASK-081: Master-Prompt Audit — Scaling, CPU, Complexity, Memory & Observability (`RULE-SCALE-02`, `RULE-CPU-01`, `RULE-CPU-03`, `RULE-CPLX-01`, `RULE-MEM-04`)**
+  - Whole-codebase review against the master prompt's pillars. Fixes:
+    - `StripedCounter`: per-thread, cache-line-padded read and write telemetry counters (previously one atomic shared by every core).
+    - Cache-padded ordinal-table lock (false sharing).
+    - Top-K over a small vector index enumerates `HnswVectorIndex::live_ordinals` (previously cloned every primary entry).
+    - `sweep_expired` walks the TTL bitmap and re-checks expiry under the stripe lock.
+    - Non-blocking rejection of over-limit connections.
+    - Per-shard self-wake socket: reactor workers block in the kernel with an infinite timeout (previously re-polled every connection every 25 ms), plus a lost-wakeup-free `stop()`.
+    - Raft §7 log compaction (`compact_log_through`, automatic above 8,192 applied entries with a 1,024-entry tail; `snapshot_index` / `snapshot_term` persisted crash-safely; WAL `sync_to_disk` first).
+    - Per-shard read and write RPC latency histograms plus a slow-operation log, exported via `OP_METRICS`.
+  - **Exit Criteria**: `test_raft_log_compaction_bounds_memory_and_survives_restart`, `test_rpc_latency_histograms_and_slow_log_are_recorded_and_exported`; `83` tests passing, `0` warnings (native and portable).
+
+- [x] **TASK-082: Wire HNSW Graph Persistence via Stable Ordinals (`F-HNSW-02`, `F-INDX-02`)**
+  - **Primary checkpoint v3** (`STGEIDX3` / `STGEDLT3`) persists every record's ordinal; `PrimaryIndex::restore_entry_at` restores it exactly and `finish_restore` rebuilds the free list from the holes. v2 / v1 files still load (dense ordinals). Delta replay now applies a frame's deletes before its upserts: a key deleted and re-created in one window was previously deleted on replay.
+  - **Engine**: loads `indexes/<stem>_hnsw.idx` at open. `rebuild_secondary_indexes` reconciles the graph with the records using one zero-copy `O(D)` `vector_matches` per vector: changed or missing vectors are re-inserted and nodes of records without vectors removed. A missing, stale or corrupted file therefore only costs rebuild work. Checkpoints save the graph atomically when its generation changed.
+  - **HNSW connectivity fix** (bug found while testing): an outlier vector could receive zero inbound edges and become unreachable even by an exact-match query. Every node now keeps at least one base-layer inbound edge (tracked inbound degrees, eviction never removes a node's last inbound link, forced link from the nearest neighbor).
+  - **Reactor poll policy** (benchmark-gate finding on `TASK-081`): an untimed wait resumed measurably slower on Windows under request/response traffic. Workers use 1 ms / 5 ms timed waits while recently active and block indefinitely only after about 128 ms idle.
+  - **Exit Criteria**: `test_hnsw_graph_persists_reconciles_and_recovers` (graph reused with zero re-insertions and identical results; stale-graph reconciliation; corrupted-file rebuild; recall@10 `>= 95%` on every path), `test_outlier_vectors_remain_reachable`, `test_v3_checkpoint_preserves_ordinals_with_holes_and_deltas`; `86` tests passing, `0` warnings.
+
+- [x] **TASK-083: Wire the Paged Secondary-Index Tier (`F-PIDX-01`, `F-PIDX-02`, `RULE-CONC-01`, `RULE-MEM-04`)**
+  - **`PagedBTreeIndex` rewrite.**
+    - Immutable generation files behind an atomic manifest (`paged_files`).
+    - Three disjoint sources: base pages, a frozen delta and a hot delta.
+    - Streaming `O(page)`-memory merge checkpoints that hold no lock during I/O (`begin_checkpoint` / `finish_checkpoint`).
+    - Full query parity with `NumericRangeIndex`, including keyset pagination.
+    - Pages validated once at open (sorted, contiguous, whole-page CRC).
+    - The previous version materialized every posting in RAM and held the index write lock across the whole disk write.
+  - **`PagedBitmapIndex` rewrite.**
+    - Same architecture: chunk-streaming merge, `BMX3` generation file with header, directory and blocks checksums and per-tag cardinality.
+    - Point-lookup `contains` / `matches_ordinal`.
+    - Full query parity with `BitmapTagIndex`.
+  - **Bloom filter / `ColdPrimaryIndex`** moved unchanged to `cold_primary`.
+  - **Engine.**
+    - `EngineConfig::index_tier` (`IndexTier::{Memory, Paged}`) with tier-agnostic `RangeIndex` / `TagIndex` dispatch.
+    - Checkpoint v3 header `stamp`. `save_checkpoint_files` stamps the primary checkpoint and both paged indexes alike, without pausing writers; the WAL is synced before index generations are published.
+    - Paged indexes are reused at open only after a clean shutdown (matching stamps, no delta frames, no WAL replay, not in shared-catalog-WAL mode). Otherwise they are rebuilt from the records, spilling every 1 M records.
+  - **Exit Criteria**:
+    - `test_paged_btree_matches_in_memory_index_through_checkpoints`, `test_paged_bitmap_matches_in_memory_index_through_checkpoints`, `test_paged_btree_checkpoint_never_blocks_writers_and_keeps_concurrent_writes`.
+    - `test_paged_tier_matches_memory_tier_through_checkpoints_and_restarts` (every query family identical, including paginated scans).
+    - `test_paged_indexes_are_rebuilt_when_not_provably_current`.
+    - The process-kill crash test, extended to the paged tier, verifies that recovered secondary indexes are exact.
+    - `91` tests passing, `0` warnings.
+
+- [x] **TASK-084: Wire Encryption at Rest (`F-SEC-02`, `RULE-SAFE-07`, `RULE-MEM-01`)**
+  - **Configuration**: `EngineConfig::encryption_key: Option<EncryptionKey>` (redacted `Debug`, zeroed on drop) and `decrypted_cache_bytes` (default 256 MiB).
+  - **Frame encryption**: `RecordCodec::encrypt_frame` / `decrypt_frame` seal the payload with ChaCha20-Poly1305 (unique 96-bit nonce per frame). The authenticated data binds the ciphertext to the record id and every header field that decryption does not recompute, so frames cannot be swapped between records and metadata (e.g. TTL) cannot be edited undetected. `validate_frame` / `decode_fast` / `decode_owned` reject encrypted frames (one bitmask test).
+  - **Engine**:
+    - Every on-disk frame (arena segments, dedicated and ping-pong files, compaction rewrites) and every WAL upsert body (single, pair, cascade, transaction, cross-collection catalog transaction) is sealed. Replay decrypts.
+    - Reads go through a bounded, sharded decrypted-frame cache, filled at flush time and on cold reads. MVCC history keeps plaintext.
+    - With a key configured, plaintext frames are rejected (no downgrade attack); encryption must therefore be enabled at database creation.
+  - **Exit Criteria**:
+    - `test_frame_encryption_roundtrip_and_tamper_detection` (wrong key, wrong record id, flipped ciphertext, forged TTL all rejected).
+    - `test_encrypted_engine_keeps_plaintext_off_disk_and_reads_back` (no plaintext in any file, before and after flush, for both layouts; correct reads and queries with the right key; errors with a wrong or no key).
+    - `test_tampered_ciphertext_is_detected`.
+    - Process-kill crash test variant with encryption (encrypted WAL replay).
+    - Codec hostile sweep over encrypted frames.
+    - Benchmark gate: encrypted warm `with_ref` at `0.00` allocs/op.
+    - `95` tests passing, `0` warnings.

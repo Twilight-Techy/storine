@@ -13,13 +13,13 @@
 use std::any::Any;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use storage_codec::{checksum_payload, AlignedBytes, RecordCodec, ZeroCopyRecord};
 use storage_graph::OnDelete;
 use storage_index::Indexable;
-use storage_mmap::atomic_write_replace;
+use storage_mmap::{atomic_write_replace, cleanup_temp_files};
 use storage_types::{FastHashMap, FastHashSet, InlineId, RecordFlags, Result, StorageError, Version};
 use storage_wal::{GroupCommitWal, SyncPolicy, WalEntry, WalOpKind};
 
@@ -48,8 +48,10 @@ pub trait ErasedCollectionEngine: Send + Sync {
     fn lock_many<'a>(&'a self, ids: &[InlineId]) -> MultiRecordLockGuard<'a>;
     fn apply_delete_locked(&self, id: InlineId) -> Result<bool>;
     fn flush_collection(&self) -> Result<usize>;
-    fn replay_entry(&self, entry: &WalEntry) -> Result<()>;
+    fn replay_entries(&self, entries: &[WalEntry]) -> Result<()>;
     fn stats(&self) -> EngineStats;
+    /// Shared MVCC writer gate held across a commit's apply phase.
+    fn mvcc_guard(&self) -> RwLockReadGuard<'_, ()>;
 }
 
 impl<T: ZeroCopyRecord + Indexable + 'static> ErasedCollectionEngine for StorageEngine<T> {
@@ -94,8 +96,13 @@ impl<T: ZeroCopyRecord + Indexable + 'static> ErasedCollectionEngine for Storage
     }
 
     #[inline]
-    fn replay_entry(&self, entry: &WalEntry) -> Result<()> {
-        self.replay_wal_entry(entry)
+    fn replay_entries(&self, entries: &[WalEntry]) -> Result<()> {
+        self.replay_wal_entries(entries)
+    }
+
+    #[inline]
+    fn mvcc_guard(&self) -> RwLockReadGuard<'_, ()> {
+        self.mvcc_writer_guard()
     }
 
     #[inline]
@@ -135,6 +142,10 @@ impl DatabaseCatalog {
             fs::create_dir_all(&base_dir)
                 .map_err(|e| StorageError::io("create catalog base_dir", e))?;
         }
+
+        // Collections opened in shared mode skip temp-file cleanup (others may be writing),
+        // so it happens exactly once here, before any collection is open.
+        let _ = cleanup_temp_files(&base_dir)?;
 
         let meta_path = base_dir.join("catalog.meta");
         let persisted = load_catalog_meta(&meta_path)?;
@@ -207,18 +218,12 @@ impl DatabaseCatalog {
                 .write()
                 .unwrap_or_else(|p| p.into_inner());
             if !pending.is_empty() {
-                let mut remaining = Vec::with_capacity(pending.len());
-                for entry in pending.drain(..) {
-                    if entry.collection_id == T::COLLECTION_ID {
-                        engine.replay_wal_entry(&entry)?;
-                    } else {
-                        remaining.push(entry);
-                    }
-                }
+                let (mine, remaining): (Vec<WalEntry>, Vec<WalEntry>) = pending
+                    .drain(..)
+                    .partition(|e| e.collection_id == T::COLLECTION_ID);
                 *pending = remaining;
-                if pending.is_empty() {
-                    self.shared_wal.checkpoint_truncate()?;
-                }
+                // One batched replay (one checkpoint, incremental index maintenance).
+                engine.replay_wal_entries(&mine)?;
             }
         }
 
@@ -287,27 +292,40 @@ impl DatabaseCatalog {
         out
     }
 
-    /// Flushes all registered collections and truncates the shared catalog WAL checkpoint.
+    /// Flushes and checkpoints all registered collections, then truncates the shared WAL.
+    ///
+    /// The cutoff LSN is taken before the collections flush; each collection waits out its
+    /// in-flight writers (stripe barrier) before draining, so every operation `<= cutoff` is
+    /// durable when the WAL is truncated. Frames of collections that have not been registered
+    /// (and therefore not replayed) yet are always kept.
     pub fn flush_all(&self) -> Result<usize> {
+        let cutoff = self.shared_wal.current_lsn();
         let engines: Vec<Arc<dyn ErasedCollectionEngine>> = {
             let by_id = self
                 .collections_by_id
                 .read()
                 .unwrap_or_else(|p| p.into_inner());
-            by_id.values().cloned().collect()
+            let mut v: Vec<_> = by_id.values().cloned().collect();
+            v.sort_by_key(|e| e.collection_id());
+            v
         };
         let mut total = 0usize;
-        for eng in engines {
+        for eng in &engines {
             total += eng.flush_collection()?;
         }
-        if self
+        let unreplayed: FastHashSet<u16> = self
             .pending_wal_recovery
             .read()
             .unwrap_or_else(|p| p.into_inner())
-            .is_empty()
-        {
-            self.shared_wal.checkpoint_truncate()?;
-        }
+            .iter()
+            .map(|e| e.collection_id)
+            .collect();
+        let registered: FastHashSet<u16> = engines.iter().map(|e| e.collection_id()).collect();
+        self.shared_wal.checkpoint_truncate_before(
+            cutoff,
+            &|cid| unreplayed.contains(&cid) || (cid != 0 && !registered.contains(&cid)),
+            None,
+        )?;
         Ok(total)
     }
 
@@ -398,6 +416,8 @@ impl DatabaseCatalog {
 struct PreparedUpsert {
     version: Version,
     frame: AlignedBytes,
+    /// WAL body for `frame` (sealed when the collection encrypts at rest).
+    wal_bytes: Result<Vec<u8>>,
     apply_fn: Box<dyn FnOnce(Version, u64, AlignedBytes) -> Result<()> + Send>,
 }
 
@@ -413,6 +433,8 @@ struct StagedCollectionUpsert {
 /// transaction batch, and applies all mutations atomically.
 pub struct CatalogTransaction<'a> {
     catalog: &'a DatabaseCatalog,
+    /// First staging error (e.g. an unregistered collection); reported by `commit`.
+    deferred_error: Option<StorageError>,
     touched_engines: FastHashMap<u16, Arc<dyn ErasedCollectionEngine>>,
     read_versions: FastHashMap<(u16, InlineId), Option<Version>>,
     staged_upserts: FastHashMap<(u16, InlineId), StagedCollectionUpsert>,
@@ -433,6 +455,7 @@ impl<'a> CatalogTransaction<'a> {
     fn new(catalog: &'a DatabaseCatalog) -> Self {
         Self {
             catalog,
+            deferred_error: None,
             touched_engines: FastHashMap::default(),
             read_versions: FastHashMap::default(),
             staged_upserts: FastHashMap::default(),
@@ -498,16 +521,17 @@ impl<'a> CatalogTransaction<'a> {
         id: InlineId,
         record: T,
     ) {
-        let _ = self.ensure_engine_tracked(engine);
+        if let Err(e) = self.ensure_engine_tracked(engine) {
+            self.deferred_error.get_or_insert(e);
+            return;
+        }
         let key = (T::COLLECTION_ID, id);
         self.staged_deletes.remove(&key);
 
-        let by_id = self
-            .catalog
-            .collections_by_id
-            .read()
-            .unwrap_or_else(|p| p.into_inner());
-        let Some(erased) = by_id.get(&T::COLLECTION_ID).cloned() else {
+        let Some(erased) = self.touched_engines.get(&T::COLLECTION_ID).cloned() else {
+            self.deferred_error.get_or_insert(StorageError::invalid_key(
+                "collection engine is not registered in this DatabaseCatalog",
+            ));
             return;
         };
         let rec_clone = record.clone();
@@ -517,11 +541,17 @@ impl<'a> CatalogTransaction<'a> {
                 .current_version(id)
                 .map_or(Version::INITIAL, |v| v.next());
             let frame = RecordCodec::encode_aligned(&rec_clone, next_ver, now_ns, RecordFlags::NONE, 0);
+            let wal_bytes = erased
+                .as_any()
+                .downcast_ref::<StorageEngine<T>>()
+                .ok_or_else(|| StorageError::invalid_key("collection type mismatch"))
+                .and_then(|typed| typed.wal_frame_bytes(id, frame.as_slice()));
             let apply_erased = erased;
             let apply_rec = rec_clone;
             PreparedUpsert {
                 version: next_ver,
                 frame,
+                wal_bytes,
                 apply_fn: Box::new(move |ver, ts, aligned_frame| {
                     let typed_eng = apply_erased
                         .as_any()
@@ -547,13 +577,19 @@ impl<'a> CatalogTransaction<'a> {
         engine: &StorageEngine<T>,
         id: InlineId,
     ) {
-        let _ = self.ensure_engine_tracked(engine);
+        if let Err(e) = self.ensure_engine_tracked(engine) {
+            self.deferred_error.get_or_insert(e);
+            return;
+        }
         let key = (T::COLLECTION_ID, id);
         self.staged_upserts.remove(&key);
         self.staged_deletes.insert(key);
     }
 
     fn commit(self) -> Result<()> {
+        if let Some(e) = self.deferred_error {
+            return Err(e);
+        }
         if self.staged_upserts.is_empty() && self.staged_deletes.is_empty() {
             return Ok(());
         }
@@ -607,14 +643,9 @@ impl<'a> CatalogTransaction<'a> {
         upsert_entries.sort_by_key(|(k, _)| *k);
 
         for ((cid, id), staged) in upsert_entries {
-            let prep = (staged.prepare_fn)(now_ns);
-            wal_ops.push((
-                cid,
-                WalOpKind::Upsert,
-                id,
-                prep.version,
-                prep.frame.as_slice().to_vec(),
-            ));
+            let mut prep = (staged.prepare_fn)(now_ns);
+            let body = core::mem::replace(&mut prep.wal_bytes, Ok(Vec::new()))?;
+            wal_ops.push((cid, WalOpKind::Upsert, id, prep.version, body));
             prepared_upserts.push(prep);
         }
 
@@ -628,14 +659,21 @@ impl<'a> CatalogTransaction<'a> {
             let next_ver = eng
                 .current_version(id)
                 .map_or(Version::INITIAL, |v| v.next());
-            wal_ops.push((cid, WalOpKind::Delete, id, next_ver, Vec::new()));
+            wal_ops.push((cid, WalOpKind::Delete, id, next_ver, now_ns.to_le_bytes().to_vec()));
         }
 
         // Write single atomic multi-collection commit batch to the shared catalog WAL!
         let txn_id = self.catalog.shared_wal.allocate_txn_id();
         self.catalog.shared_wal.append_transaction(txn_id, wal_ops)?;
 
-        // Apply all upserts and deletes in memory while still holding canonical locks
+        // Apply all upserts and deletes in memory while still holding canonical locks and every
+        // touched collection's MVCC writer gate (snapshots see all or none of the transaction).
+        let mut mvcc_guards = Vec::with_capacity(self.touched_engines.len());
+        for cid in keys_by_collection.keys() {
+            if let Some(eng) = self.touched_engines.get(cid) {
+                mvcc_guards.push(eng.mvcc_guard());
+            }
+        }
         for prep in prepared_upserts {
             (prep.apply_fn)(prep.version, now_ns, prep.frame)?;
         }
@@ -645,6 +683,7 @@ impl<'a> CatalogTransaction<'a> {
             }
         }
 
+        drop(mvcc_guards);
         drop(guards);
         Ok(())
     }
@@ -725,7 +764,7 @@ mod tests {
     use super::*;
     use crate::engine::StorageLayoutMode;
     use crate::model::AgentObjectRecord;
-    use storage_codec::ArchiveBuilder;
+    use storage_codec::{impl_archive_pod, ArchiveBuilder};
     use storage_index::IndexSnapshot;
 
     /// Second collection record type (`COLLECTION_ID = 2`) for cross-collection transaction tests.
@@ -743,6 +782,12 @@ mod tests {
         pub user_id: InlineId,
         pub amount_cents: i64,
     }
+
+    impl_archive_pod!(ArchivedOrderRecord {
+        order_id: InlineId,
+        user_id: InlineId,
+        amount_cents: i64,
+    });
 
     impl ZeroCopyRecord for OrderRecord {
         type Archived = ArchivedOrderRecord;
@@ -797,6 +842,12 @@ mod tests {
         pub tier: i64,
     }
 
+    impl_archive_pod!(ArchivedEvolvedRecordV3 {
+        val: i64,
+        bonus: i64,
+        tier: i64,
+    });
+
     impl ZeroCopyRecord for EvolvedRecordV3 {
         type Archived = ArchivedEvolvedRecordV3;
         const SCHEMA_VERSION: u16 = 3;
@@ -839,6 +890,8 @@ mod tests {
     struct ArchivedLegacyRecordV1 {
         pub val: i64,
     }
+
+    impl_archive_pod!(ArchivedLegacyRecordV1 { val: i64 });
 
     impl ZeroCopyRecord for LegacyRecordV1 {
         type Archived = ArchivedLegacyRecordV1;

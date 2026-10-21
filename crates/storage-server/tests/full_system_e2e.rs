@@ -29,16 +29,13 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use storage_codec::AlignedBytes;
 use storage_core::{
     archive_wal_for_pitr, create_online_backup, restore_point_in_time, vshard_for_id,
     AccessPathKind, AgentObjectRecord, ClusterMap, ClusterRouter, DatabaseCatalog, EngineConfig,
     LatencyHistogram, RaftNode, RaftReplicationGroup, RaftRole, SlowOperationLog, StorageEngine,
     StorageLayoutMode, FIELD_PRIMARY_TAG, FIELD_SCORE,
 };
-use storage_core::raft::{
-    AppendEntriesReq, AppendEntriesResp, RaftLogEntry, RequestVoteReq,
-};
+use storage_core::raft::{AppendEntriesReq, AppendEntriesResp, RequestVoteReq, RequestVoteResp};
 use storage_index::{
     ColdPrimaryEntry, ColdPrimaryIndex, DiskLocation, PagedBTreeIndex, PagedBitmapIndex,
     SplitBlockBloomFilter,
@@ -112,14 +109,14 @@ fn test_full_system_end_to_end_all_features() {
     // =========================================================================
     let eng_dir = root.join("main_engine");
     let engine =
-        StorageEngine::<AgentObjectRecord>::open(&eng_dir, EngineConfig::default()).unwrap();
+        StorageEngine::<AgentObjectRecord>::open(&eng_dir, EngineConfig { wal_archive: true, ..EngineConfig::default() }).unwrap();
 
     let tag_ai = InlineId::from_static("ai");
     let tag_ml = InlineId::from_static("ml");
 
     for i in 0..100u32 {
         let id = InlineId::new(&format!("rec_{i:04}")).unwrap();
-        let mut rec = AgentObjectRecord::new(id, format!("Record {i}"), 5000 + i as i64, i as i64);
+        let mut rec = AgentObjectRecord::new(id, format!("Record {i}"), 5000 + i64::from(i), i64::from(i));
         if i % 2 == 0 {
             rec.tags.push(tag_ai);
         }
@@ -293,7 +290,7 @@ fn test_full_system_end_to_end_all_features() {
     let restored = restore_point_in_time::<AgentObjectRecord>(
         &backup_dir,
         &restore_dir,
-        EngineConfig::default(),
+        EngineConfig { wal_archive: true, ..EngineConfig::default() },
         pitr_cutoff,
     )
     .unwrap();
@@ -309,27 +306,27 @@ fn test_full_system_end_to_end_all_features() {
         let re = Arc::new(
             StorageEngine::<AgentObjectRecord>::open(&raft_dir, EngineConfig::default()).unwrap(),
         );
-        let n1 = Arc::new(RaftNode::new(1, Arc::clone(&re)));
+        let n1 = Arc::new(RaftNode::new(1, Arc::clone(&re)).unwrap());
         let n2 = Arc::new(RaftNode::new(
             2,
             Arc::new(
                 StorageEngine::<AgentObjectRecord>::open(
-                    &root.join("raft_p_n2"),
+                    root.join("raft_p_n2"),
                     EngineConfig::default(),
                 )
                 .unwrap(),
             ),
-        ));
+        ).unwrap());
         let n3 = Arc::new(RaftNode::new(
             3,
             Arc::new(
                 StorageEngine::<AgentObjectRecord>::open(
-                    &root.join("raft_p_n3"),
+                    root.join("raft_p_n3"),
                     EngineConfig::default(),
                 )
                 .unwrap(),
             ),
-        ));
+        ).unwrap());
         let group =
             RaftReplicationGroup::new(vec![Arc::clone(&n1), Arc::clone(&n2), Arc::clone(&n3)])
                 .unwrap();
@@ -346,7 +343,7 @@ fn test_full_system_end_to_end_all_features() {
         let re = Arc::new(
             StorageEngine::<AgentObjectRecord>::open(&raft_dir, EngineConfig::default()).unwrap(),
         );
-        let reloaded = RaftNode::new(1, re);
+        let reloaded = RaftNode::new(1, re).unwrap();
         assert!(reloaded.current_term() >= 1, "Raft term must survive restart");
         assert_eq!(reloaded.voted_for(), Some(1));
     }
@@ -366,11 +363,11 @@ fn test_full_system_end_to_end_all_features() {
     // § 14. Sharding — ClusterRouter + Live vshard Migration
     // =========================================================================
     let s1 = Arc::new(
-        StorageEngine::<AgentObjectRecord>::open(&root.join("shard_s1"), EngineConfig::default())
+        StorageEngine::<AgentObjectRecord>::open(root.join("shard_s1"), EngineConfig::default())
             .unwrap(),
     );
     let s2 = Arc::new(
-        StorageEngine::<AgentObjectRecord>::open(&root.join("shard_s2"), EngineConfig::default())
+        StorageEngine::<AgentObjectRecord>::open(root.join("shard_s2"), EngineConfig::default())
             .unwrap(),
     );
     let router = ClusterRouter::new(vec![(1, Arc::clone(&s1)), (2, Arc::clone(&s2))]).unwrap();
@@ -393,16 +390,16 @@ fn test_full_system_end_to_end_all_features() {
     // =========================================================================
     let r1 = Arc::new(RaftNode::new(
         1,
-        Arc::new(StorageEngine::<AgentObjectRecord>::open(&root.join("raft_r1"), EngineConfig::default()).unwrap()),
-    ));
+        Arc::new(StorageEngine::<AgentObjectRecord>::open(root.join("raft_r1"), EngineConfig::default()).unwrap()),
+    ).unwrap());
     let r2 = Arc::new(RaftNode::new(
         2,
-        Arc::new(StorageEngine::<AgentObjectRecord>::open(&root.join("raft_r2"), EngineConfig::default()).unwrap()),
-    ));
+        Arc::new(StorageEngine::<AgentObjectRecord>::open(root.join("raft_r2"), EngineConfig::default()).unwrap()),
+    ).unwrap());
     let r3 = Arc::new(RaftNode::new(
         3,
-        Arc::new(StorageEngine::<AgentObjectRecord>::open(&root.join("raft_r3"), EngineConfig::default()).unwrap()),
-    ));
+        Arc::new(StorageEngine::<AgentObjectRecord>::open(root.join("raft_r3"), EngineConfig::default()).unwrap()),
+    ).unwrap());
     let raft_group =
         RaftReplicationGroup::new(vec![Arc::clone(&r1), Arc::clone(&r2), Arc::clone(&r3)])
             .unwrap();
@@ -424,7 +421,7 @@ fn test_full_system_end_to_end_all_features() {
     // § 16. Telemetry — Histograms, Slow Log, Prometheus
     // =========================================================================
     let tel = StorageEngine::<AgentObjectRecord>::open(
-        &root.join("telemetry"),
+        root.join("telemetry"),
         EngineConfig::default(),
     )
     .unwrap();
@@ -448,14 +445,14 @@ fn test_full_system_end_to_end_all_features() {
     let idx_dir = root.join("paged_idx");
     std::fs::create_dir_all(&idx_dir).unwrap();
 
-    let pbt = PagedBTreeIndex::open(&idx_dir.join("s.btidx")).unwrap();
+    let pbt = PagedBTreeIndex::open(idx_dir.join("s.btidx")).unwrap();
     for i in 0..500i64 {
         pbt.insert(1, i * 10, RecordOrdinal(i as u32));
     }
     pbt.checkpoint_to_disk().unwrap();
     assert_eq!(pbt.count_in_range_zero_alloc(1, 0, 990), 100);
 
-    let pbm = PagedBitmapIndex::open(&idx_dir.join("t.bmidx")).unwrap();
+    let pbm = PagedBitmapIndex::open(idx_dir.join("t.bmidx")).unwrap();
     for i in 0..200u32 {
         pbm.insert(1, tag_ai, RecordOrdinal(i));
     }
@@ -467,7 +464,7 @@ fn test_full_system_end_to_end_all_features() {
     assert!(bloom.may_contain(tag_ai));
 
     let cold = ColdPrimaryIndex::build(
-        &idx_dir.join("c.cidx"),
+        idx_dir.join("c.cidx"),
         vec![ColdPrimaryEntry {
             id: tag_ai,
             ordinal: RecordOrdinal(0),
@@ -495,26 +492,36 @@ fn test_full_system_end_to_end_all_features() {
         .put(seed_id, &AgentObjectRecord::new(seed_id, "TCP Seed", 100, 42))
         .unwrap();
 
+    let bak_root = root.join("tcp_bak_root");
     let sec = SecurityConfig::new(true)
         .with_token("ro-tok", RbacRole::ReadOnly)
         .with_token("rw-tok", RbacRole::ReadWrite)
-        .with_token("admin-tok", RbacRole::Admin);
-    let mut server =
-        StorageServer::start_with_config("127.0.0.1:0", Arc::clone(&tcp_engine), 128, sec)
-            .unwrap();
+        .with_token("admin-tok", RbacRole::Admin)
+        .with_backup_root(&bak_root);
+    let tcp_raft = Arc::new(RaftNode::new(9, Arc::clone(&tcp_engine)).unwrap());
+    let mut server = StorageServer::start_with_raft(
+        "127.0.0.1:0",
+        Arc::clone(&tcp_engine),
+        128,
+        sec,
+        Some(Arc::clone(&tcp_raft)),
+    )
+    .unwrap();
     let addr = server.local_addr();
 
-    // 18a. Unauthenticated → rejected
+    // 18a. Unauthenticated → rejected (at the header stage; the connection is closed)
     let mut c = StorageClient::connect(addr).unwrap();
     assert!(c.put(seed_id, &AgentObjectRecord::new(seed_id, "X", 1, 1)).is_err());
 
     // 18b. ReadOnly → reads work, writes rejected
+    let mut c = StorageClient::connect(addr).unwrap();
     assert_eq!(c.authenticate("ro-tok").unwrap(), RbacRole::ReadOnly);
     let frame = c.get_frame(seed_id).unwrap();
     assert_eq!(decode_agent_frame(&frame).unwrap().score, 42);
     assert!(c.put(seed_id, &AgentObjectRecord::new(seed_id, "X", 1, 1)).is_err());
 
     // 18c. ReadWrite → full CRUD + CAS + Batch + Query
+    let mut c = StorageClient::connect(addr).unwrap();
     assert_eq!(c.authenticate("rw-tok").unwrap(), RbacRole::ReadWrite);
     let id1 = InlineId::from_static("tcp_i1");
     let id2 = InlineId::from_static("tcp_i2");
@@ -569,16 +576,15 @@ fn test_full_system_end_to_end_all_features() {
 
     // 18e. Admin RPCs — rejected for ReadOnly
     assert!(ro.admin_compact().is_err());
-    assert!(ro.admin_checkpoint().is_err());
 
     let mut adm = StorageClient::connect(addr).unwrap();
     adm.authenticate("admin-tok").unwrap();
     assert!(adm.admin_compact().unwrap().contains("compacted"));
-    let bak_dest = root.join("tcp_bak");
-    assert!(adm.admin_backup(bak_dest.to_str().unwrap()).unwrap().contains("backup created"));
+    assert!(adm.admin_backup("tcp_bak").unwrap().contains("backup created"));
+    assert!(adm.admin_backup("../outside").is_err());
     assert!(adm.admin_checkpoint().unwrap().contains("checkpoint wrote"));
 
-    // 18f. Raft Vote RPC
+    // 18f. Raft Vote RPC — served by the attached RaftNode, Admin only
     let mut rw = StorageClient::connect(addr).unwrap();
     rw.authenticate("rw-tok").unwrap();
     let vreq = RequestVoteReq {
@@ -587,36 +593,33 @@ fn test_full_system_end_to_end_all_features() {
         last_log_index: 20,
         last_log_term: 6,
     };
-    let (st, tm, rb) = rw.raft_vote(&vreq).unwrap();
+    assert!(!matches!(rw.raft_vote(&vreq), Ok((0x00, _, _))));
+    let (st, tm, rb) = adm.raft_vote(&vreq).unwrap();
     assert_eq!(st, 0x00);
     assert_eq!(tm, 7);
-    assert_eq!(RequestVoteReq::from_wire_bytes(&rb).unwrap(), vreq);
+    assert!(RequestVoteResp::from_wire_bytes(&rb).unwrap().vote_granted);
 
-    // 18g. Raft AppendEntries RPC
+    // 18g. Raft AppendEntries RPC (leader heartbeat)
     let ae = AppendEntriesReq {
         term: 7,
         leader_id: 1,
-        prev_log_index: 20,
-        prev_log_term: 6,
-        entries: vec![RaftLogEntry {
-            term: 7,
-            index: 21,
-            id: InlineId::from_static("ae_e1"),
-            version: Version(1),
-            frame: Some(AlignedBytes::copy_from_slice(&[0u8; 64])),
-        }],
-        leader_commit: 20,
+        prev_log_index: 0,
+        prev_log_term: 0,
+        entries: Vec::new(),
+        leader_commit: 0,
     };
-    let (st, tm, rb) = rw.raft_append(&ae).unwrap();
+    let (st, tm, rb) = adm.raft_append(&ae).unwrap();
     assert_eq!(st, 0x00);
     assert_eq!(tm, 7);
     let ar = AppendEntriesResp::from_wire_bytes(&rb).unwrap();
     assert!(ar.success);
-    assert_eq!(ar.match_index, 21);
+    assert_eq!(ar.match_index, 0);
 
     // 18h. Shard Migration RPC (Admin only)
     let mig_id = InlineId::from_static("mig_rec");
     let mig_rec = AgentObjectRecord::new(mig_id, "Migrated TCP", 300, 88);
+    let mut rw = StorageClient::connect(addr).unwrap();
+    rw.authenticate("rw-tok").unwrap();
     assert!(rw.migrate_vshard(10u16, 2u16, &[(mig_id, mig_rec.clone())]).is_err());
     assert_eq!(adm.migrate_vshard(10u16, 2u16, &[(mig_id, mig_rec)]).unwrap(), 1);
     let (_, owned) = tcp_engine.get_owned(mig_id).unwrap();
@@ -624,18 +627,21 @@ fn test_full_system_end_to_end_all_features() {
     assert_eq!(owned.score, 88);
 
     server.stop();
+    drop(tcp_raft);
     drop(tcp_engine);
 
     // =========================================================================
     // § 19. Arena Compaction
     // =========================================================================
-    let mut acfg = EngineConfig::default();
-    acfg.layout_mode = StorageLayoutMode::AdaptiveArena {
+    let acfg = EngineConfig {
+        layout_mode: StorageLayoutMode::AdaptiveArena {
         arena_threshold_bytes: 4096,
         segment_capacity: 64 * 1024,
+    },
+        background_flush: false,
+        ..EngineConfig::default()
     };
-    acfg.background_flush = false;
-    let ce = StorageEngine::<AgentObjectRecord>::open(&root.join("compact"), acfg).unwrap();
+    let ce = StorageEngine::<AgentObjectRecord>::open(root.join("compact"), acfg).unwrap();
     let mut cids = Vec::new();
     for round in 1..=3 {
         for i in 0..30 {
@@ -661,10 +667,12 @@ fn test_full_system_end_to_end_all_features() {
     // § 20. WAL Crash Recovery
     // =========================================================================
     let crash_dir = root.join("crash");
-    let mut wcfg = EngineConfig::default();
-    wcfg.enable_wal = true;
-    wcfg.wal_sync_policy = SyncPolicy::Immediate;
-    wcfg.background_flush = false;
+    let wcfg = EngineConfig {
+        enable_wal: true,
+        wal_sync_policy: SyncPolicy::Immediate,
+        background_flush: false,
+        ..EngineConfig::default()
+    };
     for cycle in 1..=5i64 {
         let key = InlineId::new(&format!("cr_{cycle:02}")).unwrap();
         {

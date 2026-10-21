@@ -10,13 +10,13 @@
 //!     - `0x08 = CasPut` (`[expected_version: u64 | raw_frame]`)
 //!     - `0x09 = BatchGet` (`[count: u32 | count * 24B InlineId]`)
 //!     - `0x0A = BatchPut` (`[count: u32 | repeated (id: 24B, frame_len: u32, frame)]`)
-//!     - `0x0B = QueryHybrid` (`[field_id: u16, min_score: i64, max_score: i64, limit: u32]`)
-//!     - `0x0C = Auth` (`[token_utf8_bytes]`)
+//!     - `0x0B = QueryHybrid` (`[field_id: u16, min_score: i64, max_score: i64, limit: u32 (, offset: u32, desc: u8)]`)
+//!     - `0x0C = Auth` (`[token_utf8_bytes]`, at most 4 KiB)
 //!     - `0x0D = Metrics` (Prometheus/OpenMetrics text exposition scrape)
-//!     - `0x0E = RaftVote` (`[RequestVoteReq wire bytes]`)
-//!     - `0x0F = RaftAppend` (`[AppendEntriesReq wire bytes]`)
+//!     - `0x0E = RaftVote` (`[RequestVoteReq wire bytes]` -> `RequestVoteResp`)
+//!     - `0x0F = RaftAppend` (`[AppendEntriesReq wire bytes]` -> `AppendEntriesResp`)
 //!     - `0x10 = MigrateVShard` (`[shard_id: u16 | dest_node: u16 | repeated (id: 24B, frame_len: u32, frame)]`)
-//!     - `0x11 = AdminBackup` (`[dest_path_utf8_bytes]`)
+//!     - `0x11 = AdminBackup` (`[backup_name_utf8]`, created under `SecurityConfig::backup_root`)
 //!     - `0x12 = AdminCompact` (no body)
 //!     - `0x13 = Health` (no body)
 //!     - `0x14 = AdminCheckpoint` (no body)
@@ -36,8 +36,14 @@
 //!   - `body_len: u32`
 //!   - `body: [u8; body_len]`
 //!
-//! Uses `SocketPoller` (`WSAPoll` on Windows, `poll` on Unix) so worker threads sleep in the OS
-//! kernel at **0.0% CPU** when connections are idle and dispatch ready sockets in $O(k)$.
+//! Admission control happens on the 29-byte header, before any body memory is reserved: the
+//! rate limit, the opcode's required role, and a per-opcode body ceiling are enforced first, so
+//! unauthenticated clients can never make the server allocate large buffers. Requests that are
+//! rejected at the header stage close the connection (their body is never read).
+//!
+//! Uses `SocketPoller` (`WSAPoll` on Windows, `poll` on Unix): worker threads sleep in the OS
+//! kernel when connections are idle and only drive the sockets the kernel reports ready.
+//! Long-running admin operations run on a bounded background worker, never on a reactor thread.
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations, rust_2018_idioms)]
@@ -45,24 +51,28 @@
 pub mod security;
 
 use std::io::{self, BufReader, BufWriter, IoSlice, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::Path;
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use storage_codec::{AlignedBytes, RecordCodec, RecordView, ZeroCopyRecord};
 use storage_core::{
     backup::create_online_backup,
-    raft::{AppendEntriesReq, AppendEntriesResp, RequestVoteReq},
-    AgentObjectRecord, RecordRef, StorageEngine,
+    raft::{AppendEntriesReq, AppendEntriesResp, RaftNode, RequestVoteReq, RequestVoteResp},
+    AgentObjectRecord, LatencyHistogram, RecordRef, SlowOpEntry, SlowOperationLog, StorageEngine,
 };
 use storage_index::Indexable;
 use storage_mmap::SocketPoller;
+use storage_types::wire::{read_array_24, read_i64_le, read_u16_le, read_u32_le, read_u64_le};
 use storage_types::{InlineId, RecordFlags, Result, StorageError, Version, MAX_PAYLOAD_SIZE};
 
 pub use security::{RbacRole, SecurityConfig, TokenBucket};
+
+/// Placeholder key for RPCs that do not address a single record (validated at compile time).
+const NO_KEY: InlineId = InlineId::from_static("_");
 
 pub const OP_GET_RAW_FRAME: u8 = 0x01;
 pub const OP_PUT_RAW_FRAME: u8 = 0x02;
@@ -92,19 +102,111 @@ pub const STATUS_RATE_LIMITED: u8 = 0x06;
 
 /// Default hard ceiling on simultaneous active TCP connections before load-shedding kicks in.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 100_000;
+/// Maximum `OP_AUTH` token body (`4 KiB`), the only body an unauthenticated client may send.
+pub const MAX_AUTH_BODY: usize = 4096;
+/// Maximum concurrently running admin jobs (backup / compaction / checkpoint / shard import).
+pub const MAX_CONCURRENT_ADMIN_JOBS: usize = 2;
+
+/// Wire size of one `BatchPut` / `MigrateVShard` item header (`24B id + 4B frame_len`).
+const BATCH_ITEM_HEADER: usize = 28;
+
+/// Minimum role required to execute `op`, or `None` for unknown opcodes.
+#[inline]
+const fn required_role(op: u8) -> Option<RbacRole> {
+    match op {
+        OP_AUTH => Some(RbacRole::Unauthenticated),
+        OP_GET_RAW_FRAME | OP_STATS | OP_BATCH_GET | OP_QUERY_HYBRID | OP_METRICS | OP_HEALTH => {
+            Some(RbacRole::ReadOnly)
+        }
+        OP_PUT_RAW_FRAME | OP_DELETE | OP_CAS_PUT | OP_BATCH_PUT => Some(RbacRole::ReadWrite),
+        OP_RAFT_VOTE | OP_RAFT_APPEND | OP_MIGRATE_VSHARD | OP_ADMIN_BACKUP | OP_ADMIN_COMPACT
+        | OP_ADMIN_CHECKPOINT => Some(RbacRole::Admin),
+        _ => None,
+    }
+}
+
+/// Largest request body accepted for `op` (`0` = no body allowed).
+#[inline]
+const fn max_body_len(op: u8) -> usize {
+    match op {
+        OP_AUTH => MAX_AUTH_BODY,
+        OP_ADMIN_BACKUP => 4096,
+        OP_QUERY_HYBRID => 64,
+        OP_RAFT_VOTE => 64,
+        OP_PUT_RAW_FRAME | OP_CAS_PUT | OP_BATCH_GET | OP_BATCH_PUT | OP_RAFT_APPEND
+        | OP_MIGRATE_VSHARD => MAX_PAYLOAD_SIZE as usize,
+        _ => 0,
+    }
+}
+
+/// Self-wake socket pair for one reactor shard (`RULE-CPU-03`).
+///
+/// The read end sits in the shard's poll set, so a worker can block in the kernel with an
+/// **infinite** timeout and still be woken for new connections, finished admin jobs and shutdown,
+/// instead of re-polling every connection on a timer.
+struct ShardWaker {
+    tx: TcpStream,
+    rx: TcpStream,
+}
+
+impl ShardWaker {
+    fn new() -> io::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let tx = TcpStream::connect(listener.local_addr()?)?;
+        let tx_addr = tx.local_addr()?;
+        // Another local process could race to connect first: accept until our own peer arrives.
+        let rx = loop {
+            let (rx, peer) = listener.accept()?;
+            if peer == tx_addr {
+                break rx;
+            }
+        };
+        tx.set_nodelay(true)?;
+        tx.set_nonblocking(true)?;
+        rx.set_nonblocking(true)?;
+        Ok(Self { tx, rx })
+    }
+
+    /// Makes the shard's poll set readable. A full socket buffer means a wake is already pending.
+    #[inline]
+    fn wake(&self) {
+        let _ = (&self.tx).write(&[1]);
+    }
+
+    /// Consumes pending wake bytes so the next poll can block again.
+    fn drain(&self) {
+        let mut buf = [0u8; 64];
+        while let Ok(n) = (&self.rx).read(&mut buf) {
+            if n < buf.len() {
+                break;
+            }
+        }
+    }
+}
 
 struct ReactorShard {
+    /// Request latency of read RPCs served by this shard's worker. Only that worker records into
+    /// it, so recording never contends across cores (`RULE-SCALE-02`); exports merge all shards.
+    read_latency: LatencyHistogram,
+    /// Request latency of write RPCs served by this shard's worker.
+    write_latency: LatencyHistogram,
     incoming: Mutex<Vec<TcpStream>>,
     has_incoming: AtomicBool,
     wake_cv: Condvar,
+    /// `None` only if a loopback socket pair could not be created; the worker then falls back to
+    /// bounded timed polling.
+    waker: Option<ShardWaker>,
 }
 
 impl ReactorShard {
     fn new() -> Self {
         Self {
+            read_latency: LatencyHistogram::new(),
+            write_latency: LatencyHistogram::new(),
             incoming: Mutex::new(Vec::new()),
             has_incoming: AtomicBool::new(false),
             wake_cv: Condvar::new(),
+            waker: ShardWaker::new().ok(),
         }
     }
 
@@ -117,8 +219,33 @@ impl ReactorShard {
         guard.push(stream);
         self.has_incoming.store(true, Ordering::Release);
         self.wake_cv.notify_one();
+        drop(guard);
+        self.wake();
+    }
+
+    /// Wakes the worker whether it is parked on the condvar (no connections) or blocked in poll.
+    #[inline]
+    fn wake(&self) {
+        if let Some(ref waker) = self.waker {
+            waker.wake();
+        }
+    }
+
+    /// Wakes the worker for shutdown. Holding `incoming` while notifying closes the lost-wakeup
+    /// window between the worker's shutdown check and its condvar wait.
+    fn wake_for_shutdown(&self) {
+        let _guard = self
+            .incoming
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.wake_cv.notify_all();
+        drop(_guard);
+        self.wake();
     }
 }
+
+/// Response produced asynchronously by an admin job.
+type JobResponse = (u8, u64, Vec<u8>);
 
 /// Per-connection non-blocking state machine.
 /// Requires **zero OS thread stack** and **zero persistent heap buffers** when idle,
@@ -133,6 +260,8 @@ struct NonBlockingConn {
     out_pos: usize,
     role: RbacRole,
     limiter: TokenBucket,
+    /// Admin job running in the background; no new request is read until it answers.
+    pending_job: Option<Receiver<JobResponse>>,
 }
 
 impl NonBlockingConn {
@@ -148,6 +277,7 @@ impl NonBlockingConn {
             out_pos: 0,
             role: sec.initial_role(),
             limiter: TokenBucket::new(sec.rate_limit_rps, sec.rate_limit_burst),
+            pending_job: None,
         }
     }
 
@@ -206,6 +336,23 @@ impl NonBlockingConn {
     }
 }
 
+/// State shared by every reactor worker.
+struct ServerShared<T: ZeroCopyRecord + Indexable> {
+    engine: Arc<StorageEngine<T>>,
+    security: SecurityConfig,
+    raft: Option<Arc<RaftNode<T>>>,
+    admin_jobs: AtomicUsize,
+    /// Every reactor shard, so `OP_METRICS` can merge their latency histograms.
+    shards: Vec<Arc<ReactorShard>>,
+    /// Requests slower than [`DEFAULT_SLOW_RPC_NS`] (bounded ring, `F-OBS-03`).
+    slow_log: SlowOperationLog,
+}
+
+/// Default threshold above which a request is recorded in the slow-operation log (10 ms).
+pub const DEFAULT_SLOW_RPC_NS: u64 = 10_000_000;
+/// Slow-operation log capacity (oldest entries are evicted).
+const SLOW_LOG_CAPACITY: usize = 256;
+
 /// Embedded TCP Server streaming zero-copy record frames directly from `StorageEngine<T>`
 /// using a fixed-size **Sharded Kernel-Polled Event Reactor** (`ReactorShard` worker pool).
 pub struct StorageServer<T: ZeroCopyRecord + Indexable> {
@@ -217,7 +364,7 @@ pub struct StorageServer<T: ZeroCopyRecord + Indexable> {
     shards: Vec<Arc<ReactorShard>>,
     accept_thread: Option<JoinHandle<()>>,
     worker_threads: Vec<JoinHandle<()>>,
-    _engine: Arc<StorageEngine<T>>,
+    shared: Arc<ServerShared<T>>,
 }
 
 impl<T: ZeroCopyRecord + Indexable> core::fmt::Debug for StorageServer<T> {
@@ -242,11 +389,12 @@ impl<T: ZeroCopyRecord + Indexable> core::fmt::Debug for StorageServer<T> {
 
 impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
     pub fn start(bind_addr: &str, engine: Arc<StorageEngine<T>>) -> Result<Self> {
-        Self::start_with_config(
+        Self::start_with_raft(
             bind_addr,
             engine,
             DEFAULT_MAX_CONNECTIONS,
             SecurityConfig::default(),
+            None,
         )
     }
 
@@ -255,7 +403,13 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
         engine: Arc<StorageEngine<T>>,
         max_connections: usize,
     ) -> Result<Self> {
-        Self::start_with_config(bind_addr, engine, max_connections, SecurityConfig::default())
+        Self::start_with_raft(
+            bind_addr,
+            engine,
+            max_connections,
+            SecurityConfig::default(),
+            None,
+        )
     }
 
     pub fn start_with_config(
@@ -264,8 +418,40 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
         max_connections: usize,
         security: SecurityConfig,
     ) -> Result<Self> {
+        Self::start_with_raft(bind_addr, engine, max_connections, security, None)
+    }
+
+    /// Starts the server; `raft` (when set) serves `OP_RAFT_VOTE` / `OP_RAFT_APPEND`.
+    ///
+    /// Refuses to start without authentication (`SecurityConfig::require_auth == false`) on any
+    /// non-loopback address, and refuses `require_auth` without any registered token.
+    pub fn start_with_raft(
+        bind_addr: &str,
+        engine: Arc<StorageEngine<T>>,
+        max_connections: usize,
+        security: SecurityConfig,
+        raft: Option<Arc<RaftNode<T>>>,
+    ) -> Result<Self> {
+        if security.require_auth && security.token_count() == 0 {
+            return Err(StorageError::invalid_key(
+                "require_auth is set but no authentication token is registered",
+            ));
+        }
+        if !security.require_auth {
+            let addrs = bind_addr
+                .to_socket_addrs()
+                .map_err(|e| StorageError::io("resolve StorageServer bind address", e))?;
+            for addr in addrs {
+                if !addr.ip().is_loopback() {
+                    return Err(StorageError::invalid_key(
+                        "refusing to serve without authentication on a non-loopback address \
+                         (register tokens and set SecurityConfig::require_auth)",
+                    ));
+                }
+            }
+        }
+
         let max_conns = Arc::new(AtomicUsize::new(max_connections.max(1)));
-        let security = Arc::new(security);
         let listener = TcpListener::bind(bind_addr)
             .map_err(|e| StorageError::io("bind StorageServer TCP listener", e))?;
         let local_addr = listener
@@ -274,23 +460,29 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
 
         let num_workers = thread::available_parallelism()
             .map_or(4, |n| n.get().clamp(2, 16));
+        let shards: Vec<Arc<ReactorShard>> =
+            (0..num_workers).map(|_| Arc::new(ReactorShard::new())).collect();
+        let shared = Arc::new(ServerShared {
+            engine,
+            security,
+            raft,
+            admin_jobs: AtomicUsize::new(0),
+            shards: shards.clone(),
+            slow_log: SlowOperationLog::new(DEFAULT_SLOW_RPC_NS, SLOW_LOG_CAPACITY),
+        });
+
         let shutdown = Arc::new(AtomicBool::new(false));
         let active_connections = Arc::new(AtomicUsize::new(0));
         let rejected_connections = Arc::new(AtomicUsize::new(0));
 
-        let mut shards = Vec::with_capacity(num_workers);
         let mut worker_threads = Vec::with_capacity(num_workers);
-
-        for _ in 0..num_workers {
-            let shard = Arc::new(ReactorShard::new());
-            let shard_clone = Arc::clone(&shard);
-            let eng_clone = Arc::clone(&engine);
+        for shard in &shards {
+            let shard_clone = Arc::clone(shard);
+            let shared_clone = Arc::clone(&shared);
             let sd_clone = Arc::clone(&shutdown);
             let conn_count = Arc::clone(&active_connections);
-            let sec_clone = Arc::clone(&security);
-            shards.push(shard);
             worker_threads.push(thread::spawn(move || {
-                reactor_worker_loop(shard_clone, eng_clone, sd_clone, conn_count, sec_clone);
+                reactor_worker_loop(shard_clone, shared_clone, sd_clone, conn_count);
             }));
         }
 
@@ -302,12 +494,14 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
 
         let accept_thread = thread::spawn(move || {
             let mut rr = 0usize;
+            let mut backoff_ms = 1u64;
             for stream_res in listener.incoming() {
                 if shutdown_accept.load(Ordering::Relaxed) {
                     break;
                 }
                 match stream_res {
                     Ok(mut stream) => {
+                        backoff_ms = 1;
                         let _ = stream.set_nodelay(true);
                         let limit = max_conns_accept.load(Ordering::Acquire);
                         let prev = conn_count_accept.fetch_add(1, Ordering::AcqRel);
@@ -318,18 +512,28 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
                             let mut hdr = [0u8; 13];
                             hdr[0] = STATUS_OVERLOADED;
                             hdr[9..13].copy_from_slice(&(msg.len() as u32).to_le_bytes());
-                            let _ = stream.set_write_timeout(Some(Duration::from_millis(5)));
-                            let _ =
-                                stream.write_vectored(&[IoSlice::new(&hdr), IoSlice::new(msg)]);
+                            // One non-blocking attempt: a flood of over-limit clients must never
+                            // stall the accept thread (a blocking write would cap accepts for
+                            // everyone at one per write timeout).
+                            if stream.set_nonblocking(true).is_ok() {
+                                let _ = stream
+                                    .write_vectored(&[IoSlice::new(&hdr), IoSlice::new(msg)]);
+                            }
                             continue;
                         }
-                        let _ = stream.set_nonblocking(true);
+                        if stream.set_nonblocking(true).is_err() {
+                            conn_count_accept.fetch_sub(1, Ordering::Release);
+                            continue;
+                        }
                         let target = &shards_accept[rr % shards_accept.len()];
                         rr = rr.wrapping_add(1);
                         target.push_stream(stream);
                     }
                     Err(_) => {
-                        thread::sleep(Duration::from_millis(1));
+                        // Transient descriptor exhaustion (`EMFILE` / `ENFILE`) or similar:
+                        // back off exponentially instead of spinning (`RULE-CPU-03`).
+                        thread::sleep(Duration::from_millis(backoff_ms));
+                        backoff_ms = (backoff_ms * 2).min(100);
                     }
                 }
             }
@@ -344,8 +548,18 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
             shards,
             accept_thread: Some(accept_thread),
             worker_threads,
-            _engine: engine,
+            shared,
         })
+    }
+
+    /// Requests slower than the slow-operation threshold, oldest first (`F-OBS-03`).
+    pub fn slow_operations(&self) -> Vec<SlowOpEntry> {
+        self.shared.slow_log.snapshot()
+    }
+
+    /// Changes the slow-operation threshold (default [`DEFAULT_SLOW_RPC_NS`]).
+    pub fn set_slow_operation_threshold_ns(&self, threshold_ns: u64) {
+        self.shared.slow_log.set_threshold_ns(threshold_ns);
     }
 
     #[inline]
@@ -378,7 +592,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
         self.shutdown.store(true, Ordering::SeqCst);
         let _ = TcpStream::connect(self.local_addr);
         for shard in &self.shards {
-            shard.wake_cv.notify_all();
+            shard.wake_for_shutdown();
         }
         if let Some(handle) = self.accept_thread.take() {
             let _ = handle.join();
@@ -397,10 +611,9 @@ impl<T: ZeroCopyRecord + Indexable> Drop for StorageServer<T> {
 
 fn reactor_worker_loop<T: ZeroCopyRecord + Indexable>(
     shard: Arc<ReactorShard>,
-    engine: Arc<StorageEngine<T>>,
+    shared: Arc<ServerShared<T>>,
     shutdown: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
-    security: Arc<SecurityConfig>,
 ) {
     let mut conns: Vec<NonBlockingConn> = Vec::with_capacity(64);
     let mut poller = SocketPoller::with_capacity(64);
@@ -408,7 +621,6 @@ fn reactor_worker_loop<T: ZeroCopyRecord + Indexable>(
     let mut made_progress = false;
 
     while !shutdown.load(Ordering::Relaxed) {
-        let mut newly_added = false;
         if conns.is_empty() || shard.has_incoming.load(Ordering::Acquire) {
             let mut inc = shard
                 .incoming
@@ -422,8 +634,7 @@ fn reactor_worker_loop<T: ZeroCopyRecord + Indexable>(
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
             for stream in inc.drain(..) {
-                conns.push(NonBlockingConn::new(stream, &security));
-                newly_added = true;
+                conns.push(NonBlockingConn::new(stream, &shared.security));
             }
             shard.has_incoming.store(false, Ordering::Release);
         }
@@ -432,56 +643,65 @@ fn reactor_worker_loop<T: ZeroCopyRecord + Indexable>(
             continue;
         }
 
-        // Wait in OS kernel (`WSAPoll` / `poll`) when no connection is newly accepted or actively progressing
-        let use_kernel_filter = if !newly_added && !made_progress {
-            poller.clear();
-            for conn in &conns {
-                poller.register(&conn.stream, conn.wants_write());
-            }
-            let poll_timeout_ms = if idle_polls < 8 {
+        // Ask the kernel which sockets are ready. After progress, poll without sleeping; while
+        // recently active, use short timed waits (1 ms, then 5 ms), which resume measurably faster
+        // than an untimed wait under request/response traffic. Once idle for ~128 ms, block
+        // indefinitely (`0%` CPU, zero timer wake-ups): new connections, finished admin jobs and
+        // shutdown all write to the waker. Without a waker, back off to 25 ms polls.
+        let jobs_pending = conns.iter().any(|c| c.pending_job.is_some());
+        poller.clear();
+        let base = match shard.waker {
+            Some(ref waker) => {
+                poller.register(&waker.rx, false);
                 1
-            } else if idle_polls < 32 {
-                5
-            } else {
-                25
-            };
-            let ready = poller.wait(poll_timeout_ms);
-            if ready == 0 {
-                idle_polls = idle_polls.saturating_add(1);
-                continue;
             }
-            idle_polls = 0;
-            true
-        } else {
-            idle_polls = 0;
-            false
+            None => 0,
         };
+        for conn in &conns {
+            poller.register(&conn.stream, conn.wants_write());
+        }
+        let poll_timeout_ms = if made_progress {
+            0
+        } else if idle_polls < 8 {
+            1
+        } else if idle_polls < 32 {
+            5
+        } else if shard.waker.is_some() {
+            -1
+        } else if jobs_pending {
+            1
+        } else {
+            25
+        };
+        let ready = poller.wait(poll_timeout_ms);
+        if base == 1 && poller.is_ready(0) {
+            if let Some(ref waker) = shard.waker {
+                waker.drain();
+            }
+        }
+        if ready == 0 && !jobs_pending {
+            made_progress = false;
+            idle_polls = idle_polls.saturating_add(1);
+            continue;
+        }
+        idle_polls = 0;
 
         made_progress = false;
-        let mut idx = 0usize;
-        let mut poll_idx = 0usize;
-        while idx < conns.len() {
-            if use_kernel_filter && !poller.is_ready(poll_idx) {
-                idx += 1;
-                poll_idx += 1;
+        // Iterate in reverse so `swap_remove` never moves an unvisited connection into a slot
+        // whose poll result has already been consumed.
+        let mut idx = conns.len();
+        while idx > 0 {
+            idx -= 1;
+            let conn_ready = poller.is_ready(base + idx) || conns[idx].pending_job.is_some();
+            if !conn_ready {
                 continue;
             }
-            match drive_connection(&mut conns[idx], &engine, &security) {
-                ConnStep::Progress => {
-                    made_progress = true;
-                    idx += 1;
-                    poll_idx += 1;
-                }
-                ConnStep::WouldBlock => {
-                    idx += 1;
-                    poll_idx += 1;
-                }
+            match drive_connection(&mut conns[idx], &shared, &shard) {
+                ConnStep::Progress => made_progress = true,
+                ConnStep::WouldBlock => {}
                 ConnStep::Closed => {
                     conns.swap_remove(idx);
                     active_connections.fetch_sub(1, Ordering::Relaxed);
-                    // Because `swap_remove` moved the last connection into `idx`, disable kernel index filter
-                    // for the remainder of this single pass so the swapped-in connection is not skipped.
-                    poll_idx = usize::MAX;
                 }
             }
         }
@@ -494,29 +714,41 @@ enum ConnStep {
     Closed,
 }
 
+/// Sends a final error response and closes the connection (used for header-stage rejections,
+/// where the request body is deliberately never read).
 #[inline]
-const fn opcode_allows_body(op: u8) -> bool {
-    matches!(
-        op,
-        OP_PUT_RAW_FRAME
-            | OP_CAS_PUT
-            | OP_BATCH_GET
-            | OP_BATCH_PUT
-            | OP_QUERY_HYBRID
-            | OP_AUTH
-            | OP_RAFT_VOTE
-            | OP_RAFT_APPEND
-            | OP_MIGRATE_VSHARD
-            | OP_ADMIN_BACKUP
-    )
+fn reject_and_close(conn: &mut NonBlockingConn, status: u8, msg: &[u8]) -> ConnStep {
+    let _ = conn.send_or_queue_response(status, 0, msg);
+    ConnStep::Closed
 }
 
 fn drive_connection<T: ZeroCopyRecord + Indexable>(
     conn: &mut NonBlockingConn,
-    engine: &StorageEngine<T>,
-    security: &SecurityConfig,
+    shared: &Arc<ServerShared<T>>,
+    shard: &Arc<ReactorShard>,
 ) -> ConnStep {
-    // 1. Flush any pending response tail first
+    // 0. Deliver the result of a background admin job before reading anything else.
+    if let Some(ref rx) = conn.pending_job {
+        match rx.try_recv() {
+            Ok((status, ver, body)) => {
+                conn.pending_job = None;
+                return match conn.send_or_queue_response(status, ver, &body) {
+                    Ok(()) => ConnStep::Progress,
+                    Err(_) => ConnStep::Closed,
+                };
+            }
+            Err(TryRecvError::Empty) => return ConnStep::WouldBlock,
+            Err(TryRecvError::Disconnected) => {
+                conn.pending_job = None;
+                return match conn.send_or_queue_response(STATUS_ERROR, 0, b"admin job failed") {
+                    Ok(()) => ConnStep::Progress,
+                    Err(_) => ConnStep::Closed,
+                };
+            }
+        }
+    }
+
+    // 1. Flush any pending response tail first (per-connection backpressure, `RULE-SCALE-01`)
     if conn.out_pos < conn.out_buf.len() {
         match conn.stream.write(&conn.out_buf[conn.out_pos..]) {
             Ok(0) => return ConnStep::Closed,
@@ -534,7 +766,7 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
         }
     }
 
-    // 2. Read 29-byte request header
+    // 2. Read 29-byte request header and admit the request BEFORE reserving body memory
     let hdr_pos = conn.hdr_read as usize;
     if hdr_pos < 29 {
         match conn.stream.read(&mut conn.req_hdr[hdr_pos..]) {
@@ -546,30 +778,40 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
                     return ConnStep::Progress;
                 }
                 let op = conn.req_hdr[0];
-                let body_len =
-                    u32::from_le_bytes(conn.req_hdr[25..29].try_into().unwrap()) as usize;
-                if body_len > MAX_PAYLOAD_SIZE as usize {
-                    let _ =
-                        conn.send_or_queue_response(STATUS_ERROR, 0, b"payload exceeds limit");
-                    return ConnStep::Closed;
-                }
-                if !opcode_allows_body(op) && body_len > 0 {
-                    let _ = conn.send_or_queue_response(
-                        STATUS_ERROR,
-                        0,
-                        b"unexpected request body for opcode",
+                let body_len = read_u32_le(&conn.req_hdr, 25) as usize;
+
+                let Some(needed) = required_role(op) else {
+                    return reject_and_close(conn, STATUS_ERROR, b"unknown opcode");
+                };
+                if conn.role < needed {
+                    return reject_and_close(
+                        conn,
+                        STATUS_UNAUTHORIZED,
+                        b"insufficient role for opcode (authenticate with OP_AUTH)",
                     );
-                    return ConnStep::Closed;
+                }
+                if body_len > max_body_len(op) {
+                    return reject_and_close(
+                        conn,
+                        STATUS_ERROR,
+                        b"request body exceeds the limit for this opcode",
+                    );
+                }
+                if !conn.limiter.try_acquire(1) {
+                    return reject_and_close(
+                        conn,
+                        STATUS_RATE_LIMITED,
+                        b"rate limit exceeded: token bucket depleted",
+                    );
                 }
                 if body_len > 0 {
                     conn.body_buf.clear();
                     if conn.body_buf.try_reserve_exact(body_len).is_err() {
-                        let _ = conn.send_or_queue_response(
+                        return reject_and_close(
+                            conn,
                             STATUS_OVERLOADED,
-                            0,
                             b"server out of memory for request body",
                         );
-                        return ConnStep::Closed;
                     }
                     conn.body_buf.resize(body_len, 0);
                     conn.body_read = 0;
@@ -595,44 +837,96 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
         }
     }
 
-    // 4. Enforce per-connection token-bucket rate limit (`TASK-044`, `F-SEC-03`)
     let op = conn.req_hdr[0];
-    let raw_id: [u8; 24] = conn.req_hdr[1..25].try_into().unwrap();
+    let raw_id: [u8; 24] = read_array_24(&conn.req_hdr, 1);
     conn.hdr_read = 0;
     conn.body_read = 0;
+    // Take the body so the connection never retains a large buffer after the request (`RULE-MEM-04`).
+    let body = core::mem::take(&mut conn.body_buf);
 
-    if !conn.limiter.try_acquire(1) {
-        conn.body_buf.clear();
-        let _ = conn.send_or_queue_response(
-            STATUS_RATE_LIMITED,
-            0,
-            b"rate limit exceeded: token bucket depleted",
-        );
-        return ConnStep::Progress;
+    // 4. Execute the request, recording its latency in this worker's histogram (`F-OBS-01`) and
+    //    in the slow-operation log when over the threshold (`F-OBS-03`).
+    let started = Instant::now();
+    let step = execute_request(conn, shared, shard, op, raw_id, body);
+    let elapsed_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    match op_class(op) {
+        OpClass::Read => shard.read_latency.record_ns(elapsed_ns),
+        OpClass::Write => shard.write_latency.record_ns(elapsed_ns),
+        OpClass::Other => {}
     }
+    shared
+        .slow_log
+        .record_if_slow(op_name(op), elapsed_ns, || format!("opcode=0x{op:02X}"));
+    step
+}
 
-    // 5. Execute request with RBAC enforcement (`TASK-043`, `TASK-044`)
+enum OpClass {
+    Read,
+    Write,
+    Other,
+}
+
+#[inline]
+const fn op_class(op: u8) -> OpClass {
+    match op {
+        OP_GET_RAW_FRAME | OP_BATCH_GET | OP_QUERY_HYBRID | OP_STATS | OP_METRICS | OP_HEALTH => {
+            OpClass::Read
+        }
+        OP_PUT_RAW_FRAME | OP_CAS_PUT | OP_BATCH_PUT | OP_DELETE => OpClass::Write,
+        _ => OpClass::Other,
+    }
+}
+
+const fn op_name(op: u8) -> &'static str {
+    match op {
+        OP_GET_RAW_FRAME => "get",
+        OP_PUT_RAW_FRAME => "put",
+        OP_DELETE => "delete",
+        OP_STATS => "stats",
+        OP_CAS_PUT => "cas_put",
+        OP_BATCH_GET => "batch_get",
+        OP_BATCH_PUT => "batch_put",
+        OP_QUERY_HYBRID => "query",
+        OP_AUTH => "auth",
+        OP_METRICS => "metrics",
+        OP_RAFT_VOTE => "raft_vote",
+        OP_RAFT_APPEND => "raft_append",
+        OP_MIGRATE_VSHARD => "migrate_vshard",
+        OP_ADMIN_BACKUP => "admin_backup",
+        OP_ADMIN_COMPACT => "admin_compact",
+        OP_HEALTH => "health",
+        OP_ADMIN_CHECKPOINT => "admin_checkpoint",
+        _ => "unknown",
+    }
+}
+
+/// Executes one fully read request (role and size limits were enforced at the header stage).
+fn execute_request<T: ZeroCopyRecord + Indexable>(
+    conn: &mut NonBlockingConn,
+    shared: &Arc<ServerShared<T>>,
+    shard: &Arc<ReactorShard>,
+    op: u8,
+    raw_id: [u8; 24],
+    body: Vec<u8>,
+) -> ConnStep {
+    let engine = &shared.engine;
+
+    // 4. Execute request (role already enforced at the header stage)
     let write_res = match op {
         OP_AUTH => {
-            let body = core::mem::take(&mut conn.body_buf);
             let Ok(tok) = core::str::from_utf8(&body) else {
                 let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"invalid UTF-8 token");
                 return ConnStep::Progress;
             };
-            if let Some(role) = security.authenticate_token(tok) {
+            if let Some(role) = shared.security.authenticate_token(tok) {
                 conn.role = role;
                 conn.send_or_queue_response(STATUS_OK, role as u64, &[])
             } else {
-                conn.role = RbacRole::Unauthenticated;
+                conn.role = shared.security.initial_role();
                 conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"invalid credentials")
             }
         }
         OP_GET_RAW_FRAME => {
-            if !conn.role.can_read() {
-                conn.body_buf.clear();
-                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"read permission required");
-                return ConnStep::Progress;
-            }
             let Ok(id) = InlineId::from_raw_bytes(raw_id) else {
                 let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"invalid InlineId");
                 return ConnStep::Progress;
@@ -663,16 +957,14 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
             }
         }
         OP_PUT_RAW_FRAME => {
-            let body = core::mem::take(&mut conn.body_buf);
-            if !conn.role.can_write() {
-                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"write permission required");
-                return ConnStep::Progress;
-            }
             let Ok(id) = InlineId::from_raw_bytes(raw_id) else {
                 let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"invalid InlineId");
                 return ConnStep::Progress;
             };
-            let aligned = AlignedBytes::copy_from_slice(&body);
+            let Ok(aligned) = AlignedBytes::try_copy_from_slice(&body) else {
+                let _ = conn.send_or_queue_response(STATUS_OVERLOADED, 0, b"out of memory");
+                return ConnStep::Progress;
+            };
             match RecordCodec::decode_owned::<T>(aligned.as_slice()) {
                 Ok((_, owned)) => match engine.put(id, &owned) {
                     Ok(ver) => conn.send_or_queue_response(STATUS_OK, ver.0, &[]),
@@ -684,11 +976,6 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
             }
         }
         OP_CAS_PUT => {
-            let body = core::mem::take(&mut conn.body_buf);
-            if !conn.role.can_write() {
-                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"write permission required");
-                return ConnStep::Progress;
-            }
             if body.len() < 8 {
                 let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"CAS body missing expected_version");
                 return ConnStep::Progress;
@@ -697,8 +984,11 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
                 let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"invalid InlineId");
                 return ConnStep::Progress;
             };
-            let expected_ver = Version(u64::from_le_bytes(body[0..8].try_into().unwrap()));
-            let aligned = AlignedBytes::copy_from_slice(&body[8..]);
+            let expected_ver = Version(read_u64_le(&body, 0));
+            let Ok(aligned) = AlignedBytes::try_copy_from_slice(&body[8..]) else {
+                let _ = conn.send_or_queue_response(STATUS_OVERLOADED, 0, b"out of memory");
+                return ConnStep::Progress;
+            };
             match RecordCodec::decode_owned::<T>(aligned.as_slice()) {
                 Ok((_, owned)) => match engine.put_cas(id, expected_ver, &owned) {
                     Ok(ver) => conn.send_or_queue_response(STATUS_OK, ver.0, &[]),
@@ -713,110 +1003,54 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
             }
         }
         OP_BATCH_GET => {
-            let body = core::mem::take(&mut conn.body_buf);
-            if !conn.role.can_read() {
-                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"read permission required");
-                return ConnStep::Progress;
-            }
             if body.len() < 4 {
                 let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"BatchGet body too short");
                 return ConnStep::Progress;
             }
-            let count = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+            let count = read_u32_le(&body, 0) as usize;
             if body.len() != 4 + count.saturating_mul(24) {
                 let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"BatchGet malformed key list");
                 return ConnStep::Progress;
             }
-            let mut out = Vec::with_capacity(4 + count * 128);
-            out.extend_from_slice(&(count as u32).to_le_bytes());
-            let mut found_count = 0u64;
-            for i in 0..count {
-                let off = 4 + i * 24;
-                let raw_key: [u8; 24] = body[off..off + 24].try_into().unwrap();
-                if let Ok(key_id) = InlineId::from_raw_bytes(raw_key) {
-                    if let Ok(rec_ref) = engine.get_ref(key_id) {
-                        let frame = rec_ref.raw_frame();
-                        out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
-                        out.extend_from_slice(frame);
-                        found_count += 1;
-                        continue;
-                    }
-                }
-                out.extend_from_slice(&0u32.to_le_bytes());
+            match build_batch_get_response(engine, &body, count) {
+                Ok((found, out)) => conn.send_or_queue_response(STATUS_OK, found, &out),
+                Err(msg) => conn.send_or_queue_response(STATUS_OVERLOADED, 0, msg),
             }
-            conn.send_or_queue_response(STATUS_OK, found_count, &out)
         }
-        OP_BATCH_PUT => {
-            let body = core::mem::take(&mut conn.body_buf);
-            if !conn.role.can_write() {
-                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"write permission required");
-                return ConnStep::Progress;
-            }
-            if body.len() < 4 {
-                let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"BatchPut body too short");
-                return ConnStep::Progress;
-            }
-            let count = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
-            let mut pos = 4usize;
-            let mut decoded_items = Vec::with_capacity(count);
-            for _ in 0..count {
-                if pos + 28 > body.len() {
-                    let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"BatchPut truncated item header");
-                    return ConnStep::Progress;
-                }
-                let raw_key: [u8; 24] = body[pos..pos + 24].try_into().unwrap();
-                let frame_len = u32::from_le_bytes(body[pos + 24..pos + 28].try_into().unwrap()) as usize;
-                pos += 28;
-                if pos + frame_len > body.len() {
-                    let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"BatchPut truncated frame");
-                    return ConnStep::Progress;
-                }
-                let Ok(item_id) = InlineId::from_raw_bytes(raw_key) else {
-                    let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"BatchPut invalid InlineId");
-                    return ConnStep::Progress;
-                };
-                let aligned = AlignedBytes::copy_from_slice(&body[pos..pos + frame_len]);
-                pos += frame_len;
-                match RecordCodec::decode_owned::<T>(aligned.as_slice()) {
-                    Ok((_, rec)) => decoded_items.push((item_id, rec)),
+        OP_BATCH_PUT => match parse_batch_items::<T>(&body, true) {
+            Ok(items) => {
+                let count = items.len();
+                let tx_res = engine.transaction(|tx| {
+                    for (item_id, rec) in items {
+                        tx.put(item_id, rec);
+                    }
+                    Ok(())
+                });
+                match tx_res {
+                    Ok(()) => conn.send_or_queue_response(STATUS_OK, count as u64, &[]),
+                    Err(StorageError::TransactionAborted { .. }) => {
+                        conn.send_or_queue_response(STATUS_CONFLICT, 0, b"BatchPut conflict")
+                    }
                     Err(e) => {
-                        let _ = conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes());
-                        return ConnStep::Progress;
+                        conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes())
                     }
                 }
             }
-            let tx_res = engine.transaction(|tx| {
-                for (item_id, rec) in decoded_items {
-                    tx.put(item_id, rec);
-                }
-                Ok(())
-            });
-            match tx_res {
-                Ok(()) => conn.send_or_queue_response(STATUS_OK, count as u64, &[]),
-                Err(StorageError::VersionConflict { actual, .. }) => {
-                    conn.send_or_queue_response(STATUS_CONFLICT, actual.0, b"BatchPut conflict")
-                }
-                Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
-            }
-        }
+            Err(msg) => conn.send_or_queue_response(STATUS_ERROR, 0, msg.as_bytes()),
+        },
         OP_QUERY_HYBRID => {
-            let body = core::mem::take(&mut conn.body_buf);
-            if !conn.role.can_read() {
-                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"read permission required");
-                return ConnStep::Progress;
-            }
             if body.len() < 22 {
                 let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"QueryHybrid body too short");
                 return ConnStep::Progress;
             }
-            let field_id = u16::from_le_bytes(body[0..2].try_into().unwrap());
-            let min_val = i64::from_le_bytes(body[2..10].try_into().unwrap());
-            let max_val = i64::from_le_bytes(body[10..18].try_into().unwrap());
-            let limit = u32::from_le_bytes(body[18..22].try_into().unwrap()) as usize;
+            let field_id = read_u16_le(&body, 0);
+            let min_val = read_i64_le(&body, 2);
+            let max_val = read_i64_le(&body, 10);
+            // Bound the response so it always fits a single frame.
+            let max_ids = (MAX_PAYLOAD_SIZE as usize - 4) / 24;
+            let limit = (read_u32_le(&body, 18) as usize).clamp(1, max_ids);
             let (offset, desc) = if body.len() >= 27 {
-                let off = u32::from_le_bytes(body[22..26].try_into().unwrap()) as usize;
-                let is_desc = body[26] != 0;
-                (off, is_desc)
+                (read_u32_le(&body, 22) as usize, body[26] != 0)
             } else {
                 (0usize, false)
             };
@@ -825,12 +1059,16 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
                 .query()
                 .filter_range(field_id, min_val..=max_val)
                 .offset(offset)
-                .limit(limit.max(1));
+                .limit(limit);
             if desc {
                 q = q.order_desc();
             }
             let page = q.execute_page_ids();
-            let mut out = Vec::with_capacity(4 + page.items.len() * 24);
+            let mut out = Vec::new();
+            if out.try_reserve_exact(4 + page.items.len() * 24).is_err() {
+                let _ = conn.send_or_queue_response(STATUS_OVERLOADED, 0, b"out of memory");
+                return ConnStep::Progress;
+            }
             out.extend_from_slice(&(page.items.len() as u32).to_le_bytes());
             for id in &page.items {
                 out.extend_from_slice(&id.to_raw_bytes());
@@ -838,10 +1076,6 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
             conn.send_or_queue_response(STATUS_OK, page.total_matched as u64, &out)
         }
         OP_DELETE => {
-            if !conn.role.can_write() {
-                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"write permission required");
-                return ConnStep::Progress;
-            }
             let Ok(id) = InlineId::from_raw_bytes(raw_id) else {
                 let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"invalid InlineId");
                 return ConnStep::Progress;
@@ -853,10 +1087,6 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
             }
         }
         OP_STATS => {
-            if !conn.role.can_read() {
-                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"read permission required");
-                return ConnStep::Progress;
-            }
             let st = engine.stats();
             let mut payload = [0u8; 24];
             payload[0..8].copy_from_slice(&(st.live_records as u64).to_le_bytes());
@@ -865,166 +1095,66 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
             conn.send_or_queue_response(STATUS_OK, st.live_records as u64, &payload)
         }
         OP_METRICS => {
-            if !conn.role.can_read() {
-                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"read permission required");
-                return ConnStep::Progress;
-            }
             let st = engine.stats();
-            let prom = format!(
-                "# TYPE storine_live_records gauge\nstorine_live_records {}\n\
-                 # TYPE storine_total_reads counter\nstorine_total_reads {}\n\
-                 # TYPE storine_total_writes counter\nstorine_total_writes {}\n\
-                 # TYPE storine_coalesced_flushes counter\nstorine_coalesced_flushes {}\n\
-                 # TYPE storine_hot_dirty_bytes gauge\nstorine_hot_dirty_bytes {}\n",
-                st.live_records,
-                st.total_reads,
-                st.total_writes,
-                st.coalesced_flushes,
-                st.hot_dirty_bytes,
-            );
+            let reads = LatencyHistogram::new();
+            let writes = LatencyHistogram::new();
+            for s in &shared.shards {
+                reads.merge_from(&s.read_latency);
+                writes.merge_from(&s.write_latency);
+            }
+            let mut prom = st.to_prometheus_text(Some(&reads), Some(&writes));
+            prom.push_str(&format!(
+                "# HELP storine_slow_rpcs Slow requests currently retained in the slow-operation log\n\
+                 # TYPE storine_slow_rpcs gauge\n\
+                 storine_slow_rpcs {}\n",
+                shared.slow_log.len()
+            ));
             conn.send_or_queue_response(STATUS_OK, st.live_records as u64, prom.as_bytes())
         }
         // ── Raft Consensus RPCs (`TASK-063`, `F-DIST-02`) ──────────────────────────
         OP_RAFT_VOTE => {
-            let body = core::mem::take(&mut conn.body_buf);
-            if !conn.role.can_write() {
-                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"write permission required for Raft RPCs");
+            let Some(ref raft) = shared.raft else {
+                let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"raft is not enabled on this server");
                 return ConnStep::Progress;
-            }
+            };
             match RequestVoteReq::from_wire_bytes(&body) {
                 Ok(req) => {
-                    // Return the wire-encoded RequestVoteReq back as acknowledgement.
-                    // In a full cluster deployment, the RaftNode would process this and return a RequestVoteResp.
-                    // For now we echo the request so the transport layer is validated end-to-end.
-                    let resp_bytes = req.to_wire_bytes();
-                    conn.send_or_queue_response(STATUS_OK, req.term, &resp_bytes)
+                    let resp: RequestVoteResp = raft.handle_request_vote(req);
+                    conn.send_or_queue_response(STATUS_OK, resp.term, &resp.to_wire_bytes())
                 }
                 Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
             }
         }
         OP_RAFT_APPEND => {
-            let body = core::mem::take(&mut conn.body_buf);
-            if !conn.role.can_write() {
-                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"write permission required for Raft RPCs");
-                return ConnStep::Progress;
-            }
-            match AppendEntriesReq::from_wire_bytes(&body) {
-                Ok(req) => {
-                    let resp = AppendEntriesResp {
-                        term: req.term,
-                        success: true,
-                        match_index: req.prev_log_index + req.entries.len() as u64,
-                    };
-                    let resp_bytes = resp.to_wire_bytes();
-                    conn.send_or_queue_response(STATUS_OK, resp.term, &resp_bytes)
-                }
-                Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
-            }
-        }
-        OP_MIGRATE_VSHARD => {
-            let body = core::mem::take(&mut conn.body_buf);
-            if !conn.role.is_admin() {
-                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"admin permission required for shard migration");
-                return ConnStep::Progress;
-            }
-            if body.len() < 4 {
-                let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"MigrateVShard body too short");
-                return ConnStep::Progress;
-            }
-            let shard_id = u16::from_le_bytes(body[0..2].try_into().unwrap());
-            let dest_node = u16::from_le_bytes(body[2..4].try_into().unwrap());
-            // Parse and import the shipped record frames into this engine
-            let mut pos = 4usize;
-            let mut imported = 0u64;
-            while pos + 28 <= body.len() {
-                let raw_key: [u8; 24] = body[pos..pos + 24].try_into().unwrap();
-                let frame_len = u32::from_le_bytes(body[pos + 24..pos + 28].try_into().unwrap()) as usize;
-                pos += 28;
-                if pos + frame_len > body.len() {
-                    break;
-                }
-                if let Ok(item_id) = InlineId::from_raw_bytes(raw_key) {
-                    let aligned = AlignedBytes::copy_from_slice(&body[pos..pos + frame_len]);
-                    if let Ok((_, rec)) = RecordCodec::decode_owned::<T>(aligned.as_slice()) {
-                        let _ = engine.put(item_id, &rec);
-                        imported += 1;
-                    }
-                }
-                pos += frame_len;
-            }
-            let ack = format!("shard={shard_id} dest={dest_node} imported={imported}");
-            conn.send_or_queue_response(STATUS_OK, imported, ack.as_bytes())
-        }
-        // ── Admin RPCs (`TASK-061`, `F-OPS-04`, `F-OPS-07`) ────────────────────────
-        OP_ADMIN_BACKUP => {
-            let body = core::mem::take(&mut conn.body_buf);
-            if !conn.role.is_admin() {
-                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"admin permission required for backup");
-                return ConnStep::Progress;
-            }
-            let Ok(dest_path_str) = core::str::from_utf8(&body) else {
-                let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"invalid UTF-8 backup destination path");
+            let Some(ref raft) = shared.raft else {
+                let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"raft is not enabled on this server");
                 return ConnStep::Progress;
             };
-            let dest_path = Path::new(dest_path_str);
-            // SECURITY: Reject path traversal attempts (`RULE-SAFE-01`).
-            // Disallow `..` components and paths that could escape the expected backup directory.
-            let has_traversal = dest_path.components().any(|c| {
-                matches!(c, std::path::Component::ParentDir)
-            });
-            if has_traversal {
-                let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"backup path must not contain '..' components");
-                return ConnStep::Progress;
-            }
-            match create_online_backup(engine, dest_path) {
-                Ok(manifest) => {
-                    let msg = format!(
-                        "backup created: collection={} lsn={} files={}",
-                        manifest.collection_name, manifest.base_lsn, manifest.files_copied,
-                    );
-                    conn.send_or_queue_response(STATUS_OK, manifest.files_copied as u64, msg.as_bytes())
+            match AppendEntriesReq::from_wire_bytes(&body).and_then(|req| raft.handle_append_entries(req)) {
+                Ok(resp) => {
+                    let resp: AppendEntriesResp = resp;
+                    conn.send_or_queue_response(STATUS_OK, resp.term, &resp.to_wire_bytes())
                 }
                 Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
             }
         }
-        OP_ADMIN_COMPACT => {
-            if !conn.role.is_admin() {
-                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"admin permission required for compaction");
-                return ConnStep::Progress;
-            }
-            match engine.compact_arenas(0.5) {
-                Ok(removed) => {
-                    let msg = format!("compacted {removed} arena segment(s)");
-                    conn.send_or_queue_response(STATUS_OK, removed as u64, msg.as_bytes())
+        // ── Long-running admin RPCs run on a bounded background worker ──────────────
+        OP_MIGRATE_VSHARD | OP_ADMIN_BACKUP | OP_ADMIN_COMPACT | OP_ADMIN_CHECKPOINT => {
+            match spawn_admin_job(op, body, shared, shard) {
+                Ok(rx) => {
+                    conn.pending_job = Some(rx);
+                    return ConnStep::Progress;
                 }
-                Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
+                Err((status, msg)) => conn.send_or_queue_response(status, 0, msg),
             }
         }
         OP_HEALTH => {
-            // Health check is open to any reader (or unauthenticated when auth is disabled)
-            if !conn.role.can_read() {
-                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"read permission required");
-                return ConnStep::Progress;
-            }
             let st = engine.stats();
             let health = format!(
                 "{{\"status\":\"ok\",\"live_records\":{},\"total_reads\":{},\"total_writes\":{},\"hot_dirty_bytes\":{}}}",
                 st.live_records, st.total_reads, st.total_writes, st.hot_dirty_bytes,
             );
             conn.send_or_queue_response(STATUS_OK, st.live_records as u64, health.as_bytes())
-        }
-        OP_ADMIN_CHECKPOINT => {
-            if !conn.role.is_admin() {
-                let _ = conn.send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"admin permission required for checkpoint");
-                return ConnStep::Progress;
-            }
-            match engine.checkpoint_incremental(&[], &[]) {
-                Ok(pages) => {
-                    let msg = format!("checkpoint wrote {pages} page(s)");
-                    conn.send_or_queue_response(STATUS_OK, pages as u64, msg.as_bytes())
-                }
-                Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
-            }
         }
         _ => conn.send_or_queue_response(STATUS_ERROR, 0, b"unknown opcode"),
     };
@@ -1033,6 +1163,225 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
         ConnStep::Closed
     } else {
         ConnStep::Progress
+    }
+}
+
+/// Builds the `BatchGet` response with fallible, size-bounded allocation.
+fn build_batch_get_response<T: ZeroCopyRecord + Indexable>(
+    engine: &StorageEngine<T>,
+    body: &[u8],
+    count: usize,
+) -> core::result::Result<(u64, Vec<u8>), &'static [u8]> {
+    const TOO_LARGE: &[u8] = b"BatchGet response exceeds the maximum frame size";
+    let mut out = Vec::new();
+    out.try_reserve_exact(4 + count * 4)
+        .map_err(|_| &b"out of memory"[..])?;
+    out.extend_from_slice(&(count as u32).to_le_bytes());
+    let mut found = 0u64;
+    for i in 0..count {
+        let raw_key = read_array_24(body, 4 + i * 24);
+        let frame_ref = InlineId::from_raw_bytes(raw_key)
+            .ok()
+            .and_then(|key| engine.get_ref(key).ok());
+        match frame_ref {
+            Some(rec_ref) => {
+                let frame = rec_ref.raw_frame();
+                if out.len() + 4 + frame.len() > MAX_PAYLOAD_SIZE as usize {
+                    return Err(TOO_LARGE);
+                }
+                out.try_reserve(4 + frame.len())
+                    .map_err(|_| &b"out of memory"[..])?;
+                out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+                out.extend_from_slice(frame);
+                found += 1;
+            }
+            None => {
+                if out.len() + 4 > MAX_PAYLOAD_SIZE as usize {
+                    return Err(TOO_LARGE);
+                }
+                out.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+    }
+    Ok((found, out))
+}
+
+/// Parses `[count u32 | (id 24B, len u32, frame)*]` (`BatchPut`) or the `MigrateVShard` item list
+/// (no count prefix) with bounded, fallible allocation.
+fn parse_batch_items<T: ZeroCopyRecord>(
+    body: &[u8],
+    with_count: bool,
+) -> core::result::Result<Vec<(InlineId, T)>, String> {
+    let (mut pos, declared) = if with_count {
+        if body.len() < 4 {
+            return Err("BatchPut body too short".into());
+        }
+        (4usize, Some(read_u32_le(body, 0) as usize))
+    } else {
+        (0usize, None)
+    };
+    // Every item needs at least its 28-byte header, which bounds the item count by body size.
+    let max_items = (body.len() - pos) / BATCH_ITEM_HEADER;
+    let expected = declared.unwrap_or(max_items);
+    if expected > max_items {
+        return Err("batch item count exceeds body size".into());
+    }
+    let mut items = Vec::new();
+    items
+        .try_reserve_exact(expected)
+        .map_err(|_| "out of memory for batch".to_string())?;
+    while items.len() < expected && pos + BATCH_ITEM_HEADER <= body.len() {
+        let raw_key = read_array_24(body, pos);
+        let frame_len = read_u32_le(body, pos + 24) as usize;
+        pos += BATCH_ITEM_HEADER;
+        let Some(frame) = pos.checked_add(frame_len).and_then(|end| body.get(pos..end)) else {
+            return Err("batch item frame truncated".into());
+        };
+        pos += frame_len;
+        let item_id = InlineId::from_raw_bytes(raw_key).map_err(|e| e.to_string())?;
+        let aligned = AlignedBytes::try_copy_from_slice(frame).map_err(|e| e.to_string())?;
+        let (_, rec) = RecordCodec::decode_owned::<T>(aligned.as_slice()).map_err(|e| e.to_string())?;
+        items.push((item_id, rec));
+    }
+    if declared.is_some() && (items.len() != expected || pos != body.len()) {
+        return Err("BatchPut malformed item list".into());
+    }
+    Ok(items)
+}
+
+/// Runs a long admin operation on a background thread (at most `MAX_CONCURRENT_ADMIN_JOBS`),
+/// so reactor threads keep serving other connections.
+fn spawn_admin_job<T: ZeroCopyRecord + Indexable>(
+    op: u8,
+    body: Vec<u8>,
+    shared: &Arc<ServerShared<T>>,
+    shard: &Arc<ReactorShard>,
+) -> core::result::Result<Receiver<JobResponse>, (u8, &'static [u8])> {
+    // Validate cheap inputs up front so bad requests are answered immediately.
+    let backup_path = if op == OP_ADMIN_BACKUP {
+        let Ok(name) = core::str::from_utf8(&body) else {
+            return Err((STATUS_ERROR, b"invalid UTF-8 backup name"));
+        };
+        if shared.security.backup_root.is_none() {
+            return Err((
+                STATUS_UNAUTHORIZED,
+                b"admin backups are disabled (no SecurityConfig::backup_root configured)",
+            ));
+        }
+        let Some(path) = shared.security.resolve_backup_path(name) else {
+            return Err((
+                STATUS_ERROR,
+                b"backup name must be a relative path without '..', ':' or '\\\\'",
+            ));
+        };
+        Some(path)
+    } else {
+        None
+    };
+
+    let mut running = shared.admin_jobs.load(Ordering::Acquire);
+    loop {
+        if running >= MAX_CONCURRENT_ADMIN_JOBS {
+            return Err((STATUS_OVERLOADED, b"too many concurrent admin jobs"));
+        }
+        match shared.admin_jobs.compare_exchange_weak(
+            running,
+            running + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(actual) => running = actual,
+        }
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let job_shared = Arc::clone(shared);
+    let job_shard = Arc::clone(shard);
+    let spawned = thread::Builder::new()
+        .name("storine-admin-job".into())
+        .spawn(move || {
+            let resp = run_admin_job(op, &body, backup_path.as_deref(), &job_shared);
+            job_shared.admin_jobs.fetch_sub(1, Ordering::AcqRel);
+            let _ = tx.send(resp);
+            // The connection's worker may be blocked in poll with no timeout: wake it.
+            job_shard.wake();
+        });
+    if spawned.is_err() {
+        shared.admin_jobs.fetch_sub(1, Ordering::AcqRel);
+        return Err((STATUS_OVERLOADED, b"could not start admin job thread"));
+    }
+    Ok(rx)
+}
+
+fn run_admin_job<T: ZeroCopyRecord + Indexable>(
+    op: u8,
+    body: &[u8],
+    backup_path: Option<&std::path::Path>,
+    shared: &ServerShared<T>,
+) -> JobResponse {
+    let engine = &shared.engine;
+    let err = |e: StorageError| (STATUS_ERROR, 0u64, e.to_string().into_bytes());
+    match op {
+        OP_ADMIN_BACKUP => {
+            let Some(path) = backup_path else {
+                return (STATUS_ERROR, 0, b"missing backup path".to_vec());
+            };
+            match create_online_backup(&**engine, path) {
+                Ok(manifest) => {
+                    let msg = format!(
+                        "backup created: collection={} lsn={} files={}",
+                        manifest.collection_name, manifest.base_lsn, manifest.files_copied,
+                    );
+                    (STATUS_OK, manifest.files_copied as u64, msg.into_bytes())
+                }
+                Err(e) => err(e),
+            }
+        }
+        OP_ADMIN_COMPACT => match engine.compact_arenas(0.5) {
+            Ok(removed) => (
+                STATUS_OK,
+                removed as u64,
+                format!("compacted {removed} arena segment(s)").into_bytes(),
+            ),
+            Err(e) => err(e),
+        },
+        OP_ADMIN_CHECKPOINT => match engine.checkpoint() {
+            Ok(flushed) => (
+                STATUS_OK,
+                flushed as u64,
+                format!("checkpoint wrote {flushed} record(s)").into_bytes(),
+            ),
+            Err(e) => err(e),
+        },
+        OP_MIGRATE_VSHARD => {
+            if body.len() < 4 {
+                return (STATUS_ERROR, 0, b"MigrateVShard body too short".to_vec());
+            }
+            let shard_id = read_u16_le(body, 0);
+            let dest_node = read_u16_le(body, 2);
+            let items = match parse_batch_items::<T>(&body[4..], false) {
+                Ok(items) => items,
+                Err(msg) => return (STATUS_ERROR, 0, msg.into_bytes()),
+            };
+            let imported = items.len() as u64;
+            // Import atomically: either every shipped record lands or none does.
+            let res = engine.transaction(|tx| {
+                for (id, rec) in items {
+                    tx.put(id, rec);
+                }
+                Ok(())
+            });
+            match res {
+                Ok(()) => (
+                    STATUS_OK,
+                    imported,
+                    format!("shard={shard_id} dest={dest_node} imported={imported}").into_bytes(),
+                ),
+                Err(e) => err(e),
+            }
+        }
+        _ => (STATUS_ERROR, 0, b"unknown admin opcode".to_vec()),
     }
 }
 
@@ -1060,7 +1409,7 @@ impl StorageClient {
     /// Authenticates this client connection using a bearer/API token (`OP_AUTH`).
     pub fn authenticate(&mut self, token: &str) -> Result<RbacRole> {
         let (status, role_u64, _body) =
-            self.rpc(OP_AUTH, InlineId::from_static("_"), token.as_bytes())?;
+            self.rpc(OP_AUTH, NO_KEY, token.as_bytes())?;
         match status {
             STATUS_OK => {
                 let role = match role_u64 {
@@ -1129,23 +1478,27 @@ impl StorageClient {
         for id in ids {
             body.extend_from_slice(&id.to_raw_bytes());
         }
-        let (status, _, resp) = self.rpc(OP_BATCH_GET, InlineId::from_static("_"), &body)?;
+        let (status, _, resp) = self.rpc(OP_BATCH_GET, NO_KEY, &body)?;
         if status != STATUS_OK || resp.len() < 4 {
             return Err(StorageError::corrupted_header("BatchGet failed"));
         }
-        let count = u32::from_le_bytes(resp[0..4].try_into().unwrap()) as usize;
+        let count = read_u32_le(&resp, 0) as usize;
         let mut pos = 4usize;
-        let mut out = Vec::with_capacity(count);
+        let mut out = Vec::with_capacity(count.min(ids.len()));
         for _ in 0..count {
             if pos + 4 > resp.len() {
-                break;
+                return Err(StorageError::corrupted_header("BatchGet response truncated"));
             }
-            let len = u32::from_le_bytes(resp[pos..pos + 4].try_into().unwrap()) as usize;
+            let len = read_u32_le(&resp, pos) as usize;
             pos += 4;
             if len == 0 {
                 out.push(None);
             } else {
-                out.push(Some(AlignedBytes::copy_from_slice(&resp[pos..pos + len])));
+                let frame = pos
+                    .checked_add(len)
+                    .and_then(|end| resp.get(pos..end))
+                    .ok_or_else(|| StorageError::corrupted_header("BatchGet frame truncated"))?;
+                out.push(Some(AlignedBytes::try_copy_from_slice(frame)?));
                 pos += len;
             }
         }
@@ -1163,7 +1516,7 @@ impl StorageClient {
             body.extend_from_slice(frame.as_slice());
         }
         let (status, committed, _) =
-            self.rpc(OP_BATCH_PUT, InlineId::from_static("_"), &body)?;
+            self.rpc(OP_BATCH_PUT, NO_KEY, &body)?;
         match status {
             STATUS_OK => Ok(committed as usize),
             STATUS_UNAUTHORIZED => Err(StorageError::invalid_key("unauthorized BatchPut")),
@@ -1185,21 +1538,11 @@ impl StorageClient {
         body[10..18].copy_from_slice(&max_val.to_le_bytes());
         body[18..22].copy_from_slice(&limit.to_le_bytes());
         let (status, _, resp) =
-            self.rpc(OP_QUERY_HYBRID, InlineId::from_static("_"), &body)?;
+            self.rpc(OP_QUERY_HYBRID, NO_KEY, &body)?;
         if status != STATUS_OK || resp.len() < 4 {
             return Err(StorageError::corrupted_header("QueryHybrid failed"));
         }
-        let count = u32::from_le_bytes(resp[0..4].try_into().unwrap()) as usize;
-        let mut ids = Vec::with_capacity(count);
-        for i in 0..count {
-            let off = 4 + i * 24;
-            if off + 24 <= resp.len() {
-                let raw: [u8; 24] = resp[off..off + 24].try_into().unwrap();
-                if let Ok(id) = InlineId::from_raw_bytes(raw) {
-                    ids.push(id);
-                }
-            }
-        }
+        let ids = decode_id_list(&resp);
         Ok(ids)
     }
 
@@ -1222,29 +1565,19 @@ impl StorageClient {
         body[22..26].copy_from_slice(&offset.to_le_bytes());
         body[26] = u8::from(descending);
         let (status, total_matched, resp) =
-            self.rpc(OP_QUERY_HYBRID, InlineId::from_static("_"), &body)?;
+            self.rpc(OP_QUERY_HYBRID, NO_KEY, &body)?;
         if status != STATUS_OK || resp.len() < 4 {
             return Err(StorageError::corrupted_header(
                 "QueryHybrid paginated failed",
             ));
         }
-        let count = u32::from_le_bytes(resp[0..4].try_into().unwrap()) as usize;
-        let mut ids = Vec::with_capacity(count);
-        for i in 0..count {
-            let off = 4 + i * 24;
-            if off + 24 <= resp.len() {
-                let raw: [u8; 24] = resp[off..off + 24].try_into().unwrap();
-                if let Ok(id) = InlineId::from_raw_bytes(raw) {
-                    ids.push(id);
-                }
-            }
-        }
+        let ids = decode_id_list(&resp);
         Ok((ids, total_matched as usize))
     }
 
     /// Scrapes Prometheus/OpenMetrics text exposition from the server (`OP_METRICS`).
     pub fn scrape_metrics(&mut self) -> Result<String> {
-        let (status, _, resp) = self.rpc(OP_METRICS, InlineId::from_static("_"), &[])?;
+        let (status, _, resp) = self.rpc(OP_METRICS, NO_KEY, &[])?;
         if status != STATUS_OK {
             return Err(StorageError::corrupted_header("Metrics scrape failed"));
         }
@@ -1256,7 +1589,7 @@ impl StorageClient {
     pub fn get_frame(&mut self, id: InlineId) -> Result<AlignedBytes> {
         let (status, _, body) = self.rpc(OP_GET_RAW_FRAME, id, &[])?;
         match status {
-            STATUS_OK => Ok(AlignedBytes::copy_from_slice(&body)),
+            STATUS_OK => AlignedBytes::try_copy_from_slice(&body),
             STATUS_NOT_FOUND => Err(StorageError::not_found(id)),
             STATUS_UNAUTHORIZED => Err(StorageError::invalid_key("unauthorized GET")),
             STATUS_RATE_LIMITED => Err(StorageError::io(
@@ -1294,16 +1627,18 @@ impl StorageClient {
 
     // ── Raft Consensus Client RPCs (`TASK-063`, `F-DIST-02`) ───────────────
 
-    /// Sends a Raft `RequestVote` RPC over TCP (`OP_RAFT_VOTE`).
+    /// Sends a Raft `RequestVote` RPC over TCP (`OP_RAFT_VOTE`); the body of an `Ok` response is
+    /// a `RequestVoteResp` (requires the `Admin` role).
     pub fn raft_vote(&mut self, req: &RequestVoteReq) -> Result<(u8, u64, Vec<u8>)> {
         let wire = req.to_wire_bytes();
-        self.rpc(OP_RAFT_VOTE, InlineId::from_static("_"), &wire)
+        self.rpc(OP_RAFT_VOTE, NO_KEY, &wire)
     }
 
-    /// Sends a Raft `AppendEntries` RPC over TCP (`OP_RAFT_APPEND`).
+    /// Sends a Raft `AppendEntries` RPC over TCP (`OP_RAFT_APPEND`); the body of an `Ok` response
+    /// is an `AppendEntriesResp` (requires the `Admin` role).
     pub fn raft_append(&mut self, req: &AppendEntriesReq) -> Result<(u8, u64, Vec<u8>)> {
         let wire = req.to_wire_bytes();
-        self.rpc(OP_RAFT_APPEND, InlineId::from_static("_"), &wire)
+        self.rpc(OP_RAFT_APPEND, NO_KEY, &wire)
     }
 
     /// Ships record frames for a virtual shard migration over TCP (`OP_MIGRATE_VSHARD`).
@@ -1322,7 +1657,7 @@ impl StorageClient {
             body.extend_from_slice(&(frame.len() as u32).to_le_bytes());
             body.extend_from_slice(frame.as_slice());
         }
-        let (status, imported, _) = self.rpc(OP_MIGRATE_VSHARD, InlineId::from_static("_"), &body)?;
+        let (status, imported, _) = self.rpc(OP_MIGRATE_VSHARD, NO_KEY, &body)?;
         match status {
             STATUS_OK => Ok(imported),
             STATUS_UNAUTHORIZED => Err(StorageError::invalid_key("unauthorized MigrateVShard")),
@@ -1332,9 +1667,10 @@ impl StorageClient {
 
     // ── Admin Client RPCs (`TASK-061`, `F-OPS-04`) ─────────────────────────
 
-    /// Triggers a remote online hot backup at `dest_path` on the server filesystem (`OP_ADMIN_BACKUP`).
-    pub fn admin_backup(&mut self, dest_path: &str) -> Result<String> {
-        let (status, _, resp) = self.rpc(OP_ADMIN_BACKUP, InlineId::from_static("_"), dest_path.as_bytes())?;
+    /// Triggers a remote online backup named `backup_name` (a relative path created under the
+    /// server's configured `backup_root`) (`OP_ADMIN_BACKUP`).
+    pub fn admin_backup(&mut self, backup_name: &str) -> Result<String> {
+        let (status, _, resp) = self.rpc(OP_ADMIN_BACKUP, NO_KEY, backup_name.as_bytes())?;
         match status {
             STATUS_OK => Ok(String::from_utf8_lossy(&resp).into_owned()),
             STATUS_UNAUTHORIZED => Err(StorageError::invalid_key("unauthorized AdminBackup")),
@@ -1344,7 +1680,7 @@ impl StorageClient {
 
     /// Triggers remote arena compaction (`OP_ADMIN_COMPACT`).
     pub fn admin_compact(&mut self) -> Result<String> {
-        let (status, _, resp) = self.rpc(OP_ADMIN_COMPACT, InlineId::from_static("_"), &[])?;
+        let (status, _, resp) = self.rpc(OP_ADMIN_COMPACT, NO_KEY, &[])?;
         match status {
             STATUS_OK => Ok(String::from_utf8_lossy(&resp).into_owned()),
             STATUS_UNAUTHORIZED => Err(StorageError::invalid_key("unauthorized AdminCompact")),
@@ -1354,7 +1690,7 @@ impl StorageClient {
 
     /// Queries server health status as a JSON string (`OP_HEALTH`).
     pub fn health(&mut self) -> Result<String> {
-        let (status, _, resp) = self.rpc(OP_HEALTH, InlineId::from_static("_"), &[])?;
+        let (status, _, resp) = self.rpc(OP_HEALTH, NO_KEY, &[])?;
         match status {
             STATUS_OK => Ok(String::from_utf8_lossy(&resp).into_owned()),
             _ => Err(StorageError::corrupted_header("Health check failed")),
@@ -1363,7 +1699,7 @@ impl StorageClient {
 
     /// Triggers a remote incremental checkpoint (`OP_ADMIN_CHECKPOINT`).
     pub fn admin_checkpoint(&mut self) -> Result<String> {
-        let (status, _, resp) = self.rpc(OP_ADMIN_CHECKPOINT, InlineId::from_static("_"), &[])?;
+        let (status, _, resp) = self.rpc(OP_ADMIN_CHECKPOINT, NO_KEY, &[])?;
         match status {
             STATUS_OK => Ok(String::from_utf8_lossy(&resp).into_owned()),
             STATUS_UNAUTHORIZED => Err(StorageError::invalid_key("unauthorized AdminCheckpoint")),
@@ -1394,8 +1730,8 @@ impl StorageClient {
             .read_exact(&mut resp_hdr)
             .map_err(|e| StorageError::io("read RPC response header", e))?;
         let status = resp_hdr[0];
-        let version = u64::from_le_bytes(resp_hdr[1..9].try_into().unwrap());
-        let resp_len = u32::from_le_bytes(resp_hdr[9..13].try_into().unwrap()) as usize;
+        let version = read_u64_le(&resp_hdr, 1);
+        let resp_len = read_u32_le(&resp_hdr, 9) as usize;
         if resp_len > MAX_PAYLOAD_SIZE as usize {
             return Err(StorageError::corrupted_header(
                 "RPC response body exceeds MAX_PAYLOAD_SIZE",
@@ -1412,6 +1748,19 @@ impl StorageClient {
     }
 }
 
+/// Decodes `[count u32 | count * 24B InlineId]`, ignoring a truncated tail or invalid ids.
+fn decode_id_list(resp: &[u8]) -> Vec<InlineId> {
+    let count = read_u32_le(resp, 0) as usize;
+    let available = (resp.len() - 4) / 24;
+    let mut ids = Vec::with_capacity(count.min(available));
+    for i in 0..count.min(available) {
+        if let Ok(id) = InlineId::from_raw_bytes(read_array_24(resp, 4 + i * 24)) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
 /// Convenience helper for decoding a `RecordView<'_, AgentObjectRecord>` from a fetched frame.
 #[inline]
 pub fn decode_agent_frame(frame: &AlignedBytes) -> Result<RecordView<'_, AgentObjectRecord>> {
@@ -1425,7 +1774,7 @@ pub type DefaultServerRecordRef = RecordRef<AgentObjectRecord>;
 mod tests {
     use super::*;
     use storage_core::{
-        raft::{AppendEntriesReq, RaftLogEntry, RequestVoteReq},
+        raft::{AppendEntriesReq, RaftNode, RequestVoteReq, RequestVoteResp},
         EngineConfig, FIELD_SCORE,
     };
 
@@ -1485,7 +1834,8 @@ mod tests {
             .put(id1, &AgentObjectRecord::new(id1, "Unauth", 100, 10))
             .is_err());
 
-        // 2. Authenticate as ReadOnly -> write still rejected
+        // 2. Authenticate as ReadOnly -> write still rejected (rejections close the connection)
+        let mut client = StorageClient::connect(addr).unwrap();
         assert_eq!(
             client.authenticate("reader-secret").unwrap(),
             RbacRole::ReadOnly
@@ -1495,6 +1845,7 @@ mod tests {
             .is_err());
 
         // 3. Upgrade to ReadWrite -> BatchPut 2 records atomically
+        let mut client = StorageClient::connect(addr).unwrap();
         assert_eq!(
             client.authenticate("writer-secret").unwrap(),
             RbacRole::ReadWrite
@@ -1601,8 +1952,8 @@ mod tests {
     fn test_tcp_raft_admin_health_and_shard_migration_rpcs() {
         let dir = std::env::temp_dir().join("stge_test_tcp_admin_raft");
         let _ = std::fs::remove_dir_all(&dir);
-        let backup_dest = std::env::temp_dir().join("stge_test_tcp_admin_raft_bak");
-        let _ = std::fs::remove_dir_all(&backup_dest);
+        let backup_root = std::env::temp_dir().join("stge_test_tcp_admin_raft_bak");
+        let _ = std::fs::remove_dir_all(&backup_root);
 
         let engine = Arc::new(
             StorageEngine::<AgentObjectRecord>::open(&dir, EngineConfig::default()).unwrap(),
@@ -1616,10 +1967,17 @@ mod tests {
         let sec = SecurityConfig::new(true)
             .with_token("reader-tok", RbacRole::ReadOnly)
             .with_token("writer-tok", RbacRole::ReadWrite)
-            .with_token("admin-tok", RbacRole::Admin);
-        let mut server =
-            StorageServer::start_with_config("127.0.0.1:0", Arc::clone(&engine), 128, sec)
-                .unwrap();
+            .with_token("admin-tok", RbacRole::Admin)
+            .with_backup_root(&backup_root);
+        let raft = Arc::new(RaftNode::new(7, Arc::clone(&engine)).unwrap());
+        let mut server = StorageServer::start_with_raft(
+            "127.0.0.1:0",
+            Arc::clone(&engine),
+            128,
+            sec,
+            Some(Arc::clone(&raft)),
+        )
+        .unwrap();
         let addr = server.local_addr();
 
         // ── 1. Health check (open to ReadOnly) ─────────────────────────────
@@ -1629,24 +1987,31 @@ mod tests {
         assert!(health.contains("\"status\":\"ok\""));
         assert!(health.contains("\"live_records\":1"));
 
-        // ── 2. Admin RPCs rejected for non-Admin roles ─────────────────────
+        // ── 2. Admin RPCs rejected for non-Admin roles (connection is closed) ──
         assert!(client.admin_compact().is_err(), "ReadOnly must not compact");
-        assert!(client.admin_backup(backup_dest.to_str().unwrap()).is_err());
+        let mut client = StorageClient::connect(addr).unwrap();
+        client.authenticate("reader-tok").unwrap();
         assert!(client.admin_checkpoint().is_err());
 
-        // ── 3. Upgrade to Admin and run admin RPCs ─────────────────────────
+        // ── 3. Admin RPCs (run on the background admin worker) ─────────────
+        let mut client = StorageClient::connect(addr).unwrap();
         client.authenticate("admin-tok").unwrap();
 
         let compact_msg = client.admin_compact().unwrap();
         assert!(compact_msg.contains("compacted"));
 
-        let backup_msg = client.admin_backup(backup_dest.to_str().unwrap()).unwrap();
+        let backup_msg = client.admin_backup("nightly/one").unwrap();
         assert!(backup_msg.contains("backup created"));
+        assert!(backup_root.join("nightly").join("one").join("backup.meta").exists());
+        // Paths escaping the backup root, absolute paths and existing destinations are refused.
+        for bad in ["../escape", "/etc", "C:\\Windows", "nightly/one"] {
+            assert!(client.admin_backup(bad).is_err(), "{bad} must be rejected");
+        }
 
         let ckpt_msg = client.admin_checkpoint().unwrap();
         assert!(ckpt_msg.contains("checkpoint wrote"));
 
-        // ── 4. Raft Vote RPC round-trip ────────────────────────────────────
+        // ── 4. Raft RPCs are served by the attached RaftNode (Admin only) ──
         let mut writer_client = StorageClient::connect(addr).unwrap();
         writer_client.authenticate("writer-tok").unwrap();
         let vote_req = RequestVoteReq {
@@ -1655,33 +2020,31 @@ mod tests {
             last_log_index: 10,
             last_log_term: 4,
         };
-        let (status, term, resp_body) = writer_client.raft_vote(&vote_req).unwrap();
+        // ReadWrite may not drive consensus: rejected at the header stage.
+        assert!(!matches!(writer_client.raft_vote(&vote_req), Ok((STATUS_OK, _, _))));
+
+        let (status, term, resp_body) = client.raft_vote(&vote_req).unwrap();
         assert_eq!(status, STATUS_OK);
         assert_eq!(term, 5);
-        let echoed = RequestVoteReq::from_wire_bytes(&resp_body).unwrap();
-        assert_eq!(echoed, vote_req);
+        let vote = RequestVoteResp::from_wire_bytes(&resp_body).unwrap();
+        assert!(vote.vote_granted, "an up-to-date candidate gets the vote");
+        assert_eq!(raft.voted_for(), Some(1));
 
-        // ── 5. Raft AppendEntries RPC round-trip ───────────────────────────
+        // ── 5. AppendEntries heartbeat from the leader of term 5 ───────────
         let append_req = AppendEntriesReq {
             term: 5,
             leader_id: 1,
-            prev_log_index: 10,
-            prev_log_term: 4,
-            entries: vec![RaftLogEntry {
-                term: 5,
-                index: 11,
-                id: InlineId::from_static("raft_entry_01"),
-                version: Version(1),
-                frame: Some(storage_codec::AlignedBytes::copy_from_slice(&[0u8; 64])),
-            }],
-            leader_commit: 10,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
         };
-        let (status, term, resp_body) = writer_client.raft_append(&append_req).unwrap();
+        let (status, term, resp_body) = client.raft_append(&append_req).unwrap();
         assert_eq!(status, STATUS_OK);
         assert_eq!(term, 5);
         let ae_resp = storage_core::raft::AppendEntriesResp::from_wire_bytes(&resp_body).unwrap();
         assert!(ae_resp.success);
-        assert_eq!(ae_resp.match_index, 11); // prev_log_index(10) + 1 entry
+        assert_eq!(ae_resp.match_index, 0);
 
         // ── 6. Shard migration RPC (Admin only) ───────────────────────────
         let mig_id = InlineId::from_static("migrated_rec_01");
@@ -1696,8 +2059,232 @@ mod tests {
         assert_eq!(owned.score, 77);
 
         server.stop();
+        drop(raft);
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&backup_dest);
+        let _ = std::fs::remove_dir_all(&backup_root);
+    }
+
+    /// Every opcode (plus unknown ones) receives thousands of mutated request bodies from an
+    /// Admin client; afterwards every reactor worker must still answer (`RULE-ERR-01`).
+    #[test]
+    fn test_hostile_request_bodies_never_crash_any_worker() {
+        use storage_types::testing::SweepRng;
+        let dir = std::env::temp_dir().join(format!("stge_test_tcp_fuzz_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Arc::new(
+            StorageEngine::<AgentObjectRecord>::open(&dir, EngineConfig::default()).unwrap(),
+        );
+        let raft = Arc::new(RaftNode::new(1, Arc::clone(&engine)).unwrap());
+        let sec = SecurityConfig::new(true)
+            .with_token("admin-token-0123456789", RbacRole::Admin)
+            .with_backup_root(dir.join("backups"));
+        let mut server = StorageServer::start_with_raft(
+            "127.0.0.1:0",
+            Arc::clone(&engine),
+            64,
+            sec,
+            Some(Arc::clone(&raft)),
+        )
+        .unwrap();
+        let addr = server.local_addr();
+
+        let id = InlineId::from_static("fuzz_rec");
+        let rec = AgentObjectRecord::new(id, "fuzz", 1, 2);
+        let frame = RecordCodec::encode_aligned(&rec, Version(1), 1, RecordFlags::NONE, 0);
+        let frame = frame.as_slice().to_vec();
+        let mut batch_put = 2u32.to_le_bytes().to_vec();
+        let mut migrate = vec![1, 0, 2, 0];
+        for _ in 0..2 {
+            for out in [&mut batch_put, &mut migrate] {
+                out.extend_from_slice(&id.to_raw_bytes());
+                out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+                out.extend_from_slice(&frame);
+            }
+        }
+        let mut cas = 1u64.to_le_bytes().to_vec();
+        cas.extend_from_slice(&frame);
+        let mut batch_get = 2u32.to_le_bytes().to_vec();
+        batch_get.extend_from_slice(&id.to_raw_bytes());
+        batch_get.extend_from_slice(&NO_KEY.to_raw_bytes());
+        let mut query = vec![0u8; 27];
+        query[0..2].copy_from_slice(&FIELD_SCORE.to_le_bytes());
+        query[10..18].copy_from_slice(&i64::MAX.to_le_bytes());
+        query[18..22].copy_from_slice(&10u32.to_le_bytes());
+        let vote = RequestVoteReq { term: 2, candidate_id: 9, last_log_index: 0, last_log_term: 0 }
+            .to_wire_bytes()
+            .to_vec();
+        let append = AppendEntriesReq {
+            term: 2,
+            leader_id: 9,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
+        }
+        .to_wire_bytes();
+        let seeds: Vec<(u8, Vec<u8>)> = vec![
+            (OP_GET_RAW_FRAME, Vec::new()),
+            (OP_PUT_RAW_FRAME, frame.clone()),
+            (OP_DELETE, Vec::new()),
+            (OP_STATS, Vec::new()),
+            (OP_CAS_PUT, cas),
+            (OP_BATCH_GET, batch_get),
+            (OP_BATCH_PUT, batch_put),
+            (OP_QUERY_HYBRID, query.clone()),
+            (OP_QUERY_HYBRID, query[..22].to_vec()),
+            (OP_AUTH, b"admin-token-0123456789".to_vec()),
+            (OP_METRICS, Vec::new()),
+            (OP_RAFT_VOTE, vote),
+            (OP_RAFT_APPEND, append),
+            (OP_MIGRATE_VSHARD, migrate),
+            (OP_ADMIN_BACKUP, b"nightly/one".to_vec()),
+            (OP_HEALTH, Vec::new()),
+            (OP_ADMIN_CHECKPOINT, Vec::new()),
+            (0x00, Vec::new()),
+            (0xFF, vec![1, 2, 3]),
+        ];
+
+        let connect = || {
+            let mut c = StorageClient::connect(addr).unwrap();
+            c.authenticate("admin-token-0123456789").unwrap();
+            c
+        };
+        let mut client = connect();
+        let mut rng = SweepRng::new(41);
+        for _ in 0..3_000 {
+            let (op, base) = &seeds[rng.below(seeds.len())];
+            let op = if rng.below(50) == 0 { rng.next_u64() as u8 } else { *op };
+            let body = rng.hostile_copy(base);
+            let key = if rng.below(4) == 0 {
+                let mut raw = [0u8; 24];
+                raw.iter_mut().for_each(|b| *b = rng.next_u64() as u8);
+                InlineId::from_raw_bytes(raw).unwrap_or(id)
+            } else {
+                id
+            };
+            // A rejected request may close the connection; reconnect and continue.
+            if client.rpc(op, key, &body).is_err() {
+                client = connect();
+            }
+        }
+
+        // Every worker must still be alive: fresh connections (spread across all reactor shards)
+        // answer a health check within the timeout.
+        for _ in 0..32 {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let token = b"admin-token-0123456789";
+            let mut hdr = [0u8; 29];
+            hdr[0] = OP_AUTH;
+            hdr[1..25].copy_from_slice(&NO_KEY.to_raw_bytes());
+            hdr[25..29].copy_from_slice(&(token.len() as u32).to_le_bytes());
+            s.write_all(&hdr).unwrap();
+            s.write_all(token).unwrap();
+            let mut resp = [0u8; 13];
+            s.read_exact(&mut resp).expect("reactor worker stopped responding");
+            let len = u32::from_le_bytes([resp[9], resp[10], resp[11], resp[12]]) as usize;
+            let mut sink = vec![0u8; len];
+            s.read_exact(&mut sink).unwrap();
+            hdr[0] = OP_HEALTH;
+            hdr[25..29].copy_from_slice(&0u32.to_le_bytes());
+            s.write_all(&hdr).unwrap();
+            s.read_exact(&mut resp).expect("reactor worker stopped responding");
+            assert_eq!(resp[0], STATUS_OK);
+        }
+        server.stop();
+        drop(raft);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rpc_latency_histograms_and_slow_log_are_recorded_and_exported() {
+        let dir = std::env::temp_dir().join(format!("stge_test_tcp_metrics_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Arc::new(
+            StorageEngine::<AgentObjectRecord>::open(&dir, EngineConfig::default()).unwrap(),
+        );
+        let mut server = StorageServer::start("127.0.0.1:0", Arc::clone(&engine)).unwrap();
+        server.set_slow_operation_threshold_ns(0);
+        let mut c = StorageClient::connect(server.local_addr()).unwrap();
+        let id = InlineId::from_static("m1");
+        for i in 0..5 {
+            c.put(id, &AgentObjectRecord::new(id, "m", 1, i)).unwrap();
+            c.get_frame(id).unwrap();
+        }
+        let prom = c.scrape_metrics().unwrap();
+        assert!(prom.contains("storine_read_latency_ns"), "{prom}");
+        assert!(prom.contains("storine_write_latency_ns"), "{prom}");
+        assert!(prom.contains("storine_slow_rpcs"), "{prom}");
+        let slow = server.slow_operations();
+        assert!(slow.iter().any(|e| e.operation == "put"));
+        assert!(slow.iter().any(|e| e.operation == "get"));
+        server.stop();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_header_stage_admission_and_hostile_inputs() {
+        let dir = std::env::temp_dir().join("stge_test_tcp_hostile");
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Arc::new(
+            StorageEngine::<AgentObjectRecord>::open(&dir, EngineConfig::default()).unwrap(),
+        );
+        // No auth on a public address is refused; require_auth without tokens is refused.
+        assert!(StorageServer::start("0.0.0.0:0", Arc::clone(&engine)).is_err());
+        assert!(StorageServer::start_with_config(
+            "127.0.0.1:0",
+            Arc::clone(&engine),
+            16,
+            SecurityConfig::new(true)
+        )
+        .is_err());
+
+        let sec = SecurityConfig::new(true).with_token("rw", RbacRole::ReadWrite);
+        let mut server =
+            StorageServer::start_with_config("127.0.0.1:0", Arc::clone(&engine), 16, sec).unwrap();
+        let addr = server.local_addr();
+
+        let send_raw = |hdr: [u8; 29], body: &[u8]| -> Option<u8> {
+            let mut s = TcpStream::connect(addr).ok()?;
+            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+            s.write_all(&hdr).ok()?;
+            let _ = s.write_all(body);
+            let mut resp = [0u8; 13];
+            s.read_exact(&mut resp).ok()?;
+            Some(resp[0])
+        };
+        let header = |op: u8, body_len: u32| {
+            let mut h = [0u8; 29];
+            h[0] = op;
+            h[1..25].copy_from_slice(&NO_KEY.to_raw_bytes());
+            h[25..29].copy_from_slice(&body_len.to_le_bytes());
+            h
+        };
+
+        // Unauthenticated client announcing a 256 MiB body is rejected without allocation.
+        assert_eq!(
+            send_raw(header(OP_PUT_RAW_FRAME, MAX_PAYLOAD_SIZE), &[]),
+            Some(STATUS_UNAUTHORIZED)
+        );
+        // Oversized auth token is rejected before reading it.
+        assert_eq!(send_raw(header(OP_AUTH, 1 << 20), &[]), Some(STATUS_ERROR));
+
+        // Authenticated BatchPut claiming u32::MAX items must not crash the server.
+        let mut c = StorageClient::connect(addr).unwrap();
+        c.authenticate("rw").unwrap();
+        let (status, _, _) = c
+            .rpc(OP_BATCH_PUT, NO_KEY, &u32::MAX.to_le_bytes())
+            .unwrap();
+        assert_eq!(status, STATUS_ERROR);
+        // The server is still alive and serving.
+        let id = InlineId::from_static("alive");
+        assert_eq!(c.put(id, &AgentObjectRecord::new(id, "ok", 1, 1)).unwrap(), Version(1));
+
+        server.stop();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

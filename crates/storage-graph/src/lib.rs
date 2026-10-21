@@ -7,7 +7,6 @@
 pub mod containers;
 pub mod integrity;
 
-pub use containers::{
-    ArchivedManyToMany, ArchivedOneToMany, ArchivedOneToOne, ManyToMany, OneToMany, OneToOne,
-};
+pub use containers::{ManyToMany, OneToMany, OneToOne};
+pub use storage_codec::{ArchivedManyToMany, ArchivedOneToMany, ArchivedOneToOne};
 pub use integrity::{canonical_lock_order, DanglingEdge, IntegrityPolicy, OnDelete};

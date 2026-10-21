@@ -11,7 +11,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, RwLock, RwLockReadGuard};
 
 use storage_codec::{AlignedBytes, RecordCodec, ZeroCopyRecord};
 use storage_index::Indexable;
@@ -45,8 +45,14 @@ struct MvccShard {
 pub struct MvccManager {
     clock: CachePadded<AtomicU64>,
     active_count: CachePadded<AtomicUsize>,
+    /// Number of per-record version chains currently retained (fast "nothing to forget" check).
+    chain_count: CachePadded<AtomicUsize>,
     shards: Box<[CachePadded<RwLock<MvccShard>>; MVCC_SHARDS]>,
     active_snapshots: Mutex<Vec<CommitTs>>,
+    /// Writers hold this shared for the whole "check snapshots -> record version -> publish"
+    /// sequence; `register_snapshot` takes it exclusively, so a snapshot can never be registered
+    /// in the middle of a write (which would let it observe a post-snapshot version).
+    write_gate: RwLock<()>,
 }
 
 impl core::fmt::Debug for MvccManager {
@@ -67,18 +73,14 @@ impl Default for MvccManager {
 
 impl MvccManager {
     pub fn new() -> Self {
-        let vec: Vec<CachePadded<RwLock<MvccShard>>> = (0..MVCC_SHARDS)
-            .map(|_| CachePadded::new(RwLock::new(MvccShard::default())))
-            .collect();
-        let shards = vec
-            .into_boxed_slice()
-            .try_into()
-            .unwrap_or_else(|_| unreachable!());
+        let shards = CachePadded::boxed_array(|| RwLock::new(MvccShard::default()));
         Self {
             clock: CachePadded::new(AtomicU64::new(1)),
             active_count: CachePadded::new(AtomicUsize::new(0)),
+            chain_count: CachePadded::new(AtomicUsize::new(0)),
             shards,
             active_snapshots: Mutex::new(Vec::new()),
+            write_gate: RwLock::new(()),
         }
     }
 
@@ -105,8 +107,53 @@ impl MvccManager {
         self.active_count.load(Ordering::Acquire) > 0
     }
 
+    /// Shared guard every writer holds while it records MVCC history and publishes a new version.
+    #[inline]
+    pub fn writer_guard(&self) -> RwLockReadGuard<'_, ()> {
+        self.write_gate
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Drops the version chain of `id` (called by writers when no snapshot is open, so a chain
+    /// left over from an earlier snapshot can never be mistaken for the current state).
+    #[inline]
+    pub fn forget(&self, id: InlineId) {
+        if self.chain_count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let s_idx = Self::shard_idx(id);
+        let mut shard = self.shards[s_idx]
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if shard.chains.remove(&id).is_some() {
+            self.chain_count.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Returns `true` if `id` currently has a retained version chain.
+    #[inline]
+    pub fn has_chain(&self, id: InlineId) -> bool {
+        if self.chain_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let s_idx = Self::shard_idx(id);
+        self.shards[s_idx]
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .chains
+            .contains_key(&id)
+    }
+
     /// Registers a new active reader snapshot at `current_ts()`.
+    ///
+    /// Waits for in-flight writes to finish publishing (exclusive `write_gate`), so every write
+    /// is either fully visible to the snapshot or recorded as history it can skip.
     pub fn register_snapshot(&self) -> CommitTs {
+        let _gate = self
+            .write_gate
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         let mut active = self
             .active_snapshots
             .lock()
@@ -164,7 +211,10 @@ impl MvccManager {
         let mut shard = self.shards[s_idx]
             .write()
             .unwrap_or_else(|p| p.into_inner());
-        let chain = shard.chains.entry(id).or_default();
+        let chain = shard.chains.entry(id).or_insert_with(|| {
+            self.chain_count.fetch_add(1, Ordering::AcqRel);
+            VecDeque::new()
+        });
         if chain.is_empty() {
             chain.push_back(VersionChainNode {
                 commit_ts: CommitTs(1),
@@ -188,7 +238,10 @@ impl MvccManager {
         let mut shard = self.shards[s_idx]
             .write()
             .unwrap_or_else(|p| p.into_inner());
-        let chain = shard.chains.entry(id).or_default();
+        let chain = shard.chains.entry(id).or_insert_with(|| {
+            self.chain_count.fetch_add(1, Ordering::AcqRel);
+            VecDeque::new()
+        });
         chain.push_back(VersionChainNode {
             commit_ts,
             version,
@@ -217,17 +270,34 @@ impl MvccManager {
 
     /// Sweeps all 64 shards and reclaims any obsolete historical version chain nodes older than
     /// `min_active_watermark()`, returning the number of reclaimed version nodes (`RULE-MEM-04`).
+    ///
+    /// A chain whose only remaining node is visible to every open snapshot (or any chain at all
+    /// when no snapshot is open) is dropped entirely: its newest node always equals the record's
+    /// current state, which readers then fetch from the engine directly.
     pub fn gc_obsolete_versions(&self) -> usize {
+        // Hold the gate exclusively so no writer records history while chains are being dropped.
+        let _gate = self
+            .write_gate
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let no_snapshots = !self.has_active_snapshots();
         let watermark = self.min_active_watermark();
         let mut reclaimed = 0usize;
+        let mut dropped_chains = 0usize;
         for shard_lock in self.shards.iter() {
             let mut shard = shard_lock.write().unwrap_or_else(|p| p.into_inner());
             shard.chains.retain(|_id, chain| {
                 reclaimed += prune_chain_to_watermark(chain, watermark);
-                // If the only remaining node at or before watermark is a deletion tombstone and no snapshots exist, drop the chain
-                !(chain.len() == 1 && chain[0].frame.is_none() && watermark == self.current_ts())
+                let drop_chain =
+                    no_snapshots || (chain.len() == 1 && chain[0].commit_ts <= watermark);
+                if drop_chain {
+                    reclaimed += chain.len();
+                    dropped_chains += 1;
+                }
+                !drop_chain
             });
         }
+        self.chain_count.fetch_sub(dropped_chains, Ordering::AcqRel);
         reclaimed
     }
 
@@ -296,20 +366,33 @@ impl<'a, T: ZeroCopyRecord + Indexable> ReadSnapshot<'a, T> {
     /// Reads the state of `id` as of `self.read_ts()` under Snapshot Isolation (`F-CONC-08`).
     /// Concurrent writes committed after `self.read_ts()` are invisible to this snapshot!
     pub fn get(&self, id: InlineId) -> Result<Option<(Version, T)>> {
-        if let Some(node) = self.engine.mvcc().get_visible_at(id, self.read_ts) {
-            let Some(ref frame) = node.frame else {
-                return Ok(None);
-            };
-            let (_hdr, owned) = RecordCodec::decode_owned::<T>(frame.as_slice())?;
-            return Ok(Some((node.version, owned)));
+        if let Some(found) = self.get_from_chain(id)? {
+            return Ok(found);
         }
-        // If `id` has no MVCC chain entries at all, check if it was loaded from checkpoint before `read_ts`
-        if self.engine.mvcc().get_visible_at(id, CommitTs(u64::MAX)).is_none() {
-            if let Ok(pair) = self.engine.get_owned(id) {
-                return Ok(Some(pair));
-            }
+        // No history: the record has not changed since this snapshot, so the engine's current
+        // state is the snapshot state. Writers create the chain *before* publishing a new
+        // version, so re-checking the chain after the read closes the race with a concurrent write.
+        let current = match self.engine.get_owned(id) {
+            Ok(pair) => Some(pair),
+            Err(storage_types::StorageError::RecordNotFound { .. }) => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(found) = self.get_from_chain(id)? {
+            return Ok(found);
         }
-        Ok(None)
+        Ok(current)
+    }
+
+    /// Returns `Some(state)` when `id` has a version chain (`state` may be a tombstone `None`).
+    fn get_from_chain(&self, id: InlineId) -> Result<Option<Option<(Version, T)>>> {
+        let Some(node) = self.engine.mvcc().get_visible_at(id, self.read_ts) else {
+            return Ok(None);
+        };
+        let Some(ref frame) = node.frame else {
+            return Ok(Some(None));
+        };
+        let (_hdr, owned) = RecordCodec::decode_owned::<T>(frame.as_slice())?;
+        Ok(Some(Some((node.version, owned))))
     }
 }
 
@@ -382,6 +465,19 @@ mod tests {
         assert_eq!(engine.mvcc().active_snapshot_count(), 0);
         let reclaimed = engine.gc_mvcc();
         assert!(reclaimed >= 2, "epoch GC must reclaim obsolete version chain nodes");
+        assert_eq!(engine.mvcc().retained_version_count(), 0);
+
+        // Regression: history from an earlier snapshot must never shadow later writes.
+        let id3 = InlineId::from_static("mvcc_rec_03");
+        engine.put(id3, &AgentObjectRecord::new(id3, "A", 1, 1)).unwrap();
+        let s_a = engine.begin_read_snapshot();
+        engine.put(id3, &AgentObjectRecord::new(id3, "B", 2, 2)).unwrap();
+        drop(s_a);
+        // No snapshot open: this write must not be hidden by the stale chain [A, B].
+        engine.put(id3, &AgentObjectRecord::new(id3, "C", 3, 3)).unwrap();
+        let s_b = engine.begin_read_snapshot();
+        assert_eq!(s_b.get(id3).unwrap().unwrap().1.title, "C");
+        drop(s_b);
 
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);

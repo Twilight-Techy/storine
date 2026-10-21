@@ -53,13 +53,7 @@ impl<'a> core::fmt::Debug for MultiRecordLockGuard<'a> {
 
 impl StripedLockTable {
     pub fn new() -> Self {
-        let vec: Vec<CachePadded<Mutex<()>>> = (0..WRITE_LOCK_STRIPES)
-            .map(|_| CachePadded::new(Mutex::new(())))
-            .collect();
-        let stripes = vec
-            .into_boxed_slice()
-            .try_into()
-            .unwrap_or_else(|_| unreachable!());
+        let stripes = CachePadded::boxed_array(|| Mutex::new(()));
         Self { stripes }
     }
 
@@ -96,5 +90,25 @@ impl StripedLockTable {
             guards.push(g);
         }
         MultiRecordLockGuard { _guards: guards }
+    }
+
+    /// Acquires every stripe in ascending order, excluding all writers until the guard drops.
+    pub fn lock_all(&self) -> MultiRecordLockGuard<'_> {
+        let mut guards = Vec::with_capacity(WRITE_LOCK_STRIPES);
+        for stripe in self.stripes.iter() {
+            guards.push(stripe.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        }
+        MultiRecordLockGuard { _guards: guards }
+    }
+
+    /// Acquires and immediately releases every stripe in ascending order.
+    ///
+    /// Every writer holds its stripe lock from WAL append until its in-memory apply completes,
+    /// so once this returns, every write whose WAL record was appended before the call has been
+    /// fully applied. Used to pick a safe WAL checkpoint cutoff without pausing writers.
+    pub fn barrier(&self) {
+        for stripe in self.stripes.iter() {
+            drop(stripe.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+        }
     }
 }

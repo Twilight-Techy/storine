@@ -8,6 +8,10 @@ use storage_types::{FastHashMap, RecordOrdinal};
 use crate::bitmap::CompressedBitmap;
 
 /// Compact inline-first ordinal list at each B+Tree key leaf (`[RecordOrdinal; 4]` inline before spilling).
+///
+/// Invariant: `inline` is sorted, `spill` is sorted, and every inline ordinal is smaller than
+/// every spilled ordinal, so `inline ++ spill` is the fully sorted posting list (required for
+/// correct keyset-cursor pagination over duplicate keys).
 #[derive(Clone, Debug, Default)]
 struct LeafPostingList {
     inline_len: u8,
@@ -18,18 +22,28 @@ struct LeafPostingList {
 impl LeafPostingList {
     #[inline]
     fn insert(&mut self, ord: RecordOrdinal) {
-        let in_slice = &self.inline[..self.inline_len as usize];
+        let len = self.inline_len as usize;
+        let in_slice = &self.inline[..len];
         if in_slice.contains(&ord) || self.spill.binary_search(&ord).is_ok() {
             return;
         }
-        if (self.inline_len as usize) < self.inline.len() {
-            self.inline[self.inline_len as usize] = ord;
+        if len < self.inline.len() && self.spill.is_empty() {
+            self.inline[len] = ord;
             self.inline_len += 1;
-            self.inline[..self.inline_len as usize].sort_unstable();
-        } else {
-            let pos = self.spill.binary_search(&ord).unwrap_or_else(|p| p);
-            self.spill.insert(pos, ord);
+            self.inline[..=len].sort_unstable();
+            return;
         }
+        // Inline is full (or spill is in use): keep the smallest ordinals inline.
+        let to_spill = if len > 0 && ord < self.inline[len - 1] {
+            let evicted = self.inline[len - 1];
+            self.inline[len - 1] = ord;
+            self.inline[..len].sort_unstable();
+            evicted
+        } else {
+            ord
+        };
+        let pos = self.spill.binary_search(&to_spill).unwrap_or_else(|p| p);
+        self.spill.insert(pos, to_spill);
     }
 
     #[inline]
@@ -166,6 +180,45 @@ impl NumericRangeIndex {
                 tree.remove(&value);
             }
         }
+    }
+
+    /// `true` if `(field_id, value, ord)` is indexed. `O(log N)`.
+    pub fn contains(&self, field_id: u16, value: i64, ord: RecordOrdinal) -> bool {
+        let guard = self
+            .trees
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .get(&field_id)
+            .and_then(|tree| tree.get(&value))
+            .is_some_and(|leaf| leaf.iter_asc().any(|o| o == ord))
+    }
+
+    /// `true` if no entry is indexed.
+    pub fn is_empty(&self) -> bool {
+        self.trees
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .all(BTreeMap::is_empty)
+    }
+
+    /// All `(key, ord)` pairs of `field_id` in `[lo, hi]`, sorted ascending by `(key, ord)`.
+    pub fn range_pairs(&self, field_id: u16, lo: i64, hi: i64) -> Vec<(i64, RecordOrdinal)> {
+        let mut out = Vec::new();
+        if lo > hi {
+            return out;
+        }
+        let guard = self
+            .trees
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(tree) = guard.get(&field_id) {
+            for (&k, leaf) in tree.range(lo..=hi) {
+                out.extend(leaf.iter_asc().map(|o| (k, o)));
+            }
+        }
+        out
     }
 
     /// Collects all `RecordOrdinal`s matching `range` on `field_id` in ascending key order.
@@ -490,6 +543,43 @@ mod tests {
         assert_eq!(page2.len(), 4);
         assert_eq!(page2[0].1, RecordOrdinal(105));
         assert_eq!(page2[3].1, RecordOrdinal(102));
+    }
+
+    #[test]
+    fn test_duplicate_key_postings_stay_sorted_for_keyset_pagination() {
+        let idx = NumericRangeIndex::new();
+        // Insert out of order so ordinals smaller than the inline maximum arrive after spilling.
+        for ord in [50u32, 40, 30, 20, 10, 5, 45, 1, 35] {
+            idx.insert(7, 100, RecordOrdinal(ord));
+        }
+        idx.remove(7, 100, RecordOrdinal(20));
+        let all = idx.range_collect(7, 100..=100, None);
+        let mut sorted = all.clone();
+        sorted.sort_unstable();
+        assert_eq!(all, sorted);
+
+        // Paging with a cursor visits every posting exactly once.
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (page, _) = idx.range_collect_paginated(
+                7,
+                100,
+                100,
+                SortOrder::Asc,
+                cursor,
+                0,
+                Some(3),
+                |_| true,
+            );
+            if page.is_empty() {
+                break;
+            }
+            let last = page[page.len() - 1];
+            cursor = Some(KeysetCursor::from_key_and_ordinal(last.0, last.1));
+            seen.extend(page.into_iter().map(|(_, o)| o));
+        }
+        assert_eq!(seen, sorted);
     }
 
     #[test]

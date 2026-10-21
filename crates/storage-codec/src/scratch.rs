@@ -10,6 +10,36 @@ use std::sync::Arc;
 /// Cache-line alignment (64 bytes) required for zero-copy `RecordHeader` and SIMD payloads.
 pub const BUFFER_ALIGNMENT: usize = 64;
 
+/// Largest capacity a 64-byte-aligned `Layout` can describe (`isize::MAX` rounded down to 64).
+const MAX_CAP: usize = (isize::MAX as usize) & !(BUFFER_ALIGNMENT - 1);
+
+/// Rounds `min` up to a non-zero multiple of 64, or `None` if no allocation could hold it.
+#[inline]
+fn aligned_cap(min: usize) -> Option<usize> {
+    let cap = min
+        .max(BUFFER_ALIGNMENT)
+        .checked_next_multiple_of(BUFFER_ALIGNMENT)?;
+    (cap <= MAX_CAP).then_some(cap)
+}
+
+/// Layout of a buffer whose capacity came from [`aligned_cap`] (or is clamped to [`MAX_CAP`]).
+#[inline]
+fn layout_for(cap: usize) -> Layout {
+    let cap = cap.clamp(BUFFER_ALIGNMENT, MAX_CAP);
+    // SAFETY: `cap` is clamped to `64..=MAX_CAP` and alignment 64 is a power of two, so the size
+    // rounded up to the alignment never exceeds `isize::MAX`. Every capacity stored in a buffer
+    // comes from `aligned_cap`, so it is already a multiple of 64 inside that range.
+    unsafe { Layout::from_size_align_unchecked(cap, BUFFER_ALIGNMENT) }
+}
+
+/// Reports an allocation that cannot be satisfied the same way the standard library does
+/// (process abort via the allocation-error handler, never a panic).
+#[cold]
+#[inline(never)]
+fn alloc_failed(requested: usize) -> ! {
+    std::alloc::handle_alloc_error(layout_for(requested))
+}
+
 /// An immutable, reference-counted byte buffer guaranteed to be 64-byte aligned in memory.
 /// Used by `HotDirtyArc` so concurrent readers can dereference `&RecordHeader` and `&T::Archived`
 /// directly from in-flight memory before background disk flush completes.
@@ -31,15 +61,26 @@ unsafe impl Sync for AlignedStorage {}
 
 impl AlignedBytes {
     /// Copies `src` into a newly allocated 64-byte-aligned immutable buffer.
+    ///
+    /// For engine-encoded (trusted) data. Out of memory aborts like the standard collections;
+    /// use [`Self::try_copy_from_slice`] for sizes derived from network, disk or decompression.
     #[inline]
     pub fn copy_from_slice(src: &[u8]) -> Self {
-        let cap = src.len().max(BUFFER_ALIGNMENT).next_multiple_of(BUFFER_ALIGNMENT);
-        let layout = Layout::from_size_align(cap, BUFFER_ALIGNMENT).expect("valid aligned layout");
-        // SAFETY: `cap >= 64` is non-zero and a multiple of 64.
-        let raw = unsafe { alloc(layout) };
-        let Some(ptr) = NonNull::new(raw) else {
-            std::alloc::handle_alloc_error(layout);
-        };
+        match Self::try_copy_from_slice(src) {
+            Ok(bytes) => bytes,
+            Err(_) => alloc_failed(src.len()),
+        }
+    }
+
+    /// Fallible [`Self::copy_from_slice`]: returns `ResourceExhausted` instead of aborting when
+    /// the allocation fails (`RULE-ERR-01`).
+    #[inline]
+    pub fn try_copy_from_slice(src: &[u8]) -> storage_types::Result<Self> {
+        let oom = || storage_types::StorageError::resource_exhausted("heap memory (aligned buffer)");
+        let cap = aligned_cap(src.len()).ok_or_else(oom)?;
+        // SAFETY: `layout_for(cap)` has a non-zero size (`cap >= 64`).
+        let raw = unsafe { alloc(layout_for(cap)) };
+        let ptr = NonNull::new(raw).ok_or_else(oom)?;
         // SAFETY: `ptr` has at least `src.len()` valid writable bytes and does not overlap `src`.
         unsafe {
             core::ptr::copy_nonoverlapping(src.as_ptr(), ptr.as_ptr(), src.len());
@@ -47,13 +88,13 @@ impl AlignedBytes {
                 core::ptr::write_bytes(ptr.as_ptr().add(src.len()), 0, cap - src.len());
             }
         }
-        Self {
+        Ok(Self {
             inner: Arc::new(AlignedStorage {
                 ptr,
                 len: src.len(),
                 cap,
             }),
-        }
+        })
     }
 
     #[inline]
@@ -75,11 +116,9 @@ impl AlignedBytes {
 
 impl Drop for AlignedStorage {
     fn drop(&mut self) {
-        let layout =
-            Layout::from_size_align(self.cap, BUFFER_ALIGNMENT).expect("valid aligned layout");
-        // SAFETY: `self.ptr` was allocated with `layout` in `AlignedBytes::copy_from_slice`.
+        // SAFETY: `self.ptr` was allocated with `layout_for(self.cap)` in `try_copy_from_slice`.
         unsafe {
-            dealloc(self.ptr.as_ptr(), layout);
+            dealloc(self.ptr.as_ptr(), layout_for(self.cap));
         }
     }
 }
@@ -111,12 +150,13 @@ unsafe impl Send for AlignedScratchBuf {}
 
 impl AlignedScratchBuf {
     pub fn with_capacity(min_cap: usize) -> Self {
-        let cap = min_cap.max(4096).next_multiple_of(BUFFER_ALIGNMENT);
-        let layout = Layout::from_size_align(cap, BUFFER_ALIGNMENT).expect("valid aligned layout");
-        // SAFETY: `cap >= 4096` is non-zero and aligned to 64.
-        let raw = unsafe { alloc(layout) };
+        let Some(cap) = aligned_cap(min_cap.max(4096)) else {
+            alloc_failed(min_cap);
+        };
+        // SAFETY: `layout_for(cap)` has a non-zero size (`cap >= 4096`).
+        let raw = unsafe { alloc(layout_for(cap)) };
         let Some(ptr) = NonNull::new(raw) else {
-            std::alloc::handle_alloc_error(layout);
+            alloc_failed(cap);
         };
         Self { ptr, len: 0, cap }
     }
@@ -143,27 +183,25 @@ impl AlignedScratchBuf {
 
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
-        let required = self.len.checked_add(additional).expect("buffer size overflow");
-        if required <= self.cap {
-            return;
+        match self.len.checked_add(additional) {
+            Some(required) if required <= self.cap => {}
+            Some(required) => self.grow_amortized(required),
+            None => alloc_failed(usize::MAX),
         }
-        self.grow_amortized(required);
     }
 
     #[cold]
     #[inline(never)]
     fn grow_amortized(&mut self, required: usize) {
-        let new_cap = required
-            .max(self.cap.saturating_mul(2))
-            .next_multiple_of(BUFFER_ALIGNMENT);
-        let old_layout =
-            Layout::from_size_align(self.cap, BUFFER_ALIGNMENT).expect("valid old layout");
-        let new_layout =
-            Layout::from_size_align(new_cap, BUFFER_ALIGNMENT).expect("valid new layout");
-        // SAFETY: `self.ptr` was allocated with `old_layout`, and `new_cap >= self.cap > 0`.
-        let raw = unsafe { realloc(self.ptr.as_ptr(), old_layout, new_cap) };
+        let Some(new_cap) = aligned_cap(required.max(self.cap.saturating_mul(2).min(MAX_CAP)))
+        else {
+            alloc_failed(required);
+        };
+        // SAFETY: `self.ptr` was allocated with `layout_for(self.cap)`, and
+        // `new_cap >= required > self.cap > 0` is a valid size for that alignment.
+        let raw = unsafe { realloc(self.ptr.as_ptr(), layout_for(self.cap), new_cap) };
         let Some(ptr) = NonNull::new(raw) else {
-            std::alloc::handle_alloc_error(new_layout);
+            alloc_failed(new_cap);
         };
         self.ptr = ptr;
         self.cap = new_cap;
@@ -172,7 +210,8 @@ impl AlignedScratchBuf {
     /// Pads `self.len` with zeroes up to a multiple of `align` (must be power of two `<= 64`).
     #[inline]
     pub fn align_to(&mut self, align: usize) {
-        debug_assert!(align.is_power_of_two() && align <= BUFFER_ALIGNMENT);
+        // Out-of-contract alignments are clamped to the nearest valid power of two (`1..=64`).
+        let align = align.clamp(1, BUFFER_ALIGNMENT).next_power_of_two();
         let mask = align - 1;
         let aligned_len = (self.len + mask) & !mask;
         let pad = aligned_len - self.len;
@@ -237,11 +276,9 @@ impl AlignedScratchBuf {
 
 impl Drop for AlignedScratchBuf {
     fn drop(&mut self) {
-        let layout =
-            Layout::from_size_align(self.cap, BUFFER_ALIGNMENT).expect("valid aligned layout");
-        // SAFETY: `self.ptr` was allocated with `layout`.
+        // SAFETY: `self.ptr` was allocated (or reallocated) with `layout_for(self.cap)`.
         unsafe {
-            dealloc(self.ptr.as_ptr(), layout);
+            dealloc(self.ptr.as_ptr(), layout_for(self.cap));
         }
     }
 }

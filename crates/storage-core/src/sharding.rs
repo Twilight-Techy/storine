@@ -1,10 +1,13 @@
 //! Horizontal Consistent-Hash Virtual Sharding (`1,024` vshards) & Online Live Shard Migration
 //! (`TASK-045`, `TASK-047`, `F-DIST-01`, `F-DIST-03`).
 //!
-//! - Maps every `InlineId` to one of `1,024` virtual shards in $O(1)$ time (`(id.fast_hash() & 1023) as u16`)
-//!   with **zero heap allocations**.
+//! - Maps every `InlineId` to one of `1,024` virtual shards in $O(1)$ time using the TOP 10 bits of
+//!   `id.fast_hash()` (the low bits pick the in-node primary-index / mmap-pool / MVCC shards, so
+//!   using them here would leave each node with only a fraction of its shards in use).
 //! - `ClusterMap` fits in a fixed 2 KiB `[NodeId; 1024]` array for $O(1)$ L1-cache-resident shard routing.
-//! - Supports online live `vshard` migration with 64-bit checksum digest verification and atomic epoch cutover.
+//! - Supports `vshard` migration with digest verification and atomic epoch cutover. Writes to the
+//!   migrating vshard are rejected with a retryable `ResourceExhausted` error while it is copied
+//!   (reads keep working), so no write can be lost.
 
 use std::collections::HashMap;
 use std::fs;
@@ -12,10 +15,13 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use storage_types::FastHashSet;
+
 use storage_codec::{checksum_payload, xxh3_64, RecordCodec, RecordView, ZeroCopyRecord};
 use storage_index::Indexable;
 use storage_mmap::atomic_write_replace;
 use storage_types::{InlineId, Result, StorageError, Version};
+use storage_types::wire::{read_u16_le, read_u32_le, read_u64_le};
 
 use crate::engine::StorageEngine;
 
@@ -23,15 +29,18 @@ const CLUSTER_MAP_MAGIC: u32 = 0x434D_4150; // "CMAP"
 
 /// Number of virtual shards across the consistent hash ring (`2^10 = 1,024`).
 pub const VIRTUAL_SHARD_COUNT: usize = 1024;
-const VSHARD_MASK: u64 = (VIRTUAL_SHARD_COUNT as u64) - 1;
+const VSHARD_BITS: u32 = VIRTUAL_SHARD_COUNT.trailing_zeros();
 
 /// Logical node identifier in a distributed Storine cluster.
 pub type NodeId = u16;
 
-/// Computes the virtual shard (`0..1024`) for `id` in $O(1)$ time (1 bitwise AND, 0 allocations).
+/// Computes the virtual shard (`0..1024`) for `id` in $O(1)$ time (1 shift, 0 allocations).
+///
+/// Uses the high hash bits, which are independent of the low bits that select the 64 in-node
+/// shards of `PrimaryIndex`, `MmapPool` and `MvccManager`.
 #[inline(always)]
 pub const fn vshard_for_id(id: InlineId) -> u16 {
-    (id.fast_hash() & VSHARD_MASK) as u16
+    (id.fast_hash() >> (64 - VSHARD_BITS)) as u16
 }
 
 /// Compact 2 KiB cluster routing table mapping each of the `1,024` virtual shards to its owner `NodeId`.
@@ -100,21 +109,21 @@ impl ClusterMap {
         if bytes.len() != expected_len {
             return Err(StorageError::corrupted_header("cluster.map invalid file length"));
         }
-        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let magic = read_u32_le(&bytes, 0);
         if magic != CLUSTER_MAP_MAGIC {
             return Err(StorageError::corrupted_header("cluster.map invalid magic"));
         }
-        let expected_crc = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+        let expected_crc = read_u64_le(&bytes, 4);
         let payload = &bytes[12..];
         let actual_crc = checksum_payload(payload);
         if actual_crc != expected_crc {
             return Err(StorageError::checksum_mismatch(expected_crc, actual_crc));
         }
-        let epoch = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let epoch = read_u64_le(payload, 0);
         let mut owners = [0u16; VIRTUAL_SHARD_COUNT];
         for (i, slot) in owners.iter_mut().enumerate() {
             let off = 8 + i * 2;
-            *slot = u16::from_le_bytes(payload[off..off + 2].try_into().unwrap());
+            *slot = read_u16_le(payload, off);
         }
         Ok(Self { epoch, owners })
     }
@@ -140,6 +149,11 @@ pub struct ClusterRouter<T: ZeroCopyRecord + Indexable> {
     map: RwLock<ClusterMap>,
     nodes: RwLock<HashMap<NodeId, Arc<StorageEngine<T>>>>,
     routed_ops: AtomicU64,
+    /// vshards currently being migrated (writes rejected until cutover).
+    frozen: RwLock<FastHashSet<u16>>,
+    /// Routed writes hold this shared for their whole duration; a migration takes it exclusively
+    /// to freeze a vshard, which guarantees no write to it is still in flight afterwards.
+    write_gate: RwLock<()>,
 }
 
 impl<T: ZeroCopyRecord + Indexable> core::fmt::Debug for ClusterRouter<T> {
@@ -166,6 +180,8 @@ impl<T: ZeroCopyRecord + Indexable> ClusterRouter<T> {
             map: RwLock::new(map),
             nodes: RwLock::new(nodes),
             routed_ops: AtomicU64::new(0),
+            frozen: RwLock::new(FastHashSet::default()),
+            write_gate: RwLock::new(()),
         })
     }
 
@@ -206,9 +222,23 @@ impl<T: ZeroCopyRecord + Indexable> ClusterRouter<T> {
         Ok((owner, eng))
     }
 
+    /// Fails with a retryable error when `id` belongs to a vshard that is being migrated.
+    #[inline]
+    fn ensure_writable(&self, id: InlineId) -> Result<()> {
+        let frozen = self.frozen.read().unwrap_or_else(|p| p.into_inner());
+        if !frozen.is_empty() && frozen.contains(&vshard_for_id(id)) {
+            return Err(StorageError::resource_exhausted(
+                "vshard is being migrated; retry the write shortly",
+            ));
+        }
+        Ok(())
+    }
+
     /// Routes `put(id, record)` to the owning shard node.
     #[inline]
     pub fn put(&self, id: InlineId, record: &T) -> Result<(NodeId, Version)> {
+        let _gate = self.write_gate.read().unwrap_or_else(|p| p.into_inner());
+        self.ensure_writable(id)?;
         let (node_id, eng) = self.route_key(id)?;
         let ver = eng.put(id, record)?;
         Ok((node_id, ver))
@@ -232,6 +262,8 @@ impl<T: ZeroCopyRecord + Indexable> ClusterRouter<T> {
     /// Routes `delete(id)` to the owning shard node.
     #[inline]
     pub fn delete(&self, id: InlineId) -> Result<bool> {
+        let _gate = self.write_gate.read().unwrap_or_else(|p| p.into_inner());
+        self.ensure_writable(id)?;
         let (_, eng) = self.route_key(id)?;
         eng.delete(id)
     }
@@ -265,14 +297,18 @@ impl<T: ZeroCopyRecord + Indexable> ClusterRouter<T> {
         results
     }
 
-    /// Online Live Virtual Shard Migration (`TASK-047`, `F-DIST-03`):
+    /// Virtual Shard Migration (`TASK-047`, `F-DIST-03`):
     ///
-    /// 1. Scans `source_node` for all live keys belonging to `vshard` (`vshard_for_id(k) == vshard`).
-    /// 2. Copies each record to `target_node` and accumulates an order-independent 64-bit `XXH3-64`
-    ///    verification digest over `(id, serialized_frame)`.
-    /// 3. Verifies that `target_node` holds every migrated record with an identical `XXH3-64` digest.
+    /// 1. Freezes `vshard` for writes (in-flight routed writes are drained first); reads continue.
+    /// 2. Copies every live key of `vshard` from the source to the target node and computes an
+    ///    order-independent digest over the record contents.
+    /// 3. Verifies the target holds identical contents; on any failure the copied keys are removed
+    ///    from the target and the vshard is unfrozen with ownership unchanged.
     /// 4. Atomically updates `ClusterMap` ownership of `vshard -> target_node` (incrementing `epoch`).
-    /// 5. Prunes the migrated keys from `source_node`.
+    /// 5. Prunes the migrated keys from the source and unfreezes the vshard.
+    ///
+    /// Only writes routed through this `ClusterRouter` are frozen; writes issued directly to a node's
+    /// engine bypass routing and are the caller's responsibility.
     pub fn migrate_vshard(
         &self,
         vshard: u16,
@@ -310,6 +346,32 @@ impl<T: ZeroCopyRecord + Indexable> ClusterRouter<T> {
             (s, d)
         };
 
+        // Freeze the vshard; taking the gate exclusively waits for in-flight routed writes.
+        {
+            let _gate = self.write_gate.write().unwrap_or_else(|p| p.into_inner());
+            let mut frozen = self.frozen.write().unwrap_or_else(|p| p.into_inner());
+            if !frozen.insert(vshard) {
+                return Err(StorageError::resource_exhausted(
+                    "vshard migration already in progress",
+                ));
+            }
+        }
+        let result = self.migrate_frozen_vshard(vshard, source_node, target_node, &src_eng, &dst_eng);
+        self.frozen
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&vshard);
+        result
+    }
+
+    fn migrate_frozen_vshard(
+        &self,
+        vshard: u16,
+        source_node: NodeId,
+        target_node: NodeId,
+        src_eng: &StorageEngine<T>,
+        dst_eng: &StorageEngine<T>,
+    ) -> Result<ShardMigrationReceipt> {
         // 1. Collect all keys belonging to `vshard` on `source_node`
         let mut keys_to_move = Vec::new();
         for id in src_eng.primary_index().ids_snapshot() {
@@ -321,9 +383,26 @@ impl<T: ZeroCopyRecord + Indexable> ClusterRouter<T> {
 
         // 2. Stream records to `target_node` and compute source shard digest
         let mut src_digest = 0u64;
+        let mut copied: Vec<InlineId> = Vec::with_capacity(keys_to_move.len());
+        let rollback = |copied: &[InlineId]| {
+            for &id in copied {
+                let _ = dst_eng.delete(id);
+            }
+        };
         for &id in &keys_to_move {
-            let (_ver, owned) = src_eng.get_owned(id)?;
-            dst_eng.put(id, &owned)?;
+            let owned = match src_eng.get_owned(id) {
+                Ok((_ver, owned)) => owned,
+                Err(StorageError::RecordNotFound { .. }) => continue, // expired meanwhile
+                Err(e) => {
+                    rollback(&copied);
+                    return Err(e);
+                }
+            };
+            if let Err(e) = dst_eng.put(id, &owned) {
+                rollback(&copied);
+                return Err(e);
+            }
+            copied.push(id);
             let frame = RecordCodec::encode_aligned(
                 &owned,
                 Version::INITIAL,
@@ -336,8 +415,14 @@ impl<T: ZeroCopyRecord + Indexable> ClusterRouter<T> {
 
         // 3. Verify target shard digest matches source shard digest (`F-DIST-03`)
         let mut dst_digest = 0u64;
-        for &id in &keys_to_move {
-            let (_ver, owned) = dst_eng.get_owned(id)?;
+        for &id in &copied {
+            let owned = match dst_eng.get_owned(id) {
+                Ok((_ver, owned)) => owned,
+                Err(e) => {
+                    rollback(&copied);
+                    return Err(e);
+                }
+            };
             let frame = RecordCodec::encode_aligned(
                 &owned,
                 Version::INITIAL,
@@ -348,6 +433,7 @@ impl<T: ZeroCopyRecord + Indexable> ClusterRouter<T> {
             dst_digest ^= xxh3_64(frame.as_slice()).rotate_left((id.fast_hash() & 63) as u32);
         }
         if src_digest != dst_digest {
+            rollback(&copied);
             return Err(StorageError::checksum_mismatch(src_digest, dst_digest));
         }
 
@@ -359,7 +445,7 @@ impl<T: ZeroCopyRecord + Indexable> ClusterRouter<T> {
         };
 
         // 5. Prune migrated records from `source_node`
-        for id in &keys_to_move {
+        for id in &copied {
             let _ = src_eng.delete(*id);
         }
 
@@ -367,7 +453,7 @@ impl<T: ZeroCopyRecord + Indexable> ClusterRouter<T> {
             vshard,
             source_node,
             target_node,
-            records_migrated: keys_to_move.len(),
+            records_migrated: copied.len(),
             shard_digest_xxh3: dst_digest,
             new_cluster_epoch: new_epoch,
         })
@@ -386,15 +472,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
 
         let n1 = Arc::new(
-            StorageEngine::<AgentObjectRecord>::open(&base.join("node1"), EngineConfig::default())
+            StorageEngine::<AgentObjectRecord>::open(base.join("node1"), EngineConfig::default())
                 .unwrap(),
         );
         let n2 = Arc::new(
-            StorageEngine::<AgentObjectRecord>::open(&base.join("node2"), EngineConfig::default())
+            StorageEngine::<AgentObjectRecord>::open(base.join("node2"), EngineConfig::default())
                 .unwrap(),
         );
         let n3 = Arc::new(
-            StorageEngine::<AgentObjectRecord>::open(&base.join("node3"), EngineConfig::default())
+            StorageEngine::<AgentObjectRecord>::open(base.join("node3"), EngineConfig::default())
                 .unwrap(),
         );
 
@@ -420,6 +506,16 @@ mod tests {
         // Add Node 3 and live-migrate `target_vshard` from Node 1 -> Node 3!
         router.add_node(3, Arc::clone(&n3));
         let vs = target_vshard.unwrap();
+        // vshard selection is independent of the in-node primary shard (low hash bits).
+        let mut primary_shards = FastHashSet::default();
+        for i in 0..20_000u32 {
+            let id = InlineId::new(&format!("k{i}")).unwrap();
+            if vshard_for_id(id).is_multiple_of(64) {
+                primary_shards.insert(id.fast_hash() & 63);
+            }
+        }
+        assert!(primary_shards.len() > 48, "only {} primary shards used", primary_shards.len());
+
         let receipt = router.migrate_vshard(vs, 3).unwrap();
         assert_eq!(receipt.source_node, 1);
         assert_eq!(receipt.target_node, 3);

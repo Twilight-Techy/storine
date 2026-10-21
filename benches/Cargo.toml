@@ -2,6 +2,7 @@
 name = "storage-benches"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "Allocation-counting harness and p50/p99/p99.9 latency & throughput benchmark suite"

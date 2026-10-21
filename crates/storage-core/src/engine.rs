@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::fs;
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -9,24 +10,21 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use storage_codec::{
-    AlignedBytes, RecordCodec, RecordView, ZeroCopyRecord,
-};
+use storage_codec::{AlignedBytes, EncryptionKey, RecordCodec, RecordView, ZeroCopyRecord};
+
+use crate::decrypt_cache::DecryptedCache;
 use storage_graph::{DanglingEdge, OnDelete};
 use storage_index::{
-    append_primary_checkpoint_delta, cosine_similarity_f32, delta_checkpoint_path,
-    load_primary_checkpoint, save_primary_checkpoint, BitmapTagIndex, CompressedBitmap,
-    DiskLocation, HnswConfig, HnswVectorIndex, IndexDelta, IndexSnapshot, Indexable,
-    NumericRangeIndex, PrimaryEntry, PrimaryIndex, VectorTopKHit,
+    append_primary_checkpoint_delta, cosine_similarity_f32, delta_checkpoint_path, load_primary_checkpoint_with_stamp, save_primary_checkpoint, save_primary_checkpoint_entries, BitmapTagIndex, CompressedBitmap, DiskLocation, HnswConfig, HnswVectorIndex, IndexDelta, IndexSnapshot, Indexable, NumericRangeIndex, PagedBTreeIndex, PagedBitmapIndex, PrimaryEntry, PrimaryIndex, RangeIndex, TagIndex, VectorTopKHit,
 };
 use storage_mmap::{
     atomic_write_replace, cleanup_temp_files, read_ping_pong_active, write_ping_pong_slot,
-    ArenaManager, DirectoryLock, MmapGuard, MmapPool, MmapPoolConfig, MmapRegion, PathResolver,
-    DEFAULT_SEGMENT_CAPACITY,
+    ArenaLocation, ArenaManager, DirectoryLock, MmapGuard, MmapPool, MmapPoolConfig, MmapRegion,
+    PathResolver, StackRelPath, DEFAULT_SEGMENT_CAPACITY,
 };
 use storage_types::{
     CachePadded, FastHashMap, FastHashSet, InlineId, RecordFlags, RecordHeader, RecordOrdinal,
-    Result, StorageError, Version, HEADER_SIZE,
+    Result, StorageError, StripedCounter, Version, HEADER_SIZE,
 };
 use storage_wal::{GroupCommitWal, SyncPolicy, WalOpKind};
 
@@ -55,6 +53,19 @@ pub enum StorageLayoutMode {
 }
 
 
+/// Where the secondary (tag and numeric range) indexes live (`F-PIDX-01`, `F-PIDX-02`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IndexTier {
+    /// In RAM, rebuilt from the records at every open. Fastest; RAM grows with the postings.
+    #[default]
+    Memory,
+    /// Memory-mapped paged files (`indexes/<stem>_range.idx`, `indexes/<stem>_tags.idx`): RAM is
+    /// bounded by the page directories plus the delta since the last checkpoint. Persisted at
+    /// checkpoints and reused at open after a clean shutdown; rebuilt from the records after a
+    /// crash (any WAL replay) or whenever they cannot be proven current.
+    Paged,
+}
+
 /// Configuration for `StorageEngine<T>`.
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -72,6 +83,24 @@ pub struct EngineConfig {
     /// When exceeded under heavy multi-user write bursts, writers apply synchronous flush
     /// backpressure so in-flight dirty memory never bloats unboundedly.
     pub max_hot_dirty_bytes: usize,
+    /// When `true`, WAL frames removed by checkpoints are archived under
+    /// `wal/archive/<collection>/` instead of discarded. Required for Point-in-Time Recovery
+    /// (`archive_wal_for_pitr`). Archived segments grow until pruned
+    /// (`GroupCommitWal::prune_archived_segments_before_lsn`).
+    pub wal_archive: bool,
+    /// Storage tier of the secondary indexes (default [`IndexTier::Memory`]).
+    pub index_tier: IndexTier,
+    /// Encryption at rest (`F-SEC-02`): when set, every record frame written to arena segments,
+    /// record files and the WAL is sealed with ChaCha20-Poly1305 under this key, bound to its
+    /// record id and header metadata. Must be set when the database is created: with a key, any
+    /// plaintext record frame found on disk or in the WAL is rejected (no downgrade).
+    ///
+    /// Not encrypted: record ids and locations in `primary.idx`, indexed tag / numeric values in
+    /// the secondary-index files, and quantized vectors in `hnsw.idx`.
+    pub encryption_key: Option<EncryptionKey>,
+    /// Byte budget of the decrypted-frame cache used when `encryption_key` is set
+    /// (default 256 MiB). Warm reads of cached records allocate nothing.
+    pub decrypted_cache_bytes: usize,
 }
 
 impl Default for EngineConfig {
@@ -87,6 +116,10 @@ impl Default for EngineConfig {
             background_flush: true,
             flush_interval_ms: 10,
             max_hot_dirty_bytes: 64 * 1024 * 1024,
+            wal_archive: false,
+            index_tier: IndexTier::Memory,
+            encryption_key: None,
+            decrypted_cache_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -125,7 +158,7 @@ enum BackingSource {
 /// or `HotDirtyArc` buffer (`F-CORE-01`, `RULE-MEM-01`, `RULE-SAFE-02`).
 pub struct RecordRef<T: ZeroCopyRecord> {
     backing: BackingSource,
-    _marker: core::marker::PhantomData<T>,
+    _record: PhantomData<fn() -> T>,
 }
 
 impl<T: ZeroCopyRecord> core::fmt::Debug for RecordRef<T> {
@@ -150,14 +183,11 @@ impl<T: ZeroCopyRecord> RecordRef<T> {
         }
     }
 
-    /// Returns the zero-copy `RecordView<'_, T>` for this record in 1 CPU cycle (`RULE-SAFE-04`).
+    /// Returns the zero-copy `RecordView<'_, T>` for this record with O(1) safe bounds checks
+    /// (`RULE-SAFE-04`): the frame was fully validated when this `RecordRef` was created.
     #[inline]
     pub fn view(&self) -> RecordView<'_, T> {
-        let frame = self.raw_frame();
-        // SAFETY: Every `BackingSource` inside `RecordRef` is validated before construction
-        // (`HotDirty` is freshly encoded by `RecordCodec::encode_aligned`; `PooledMmap` and
-        // `ArenaMmap` are validated via `RecordCodec::validate_frame`).
-        unsafe { RecordCodec::decode_unchecked::<T>(frame) }
+        RecordCodec::decode_fast_or::<T>(self.raw_frame())
     }
 
     #[inline]
@@ -181,7 +211,10 @@ impl<T: ZeroCopyRecord> RecordRef<T> {
     }
 
     #[inline]
-    pub fn get_slice<'a, A: Copy>(&'a self, field: &storage_codec::ArchivedSlice<A>) -> &'a [A] {
+    pub fn get_slice<'a, A: storage_codec::ArchivePod>(
+        &'a self,
+        field: &storage_codec::ArchivedSlice<A>,
+    ) -> &'a [A] {
         self.view().get_slice(field)
     }
 
@@ -196,9 +229,7 @@ impl<T: ZeroCopyRecord> Deref for RecordRef<T> {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        let frame = self.raw_frame();
-        // SAFETY: `frame` is verified and 64-byte aligned.
-        unsafe { RecordCodec::decode_unchecked::<T>(frame).archived() }
+        self.view().archived()
     }
 }
 
@@ -252,17 +283,129 @@ struct SharedEngineInner<T: ZeroCopyRecord + Indexable> {
     arena: Option<ArenaManager>,
     wal: Option<Arc<GroupCommitWal>>,
     shared_wal_mode: bool,
-    range_index: NumericRangeIndex,
-    tag_index: BitmapTagIndex,
+    range_index: RangeIndex,
+    tag_index: TagIndex,
+    /// Serializes full checkpoints (`save_checkpoint_files`).
+    checkpoint_serial: Mutex<()>,
+    /// `true` if paged secondary indexes were reused at open instead of rebuilt.
+    indexes_reused: AtomicBool,
+    /// Decrypted, validated frames of encrypted records (`F-SEC-02`).
+    decrypted: DecryptedCache,
     vector_index: HnswVectorIndex,
     mvcc: MvccManager,
     migrations: RwLock<SchemaRegistry<T>>,
     flush_queue: Mutex<CoalescingQueue>,
     flush_cv: Condvar,
     shutdown: AtomicBool,
-    total_reads: CachePadded<AtomicU64>,
-    total_writes: CachePadded<AtomicU64>,
+    total_reads: StripedCounter,
+    total_writes: StripedCounter,
     coalesced_flushes: CachePadded<AtomicU64>,
+    /// Ordinals of records carrying a TTL, so queries can exclude expired records cheaply.
+    ttl_ordinals: RwLock<CompressedBitmap>,
+    /// `<base>/indexes/<collection>_primary.idx`.
+    idx_path: PathBuf,
+    /// Persisted HNSW graph (`indexes/<stem>_hnsw.idx`, `F-HNSW-02`), saved at checkpoints.
+    hnsw_path: PathBuf,
+    /// `HnswVectorIndex::generation` at the last save (`u64::MAX` = never saved).
+    hnsw_saved_generation: AtomicU64,
+    /// Archive directory for WAL frames removed by checkpoints (`EngineConfig::wal_archive`).
+    wal_archive_dir: Option<PathBuf>,
+    /// `(id, path)` of deleted record files whose removal failed (e.g. still mapped on Windows).
+    pending_file_removals: Mutex<Vec<(InlineId, PathBuf)>>,
+}
+
+/// Percent-encodes `name` into a single safe path component (no separators, `..` or `:`).
+pub(crate) fn collection_file_stem(name: &str) -> Result<String> {
+    if name.is_empty() {
+        return Err(StorageError::invalid_key("collection_name cannot be empty"));
+    }
+    let mut buf = StackRelPath::new();
+    buf.push_safe_component(name)?;
+    Ok(buf.as_str().to_string())
+}
+
+/// Moves legacy `segments/seg_*.dat` files (pre per-collection layout) into `seg_dir`.
+fn migrate_legacy_segments(legacy_dir: &Path, seg_dir: &Path) -> Result<()> {
+    if seg_dir.exists() || !legacy_dir.exists() {
+        return Ok(());
+    }
+    let mut legacy = Vec::new();
+    if let Ok(entries) = fs::read_dir(legacy_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_seg = path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("seg_") && n.ends_with(".dat"));
+            if is_seg {
+                legacy.push(path);
+            }
+        }
+    }
+    if legacy.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(seg_dir).map_err(|e| StorageError::io("create arena segment dir", e))?;
+    for path in legacy {
+        if let Some(name) = path.file_name() {
+            fs::rename(&path, seg_dir.join(name))
+                .map_err(|e| StorageError::io("migrate legacy arena segment", e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Rejects snapshot/restore destinations that are non-empty or located inside `base_dir`, so
+/// a backup can never delete or overwrite existing data or recurse into itself.
+pub(crate) fn ensure_fresh_destination(dest: &Path, base_dir: Option<&Path>) -> Result<()> {
+    if dest.exists() {
+        if !dest.is_dir() {
+            return Err(StorageError::invalid_key(
+                "destination exists and is not a directory",
+            ));
+        }
+        let mut entries =
+            fs::read_dir(dest).map_err(|e| StorageError::io("read destination directory", e))?;
+        if entries.next().is_some() {
+            return Err(StorageError::invalid_key(
+                "destination directory must be empty (refusing to overwrite existing data)",
+            ));
+        }
+    }
+    if let Some(base) = base_dir {
+        let canon_base = fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+        // Canonicalize the deepest existing ancestor of `dest`.
+        let mut probe = dest.to_path_buf();
+        let mut suffix = Vec::new();
+        while !probe.exists() {
+            match (probe.file_name().map(|n| n.to_os_string()), probe.parent()) {
+                (Some(name), Some(parent)) => {
+                    suffix.push(name);
+                    probe = parent.to_path_buf();
+                }
+                _ => break,
+            }
+        }
+        let mut canon_dest = fs::canonicalize(&probe).unwrap_or(probe);
+        for name in suffix.into_iter().rev() {
+            canon_dest.push(name);
+        }
+        if canon_dest.starts_with(&canon_base) {
+            return Err(StorageError::invalid_key(
+                "destination must not be inside the database directory",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Hot-read source resolved under the primary-index shard lock and used after releasing it.
+enum FastRead {
+    Dirty(AlignedBytes),
+    Arena(Arc<MmapRegion>, ArenaLocation),
+    Mapped(MmapGuard),
+    Cold,
 }
 
 /// High-Performance Zero-Copy Memory-Mapped Object Storage Engine.
@@ -299,13 +442,19 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             fs::create_dir_all(&base_dir)
                 .map_err(|e| StorageError::io("create engine base directory", e))?;
         }
+        let stem = collection_file_stem(&config.collection_name)?;
 
-        // Acquire OS-level exclusive lock on `<base_dir>/<collection_name>.lock` (`TASK-059`)
-        let lock_path = base_dir.join(format!("{}.lock", config.collection_name));
+        // Acquire OS-level exclusive lock on `<base_dir>/<collection>.lock` (`TASK-059`)
+        let lock_path = base_dir.join(format!("{stem}.lock"));
         let dir_lock = DirectoryLock::try_acquire(&lock_path)?;
+        let shared_wal_mode = shared_wal.is_some();
 
-        // Clean up any orphaned `.tmp` files left from a prior power loss (`F-DURA-04`)
-        let _ = cleanup_temp_files(&base_dir)?;
+        // Clean up orphaned `.tmp` files left from a prior power loss (`F-DURA-04`). In a shared
+        // catalog directory other collections may be writing right now, so the catalog performs
+        // this cleanup once before any collection opens.
+        if !shared_wal_mode {
+            let _ = cleanup_temp_files(&base_dir)?;
+        }
 
         let paths = PathResolver::new(&base_dir);
         let primary = PrimaryIndex::new();
@@ -314,23 +463,67 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         let arena = match config.layout_mode {
             StorageLayoutMode::AdaptiveArena {
                 segment_capacity, ..
-            } => Some(ArenaManager::open(
-                &base_dir,
-                segment_capacity.max(DEFAULT_SEGMENT_CAPACITY),
-            )?),
+            } => {
+                let seg_root = base_dir.join("segments");
+                let seg_dir = seg_root.join(&stem);
+                migrate_legacy_segments(&seg_root, &seg_dir)?;
+                Some(ArenaManager::open(
+                    seg_dir,
+                    segment_capacity.max(DEFAULT_SEGMENT_CAPACITY),
+                )?)
+            }
             _ => None,
         };
 
         // Load primary index checkpoint if present
-        let idx_path = base_dir
-            .join("indexes")
-            .join(format!("{}_primary.idx", config.collection_name));
-        let _ = load_primary_checkpoint(&primary, &idx_path)?;
+        let idx_path = base_dir.join("indexes").join(format!("{stem}_primary.idx"));
+        let (_, primary_stamp) = load_primary_checkpoint_with_stamp(&primary, &idx_path)?;
 
-        let wal_path = base_dir
-            .join("wal")
-            .join(format!("{}.wal", config.collection_name));
-        let shared_wal_mode = shared_wal.is_some();
+        // Secondary indexes. The paged tier may reuse its files only if they were written by the
+        // same checkpoint as the primary index (equal stamps) and nothing happened afterwards (no
+        // WAL frames to replay, checked below); otherwise they are rebuilt from the records.
+        let (range_index, tag_index, paged_stamp_matches) = match config.index_tier {
+            IndexTier::Memory => (
+                RangeIndex::Memory(NumericRangeIndex::new()),
+                TagIndex::Memory(BitmapTagIndex::new()),
+                false,
+            ),
+            IndexTier::Paged => {
+                let range_path = base_dir.join("indexes").join(format!("{stem}_range.idx"));
+                let tags_path = base_dir.join("indexes").join(format!("{stem}_tags.idx"));
+                let range = PagedBTreeIndex::open(&range_path).ok();
+                let tags = PagedBitmapIndex::open(&tags_path).ok();
+                let matches = match (&range, &tags, primary_stamp) {
+                    (Some(r), Some(t), Some(stamp)) => {
+                        stamp != 0 && r.stamp() == stamp && t.stamp() == stamp
+                    }
+                    _ => false,
+                };
+                let (range, tags) = match (range, tags) {
+                    (Some(r), Some(t)) if matches => (r, t),
+                    _ => (fresh_paged_btree(&range_path)?, fresh_paged_bitmap(&tags_path)?),
+                };
+                (RangeIndex::Paged(range), TagIndex::Paged(tags), matches)
+            }
+        };
+
+        // Load the persisted HNSW graph (`F-HNSW-02`). It is reconciled against the records in
+        // `rebuild_secondary_indexes`, so a missing, stale or corrupted file only costs rebuild work.
+        let hnsw_path = base_dir.join("indexes").join(format!("{stem}_hnsw.idx"));
+        let (vector_index, hnsw_saved_generation) =
+            match HnswVectorIndex::load_from_disk(&hnsw_path, HnswConfig::default()) {
+                Ok(loaded) if hnsw_path.exists() => {
+                    let generation = loaded.generation();
+                    (loaded, generation)
+                }
+                _ => (HnswVectorIndex::new(HnswConfig::default()), u64::MAX),
+            };
+
+        let wal_dir = base_dir.join("wal");
+        let wal_path = wal_dir.join(format!("{stem}.wal"));
+        let wal_archive_dir = config
+            .wal_archive
+            .then(|| wal_dir.join("archive").join(&stem));
 
         let inner = Arc::new(SharedEngineInner {
             _dir_lock: dir_lock,
@@ -342,54 +535,93 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             arena,
             wal: None,
             shared_wal_mode,
-            range_index: NumericRangeIndex::new(),
-            tag_index: BitmapTagIndex::new(),
-            vector_index: HnswVectorIndex::new(HnswConfig::default()),
+            range_index,
+            tag_index,
+            checkpoint_serial: Mutex::new(()),
+            indexes_reused: AtomicBool::new(false),
+            decrypted: DecryptedCache::new(config.decrypted_cache_bytes),
+            vector_index,
             mvcc: MvccManager::new(),
             migrations: RwLock::new(SchemaRegistry::new()),
             flush_queue: Mutex::new(CoalescingQueue::default()),
             flush_cv: Condvar::new(),
             shutdown: AtomicBool::new(false),
-            total_reads: CachePadded::new(AtomicU64::new(0)),
-            total_writes: CachePadded::new(AtomicU64::new(0)),
+            total_reads: StripedCounter::new(),
+            total_writes: StripedCounter::new(),
             coalesced_flushes: CachePadded::new(AtomicU64::new(0)),
+            ttl_ordinals: RwLock::new(CompressedBitmap::new()),
+            idx_path: idx_path.clone(),
+            hnsw_path,
+            hnsw_saved_generation: AtomicU64::new(hnsw_saved_generation),
+            wal_archive_dir,
+            pending_file_removals: Mutex::new(Vec::new()),
         });
 
-        // Replay committed WAL frames if dedicated WAL exists (`F-DURA-04`)
+        // Replay committed WAL frames of a dedicated WAL (`F-DURA-04`). Every replayed record is
+        // flushed with `fsync` and checkpointed before the WAL is truncated below.
+        let mut replayed = false;
+        // Paged indexes are current only after a clean shutdown: a shared catalog WAL is replayed
+        // later by the catalog, and any recovered frame means a crash.
+        let mut paged_indexes_current = paged_stamp_matches && !shared_wal_mode;
         if !shared_wal_mode {
             let recovered = GroupCommitWal::recover_committed(&wal_path)?;
             if !recovered.is_empty() {
-                for entry in &recovered {
-                    if entry.collection_id != T::COLLECTION_ID && entry.collection_id != 0 {
-                        continue;
-                    }
-                    inner.replay_wal_entry(entry)?;
+                paged_indexes_current = false;
+                if inner.range_index.as_paged().is_some() {
+                    inner.reset_paged_indexes()?;
+                }
+                inner.replay_wal_entries(&recovered, false)?;
+                if let Some(ref arena) = inner.arena {
+                    arena.sync_all()?;
                 }
                 save_primary_checkpoint(&inner.primary, &idx_path)?;
+                replayed = true;
             }
         }
 
-        // Open fresh WAL for active writes (or attach shared catalog WAL)
+        // Open the WAL for active writes (or attach the shared catalog WAL)
         let wal = if let Some(shared) = shared_wal {
             Some(shared)
-        } else if config.enable_wal {
+        } else if config.enable_wal || replayed {
             let w = GroupCommitWal::open(&wal_path, config.wal_sync_policy)?;
-            w.checkpoint_truncate()?;
-            Some(Arc::new(w))
+            if replayed {
+                w.checkpoint_truncate_before(
+                    w.current_lsn(),
+                    &|_| false,
+                    inner.wal_archive_dir.as_deref(),
+                )?;
+            }
+            config.enable_wal.then(|| Arc::new(w))
         } else {
             None
         };
 
-        // Unsafe-free reconstruction with active WAL
         let inner = {
-            let mut inner_mut = Arc::try_unwrap(inner)
-                .unwrap_or_else(|_| unreachable!("unique Arc during open"));
+            let mut inner_mut = Arc::try_unwrap(inner).map_err(|_| {
+                StorageError::resource_exhausted("engine state unexpectedly shared during open")
+            })?;
             inner_mut.wal = wal;
             Arc::new(inner_mut)
         };
 
-        // Rebuild in-memory secondary indexes from live checkpointed records
-        inner.rebuild_secondary_indexes()?;
+        // Arena segments referenced by no record (left over from compaction whose deletion
+        // failed, or superseded by replay) are reclaimed.
+        inner.remove_unreferenced_segments();
+
+        // Rebuild the secondary indexes from the records unless reusable paged indexes were
+        // loaded (TTL bitmap and vector graph are always reconciled).
+        let rebuild_postings = !paged_indexes_current;
+        inner
+            .indexes_reused
+            .store(paged_indexes_current, Ordering::Relaxed);
+        if rebuild_postings && inner.range_index.as_paged().is_some() && !replayed {
+            inner.reset_paged_indexes()?;
+        }
+        inner.rebuild_secondary_indexes(rebuild_postings)?;
+        if rebuild_postings && inner.range_index.as_paged().is_some() {
+            // Persist the rebuilt indexes now (no writers yet), so the next clean open reuses them.
+            inner.save_checkpoint_files()?;
+        }
 
         let flusher_handle = if config.background_flush {
             let bg_inner = Arc::clone(&inner);
@@ -423,12 +655,28 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
     }
 
     #[inline]
-    pub fn range_index(&self) -> &NumericRangeIndex {
+    /// WAL body for an upsert of `id` (sealed when encryption at rest is enabled).
+    pub(crate) fn wal_frame_bytes(&self, id: InlineId, frame: &[u8]) -> Result<Vec<u8>> {
+        self.inner.wal_frame_bytes(id, frame)
+    }
+
+    /// Bytes currently held by the decrypted-frame cache (`0` without encryption).
+    pub fn decrypted_cache_bytes(&self) -> usize {
+        self.inner.decrypted.bytes()
+    }
+
+    /// `true` if this open reused persisted paged secondary indexes (`IndexTier::Paged` after a
+    /// clean shutdown) instead of rebuilding them from the records.
+    pub fn secondary_indexes_reused(&self) -> bool {
+        self.inner.indexes_reused.load(Ordering::Relaxed)
+    }
+
+    pub fn range_index(&self) -> &RangeIndex {
         &self.inner.range_index
     }
 
     #[inline]
-    pub fn tag_index(&self) -> &BitmapTagIndex {
+    pub fn tag_index(&self) -> &TagIndex {
         &self.inner.tag_index
     }
 
@@ -461,12 +709,23 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         self.inner.wal.as_ref().map_or(0, |w| w.current_lsn())
     }
 
-    /// Rotates the active WAL file into an immutable `wal_XXXXXX.log` segment for PITR archival (`TASK-040`).
-    pub fn rotate_wal_segment(&self) -> Result<Option<PathBuf>> {
-        if let Some(ref wal) = self.inner.wal {
-            Ok(Some(wal.rotate_segment()?))
-        } else {
-            Ok(None)
+    /// Directory receiving WAL frames removed by checkpoints, when `EngineConfig::wal_archive` is set.
+    #[inline]
+    pub fn wal_archive_dir(&self) -> Option<&Path> {
+        self.inner.wal_archive_dir.as_deref()
+    }
+
+    /// Copies the current active WAL (frames not yet checkpointed) to `dest`.
+    pub fn copy_active_wal(&self, dest: &Path) -> Result<bool> {
+        if self.inner.shared_wal_mode {
+            return Ok(false);
+        }
+        match self.inner.wal {
+            Some(ref wal) => {
+                wal.copy_active_to(dest)?;
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 
@@ -589,77 +848,75 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         id: InlineId,
         f: impl FnOnce(RecordView<'_, T>) -> R,
     ) -> Result<R> {
-        self.inner.total_reads.fetch_add(1, Ordering::Relaxed);
-        let mut f_opt = Some(f);
+        self.inner.total_reads.add(1);
 
-        // Fast path: check `hot_dirty`, `Arena`, or warm `MmapPool` inside shard read lock (0 allocs, 0 refcount ops!)
-        let fast_hit = self.inner.primary.with_entry(id, |entry| {
+        // Resolve the backing bytes under the shard read lock, but run `f` only after releasing
+        // it (Arc bumps only, 0 heap allocations), so `f` may freely call back into the engine.
+        let resolved = self.inner.primary.with_entry(id, |entry| -> Result<FastRead> {
             if entry.ttl_expires_at_ns > 0 && current_time_ns() >= entry.ttl_expires_at_ns {
-                return Some(Err(StorageError::not_found(id)));
+                return Err(StorageError::not_found(id));
             }
             if let Some(ref dirty) = entry.hot_dirty {
-                let slice = dirty.as_slice();
-                // SAFETY: `dirty` was produced by `RecordCodec::encode_aligned` and is 64B-aligned.
-                let hdr = unsafe { RecordHeader::from_aligned_unchecked(slice) };
-                if !hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4) {
-                    // SAFETY: `dirty` was produced by `encode_aligned`; header validated above.
-                    let view = unsafe { RecordCodec::decode_unchecked::<T>(slice) };
-                    let cb = f_opt.take().expect("f_opt consumed once");
-                    return Some(Ok(cb(view)));
+                let compressed = RecordCodec::header_ref(dirty.as_slice())
+                    .map_or(true, |h| h.flags_typed().contains(RecordFlags::COMPRESSED_LZ4));
+                if !compressed {
+                    return Ok(FastRead::Dirty(dirty.clone()));
                 }
+            }
+            if self.inner.config.encryption_key.is_some() {
+                // Ciphertext is never read in place: serve the cached plaintext or go cold.
+                return Ok(match self.inner.decrypted.get(id, entry.version) {
+                    Some(plain) => FastRead::Dirty(plain),
+                    None => FastRead::Cold,
+                });
             }
             match entry.location {
                 DiskLocation::Arena(loc) if entry.disk_verified => {
                     if let Some(ref arena) = self.inner.arena {
-                        let cb = f_opt.take().expect("f_opt consumed once");
-                        let res = arena.with_slice(loc, |slice| {
-                            // SAFETY: `entry.disk_verified` is true, proving `validate_frame` succeeded
-                            // and the frame is uncompressed and 64B-aligned.
-                            let view = unsafe { RecordCodec::decode_unchecked::<T>(slice) };
-                            Ok(cb(view))
-                        });
-                        return Some(res);
+                        return Ok(FastRead::Arena(arena.get_region(loc.segment_id)?, loc));
                     }
                 }
                 DiskLocation::DedicatedFile {
                     ping_pong_stride: 0,
                     ..
                 } => {
-                    if let Some(res) = self.inner.mmap_pool.with_verified_slice(id, |slice| {
-                        // SAFETY: `with_verified_slice` only invokes the closure when `is_verified()` is true.
-                        let view = unsafe { RecordCodec::decode_unchecked::<T>(slice) };
-                        let cb = f_opt.take().expect("f_opt consumed once");
-                        Ok(cb(view))
-                    }) {
-                        return Some(res);
+                    if let Some(guard) = self.inner.mmap_pool.get_if_mapped(id) {
+                        if guard.is_verified() {
+                            return Ok(FastRead::Mapped(guard));
+                        }
                     }
                 }
                 _ => {}
             }
-            None
+            Ok(FastRead::Cold)
         });
 
-        match fast_hit {
-            Some(Some(res)) => res,
-            None => Err(StorageError::not_found(id)),
-            Some(None) => {
+        match resolved.ok_or_else(|| StorageError::not_found(id))?? {
+            // O(1) safe decode: the frame was fully validated once (encode / `validate_frame`);
+            // holding `region` / `guard` keeps the bytes mapped and blocks in-place slot reuse.
+            FastRead::Dirty(bytes) => Ok(f(RecordCodec::decode_fast::<T>(bytes.as_slice())?)),
+            FastRead::Arena(region, loc) => {
+                let slice = region.subslice_aligned(loc.offset as usize, loc.len as usize)?;
+                Ok(f(RecordCodec::decode_fast::<T>(slice)?))
+            }
+            FastRead::Mapped(guard) => Ok(f(RecordCodec::decode_fast::<T>(guard.as_slice())?)),
+            FastRead::Cold => {
                 // Cold path: map from disk, validate once, and invoke `f`
-                let rec_ref = self.get_ref(id)?;
-                let cb = f_opt.take().expect("f_opt not consumed on cold path");
-                Ok(cb(rec_ref.view()))
+                let rec_ref = self.inner.get_ref_internal(id)?;
+                Ok(f(rec_ref.view()))
             }
         }
     }
 
     /// Returns a zero-copy `RecordRef<T>` guard for `id` (`F-CORE-01`).
     pub fn get_ref(&self, id: InlineId) -> Result<RecordRef<T>> {
-        self.inner.total_reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.total_reads.add(1);
         self.inner.get_ref_internal(id)
     }
 
     /// Materializes an owned copy of `T` (automatically running schema migration or cold LZ4 decompression if needed).
     pub fn get_owned(&self, id: InlineId) -> Result<(Version, T)> {
-        self.inner.total_reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.total_reads.add(1);
         self.inner.get_owned_internal(id)
     }
 
@@ -667,13 +924,16 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
     pub fn insert(&self, id: InlineId, record: &T) -> Result<Version> {
         let _lock = self.inner.locks.lock_one(id);
         let now_ns = current_time_ns();
+        let mut version = Version::INITIAL;
         if let Some(existing) = self.inner.primary.get(id) {
             if existing.ttl_expires_at_ns == 0 || now_ns < existing.ttl_expires_at_ns {
                 return Err(StorageError::already_exists(id));
             }
+            // Replacing an expired record keeps the version monotonic (no OCC ABA).
+            version = existing.version.next();
         }
         self.inner
-            .write_record_locked(id, None, record, Version::INITIAL, now_ns, 0, RecordFlags::NONE)
+            .write_record_locked(id, None, record, version, now_ns, 0, RecordFlags::NONE)
     }
 
     /// Inserts or overwrites a record under `id` (optionally grouped under `parent_group` folder).
@@ -871,19 +1131,20 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                         WalOpKind::Upsert,
                         id_a,
                         next_a,
-                        frame_a.as_slice().to_vec(),
+                        self.inner.wal_frame_bytes(id_a, frame_a.as_slice())?,
                     ),
                     (
                         T::COLLECTION_ID,
                         WalOpKind::Upsert,
                         id_b,
                         next_b,
-                        frame_b.as_slice().to_vec(),
+                        self.inner.wal_frame_bytes(id_b, frame_b.as_slice())?,
                     ),
                 ],
             )?;
         }
 
+        let _mvcc_gate = self.inner.mvcc.writer_guard();
         self.inner
             .apply_encoded_upsert_locked(id_a, pg_a, &draft_a, next_a, now_ns, ttl_a, frame_a)?;
         self.inner
@@ -907,13 +1168,60 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         FRel: Fn(&T) -> Vec<InlineId>,
         FUnlink: FnMut(&mut T, InlineId),
     {
-        let (_, target_owned) = self.get_owned(id)?;
-        let related_ids = extract_related(&target_owned);
+        // The set of records to lock depends on record contents, which may change until locked:
+        // compute it, lock it, recompute it under the locks, and retry if it grew.
+        let compute_set = |policy: OnDelete| -> Result<Vec<InlineId>> {
+            let (_, target) = self.get_owned(id)?;
+            let mut set = vec![id];
+            match policy {
+                OnDelete::Restrict | OnDelete::Unlink => set.extend(extract_related(&target)),
+                OnDelete::Cascade => {
+                    let mut visited = FastHashSet::default();
+                    visited.insert(id);
+                    let mut queue = VecDeque::new();
+                    queue.push_back(target);
+                    while let Some(rec) = queue.pop_front() {
+                        for child in extract_related(&rec) {
+                            if visited.insert(child) {
+                                set.push(child);
+                                if let Ok((_, child_rec)) = self.get_owned(child) {
+                                    queue.push_back(child_rec);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            set.sort_unstable();
+            set.dedup();
+            Ok(set)
+        };
+
+        let mut locked_set = compute_set(policy)?;
+        let mut attempts = 0usize;
+        let (_guards, related) = loop {
+            let guards = self.inner.locks.lock_many(&locked_set);
+            let current = compute_set(policy)?;
+            if current.iter().all(|k| locked_set.binary_search(k).is_ok()) {
+                break (guards, current);
+            }
+            drop(guards);
+            attempts += 1;
+            if attempts >= 16 {
+                return Err(StorageError::TransactionAborted {
+                    reason: "relationship set kept changing while acquiring locks",
+                });
+            }
+            locked_set.extend(current);
+            locked_set.sort_unstable();
+            locked_set.dedup();
+        };
+        let peers: Vec<InlineId> = related.into_iter().filter(|&k| k != id).collect();
 
         match policy {
             OnDelete::Restrict => {
-                for peer_id in related_ids {
-                    if self.inner.primary.get(peer_id).is_some() {
+                for &peer_id in &peers {
+                    if self.inner.live_version(peer_id).is_some() {
                         return Err(StorageError::integrity_violation(
                             id,
                             peer_id,
@@ -921,59 +1229,82 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                         ));
                     }
                 }
-                let deleted = self.delete(id)?;
-                Ok(usize::from(deleted))
+                Ok(usize::from(self.inner.delete_record_locked(id)?))
             }
             OnDelete::Unlink => {
-                let mut all_ids = Vec::with_capacity(related_ids.len() + 1);
-                all_ids.push(id);
-                all_ids.extend(related_ids.iter().copied());
-                let _guards = self.inner.locks.lock_many(&all_ids);
-
+                // Unlink every live peer and delete `id` in ONE atomic WAL transaction.
                 let now_ns = current_time_ns();
-                for peer_id in related_ids {
-                    if peer_id == id {
-                        continue;
-                    }
-                    if let Ok((peer_ver, mut peer_draft, pg, ttl, flags)) =
+                let mut staged = Vec::with_capacity(peers.len());
+                for &peer_id in &peers {
+                    if let Ok((peer_ver, mut draft, pg, ttl, flags)) =
                         self.inner.load_mutable_draft_locked(peer_id)
                     {
-                        unlink_from_peer(&mut peer_draft, id);
-                        let _ = self.inner.write_record_locked(
-                            peer_id,
-                            pg,
-                            &peer_draft,
-                            peer_ver.next(),
-                            now_ns,
-                            ttl,
-                            flags,
-                        )?;
+                        unlink_from_peer(&mut draft, id);
+                        let next = peer_ver.next();
+                        let frame = RecordCodec::encode_aligned(&draft, next, now_ns, flags, ttl);
+                        staged.push((peer_id, pg, draft, next, ttl, frame));
                     }
                 }
-                let deleted = self.inner.delete_record_locked(id)?;
-                Ok(usize::from(deleted))
+                let Some(target_ver) = self.inner.live_version(id) else {
+                    return Ok(0);
+                };
+                if let Some(ref wal) = self.inner.wal {
+                    let mut ops = Vec::with_capacity(staged.len() + 1);
+                    for (peer_id, _, _, next, _, frame) in &staged {
+                        ops.push((
+                            T::COLLECTION_ID,
+                            WalOpKind::Upsert,
+                            *peer_id,
+                            *next,
+                            self.inner.wal_frame_bytes(*peer_id, frame.as_slice())?,
+                        ));
+                    }
+                    ops.push((
+                        T::COLLECTION_ID,
+                        WalOpKind::Delete,
+                        id,
+                        target_ver.next(),
+                        now_ns.to_le_bytes().to_vec(),
+                    ));
+                    wal.append_transaction(wal.allocate_txn_id(), ops)?;
+                }
+                let _mvcc_gate = self.inner.mvcc.writer_guard();
+                for (peer_id, pg, draft, next, ttl, frame) in staged {
+                    self.inner
+                        .apply_encoded_upsert_locked(peer_id, pg, &draft, next, now_ns, ttl, frame)?;
+                }
+                Ok(usize::from(self.inner.remove_record_after_wal_locked(id)))
             }
             OnDelete::Cascade => {
-                let mut visited = FastHashSet::default();
-                let mut queue = VecDeque::new();
-                queue.push_back(id);
-                visited.insert(id);
-
-                while let Some(cur) = queue.pop_front() {
-                    if let Ok((_, rec)) = self.get_owned(cur) {
-                        for child in extract_related(&rec) {
-                            if visited.insert(child) {
-                                queue.push_back(child);
-                            }
-                        }
+                let mut all: Vec<(InlineId, Version)> = Vec::with_capacity(peers.len() + 1);
+                for k in core::iter::once(id).chain(peers.iter().copied()) {
+                    if let Some(v) = self.inner.live_version(k) {
+                        all.push((k, v));
                     }
                 }
-
-                let all_to_delete: Vec<InlineId> = visited.into_iter().collect();
-                let _guards = self.inner.locks.lock_many(&all_to_delete);
+                if all.is_empty() {
+                    return Ok(0);
+                }
+                if let Some(ref wal) = self.inner.wal {
+                    let now_ns = current_time_ns();
+                    let ops = all
+                        .iter()
+                        .map(|&(k, v)| {
+                            (
+                                T::COLLECTION_ID,
+                                WalOpKind::Delete,
+                                k,
+                                v.next(),
+                                now_ns.to_le_bytes().to_vec(),
+                            )
+                        })
+                        .collect();
+                    wal.append_transaction(wal.allocate_txn_id(), ops)?;
+                }
+                let _mvcc_gate = self.inner.mvcc.writer_guard();
                 let mut count = 0usize;
-                for del_id in all_to_delete {
-                    if self.inner.delete_record_locked(del_id)? {
+                for (k, _) in all {
+                    if self.inner.remove_record_after_wal_locked(k) {
                         count += 1;
                     }
                 }
@@ -1037,44 +1368,52 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
     }
 
     /// Sweeps and deletes all records whose TTL has expired as of `now_ns` (`TASK-027`, `F-OPS-02`).
+    ///
+    /// `O(#TTL records)`: walks the TTL ordinal bitmap instead of the whole primary index. Expiry
+    /// is re-checked under each record's stripe lock, so a key rewritten without a TTL after the
+    /// scan is never deleted.
     pub fn sweep_expired(&self) -> Result<usize> {
-        let now_ns = current_time_ns();
-        let entries = self.inner.primary.entries_snapshot();
+        let Some(expired) = self.inner.expired_ordinals() else {
+            return Ok(0);
+        };
         let mut expired_count = 0usize;
-        for entry in entries {
-            if entry.ttl_expires_at_ns > 0 && now_ns >= entry.ttl_expires_at_ns
-                && self.delete(entry.id)? {
-                    expired_count += 1;
-                }
+        for ord in expired.to_vec() {
+            let Some(id) = self.inner.primary.resolve_ordinal(ord) else {
+                continue;
+            };
+            let _lock = self.inner.locks.lock_one(id);
+            if self.inner.live_version(id).is_none() && self.inner.delete_record_locked(id)? {
+                expired_count += 1;
+            }
         }
         Ok(expired_count)
     }
 
     /// Flushes all pending coalesced dirty records to disk and writes an updated `primary.idx` checkpoint.
     pub fn flush_all(&self) -> Result<usize> {
-        let flushed = self.inner.drain_and_flush_all()?;
-        let idx_path = self
-            .inner
-            .paths
-            .base_dir()
-            .join("indexes")
-            .join(format!("{}_primary.idx", self.inner.config.collection_name));
-        save_primary_checkpoint(&self.inner.primary, &idx_path)?;
-        if !self.inner.vector_index.is_empty() {
-            let hnsw_path = self
-                .inner
-                .paths
-                .base_dir()
-                .join("indexes")
-                .join(format!("{}_hnsw.idx", self.inner.config.collection_name));
-            let _ = self.inner.vector_index.save_to_disk(&hnsw_path);
-        }
-        if !self.inner.shared_wal_mode {
-            if let Some(ref wal) = self.inner.wal {
-                wal.checkpoint_truncate()?;
-            }
-        }
+        // Pick the WAL cutoff first, then wait out in-flight writes: every write whose WAL frame
+        // has `lsn <= cutoff` holds its stripe lock until applied, so after the barrier all of
+        // them are in `hot_dirty` and will be drained below. Later writes keep their WAL frames.
+        let cutoff = self.inner.wal.as_ref().map_or(0, |w| w.current_lsn());
+        self.inner.locks.barrier();
+        let flushed = self.inner.drain_and_flush_all(false)?;
+        self.inner.checkpoint_and_truncate(cutoff)?;
         Ok(flushed)
+    }
+
+    /// Makes every acknowledged write durable on stable storage regardless of the configured
+    /// `SyncPolicy` (`fsync` of the WAL; a full [`Self::flush_all`] when the engine has no WAL).
+    pub fn sync_wal(&self) -> Result<()> {
+        match self.inner.wal {
+            Some(ref wal) => wal.sync_to_disk(),
+            None => self.flush_all().map(|_| ()),
+        }
+    }
+
+    /// Full durable checkpoint (alias of [`Self::flush_all`]).
+    #[inline]
+    pub fn checkpoint(&self) -> Result<usize> {
+        self.flush_all()
     }
 
     /// Appends an incremental $O(\Delta)$ delta frame (`STGEDLT2`) of modified `upserted_ids` and
@@ -1086,14 +1425,12 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         deleted_ids: &[InlineId],
     ) -> Result<usize> {
         for &id in upserted_ids {
-            let _ = self.inner.flush_single_record_to_disk(id, false)?;
+            let _ = self.inner.flush_single_record_to_disk(id, true)?;
         }
-        let idx_path = self
-            .inner
-            .paths
-            .base_dir()
-            .join("indexes")
-            .join(format!("{}_primary.idx", self.inner.config.collection_name));
+        if let Some(ref arena) = self.inner.arena {
+            arena.sync_all()?;
+        }
+        let idx_path = self.inner.idx_path.clone();
         let written = append_primary_checkpoint_delta(
             &self.inner.primary,
             &idx_path,
@@ -1103,7 +1440,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         let delta_path = delta_checkpoint_path(&idx_path);
         if let Ok(meta) = fs::metadata(&delta_path) {
             if meta.len() >= 1024 * 1024 {
-                save_primary_checkpoint(&self.inner.primary, &idx_path)?;
+                self.inner.save_checkpoint_files()?;
             }
         }
         Ok(written)
@@ -1149,9 +1486,19 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                     let slice =
                         region.subslice_aligned(cur_loc.offset as usize, cur_loc.len as usize)?;
                     let raw_hdr = RecordHeader::from_slice_verified(slice)?;
+                    // Encrypted frames: authenticate (decrypt) before trusting them; migrations
+                    // decode the plaintext and re-seal the upgraded frame.
+                    let plain = match self.inner.config.encryption_key {
+                        Some(ref key) => Some(RecordCodec::decrypt_frame(key, cur.id, slice)?),
+                        None => None,
+                    };
+                    let plain_slice = plain.as_ref().map_or(slice, |p| p.as_slice());
                     if raw_hdr.schema_version != T::SCHEMA_VERSION {
-                        let (_, upgraded) = self.inner.decode_or_migrate_frame(slice)?;
-                        let flags = raw_hdr.flags_typed().without(RecordFlags::COMPRESSED_LZ4);
+                        let (_, upgraded) = self.inner.decode_or_migrate_frame(plain_slice)?;
+                        let flags = raw_hdr
+                            .flags_typed()
+                            .without(RecordFlags::COMPRESSED_LZ4)
+                            .without(RecordFlags::ENCRYPTED);
                         let reencoded = RecordCodec::encode_aligned(
                             &upgraded,
                             cur.version,
@@ -1159,20 +1506,26 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                             flags,
                             cur.ttl_expires_at_ns,
                         );
-                        let new_loc = arena.write_record(reencoded.as_slice(), false)?;
+                        let sealed = self.inner.seal_for_disk(cur.id, reencoded.as_slice())?;
+                        let to_write = sealed.as_ref().map_or(reencoded.as_slice(), |s| s.as_slice());
+                        let new_loc = arena.write_record(to_write, false)?;
+                        self.inner.decrypted.remove(cur.id);
                         self.inner.primary.upsert(PrimaryEntry {
                             id: cur.id,
                             ordinal: cur.ordinal,
                             version: cur.version,
                             ttl_expires_at_ns: cur.ttl_expires_at_ns,
                             location: DiskLocation::Arena(new_loc),
-                            disk_verified: true,
+                            disk_verified: sealed.is_none(),
                             hot_dirty: None,
                         });
                     } else {
-                        let hdr = RecordCodec::validate_frame::<T>(slice)?;
+                        let hdr = RecordCodec::validate_frame::<T>(plain_slice)?;
+                        // Ciphertext is copied unchanged: it is bound to the record id, not to
+                        // its location.
                         let new_loc = arena.write_record(slice, false)?;
-                        let verified = !hdr.is_tombstone()
+                        let verified = plain.is_none()
+                            && !hdr.is_tombstone()
                             && !hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4);
                         self.inner.primary.upsert(PrimaryEntry {
                             id: cur.id,
@@ -1204,24 +1557,31 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             }
         }
 
-        let idx_path = self
-            .inner
-            .paths
-            .base_dir()
-            .join("indexes")
-            .join(format!("{}_primary.idx", self.inner.config.collection_name));
-        save_primary_checkpoint(&self.inner.primary, &idx_path)?;
+        // Evacuated frames must be durable before the checkpoint stops referencing old segments.
+        arena.sync_all()?;
+        self.inner.save_checkpoint_files()?;
         Ok(removed_segments)
     }
 
     /// Creates a consistent point-in-time snapshot of the entire database at `dest_dir` (`TASK-027`, `F-OPS-04`).
     pub fn create_snapshot(&self, dest_dir: &Path) -> Result<usize> {
-        self.flush_all()?;
-        if dest_dir.exists() {
-            fs::remove_dir_all(dest_dir)
-                .map_err(|e| StorageError::io("clear snapshot destination directory", e))?;
-        }
-        copy_dir_recursive(self.inner.paths.base_dir(), dest_dir)
+        Ok(self.create_snapshot_with_lsn(dest_dir)?.0)
+    }
+
+    /// Creates a consistent snapshot copy of the database directory at `dest_dir` and returns
+    /// `(files_copied, wal_lsn)`, where every operation with `lsn <= wal_lsn` is in the copy.
+    ///
+    /// Writers are paused (all stripe locks held) only while dirty records are flushed and the
+    /// files are copied; readers continue. `dest_dir` must be empty or absent and must not be
+    /// inside the database directory (existing data is never deleted).
+    pub fn create_snapshot_with_lsn(&self, dest_dir: &Path) -> Result<(usize, u64)> {
+        ensure_fresh_destination(dest_dir, Some(self.inner.paths.base_dir()))?;
+        let _all = self.inner.locks.lock_all();
+        let lsn = self.inner.wal.as_ref().map_or(0, |w| w.current_lsn());
+        self.inner.drain_and_flush_all(true)?;
+        self.inner.checkpoint_and_truncate(lsn)?;
+        let copied = copy_dir_recursive(self.inner.paths.base_dir(), dest_dir)?;
+        Ok((copied, lsn))
     }
 
     /// Returns a snapshot of engine telemetry and performance counters (`F-OPS-06`).
@@ -1236,8 +1596,8 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         EngineStats {
             live_records: self.inner.primary.len(),
             hot_dirty_bytes: self.inner.primary.hot_dirty_bytes(),
-            total_reads: self.inner.total_reads.load(Ordering::Relaxed),
-            total_writes: self.inner.total_writes.load(Ordering::Relaxed),
+            total_reads: self.inner.total_reads.sum(),
+            total_writes: self.inner.total_writes.sum(),
             coalesced_flushes: self.inner.coalesced_flushes.load(Ordering::Relaxed),
             wal_batches,
             wal_frames,
@@ -1253,9 +1613,21 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         self.inner.locks.lock_many(ids)
     }
 
+    /// Current version of a live (present and not expired) record.
     #[inline]
     pub(crate) fn current_version(&self, id: InlineId) -> Option<Version> {
-        self.inner.primary.get(id).map(|e| e.version)
+        self.inner.live_version(id)
+    }
+
+    /// Shared MVCC writer gate; hold it across the apply phase of a multi-record commit.
+    #[inline]
+    pub(crate) fn mvcc_writer_guard(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.inner.mvcc.writer_guard()
+    }
+
+    /// Ordinals of records whose TTL has expired (`None` when there are none).
+    pub(crate) fn expired_ordinals(&self) -> Option<CompressedBitmap> {
+        self.inner.expired_ordinals()
     }
 
     #[inline]
@@ -1272,43 +1644,19 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
     }
 
     pub(crate) fn apply_tx_delete_locked(&self, id: InlineId) -> Result<bool> {
-        if let Some(removed) = self.inner.primary.remove(id) {
-            self.inner.remove_from_secondary_indexes(&removed);
-            self.inner.primary.release_ordinal(removed.ordinal);
-            self.inner.mmap_pool.invalidate(id);
-            match removed.location {
-                DiskLocation::DedicatedFile { parent_group, .. } => {
-                    if let Ok(path) = self.inner.paths.full_record_path(
-                        &self.inner.config.collection_name,
-                        parent_group,
-                        id,
-                    ) {
-                        let _ = fs::remove_file(path);
-                    }
-                }
-                DiskLocation::Arena(loc) => {
-                    if let Some(ref arena) = self.inner.arena {
-                        arena.mark_dead(loc);
-                    }
-                }
-                DiskLocation::Unflushed => {}
-            }
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        Ok(self.inner.remove_record_after_wal_locked(id))
     }
 
-    pub(crate) fn replay_wal_entry(&self, entry: &WalEntry) -> Result<()> {
-        self.inner.replay_wal_entry(entry)?;
-        let idx_path = self
-            .inner
-            .paths
-            .base_dir()
-            .join("indexes")
-            .join(format!("{}_primary.idx", self.inner.config.collection_name));
-        save_primary_checkpoint(&self.inner.primary, &idx_path)?;
-        self.inner.rebuild_secondary_indexes()?;
+    /// Replays recovered WAL entries (secondary indexes maintained), then writes one checkpoint.
+    pub(crate) fn replay_wal_entries(&self, entries: &[WalEntry]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        self.inner.replay_wal_entries(entries, true)?;
+        if let Some(ref arena) = self.inner.arena {
+            arena.sync_all()?;
+        }
+        self.inner.save_checkpoint_files()?;
         Ok(())
     }
 
@@ -1373,8 +1721,12 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                     }
                 }
                 None => {
-                    for entry in self.inner.primary.entries_snapshot() {
-                        score_id(entry.id, entry.ordinal, &mut hits);
+                    // Only records that have an embedding can match: enumerate the (small)
+                    // vector index, not the whole primary index.
+                    for ord in self.inner.vector_index.live_ordinals() {
+                        if let Some(id) = self.inner.primary.resolve_ordinal(ord) {
+                            score_id(id, ord, &mut hits);
+                        }
                     }
                 }
             }
@@ -1415,8 +1767,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         }
 
         if let Some(dirty_bytes) = entry.hot_dirty {
-            // SAFETY: `dirty_bytes` was encoded by `RecordCodec::encode_aligned` and is 64B-aligned.
-            let hdr = unsafe { RecordHeader::from_aligned_unchecked(dirty_bytes.as_slice()) };
+            let hdr = RecordCodec::header_ref(dirty_bytes.as_slice())?;
             if hdr.is_tombstone() || hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4) {
                 return Err(StorageError::invalid_archive(
                     "compressed or tombstone record must be read via get_owned",
@@ -1424,7 +1775,25 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             }
             return Ok(RecordRef {
                 backing: BackingSource::HotDirty(dirty_bytes),
-                _marker: core::marker::PhantomData,
+                _record: PhantomData,
+            });
+        }
+
+        if self.config.encryption_key.is_some() {
+            let (plain, current) = self.decrypted_disk_frame(&entry)?;
+            if !current {
+                // Older schema: callers fall back to `get_owned` (which migrates).
+                RecordCodec::validate_frame::<T>(plain.as_slice())?;
+            }
+            let hdr = RecordCodec::header_ref(plain.as_slice())?;
+            if hdr.is_tombstone() || hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4) {
+                return Err(StorageError::invalid_archive(
+                    "compressed or tombstone record must be read via get_owned",
+                ));
+            }
+            return Ok(RecordRef {
+                backing: BackingSource::HotDirty(plain),
+                _record: PhantomData,
             });
         }
 
@@ -1461,7 +1830,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                             offset: slot_off,
                             len,
                         },
-                        _marker: core::marker::PhantomData,
+                        _record: PhantomData,
                     })
                 } else {
                     if !guard.is_verified() {
@@ -1482,7 +1851,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                             offset: 0,
                             len,
                         },
-                        _marker: core::marker::PhantomData,
+                        _record: PhantomData,
                     })
                 }
             }
@@ -1510,7 +1879,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                         offset: loc.offset as usize,
                         len: loc.len as usize,
                     },
-                    _marker: core::marker::PhantomData,
+                    _record: PhantomData,
                 })
             }
         }
@@ -1528,6 +1897,10 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
 
         if let Some(ref dirty) = entry.hot_dirty {
             return self.decode_or_migrate_frame(dirty.as_slice());
+        }
+        if self.config.encryption_key.is_some() {
+            let (plain, _) = self.decrypted_disk_frame(&entry)?;
+            return self.decode_or_migrate_frame(plain.as_slice());
         }
 
         match entry.location {
@@ -1561,48 +1934,102 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         }
     }
 
-    fn replay_wal_entry(&self, entry: &WalEntry) -> Result<()> {
-        match entry.kind {
-            WalOpKind::Upsert => {
-                let aligned = AlignedBytes::copy_from_slice(&entry.frame_bytes);
-                let hdr = RecordHeader::from_slice_verified(&aligned)?;
-                let ord = self
-                    .primary
-                    .get(entry.record_id)
-                    .map(|e| e.ordinal)
-                    .unwrap_or_else(|| self.primary.allocate_ordinal(entry.record_id));
-                let prev_loc = self
-                    .primary
-                    .get(entry.record_id)
-                    .map(|e| e.location)
-                    .unwrap_or(DiskLocation::Unflushed);
-                self.primary.upsert(PrimaryEntry {
-                    id: entry.record_id,
-                    ordinal: ord,
-                    version: entry.version,
-                    ttl_expires_at_ns: hdr.ttl_expires_at_ns,
-                    location: prev_loc,
-                    disk_verified: false,
-                    hot_dirty: Some(aligned),
-                });
-                self.flush_single_record_to_disk(entry.record_id, true)?;
+    /// Replays committed WAL entries. Each upsert is flushed to disk with `fsync`.
+    /// When `maintain_indexes` is set, secondary indexes are diffed per entry (used when the
+    /// engine is already live); at open they are rebuilt from scratch afterwards instead.
+    fn replay_wal_entries(&self, entries: &[WalEntry], maintain_indexes: bool) -> Result<()> {
+        for entry in entries {
+            if entry.collection_id != T::COLLECTION_ID && entry.collection_id != 0 {
+                continue;
             }
-            WalOpKind::Delete => {
-                if let Some(removed) = self.primary.remove(entry.record_id) {
-                    self.primary.release_ordinal(removed.ordinal);
-                    self.mmap_pool.invalidate(entry.record_id);
-                    if let DiskLocation::DedicatedFile { parent_group, .. } = removed.location {
-                        if let Ok(p) = self.paths.full_record_path(
-                            &self.config.collection_name,
-                            parent_group,
-                            entry.record_id,
-                        ) {
-                            let _ = fs::remove_file(p);
+            let _lock = self.locks.lock_one(entry.record_id);
+            match entry.kind {
+                WalOpKind::Upsert => {
+                    let mut aligned = AlignedBytes::try_copy_from_slice(&entry.frame_bytes)?;
+                    if let Some(ref key) = self.config.encryption_key {
+                        if !RecordCodec::is_encrypted(aligned.as_slice()) {
+                            return Err(StorageError::invalid_archive(
+                                "plaintext WAL frame found in an encrypted database",
+                            ));
+                        }
+                        aligned = RecordCodec::decrypt_frame(key, entry.record_id, aligned.as_slice())?;
+                    }
+                    // WAL bytes are untrusted until validated for `T` (`RULE-SAFE-04`); frames of
+                    // an older schema are migrated and re-encoded at the current schema.
+                    match RecordCodec::validate_frame::<T>(&aligned) {
+                        Ok(_) => {}
+                        Err(StorageError::SchemaVersionMismatch { .. }) => {
+                            let (ver, upgraded) = self.decode_or_migrate_frame(&aligned)?;
+                            let old_hdr = RecordHeader::from_slice_verified(&aligned)?;
+                            aligned = RecordCodec::encode_aligned(
+                                &upgraded,
+                                ver,
+                                old_hdr.updated_at_ns,
+                                old_hdr.flags_typed().without(RecordFlags::COMPRESSED_LZ4),
+                                old_hdr.ttl_expires_at_ns,
+                            );
+                        }
+                        Err(e) => return Err(e),
+                    }
+                    let hdr = RecordHeader::from_slice_verified(&aligned)?;
+                    let existing = self.primary.get(entry.record_id);
+                    let old_snap = if maintain_indexes {
+                        existing
+                            .as_ref()
+                            .and_then(|e| self.extract_snapshot_for_entry(e))
+                            .unwrap_or_default()
+                    } else {
+                        IndexSnapshot::new()
+                    };
+                    let ord = existing
+                        .as_ref()
+                        .map(|e| e.ordinal)
+                        .unwrap_or_else(|| self.primary.allocate_ordinal(entry.record_id));
+                    let prev_loc = existing
+                        .as_ref()
+                        .map(|e| e.location)
+                        .unwrap_or(DiskLocation::Unflushed);
+                    {
+                        let _mvcc_gate = self.mvcc.writer_guard();
+                        self.mvcc.forget(entry.record_id);
+                        self.primary.upsert(PrimaryEntry {
+                            id: entry.record_id,
+                            ordinal: ord,
+                            version: entry.version,
+                            ttl_expires_at_ns: hdr.ttl_expires_at_ns,
+                            location: prev_loc,
+                            disk_verified: false,
+                            hot_dirty: Some(aligned.clone()),
+                        });
+                    }
+                    self.set_ttl_ordinal(ord, hdr.ttl_expires_at_ns > 0);
+                    self.flush_single_record_impl(entry.record_id, true, true, false)?;
+                    if maintain_indexes {
+                        let new_snap = self
+                            .extract_snapshot_from_frame(aligned.as_slice(), false)
+                            .unwrap_or_default();
+                        self.apply_index_snapshot_diff(ord, &old_snap, &new_snap);
+                        if old_snap.embedding_hash != new_snap.embedding_hash
+                            || old_snap.has_embedding != new_snap.has_embedding
+                        {
+                            match self.decode_or_migrate_frame(aligned.as_slice()) {
+                                Ok((_, owned)) => match owned.embedding_slice() {
+                                    Some(emb) if !emb.is_empty() => {
+                                        self.vector_index.insert(ord, emb);
+                                    }
+                                    _ => self.vector_index.remove(ord),
+                                },
+                                Err(_) => self.vector_index.remove(ord),
+                            }
                         }
                     }
                 }
+                WalOpKind::Delete => {
+                    let _mvcc_gate = self.mvcc.writer_guard();
+                    let _ = self.remove_record_after_wal_locked(entry.record_id);
+                }
+                _ => {}
             }
-            _ => {}
         }
         Ok(())
     }
@@ -1646,12 +2073,21 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         if let Some(ref dirty) = entry.hot_dirty {
             return Some(dirty.clone());
         }
+        if self.config.encryption_key.is_some() {
+            // MVCC history keeps plaintext in RAM, like `hot_dirty`.
+            return self.decrypted_disk_frame(entry).ok().map(|(f, _)| f);
+        }
+        self.read_disk_bytes_for_entry(entry)
+    }
+
+    /// Copies the frame bytes exactly as stored on disk for `entry` (ciphertext if encrypted).
+    fn read_disk_bytes_for_entry(&self, entry: &PrimaryEntry) -> Option<AlignedBytes> {
         match entry.location {
             DiskLocation::Unflushed => None,
             DiskLocation::Arena(loc) => {
                 let arena = self.arena.as_ref()?;
                 arena
-                    .with_slice(loc, |slice| Ok(AlignedBytes::copy_from_slice(slice)))
+                    .with_slice(loc, AlignedBytes::try_copy_from_slice)
                     .ok()
             }
             DiskLocation::DedicatedFile {
@@ -1670,9 +2106,53 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                 } else {
                     guard.as_slice()
                 };
-                Some(AlignedBytes::copy_from_slice(slice))
+                AlignedBytes::try_copy_from_slice(slice).ok()
             }
         }
+    }
+
+    /// The plaintext frame of an on-disk encrypted record and whether it validated as the current
+    /// schema (`true` for every cached frame). Decrypts and authenticates on a cache miss.
+    fn decrypted_disk_frame(&self, entry: &PrimaryEntry) -> Result<(AlignedBytes, bool)> {
+        let Some(ref key) = self.config.encryption_key else {
+            return Err(StorageError::invalid_key("encryption is not enabled"));
+        };
+        if let Some(plain) = self.decrypted.get(entry.id, entry.version) {
+            return Ok((plain, true));
+        }
+        let raw = self
+            .read_disk_bytes_for_entry(entry)
+            .ok_or_else(|| StorageError::not_found(entry.id))?;
+        if !RecordCodec::is_encrypted(raw.as_slice()) {
+            return Err(StorageError::invalid_archive(
+                "plaintext record frame found in an encrypted database",
+            ));
+        }
+        let plain = RecordCodec::decrypt_frame(key, entry.id, raw.as_slice())?;
+        match RecordCodec::validate_frame::<T>(plain.as_slice()) {
+            Ok(_) => {
+                self.decrypted.insert(entry.id, entry.version, plain.clone());
+                Ok((plain, true))
+            }
+            Err(StorageError::SchemaVersionMismatch { .. }) => Ok((plain, false)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The bytes to store on disk or in the WAL for `frame`: sealed when encryption is enabled.
+    fn seal_for_disk(&self, id: InlineId, frame: &[u8]) -> Result<Option<AlignedBytes>> {
+        match self.config.encryption_key {
+            Some(ref key) => RecordCodec::encrypt_frame(key, id, frame).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// WAL body for an upsert of `id` with `frame` (sealed when encryption is enabled).
+    pub(crate) fn wal_frame_bytes(&self, id: InlineId, frame: &[u8]) -> Result<Vec<u8>> {
+        Ok(match self.seal_for_disk(id, frame)? {
+            Some(sealed) => sealed.as_slice().to_vec(),
+            None => frame.to_vec(),
+        })
     }
 
     /// Extracts an `IndexSnapshot` on-the-fly directly from an existing record's `hot_dirty` or
@@ -1680,6 +2160,10 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
     fn extract_snapshot_for_entry(&self, entry: &PrimaryEntry) -> Option<IndexSnapshot> {
         if let Some(ref dirty) = entry.hot_dirty {
             return self.extract_snapshot_from_frame(dirty.as_slice(), true);
+        }
+        if self.config.encryption_key.is_some() {
+            let (plain, current) = self.decrypted_disk_frame(entry).ok()?;
+            return self.extract_snapshot_from_frame(plain.as_slice(), current);
         }
         match entry.location {
             DiskLocation::Unflushed => None,
@@ -1720,11 +2204,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         already_verified: bool,
     ) -> Option<IndexSnapshot> {
         if already_verified {
-            // SAFETY: `frame` is 64B-aligned and already validated for `T`.
-            let hdr = unsafe { RecordHeader::from_aligned_unchecked(frame) };
-            if !hdr.is_tombstone() && !hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4) {
-                // SAFETY: `already_verified` guarantees `frame` passed `validate_frame::<T>`.
-                let view = unsafe { RecordCodec::decode_unchecked::<T>(frame) };
+            if let Ok(view) = RecordCodec::decode_fast::<T>(frame) {
                 return T::extract_archived_snapshot(view.archived(), view.payload());
             }
         }
@@ -1754,14 +2234,9 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         };
         let (ver, owned) = if let Some(ref dirty) = entry.hot_dirty {
             let slice = dirty.as_slice();
-            // SAFETY: `dirty` was produced by `encode_aligned` and is 64B-aligned.
-            let hdr = unsafe { RecordHeader::from_aligned_unchecked(slice) };
-            if !hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4) {
-                // SAFETY: `dirty` was encoded in memory by `encode_aligned` at `T::SCHEMA_VERSION`; 64B-aligned.
-                let view = unsafe { RecordCodec::decode_unchecked::<T>(slice) };
-                (entry.version, view.to_owned_record()?)
-            } else {
-                self.decode_or_migrate_frame(slice)?
+            match RecordCodec::decode_fast::<T>(slice) {
+                Ok(view) => (entry.version, view.to_owned_record()?),
+                Err(_) => self.decode_or_migrate_frame(slice)?,
             }
         } else {
             self.get_owned_internal(id)?
@@ -1788,15 +2263,13 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         let frame = RecordCodec::encode_aligned(record, version, now_ns, flags, ttl_expires_at_ns);
 
         if let Some(ref wal) = self.wal {
-            wal.append_single(
-                T::COLLECTION_ID,
-                WalOpKind::Upsert,
-                id,
-                version,
-                frame.as_slice(),
-            )?;
+            // Borrow the plaintext frame unless it must be sealed (no copy on the plain path).
+            let sealed = self.seal_for_disk(id, frame.as_slice())?;
+            let body = sealed.as_ref().map_or(frame.as_slice(), |s| s.as_slice());
+            wal.append_single(T::COLLECTION_ID, WalOpKind::Upsert, id, version, body)?;
         }
 
+        let _mvcc_gate = self.mvcc.writer_guard();
         self.apply_encoded_upsert_locked(
             id,
             parent_group,
@@ -1809,6 +2282,10 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         Ok(version)
     }
 
+    /// Publishes an already-WAL-logged upsert in memory.
+    ///
+    /// Caller must hold the record's stripe lock and the MVCC writer guard
+    /// (`self.mvcc.writer_guard()`), which keeps snapshot registration atomic with the write.
     #[allow(clippy::too_many_arguments)]
     fn apply_encoded_upsert_locked(
         &self,
@@ -1821,6 +2298,8 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         frame: AlignedBytes,
     ) -> Result<()> {
         let existing = self.primary.get(id);
+        // History must be recorded BEFORE the new version becomes visible (snapshot readers
+        // re-check the chain after reading the current state).
         if self.mvcc.has_active_snapshots() {
             if let Some(ref old_entry) = existing {
                 let old_frame = self.read_raw_frame_for_entry(old_entry);
@@ -1831,6 +2310,8 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                     .seed_baseline_if_absent(id, Version::INITIAL, None);
             }
             self.mvcc.record_version(id, version, Some(frame.clone()));
+        } else {
+            self.mvcc.forget(id);
         }
 
         let ordinal = match &existing {
@@ -1842,14 +2323,23 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             .and_then(|e| self.extract_snapshot_for_entry(e))
             .unwrap_or_default();
 
-        let location = match existing.map(|e| e.location) {
+        // A record moved to a different parent group leaves its old file behind; it is removed
+        // once the new location has been written.
+        let mut orphaned_parent: Option<Option<InlineId>> = None;
+        let location = match existing.as_ref().map(|e| e.location) {
             Some(DiskLocation::DedicatedFile {
                 parent_group: old_pg,
                 ping_pong_stride,
-            }) => DiskLocation::DedicatedFile {
-                parent_group: parent_group.or(old_pg),
-                ping_pong_stride,
-            },
+            }) => {
+                let new_pg = parent_group.or(old_pg);
+                if new_pg != old_pg {
+                    orphaned_parent = Some(old_pg);
+                }
+                DiskLocation::DedicatedFile {
+                    parent_group: new_pg,
+                    ping_pong_stride,
+                }
+            }
             Some(other) => other,
             None => match self.config.layout_mode {
                 StorageLayoutMode::PingPongFiles { slot_stride } => DiskLocation::DedicatedFile {
@@ -1873,7 +2363,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             },
         };
 
-        // Differential secondary index update without any global IndexSnapshot map (`TASK-016`, `F-INDX-05`, `RULE-INDX-01`)
+        // Differential secondary index update without any global IndexSnapshot map (`TASK-016`, `F-INDX-05`, `RULE-MEM-02`)
         let new_snap = record.extract_index_snapshot();
         self.apply_index_snapshot_diff(ordinal, &old_snap, &new_snap);
         if old_snap.has_embedding != new_snap.has_embedding
@@ -1899,33 +2389,121 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             disk_verified: false,
             hot_dirty: Some(frame),
         });
+        self.set_ttl_ordinal(ordinal, ttl_expires_at_ns > 0);
 
-        self.total_writes.fetch_add(1, Ordering::Relaxed);
+        self.total_writes.add(1);
 
-        if self.config.background_flush {
-            // Backpressure guard: if unflushed dirty RAM exceeds `max_hot_dirty_bytes`, flush synchronously!
-            if self.primary.hot_dirty_bytes() >= self.config.max_hot_dirty_bytes {
+        let flush_now = orphaned_parent.is_some()
+            || !self.config.background_flush
+            || self.primary.hot_dirty_bytes() >= self.config.max_hot_dirty_bytes;
+        if flush_now {
+            if self.config.background_flush {
                 self.flush_cv.notify_one();
-                self.flush_single_record_to_disk_locked(id, false)?;
-            } else {
-                let mut q = self
-                    .flush_queue
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let was_empty = q.is_empty();
-                if !q.enqueue(id) {
-                    // `id` was already in the flush queue! This update coalesced in memory (`F-CONC-04`)!
-                    self.coalesced_flushes.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Err(e) = self.flush_single_record_to_disk_locked(id, self.data_sync()) {
+                // The write is already durable in the WAL and visible in memory: keep it dirty
+                // and retry on the next flush instead of reporting a failed write. Without a WAL
+                // the data would only live in RAM, so the error must surface.
+                if self.wal.is_none() {
+                    return Err(e);
                 }
-                if was_empty || q.order.len() == 256 {
-                    self.flush_cv.notify_one();
+                self.enqueue_flush(id);
+            } else if let Some(old_pg) = orphaned_parent {
+                if let Ok(path) =
+                    self.paths
+                        .full_record_path(&self.config.collection_name, old_pg, id)
+                {
+                    self.remove_record_file(id, path);
                 }
             }
         } else {
-            self.flush_single_record_to_disk_locked(id, false)?;
+            self.enqueue_flush(id);
         }
 
         Ok(())
+    }
+
+    /// Adds `id` to the coalescing flush queue and wakes the background flusher when useful.
+    fn enqueue_flush(&self, id: InlineId) {
+        let mut q = self
+            .flush_queue
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let was_empty = q.is_empty();
+        if !q.enqueue(id) {
+            // `id` was already in the flush queue! This update coalesced in memory (`F-CONC-04`)!
+            self.coalesced_flushes.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.config.background_flush && (was_empty || q.order.len() == 256) {
+            self.flush_cv.notify_one();
+        }
+    }
+
+    /// Whether data-file writes must be `fsync`ed (mirrors the WAL durability policy).
+    #[inline]
+    fn data_sync(&self) -> bool {
+        !matches!(self.config.wal_sync_policy, SyncPolicy::AsyncMemoryFirst)
+    }
+
+    #[inline]
+    fn set_ttl_ordinal(&self, ord: RecordOrdinal, has_ttl: bool) {
+        let present = self
+            .ttl_ordinals
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(ord);
+        if present != has_ttl {
+            let mut bm = self
+                .ttl_ordinals
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if has_ttl {
+                bm.insert(ord);
+            } else {
+                bm.remove(ord);
+            }
+        }
+    }
+
+    /// Current version of `id` if it exists and has not expired.
+    #[inline]
+    fn live_version(&self, id: InlineId) -> Option<Version> {
+        self.primary
+            .with_entry(id, |e| {
+                if e.ttl_expires_at_ns > 0 && current_time_ns() >= e.ttl_expires_at_ns {
+                    None
+                } else {
+                    Some(e.version)
+                }
+            })
+            .flatten()
+    }
+
+    /// Ordinals of TTL records that have expired (`None` when there are none). `O(#TTL records)`.
+    fn expired_ordinals(&self) -> Option<CompressedBitmap> {
+        let ttl = self
+            .ttl_ordinals
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ttl.is_empty() {
+            return None;
+        }
+        let now = current_time_ns();
+        let mut expired = CompressedBitmap::new();
+        for ord in ttl.to_vec() {
+            let is_expired = self
+                .primary
+                .resolve_ordinal(ord)
+                .and_then(|id| {
+                    self.primary
+                        .with_entry(id, |e| e.ttl_expires_at_ns > 0 && now >= e.ttl_expires_at_ns)
+                })
+                .unwrap_or(false);
+            if is_expired {
+                expired.insert(ord);
+            }
+        }
+        (!expired.is_empty()).then_some(expired)
     }
 
     #[inline]
@@ -1967,29 +2545,48 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         }
     }
 
+    /// Deletes `id`: WAL first (so a failed log write changes nothing), then memory and disk.
+    /// Caller must hold the record's stripe lock.
     fn delete_record_locked(&self, id: InlineId) -> Result<bool> {
-        let Some(removed) = self.primary.remove(id) else {
+        let Some(existing_version) = self.primary.version_of(id) else {
             return Ok(false);
         };
-
-        if self.mvcc.has_active_snapshots() {
-            let old_frame = self.read_raw_frame_for_entry(&removed);
-            self.mvcc
-                .seed_baseline_if_absent(id, removed.version, old_frame);
-            self.mvcc.record_version(id, removed.version.next(), None);
-        }
-
         if let Some(ref wal) = self.wal {
             wal.append_single(
                 T::COLLECTION_ID,
                 WalOpKind::Delete,
                 id,
-                removed.version.next(),
-                &[],
+                existing_version.next(),
+                &current_time_ns().to_le_bytes(),
             )?;
         }
+        let _mvcc_gate = self.mvcc.writer_guard();
+        Ok(self.remove_record_after_wal_locked(id))
+    }
 
+    /// Removes an already-WAL-logged deletion from memory and disk. Caller must hold the
+    /// record's stripe lock and the MVCC writer guard.
+    fn remove_record_after_wal_locked(&self, id: InlineId) -> bool {
+        let Some(existing) = self.primary.get(id) else {
+            return false;
+        };
+        self.decrypted.remove(id);
+        // Record the tombstone in MVCC history before the deletion becomes visible.
+        let snapshots_active = self.mvcc.has_active_snapshots();
+        if snapshots_active {
+            let old_frame = self.read_raw_frame_for_entry(&existing);
+            self.mvcc
+                .seed_baseline_if_absent(id, existing.version, old_frame);
+            self.mvcc.record_version(id, existing.version.next(), None);
+        } else {
+            self.mvcc.forget(id);
+        }
+
+        let Some(removed) = self.primary.remove(id) else {
+            return false;
+        };
         self.remove_from_secondary_indexes(&removed);
+        self.set_ttl_ordinal(removed.ordinal, false);
         self.primary.release_ordinal(removed.ordinal);
         self.mmap_pool.invalidate(id);
 
@@ -1999,12 +2596,12 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                     self.paths
                         .full_record_path(&self.config.collection_name, parent_group, id)
                 {
-                    let _ = fs::remove_file(path);
+                    self.remove_record_file(id, path);
                 }
             }
             DiskLocation::Arena(loc) => {
                 if let Some(ref arena) = self.arena {
-                    if self.mvcc.has_active_snapshots() {
+                    if snapshots_active {
                         arena.mark_dead(loc);
                     } else {
                         arena.reclaim_dead_slot(loc);
@@ -2013,25 +2610,104 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             }
             DiskLocation::Unflushed => {}
         }
-        Ok(true)
+        true
+    }
+
+    /// Removes a deleted record's file, queueing a retry if it is still in use (Windows).
+    fn remove_record_file(&self, id: InlineId, path: PathBuf) {
+        if fs::remove_file(&path).is_err() && path.exists() {
+            self.pending_file_removals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((id, path));
+        }
+    }
+
+    /// Retries queued file removals, skipping files whose record has since been re-created.
+    fn retry_pending_removals(&self) {
+        let mut pending = self
+            .pending_file_removals
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.retain(|(id, path)| {
+            if self.primary.version_of(*id).is_some() {
+                return false; // re-created: the file now belongs to the live record
+            }
+            fs::remove_file(path).is_err() && path.exists()
+        });
+    }
+
+    /// `fsync`s data files, saves the primary checkpoint and truncates WAL frames `<= cutoff`.
+    /// Caller guarantees every operation with `lsn <= cutoff` is applied and flushed.
+    fn checkpoint_and_truncate(&self, cutoff: u64) -> Result<()> {
+        if let Some(ref arena) = self.arena {
+            if self.data_sync() {
+                arena.sync_all()?;
+            }
+        }
+        self.save_checkpoint_files()?;
+        // Persist the vector graph only when it changed since the last save.
+        let generation = self.vector_index.generation();
+        if generation != self.hnsw_saved_generation.load(Ordering::Acquire) {
+            self.vector_index.save_to_disk(&self.hnsw_path)?;
+            self.hnsw_saved_generation.store(generation, Ordering::Release);
+        }
+        if !self.shared_wal_mode {
+            if let Some(ref wal) = self.wal {
+                wal.checkpoint_truncate_before(cutoff, &|_| false, self.wal_archive_dir.as_deref())?;
+            }
+        }
+        self.retry_pending_removals();
+        Ok(())
+    }
+
+    /// Deletes arena segment files that no record references (except the active segment).
+    fn remove_unreferenced_segments(&self) {
+        let Some(ref arena) = self.arena else {
+            return;
+        };
+        let mut referenced: FastHashSet<u32> = FastHashSet::default();
+        for entry in self.primary.entries_snapshot() {
+            if let DiskLocation::Arena(loc) = entry.location {
+                referenced.insert(loc.segment_id);
+            }
+        }
+        let active = arena.active_segment_id();
+        for seg_id in arena.segment_ids() {
+            if seg_id != active && !referenced.contains(&seg_id) {
+                arena.remove_segment(seg_id);
+            }
+        }
     }
 
     #[inline]
     fn flush_single_record_to_disk(&self, id: InlineId, sync_disk: bool) -> Result<bool> {
-        self.flush_single_record_impl(id, sync_disk, false)
+        self.flush_single_record_impl(id, sync_disk, false, true)
     }
 
     #[inline]
     fn flush_single_record_to_disk_locked(&self, id: InlineId, sync_disk: bool) -> Result<bool> {
-        self.flush_single_record_impl(id, sync_disk, true)
+        self.flush_single_record_impl(id, sync_disk, true, true)
     }
 
+    /// Flushes the `hot_dirty` frame of `id` to its on-disk location.
+    ///
+    /// Holds the record's stripe lock for the whole read-write-publish sequence (unless the
+    /// caller already does), so a concurrent writer or second flusher can never interleave and
+    /// publish a stale location. Arena appends are not individually `fsync`ed when
+    /// `defer_arena_sync` is set; `checkpoint_and_truncate` syncs all segments instead.
     fn flush_single_record_impl(
         &self,
         id: InlineId,
         sync_disk: bool,
         already_locked: bool,
+        defer_arena_sync: bool,
     ) -> Result<bool> {
+        let _guard = if already_locked {
+            None
+        } else {
+            Some(self.locks.lock_one(id))
+        };
         let Some(entry) = self.primary.get(id) else {
             return Ok(false);
         };
@@ -2040,14 +2716,19 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         };
 
         let flushed_ver = entry.version;
-        let frame_slice = dirty_frame.as_slice();
-        // SAFETY: `dirty_frame` is 64B-aligned and produced by `RecordCodec::encode_aligned`.
-        let hdr = unsafe { RecordHeader::from_aligned_unchecked(frame_slice) };
-        let disk_verified =
+        let hdr = RecordCodec::header_ref(dirty_frame.as_slice())?;
+        let zero_copy_frame =
             !hdr.is_tombstone() && !hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4);
+        let sealed = self.seal_for_disk(id, dirty_frame.as_slice())?;
+        // Encrypted frames are never zero-copy readable on disk; the plaintext (already
+        // validated: freshly encoded) goes to the decrypted cache instead.
+        let disk_verified = zero_copy_frame && sealed.is_none();
+        if sealed.is_some() && zero_copy_frame {
+            self.decrypted.insert(id, flushed_ver, dirty_frame.clone());
+        }
+        let frame_slice = sealed.as_ref().map_or(dirty_frame.as_slice(), |s| s.as_slice());
 
-        // Determine target disk location based on layout mode
-        let new_location = match self.config.layout_mode {
+        match self.config.layout_mode {
             StorageLayoutMode::AdaptiveArena {
                 arena_threshold_bytes,
                 ..
@@ -2064,22 +2745,25 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                     .arena
                     .as_ref()
                     .ok_or_else(|| StorageError::corrupted_header("arena manager not enabled"))?;
-                let loc = arena.write_record(frame_slice, sync_disk)?;
-                if let DiskLocation::Arena(old_loc) = entry.location {
-                    if self.mvcc.has_active_snapshots() {
-                        arena.mark_dead(old_loc);
-                    } else {
-                        arena.reclaim_dead_slot(old_loc);
+                let loc = arena.write_record(frame_slice, sync_disk && !defer_arena_sync)?;
+                if self.primary.complete_background_flush(
+                    id,
+                    flushed_ver,
+                    DiskLocation::Arena(loc),
+                    disk_verified,
+                ) {
+                    if let DiskLocation::Arena(old_loc) = entry.location {
+                        if self.mvcc.has_active_snapshots() {
+                            arena.mark_dead(old_loc);
+                        } else {
+                            arena.reclaim_dead_slot(old_loc);
+                        }
                     }
+                } else {
+                    arena.mark_dead(loc);
                 }
-                DiskLocation::Arena(loc)
             }
             StorageLayoutMode::PingPongFiles { slot_stride } => {
-                let _guard = if already_locked {
-                    None
-                } else {
-                    Some(self.locks.lock_one(id))
-                };
                 let parent_group = match entry.location {
                     DiskLocation::DedicatedFile { parent_group, .. } => parent_group,
                     _ => None,
@@ -2095,17 +2779,17 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                     .max(frame_slice.len())
                     .next_multiple_of(HEADER_SIZE);
                 write_ping_pong_slot(&path, frame_slice, actual_stride, sync_disk)?;
-                DiskLocation::DedicatedFile {
-                    parent_group,
-                    ping_pong_stride: actual_stride as u32,
-                }
+                self.primary.complete_background_flush(
+                    id,
+                    flushed_ver,
+                    DiskLocation::DedicatedFile {
+                        parent_group,
+                        ping_pong_stride: actual_stride as u32,
+                    },
+                    disk_verified,
+                );
             }
             _ => {
-                let _guard = if already_locked {
-                    None
-                } else {
-                    Some(self.locks.lock_one(id))
-                };
                 let parent_group = match entry.location {
                     DiskLocation::DedicatedFile { parent_group, .. } => parent_group,
                     _ => None,
@@ -2118,19 +2802,23 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                 // Invalidate active mapping so Windows allows atomic rename over target
                 self.mmap_pool.invalidate(id);
                 atomic_write_replace(&path, frame_slice, sync_disk)?;
-                DiskLocation::DedicatedFile {
-                    parent_group,
-                    ping_pong_stride: 0,
-                }
+                self.primary.complete_background_flush(
+                    id,
+                    flushed_ver,
+                    DiskLocation::DedicatedFile {
+                        parent_group,
+                        ping_pong_stride: 0,
+                    },
+                    disk_verified,
+                );
             }
-        };
-
-        self.primary
-            .complete_background_flush(id, flushed_ver, new_location, disk_verified);
+        }
         Ok(true)
     }
 
-    fn drain_and_flush_all(&self) -> Result<usize> {
+    /// Flushes every dirty record. `already_locked` is set when the caller holds all stripes.
+    fn drain_and_flush_all(&self, already_locked: bool) -> Result<usize> {
+        let sync = self.data_sync();
         let mut total = 0usize;
         loop {
             let batch = {
@@ -2143,15 +2831,25 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             if batch.is_empty() {
                 break;
             }
-            for id in batch {
-                if self.flush_single_record_to_disk(id, false)? {
-                    total += 1;
+            for (i, &id) in batch.iter().enumerate() {
+                match self.flush_single_record_impl(id, sync, already_locked, true) {
+                    Ok(true) => total += 1,
+                    Ok(false) => {}
+                    Err(e) => {
+                        // Keep the failed and not-yet-attempted keys queued for retry.
+                        for &rest in &batch[i..] {
+                            self.enqueue_flush(rest);
+                        }
+                        return Err(e);
+                    }
                 }
             }
         }
         // Also flush any entries that were marked dirty outside the queue
         for entry in self.primary.entries_snapshot() {
-            if entry.hot_dirty.is_some() && self.flush_single_record_to_disk(entry.id, false)? {
+            if entry.hot_dirty.is_some()
+                && self.flush_single_record_impl(entry.id, sync, already_locked, true)?
+            {
                 total += 1;
             }
         }
@@ -2186,37 +2884,155 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                 q.drain_batch(128)
             };
 
+            // Memory-first WAL frames reach the OS at least once per flush interval.
+            if let Some(ref wal) = self.wal {
+                let _ = wal.flush_buffered();
+            }
+            let sync = self.data_sync();
             for id in batch {
-                if self.flush_single_record_to_disk(id, false).is_err() {
-                    // Retain `hot_dirty` in RAM and re-enqueue `id` for retry on next flush tick
-                    let mut q = self
-                        .flush_queue
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    q.enqueue(id);
-                    self.flush_cv.notify_one();
+                if self.flush_single_record_impl(id, sync, false, true).is_err() {
+                    // Retain `hot_dirty` in RAM and re-enqueue `id` for retry after a short
+                    // back-off (no busy loop on persistent errors such as a full disk).
+                    self.enqueue_flush(id);
+                    thread::sleep(interval);
                 }
             }
         }
     }
 
-    fn rebuild_secondary_indexes(&self) -> Result<()> {
+    /// Writes the primary checkpoint and, for the paged index tier, the secondary indexes, all
+    /// tagged with one fresh stamp.
+    ///
+    /// Writers keep running: the primary snapshot is taken first and the index deltas frozen
+    /// after it, and the WAL is synced before the index generations are published, so every write
+    /// either made it into both files or is still in the WAL — and a non-empty WAL at open forces
+    /// a rebuild. Index files are written before the primary checkpoint, so a crash in between
+    /// leaves mismatched stamps (also a rebuild), never stale indexes that look current.
+    fn save_checkpoint_files(&self) -> Result<()> {
+        let _serial = self
+            .checkpoint_serial
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (Some(range), Some(tags)) = (self.range_index.as_paged(), self.tag_index.as_paged())
+        else {
+            save_primary_checkpoint(&self.primary, &self.idx_path)?;
+            return Ok(());
+        };
+        let stamp = next_checkpoint_stamp();
+        let entries = self.primary.entries_snapshot();
+        let pending_range = range.begin_checkpoint();
+        let pending_tags = tags.begin_checkpoint();
+        if let Some(ref wal) = self.wal {
+            wal.sync_to_disk()?;
+        }
+        range.finish_checkpoint(pending_range, stamp)?;
+        tags.finish_checkpoint(pending_tags, stamp)?;
+        save_primary_checkpoint_entries(&entries, &self.idx_path, stamp)?;
+        Ok(())
+    }
+
+    /// Empties the paged index files (they are about to be rebuilt from the records).
+    fn reset_paged_indexes(&self) -> Result<()> {
+        // A checkpoint stamped `0` never matches a primary checkpoint, so a crash during the
+        // rebuild can never make partial indexes look current.
+        if let Some(range) = self.range_index.as_paged() {
+            range.clear_with_stamp(0)?;
+        }
+        if let Some(tags) = self.tag_index.as_paged() {
+            tags.clear_with_stamp(0)?;
+        }
+        Ok(())
+    }
+
+    /// Rebuilds the in-memory secondary indexes from the records and reconciles the (possibly
+    /// persisted) HNSW graph with them: unchanged vectors are kept, changed or missing ones are
+    /// (re)inserted, and nodes of records that no longer have a vector are removed. With a current
+    /// `hnsw.idx` this costs one `O(D)` comparison per vector instead of a graph insertion.
+    fn rebuild_secondary_indexes(&self, rebuild_postings: bool) -> Result<()> {
+        /// Paged-tier rebuilds spill their delta to disk this often to bound RAM.
+        const SPILL_EVERY: usize = 1_000_000;
         let empty = IndexSnapshot::new();
         let entries = self.primary.entries_snapshot();
-        for entry in entries {
+        let mut with_vectors = CompressedBitmap::new();
+        for (i, entry) in entries.into_iter().enumerate() {
+            self.set_ttl_ordinal(entry.ordinal, entry.ttl_expires_at_ns > 0);
             if let Some(snap) = self.extract_snapshot_for_entry(&entry) {
-                self.apply_index_snapshot_diff(entry.ordinal, &empty, &snap);
-                if snap.has_embedding {
-                    if let Ok((_, owned)) = self.get_owned_internal(entry.id) {
-                        if let Some(emb) = owned.embedding_slice() {
-                            self.vector_index.insert(entry.ordinal, emb);
-                        }
-                    }
+                if rebuild_postings {
+                    self.apply_index_snapshot_diff(entry.ordinal, &empty, &snap);
                 }
+                if snap.has_embedding && self.reconcile_vector(&entry) {
+                    with_vectors.insert(entry.ordinal);
+                }
+            }
+            if rebuild_postings && i > 0 && i % SPILL_EVERY == 0 {
+                if let Some(range) = self.range_index.as_paged() {
+                    range.checkpoint_with_stamp(0)?;
+                }
+                if let Some(tags) = self.tag_index.as_paged() {
+                    tags.checkpoint_with_stamp(0)?;
+                }
+            }
+        }
+        for ord in self.vector_index.live_ordinals() {
+            if !with_vectors.contains(ord) {
+                self.vector_index.remove(ord);
             }
         }
         Ok(())
     }
+
+    /// Makes the vector index hold `entry`'s current embedding (zero-copy read; owned decode only
+    /// for compressed or older-schema frames). Returns `false` if the record has no embedding.
+    fn reconcile_vector(&self, entry: &PrimaryEntry) -> bool {
+        let sync = |emb: &[f32]| {
+            if !self.vector_index.vector_matches(entry.ordinal, emb) {
+                self.vector_index.insert(entry.ordinal, emb);
+            }
+        };
+        if let Ok(rec) = self.get_ref_internal(entry.id) {
+            let view = rec.view();
+            if let Some(emb) = T::archived_embedding_slice(view.archived(), view.payload()) {
+                sync(emb);
+                return true;
+            }
+        }
+        match self.get_owned_internal(entry.id) {
+            Ok((_, owned)) => match owned.embedding_slice() {
+                Some(emb) => {
+                    sync(emb);
+                    true
+                }
+                None => false,
+            },
+            Err(_) => false,
+        }
+    }
+}
+
+/// Unique, never-zero checkpoint stamp (wall clock, forced strictly increasing in-process).
+fn next_checkpoint_stamp() -> u64 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = current_time_ns().max(1);
+    let mut prev = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(prev + 1);
+        match LAST.compare_exchange_weak(prev, next, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(actual) => prev = actual,
+        }
+    }
+}
+
+/// Opens an empty paged range index at `path`, discarding any previous files.
+fn fresh_paged_btree(path: &Path) -> Result<PagedBTreeIndex> {
+    let _ = fs::remove_file(path);
+    PagedBTreeIndex::open(path)
+}
+
+/// Opens an empty paged tag index at `path`, discarding any previous files.
+fn fresh_paged_bitmap(path: &Path) -> Result<PagedBitmapIndex> {
+    let _ = fs::remove_file(path);
+    PagedBitmapIndex::open(path)
 }
 
 /// Multi-record Optimistic Concurrency Control (OCC) Transaction Batch (`TASK-024`, `F-CONC-07`).
@@ -2298,9 +3114,9 @@ impl<'a, T: ZeroCopyRecord + Indexable> TransactionBatch<'a, T> {
 
         let _guards = self.engine.inner.locks.lock_many(&all_keys);
 
-        // Verify OCC read-set versions have not changed since read
+        // Verify OCC read-set versions have not changed since read (expired == absent)
         for (&id, &expected_opt) in &self.read_versions {
-            let actual_opt = self.engine.inner.primary.get(id).map(|e| e.version);
+            let actual_opt = self.engine.inner.live_version(id);
             if actual_opt != expected_opt {
                 return Err(StorageError::TransactionAborted {
                     reason: "OCC read-set version conflict detected at commit",
@@ -2327,7 +3143,7 @@ impl<'a, T: ZeroCopyRecord + Indexable> TransactionBatch<'a, T> {
                 WalOpKind::Upsert,
                 id,
                 next_ver,
-                frame.as_slice().to_vec(),
+                self.engine.inner.wal_frame_bytes(id, frame.as_slice())?,
             ));
             encoded_upserts.push((id, pg, rec, next_ver, frame));
         }
@@ -2344,7 +3160,7 @@ impl<'a, T: ZeroCopyRecord + Indexable> TransactionBatch<'a, T> {
                 WalOpKind::Delete,
                 id,
                 next_ver,
-                Vec::new(),
+                now_ns.to_le_bytes().to_vec(),
             ));
         }
 
@@ -2354,49 +3170,16 @@ impl<'a, T: ZeroCopyRecord + Indexable> TransactionBatch<'a, T> {
             wal.append_transaction(txn_id, wal_ops)?;
         }
 
-        // Apply all mutations atomically while still holding canonical stripe locks
+        // Apply all mutations atomically while still holding canonical stripe locks; the MVCC
+        // writer guard keeps the whole batch atomic with respect to snapshot registration.
+        let _mvcc_gate = self.engine.inner.mvcc.writer_guard();
         for (id, pg, rec, next_ver, frame) in encoded_upserts {
             self.engine
                 .inner
                 .apply_encoded_upsert_locked(id, pg, &rec, next_ver, now_ns, 0, frame)?;
         }
         for id in self.staged_deletes {
-            if let Some(removed) = self.engine.inner.primary.remove(id) {
-                if self.engine.inner.mvcc.has_active_snapshots() {
-                    let old_frame = self.engine.inner.read_raw_frame_for_entry(&removed);
-                    self.engine.inner.mvcc.seed_baseline_if_absent(
-                        id,
-                        removed.version,
-                        old_frame,
-                    );
-                    self.engine
-                        .inner
-                        .mvcc
-                        .record_version(id, removed.version.next(), None);
-                }
-                self.engine
-                    .inner
-                    .remove_from_secondary_indexes(&removed);
-                self.engine.inner.primary.release_ordinal(removed.ordinal);
-                self.engine.inner.mmap_pool.invalidate(id);
-                match removed.location {
-                    DiskLocation::DedicatedFile { parent_group, .. } => {
-                        if let Ok(path) = self.engine.inner.paths.full_record_path(
-                            &self.engine.inner.config.collection_name,
-                            parent_group,
-                            id,
-                        ) {
-                            let _ = fs::remove_file(path);
-                        }
-                    }
-                    DiskLocation::Arena(loc) => {
-                        if let Some(ref arena) = self.engine.inner.arena {
-                            arena.mark_dead(loc);
-                        }
-                    }
-                    DiskLocation::Unflushed => {}
-                }
-            }
+            let _ = self.engine.inner.remove_record_after_wal_locked(id);
         }
 
         Ok(())

@@ -213,16 +213,16 @@ impl RecordHeader {
             ));
         }
         let schema_version = u16::from_le_bytes([bytes[6], bytes[7]]);
-        let record_version = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let updated_at_ns = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-        let payload_checksum = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
-        let payload_len = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
-        let uncompressed_len = u32::from_le_bytes(bytes[36..40].try_into().unwrap());
-        let root_offset = u32::from_le_bytes(bytes[40..44].try_into().unwrap());
+        let record_version = crate::wire::read_u64_le(bytes, 8);
+        let updated_at_ns = crate::wire::read_u64_le(bytes, 16);
+        let payload_checksum = crate::wire::read_u64_le(bytes, 24);
+        let payload_len = crate::wire::read_u32_le(bytes, 32);
+        let uncompressed_len = crate::wire::read_u32_le(bytes, 36);
+        let root_offset = crate::wire::read_u32_le(bytes, 40);
         let flags = u16::from_le_bytes([bytes[44], bytes[45]]);
         let collection_id = u16::from_le_bytes([bytes[46], bytes[47]]);
-        let ttl_expires_at_ns = u64::from_le_bytes(bytes[48..56].try_into().unwrap());
-        let header_checksum = u64::from_le_bytes(bytes[56..64].try_into().unwrap());
+        let ttl_expires_at_ns = crate::wire::read_u64_le(bytes, 48);
+        let header_checksum = crate::wire::read_u64_le(bytes, 56);
 
         let hdr = Self {
             magic,
@@ -258,19 +258,8 @@ impl RecordHeader {
         }
         Ok(hdr)
     }
-
-    /// Zero-copy pointer cast for already-verified 64-byte-aligned memory-mapped slices.
-    ///
-    /// # Safety
-    /// Caller must ensure `bytes.len() >= 64`, `bytes.as_ptr()` is 64-byte aligned,
-    /// and the header resides on a native little-endian target where it was previously verified.
-    #[inline]
-    pub unsafe fn from_aligned_unchecked(bytes: &[u8]) -> &Self {
-        debug_assert!(bytes.len() >= HEADER_SIZE);
-        debug_assert!((bytes.as_ptr() as usize) & (HEADER_SIZE - 1) == 0);
-        // SAFETY: Caller guarantees 64-byte alignment and length >= 64 on a verified buffer.
-        unsafe { &*bytes.as_ptr().cast::<Self>() }
-    }
+    // Zero-copy access to a header inside a mapped frame is provided by
+    // `storage_codec::RecordCodec::header_ref` (unsafe code is confined to storage-codec / storage-mmap).
 }
 
 #[cfg(test)]

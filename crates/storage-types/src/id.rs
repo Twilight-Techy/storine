@@ -107,8 +107,11 @@ impl InlineId {
         })
     }
 
-    /// Const constructor for compile-time / static string keys `<= 23` bytes.
-    /// Panics at compile time if invalid.
+    /// Const constructor for static string keys `<= 23` bytes.
+    ///
+    /// Production code must call this only in a `const` item (or `const { .. }` block), where an
+    /// invalid literal is a **compile error**; it panics if called at runtime with an invalid
+    /// literal, so runtime keys must use the fallible [`InlineId::new`].
     #[inline]
     pub const fn from_static(s: &'static str) -> Self {
         let raw = s.as_bytes();
@@ -221,9 +224,15 @@ impl InlineId {
         Ok(())
     }
 
+    /// Number of key bytes (always `<= 23`, even for an `InlineId` reinterpreted from raw bytes).
     #[inline]
     pub const fn len(&self) -> usize {
-        (self.len & LEN_MASK) as usize
+        let n = (self.len & LEN_MASK) as usize;
+        if n > MAX_INLINE_ID_LEN {
+            MAX_INLINE_ID_LEN
+        } else {
+            n
+        }
     }
 
     #[inline]
@@ -241,11 +250,14 @@ impl InlineId {
         &self.bytes[..self.len()]
     }
 
+    /// Returns the key as `&str`.
+    ///
+    /// Every validated constructor guarantees UTF-8, but an `InlineId` may also be reinterpreted
+    /// zero-copy from untrusted archived bytes, so UTF-8 is re-checked (at most 23 bytes) and an
+    /// invalid key yields `""` instead of Undefined Behavior.
     #[inline]
     pub fn as_str(&self) -> &str {
-        // SAFETY: All constructors (`new`, `from_any_str`, `from_static`, `from_raw_bytes`)
-        // enforce valid UTF-8 in `self.bytes[..self.len()]`.
-        unsafe { core::str::from_utf8_unchecked(self.as_bytes()) }
+        core::str::from_utf8(self.as_bytes()).unwrap_or("")
     }
 
     /// Returns `true` if this `InlineId` starts with `prefix` (`0` allocations, `TASK-057`).
@@ -269,9 +281,14 @@ impl InlineId {
     /// Loads the 24-byte struct as three 64-bit words for 1-cycle register equality and hashing.
     #[inline]
     pub const fn as_u64_words(&self) -> [u64; 3] {
-        // SAFETY: `InlineId` is `#[repr(C, align(8))]` of exact size 24 bytes (`3 * 8`),
-        // with all padding bytes deterministically initialized to 0.
-        unsafe { core::mem::transmute::<Self, [u64; 3]>(*self) }
+        // Safe little-endian word packing of `[len | bytes]`; compiles to three 8-byte loads on
+        // little-endian targets (identical to the previous transmute there).
+        let r = self.to_raw_bytes();
+        [
+            u64::from_le_bytes([r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]]),
+            u64::from_le_bytes([r[8], r[9], r[10], r[11], r[12], r[13], r[14], r[15]]),
+            u64::from_le_bytes([r[16], r[17], r[18], r[19], r[20], r[21], r[22], r[23]]),
+        ]
     }
 
     /// Ultra-fast 64-bit hash using XXH3/Wyhash-style 128-bit multiply-xor-fold over the 3 words.

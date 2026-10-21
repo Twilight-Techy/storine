@@ -222,12 +222,12 @@ mod tests {
 
     #[test]
     fn test_hierarchical_parent_group_path() {
-        let parent = InlineId::new("agent_skyla").unwrap();
+        let parent = InlineId::new("agent_core").unwrap();
         let child = InlineId::new("memory_001").unwrap();
         let rel =
             PathResolver::relative_hierarchical_record_path("memories", Some(parent), child)
                 .unwrap();
         assert!(rel.as_str().starts_with("groups/memories/"));
-        assert!(rel.as_str().ends_with("/agent_skyla/memory_001.rec"));
+        assert!(rel.as_str().ends_with("/agent_core/memory_001.rec"));
     }
 }

@@ -3,9 +3,17 @@
 //! Persists every `PrimaryEntry` location into a compact, checksummed binary table so startup
 //! never scans directory trees.
 //!
-//! ## Format v2 (`STGEIDX2`, written by default)
-//! `magic (8B) | count (u64 LE) | entries... | XXH3-64 checksum of all preceding bytes (8B)`
+//! ## Format v3 (`STGEIDX3`, written by default; `STGEDLT3` delta frames)
+//! `magic (8B) | count (u64 LE) | stamp (u64 LE) | entries... | checksum of all preceding bytes (8B)`
 //!
+//! `stamp` identifies the checkpoint; ordinal-keyed indexes persisted by the same checkpoint
+//! carry the same stamp, which proves at open that they describe exactly these records.
+//!
+//! A v3 entry is a v2 entry followed by its `RecordOrdinal` (LEB128 varint), which is restored
+//! exactly on load so ordinal-keyed structures persisted next to the checkpoint (the HNSW graph,
+//! paged indexes) stay valid across restarts.
+//!
+//! ## Format v2 (`STGEIDX2` / `STGEDLT2`, still readable)
 //! Each entry is variable-length (typically **~16-24 bytes** versus 88 bytes in v1):
 //! - `InlineId` compact form: `len_tag (1B) | bytes[..len]`
 //! - `version`: LEB128 varint
@@ -14,8 +22,8 @@
 //! - DedicatedFile: `ping_pong_stride` varint, then optional compact parent `InlineId`
 //! - Arena: `segment_id` varint, `offset / 64` varint (offsets are 64-byte aligned), `len` varint
 //!
-//! Ordinals are **not** persisted: they are reassigned densely on load (`PrimaryIndex::restore_entry`).
-//! Legacy v1 (`STGEIDX1`, fixed 88-byte rows) checkpoints are still readable.
+//! v2 / v1 ordinals are not persisted: they are reassigned densely on load
+//! (`PrimaryIndex::restore_entry`). Legacy v1 (`STGEIDX1`, fixed 88-byte rows) is still readable.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -28,10 +36,14 @@ use crate::primary::{DiskLocation, PrimaryEntry, PrimaryIndex};
 
 const CHECKPOINT_MAGIC_V1: &[u8; 8] = b"STGEIDX1";
 const CHECKPOINT_MAGIC_V2: &[u8; 8] = b"STGEIDX2";
-const CHECKPOINT_DELTA_MAGIC: &[u8; 8] = b"STGEDLT2";
+const CHECKPOINT_MAGIC_V3: &[u8; 8] = b"STGEIDX3";
+const CHECKPOINT_DELTA_MAGIC_V2: &[u8; 8] = b"STGEDLT2";
+const CHECKPOINT_DELTA_MAGIC: &[u8; 8] = b"STGEDLT3";
 const V1_ENTRY_STRIDE: usize = 88;
 /// Smallest possible v2 entry: 2B id + 1B version + 1B ttl + 1B tag.
 const V2_MIN_ENTRY_LEN: usize = 5;
+/// Smallest possible v3 entry: a v2 entry plus a 1-byte ordinal varint.
+const V3_MIN_ENTRY_LEN: usize = 6;
 
 const LOC_UNFLUSHED: u8 = 0;
 const LOC_DEDICATED: u8 = 1;
@@ -160,17 +172,45 @@ fn decode_v2_entry(body: &[u8], cursor: &mut usize) -> Result<PrimaryEntry> {
     Ok(restored(id, version, ttl_expires_at_ns, location))
 }
 
-/// Saves a full atomic checkpoint of `index` to `path` (`primary.idx`) in compact v2 format,
+/// v3 entry: the v2 encoding followed by the record's ordinal.
+#[inline]
+fn encode_v3_entry(buf: &mut Vec<u8>, entry: &PrimaryEntry) {
+    encode_v2_entry(buf, entry);
+    write_varint(buf, u64::from(entry.ordinal.0));
+}
+
+#[inline]
+fn decode_v3_entry(body: &[u8], cursor: &mut usize) -> Result<PrimaryEntry> {
+    let mut entry = decode_v2_entry(body, cursor)?;
+    let ordinal = read_varint_u32(body, cursor)?;
+    if ordinal == RecordOrdinal::INVALID.0 {
+        return Err(StorageError::corrupted_header("invalid ordinal in primary checkpoint"));
+    }
+    entry.ordinal = RecordOrdinal(ordinal);
+    Ok(entry)
+}
+
+/// Saves a full atomic checkpoint of `index` to `path` (`primary.idx`) in compact v3 format,
 /// and removes any superseded `<path>.delta` incremental log.
 /// Returns the number of entries written.
 pub fn save_primary_checkpoint(index: &PrimaryIndex, path: &Path) -> Result<usize> {
-    let entries = index.entries_snapshot();
-    let mut buf = Vec::with_capacity(24 + entries.len() * 24);
-    buf.extend_from_slice(CHECKPOINT_MAGIC_V2);
-    buf.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    save_primary_checkpoint_entries(&index.entries_snapshot(), path, 0)
+}
 
-    for entry in &entries {
-        encode_v2_entry(&mut buf, entry);
+/// Saves `entries` (a snapshot taken by the caller, e.g. at a consistent cut with other indexes)
+/// as a full v3 checkpoint tagged with `stamp`, and removes any superseded `.delta` log.
+pub fn save_primary_checkpoint_entries(
+    entries: &[PrimaryEntry],
+    path: &Path,
+    stamp: u64,
+) -> Result<usize> {
+    let mut buf = Vec::with_capacity(32 + entries.len() * 24);
+    buf.extend_from_slice(CHECKPOINT_MAGIC_V3);
+    buf.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&stamp.to_le_bytes());
+
+    for entry in entries {
+        encode_v3_entry(&mut buf, entry);
     }
 
     let sum = checksum_payload(&buf);
@@ -202,7 +242,7 @@ pub fn append_primary_checkpoint_delta(
     let mut payload = Vec::with_capacity((upserts.len() + deleted_ids.len()) * 24 + 8);
     write_varint(&mut payload, upserts.len() as u64);
     for entry in &upserts {
-        encode_v2_entry(&mut payload, entry);
+        encode_v3_entry(&mut payload, entry);
     }
     write_varint(&mut payload, deleted_ids.len() as u64);
     for &del_id in deleted_ids {
@@ -239,7 +279,17 @@ pub fn append_primary_checkpoint_delta(
 /// Loads a `primary.idx` checkpoint file (v2 or legacy v1) into `index` and automatically
 /// replays any companion `<path>.delta` incremental frames (`TASK-054`).
 pub fn load_primary_checkpoint(index: &PrimaryIndex, path: &Path) -> Result<usize> {
+    load_primary_checkpoint_with_stamp(index, path).map(|(n, _)| n)
+}
+
+/// [`load_primary_checkpoint`] that also returns the checkpoint stamp — `None` when the state is
+/// not exactly that of a stamped checkpoint (legacy format, no file, or delta frames applied).
+pub fn load_primary_checkpoint_with_stamp(
+    index: &PrimaryIndex,
+    path: &Path,
+) -> Result<(usize, Option<u64>)> {
     let mut base_loaded = 0usize;
+    let mut stamp = None;
     if path.exists() {
         let bytes = std::fs::read(path)
             .map_err(|e| StorageError::io("read primary index checkpoint", e))?;
@@ -251,14 +301,21 @@ pub fn load_primary_checkpoint(index: &PrimaryIndex, path: &Path) -> Result<usiz
 
         let body_len = bytes.len() - 8;
         let body = &bytes[..body_len];
-        let expected_sum = u64::from_le_bytes(bytes[body_len..].try_into().unwrap());
+        let expected_sum = storage_types::wire::read_u64_le(&bytes, body_len);
         let actual_sum = checksum_payload(body);
         if actual_sum != expected_sum {
             return Err(StorageError::checksum_mismatch(expected_sum, actual_sum));
         }
 
-        let count = u64::from_le_bytes(body[8..16].try_into().unwrap());
+        let count = storage_types::wire::read_u64_le(body, 8);
         base_loaded = match &body[0..8] {
+            m if m == CHECKPOINT_MAGIC_V3 => {
+                if body.len() < 24 {
+                    return Err(StorageError::corrupted_header("v3 checkpoint header truncated"));
+                }
+                stamp = Some(storage_types::wire::read_u64_le(body, 16));
+                load_v3(index, body, count)?
+            }
             m if m == CHECKPOINT_MAGIC_V2 => load_v2(index, body, count)?,
             m if m == CHECKPOINT_MAGIC_V1 => load_v1(index, body, count)?,
             _ => {
@@ -272,10 +329,12 @@ pub fn load_primary_checkpoint(index: &PrimaryIndex, path: &Path) -> Result<usiz
     let delta_path = delta_checkpoint_path(path);
     if delta_path.exists() {
         let _ = replay_primary_checkpoint_deltas(index, &delta_path)?;
-        return Ok(index.len());
+        index.finish_restore();
+        return Ok((index.len(), None));
     }
 
-    Ok(base_loaded)
+    index.finish_restore();
+    Ok((base_loaded, stamp))
 }
 
 fn replay_primary_checkpoint_deltas(index: &PrimaryIndex, delta_path: &Path) -> Result<usize> {
@@ -285,11 +344,13 @@ fn replay_primary_checkpoint_deltas(index: &PrimaryIndex, delta_path: &Path) -> 
     let mut applied = 0usize;
 
     while pos + 20 <= raw.len() {
-        if &raw[pos..pos + 8] != CHECKPOINT_DELTA_MAGIC {
-            break;
-        }
-        let payload_len = u32::from_le_bytes(raw[pos + 8..pos + 12].try_into().unwrap()) as usize;
-        let expected_sum = u64::from_le_bytes(raw[pos + 12..pos + 20].try_into().unwrap());
+        let with_ordinals = match &raw[pos..pos + 8] {
+            m if m == CHECKPOINT_DELTA_MAGIC => true,
+            m if m == CHECKPOINT_DELTA_MAGIC_V2 => false,
+            _ => break,
+        };
+        let payload_len = storage_types::wire::read_u32_le(&raw, pos + 8) as usize;
+        let expected_sum = storage_types::wire::read_u64_le(&raw, pos + 12);
         let Some(frame_end) = (pos + 20).checked_add(payload_len) else {
             break;
         };
@@ -301,12 +362,22 @@ fn replay_primary_checkpoint_deltas(index: &PrimaryIndex, delta_path: &Path) -> 
             break;
         }
 
+        // A frame holds the final state of its window: `upserts` are records live when the frame
+        // was written, `deletes` were removed at some point during the window (a key deleted and
+        // re-created appears in both). Applying deletes first is therefore always correct, and
+        // frees ordinals before re-created records reclaim them.
         let mut cursor = 0usize;
         let upsert_count = read_varint(payload, &mut cursor)? as usize;
+        let mut upserts = Vec::new();
+        upserts
+            .try_reserve_exact(upsert_count.min(payload.len() / V2_MIN_ENTRY_LEN))
+            .map_err(|_| StorageError::resource_exhausted("checkpoint delta memory"))?;
         for _ in 0..upsert_count {
-            let entry = decode_v2_entry(payload, &mut cursor)?;
-            index.restore_entry(entry);
-            applied += 1;
+            upserts.push(if with_ordinals {
+                decode_v3_entry(payload, &mut cursor)?
+            } else {
+                decode_v2_entry(payload, &mut cursor)?
+            });
         }
         let delete_count = read_varint(payload, &mut cursor)? as usize;
         for _ in 0..delete_count {
@@ -316,10 +387,38 @@ fn replay_primary_checkpoint_deltas(index: &PrimaryIndex, delta_path: &Path) -> 
             }
             applied += 1;
         }
+        for entry in upserts {
+            if with_ordinals {
+                index.restore_entry_at(entry)?;
+            } else {
+                index.restore_entry(entry);
+            }
+            applied += 1;
+        }
         pos = frame_end;
     }
 
     Ok(applied)
+}
+
+fn load_v3(index: &PrimaryIndex, body: &[u8], count: u64) -> Result<usize> {
+    // Reject impossible counts before doing any work (defends against crafted headers).
+    let max_possible = ((body.len() - 24) / V3_MIN_ENTRY_LEN) as u64;
+    if count > max_possible {
+        return Err(StorageError::corrupted_header(
+            "checkpoint entry count exceeds file size",
+        ));
+    }
+    let mut cursor = 24usize;
+    for _ in 0..count {
+        index.restore_entry_at(decode_v3_entry(body, &mut cursor)?)?;
+    }
+    if cursor != body.len() {
+        return Err(StorageError::corrupted_header(
+            "trailing bytes after primary checkpoint entries",
+        ));
+    }
+    Ok(count as usize)
 }
 
 fn load_v2(index: &PrimaryIndex, body: &[u8], count: u64) -> Result<usize> {
@@ -358,25 +457,25 @@ fn load_v1(index: &PrimaryIndex, body: &[u8], count: u64) -> Result<usize> {
     for i in 0..count {
         let off = 16 + i * V1_ENTRY_STRIDE;
         let row = &body[off..off + V1_ENTRY_STRIDE];
-        let id = InlineId::from_raw_bytes(row[0..24].try_into().unwrap())?;
+        let id = InlineId::from_raw_bytes(storage_types::wire::read_array_24(row, 0))?;
         let loc_tag = row[28];
         let has_parent = row[29] != 0;
-        let version = Version(u64::from_le_bytes(row[32..40].try_into().unwrap()));
-        let ttl_expires_at_ns = u64::from_le_bytes(row[48..56].try_into().unwrap());
+        let version = Version(storage_types::wire::read_u64_le(row, 32));
+        let ttl_expires_at_ns = storage_types::wire::read_u64_le(row, 48);
         let location = match loc_tag {
             0 => DiskLocation::Unflushed,
             1 => DiskLocation::DedicatedFile {
                 parent_group: if has_parent {
-                    Some(InlineId::from_raw_bytes(row[64..88].try_into().unwrap())?)
+                    Some(InlineId::from_raw_bytes(storage_types::wire::read_array_24(row, 64))?)
                 } else {
                     None
                 },
-                ping_pong_stride: u32::from_le_bytes(row[56..60].try_into().unwrap()),
+                ping_pong_stride: storage_types::wire::read_u32_le(row, 56),
             },
             2 => DiskLocation::Arena(ArenaLocation {
-                segment_id: u32::from_le_bytes(row[56..60].try_into().unwrap()),
-                offset: u32::from_le_bytes(row[60..64].try_into().unwrap()),
-                len: u32::from_le_bytes(row[64..68].try_into().unwrap()),
+                segment_id: storage_types::wire::read_u32_le(row, 56),
+                offset: storage_types::wire::read_u32_le(row, 60),
+                len: storage_types::wire::read_u32_le(row, 64),
             }),
             _ => {
                 return Err(StorageError::corrupted_header(
@@ -411,6 +510,63 @@ fn restored(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_v3_checkpoint_preserves_ordinals_with_holes_and_deltas() {
+        let dir = std::env::temp_dir().join(format!("stge_ckpt_v3_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("primary.idx");
+        let id = |s: &str| InlineId::new(s).unwrap();
+        let put = |idx: &PrimaryIndex, name: &str| {
+            let k = id(name);
+            let ord = idx.allocate_ordinal(k);
+            let mut e = restored(k, Version(1), 0, DiskLocation::Unflushed);
+            e.ordinal = ord;
+            idx.upsert(e);
+            ord
+        };
+        let del = |idx: &PrimaryIndex, name: &str| {
+            let removed = idx.remove(id(name)).unwrap();
+            idx.release_ordinal(removed.ordinal);
+        };
+        let ordinals_of = |idx: &PrimaryIndex| {
+            let mut v: Vec<(InlineId, u32)> =
+                idx.entries_snapshot().iter().map(|e| (e.id, e.ordinal.0)).collect();
+            v.sort();
+            v
+        };
+
+        let idx = PrimaryIndex::new();
+        for i in 0..10 {
+            put(&idx, &format!("k{i}"));
+        }
+        del(&idx, "k2");
+        del(&idx, "k5");
+        put(&idx, "recycled"); // reuses a freed ordinal
+        del(&idx, "k8"); // leaves a hole
+        save_primary_checkpoint(&idx, &path).unwrap();
+
+        let loaded = PrimaryIndex::new();
+        load_primary_checkpoint(&loaded, &path).unwrap();
+        assert_eq!(ordinals_of(&loaded), ordinals_of(&idx));
+        for (k, ord) in ordinals_of(&idx) {
+            assert_eq!(loaded.resolve_ordinal(RecordOrdinal(ord)), Some(k));
+        }
+        // The free list is rebuilt from the holes: the next allocation reuses one of them.
+        let reused = put(&loaded, "after_load");
+        assert!(reused.0 < 10, "expected a recycled ordinal, got {}", reused.0);
+
+        // Delta frames carry ordinals too.
+        del(&idx, "k7");
+        let m = put(&idx, "m");
+        append_primary_checkpoint_delta(&idx, &path, &[id("m")], &[id("k7")]).unwrap();
+        let loaded = PrimaryIndex::new();
+        load_primary_checkpoint(&loaded, &path).unwrap();
+        assert_eq!(ordinals_of(&loaded), ordinals_of(&idx));
+        assert_eq!(loaded.resolve_ordinal(m), Some(id("m")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_v2_checkpoint_and_incremental_delta_roundtrip() {

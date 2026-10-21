@@ -1,20 +1,23 @@
 //! Core zero-allocation data types, 24-byte stack-inlined `InlineId`,
 //! 64-byte cache-line-aligned `RecordHeader`, and error definitions.
 
-#![deny(unsafe_op_in_unsafe_fn)]
+#![forbid(unsafe_code)]
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
 pub mod error;
 pub mod header;
 pub mod id;
 pub mod padded;
+#[doc(hidden)]
+pub mod testing;
+pub mod wire;
 
 pub use error::{Result, StorageError};
 pub use header::{
     RecordFlags, RecordHeader, HEADER_SIZE, MAX_PAYLOAD_SIZE, RECORD_MAGIC, WIRE_FORMAT_VERSION,
 };
 pub use id::{InlineId, MAX_INLINE_ID_LEN};
-pub use padded::CachePadded;
+pub use padded::{CachePadded, StripedCounter};
 
 /// Dense 32-bit internal ordinal assigned to each record for compact secondary
 /// index storage (B+Tree leaves and compressed Roaring-style bitmaps).
@@ -132,4 +135,39 @@ const _: () = {
     assert!(core::mem::size_of::<RecordOrdinal>() == 4);
     assert!(core::mem::size_of::<Version>() == 8);
 };
+
+#[cfg(test)]
+mod hostile_input_tests {
+    use super::testing::SweepRng;
+    use super::*;
+
+    #[test]
+    fn test_hostile_ids_and_headers_never_panic() {
+        let mut rng = SweepRng::new(7);
+        let good = RecordHeader::new(
+            1,
+            Version(9),
+            123,
+            0xABCD,
+            128,
+            128,
+            0,
+            RecordFlags::NONE,
+            1,
+            0,
+        )
+        .to_bytes();
+        for _ in 0..20_000 {
+            let mut raw = [0u8; 24];
+            for b in &mut raw {
+                *b = rng.next_u64() as u8;
+            }
+            if let Ok(id) = InlineId::from_raw_bytes(raw) {
+                let _ = (id.as_str().len(), id.len(), id.to_raw_bytes());
+            }
+            let bytes = rng.hostile_copy(&good);
+            let _ = RecordHeader::from_slice_verified(&bytes);
+        }
+    }
+}
 

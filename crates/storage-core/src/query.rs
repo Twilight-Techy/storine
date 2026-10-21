@@ -132,9 +132,11 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
         &self.range_predicates[..self.range_len]
     }
 
+    /// `true` for the allocation-light fast path: positive tag/range drivers only, no windowing.
     #[inline]
     fn is_simple_unpaginated(&self) -> bool {
-        self.not_tag_len == 0
+        (self.tag_len > 0 || self.range_len > 0)
+            && self.not_tag_len == 0
             && self.any_tag_len == 0
             && self.extra_include_bm.is_none()
             && self.extra_exclude_bm.is_none()
@@ -547,33 +549,78 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
         )
     }
 
+    /// Bitmap of ordinals that must never be returned: explicit exclusions plus expired TTL records.
+    fn exclusion(&self) -> Option<CompressedBitmap> {
+        match (self.extra_exclude_bm.as_ref(), self.engine.expired_ordinals()) {
+            (None, None) => None,
+            (Some(a), None) => Some(a.clone()),
+            (None, Some(b)) => Some(b),
+            (Some(a), Some(b)) => Some(a.union(&b)),
+        }
+    }
+
+    /// Index-only filters (no user code): extra include / exclude bitmaps.
     #[inline]
-    fn check_extra_and_view(&self, ord: RecordOrdinal) -> bool {
+    fn check_extra(&self, ord: RecordOrdinal, exclude: Option<&CompressedBitmap>) -> bool {
         if let Some(ref inc) = self.extra_include_bm {
             if !inc.contains(ord) {
                 return false;
             }
         }
-        if let Some(ref exc) = self.extra_exclude_bm {
+        if let Some(exc) = exclude {
             if exc.contains(ord) {
                 return false;
             }
         }
-        if let Some(ref pred) = self.view_predicate {
-            let Some(id) = self.engine.primary_index().resolve_ordinal(ord) else {
-                return false;
-            };
-            self.engine.with_ref(id, |view| pred(&view)).unwrap_or_default()
-        } else {
-            true
+        true
+    }
+
+    /// Runs the user `.filter(...)` predicate. Must be called while holding NO index locks.
+    #[inline]
+    fn check_view(&self, id: InlineId) -> bool {
+        match self.view_predicate {
+            Some(ref pred) => self.engine.with_ref(id, |view| pred(&view)).unwrap_or_default(),
+            None => true,
         }
+    }
+
+    /// Applies the user predicate to candidates collected under index locks, then windows them.
+    fn window_with_view(
+        &self,
+        candidates: Vec<(Option<i64>, RecordOrdinal)>,
+        windowed: bool,
+    ) -> (Vec<(Option<i64>, RecordOrdinal)>, usize) {
+        let (offset, max_items) = if windowed {
+            (self.offset, self.limit.unwrap_or(usize::MAX))
+        } else {
+            (0, usize::MAX)
+        };
+        let mut out = Vec::with_capacity(max_items.min(candidates.len()).min(256));
+        let mut total_matched = 0usize;
+        for (key, ord) in candidates {
+            let Some(id) = self.engine.primary_index().resolve_ordinal(ord) else {
+                continue;
+            };
+            if !self.check_view(id) {
+                continue;
+            }
+            total_matched += 1;
+            if total_matched <= offset {
+                continue;
+            }
+            if out.len() < max_items {
+                out.push((key, ord));
+            }
+        }
+        (out, total_matched)
     }
 
     /// Resolves matching `RecordOrdinal`s using secondary index intersections without
     /// touching any record files on disk (unless a `.filter(|view| ...)` payload closure was attached).
     pub fn resolve_ordinals(&self) -> Vec<RecordOrdinal> {
-        if !self.is_simple_unpaginated() {
-            let (items, _) = self.resolve_paginated_ordinals();
+        let exclude = self.exclusion();
+        if exclude.is_some() || !self.is_simple_unpaginated() {
+            let (items, _) = self.resolve_paginated_ordinals(exclude.as_ref(), true);
             return items.into_iter().map(|(_, ord)| ord).collect();
         }
 
@@ -642,13 +689,26 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
         }
     }
 
-    /// Resolves a paginated window of `(Option<sort_key>, RecordOrdinal)` and `total_matched` (`TASK-056`, `TASK-058`).
-    fn resolve_paginated_ordinals(&self) -> (Vec<(Option<i64>, RecordOrdinal)>, usize) {
+    /// Resolves `(Option<sort_key>, RecordOrdinal)` matches and `total_matched` (`TASK-056`, `TASK-058`).
+    ///
+    /// With `windowed == false`, `offset`, `limit` and `after_cursor` are ignored (used to build
+    /// the full candidate set for vector search).
+    fn resolve_paginated_ordinals(
+        &self,
+        exclude: Option<&CompressedBitmap>,
+        windowed: bool,
+    ) -> (Vec<(Option<i64>, RecordOrdinal)>, usize) {
         if let Some(ref inc) = self.extra_include_bm {
             if inc.is_empty() {
                 return (Vec::new(), 0);
             }
         }
+        let (offset, limit, cursor) = if windowed {
+            (self.offset, self.limit, self.cursor)
+        } else {
+            (0, None, None)
+        };
+        let has_view = self.view_predicate.is_some();
 
         let tags = self.tag_slice();
         let not_tags = self.not_tag_slice();
@@ -672,42 +732,42 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
             any_groups[i] = (c.field_id, &c.tags[..c.len]);
         }
         let any_slice = &any_groups[..self.any_tag_len];
+        let has_extra = self.extra_include_bm.is_some() || exclude.is_some();
 
         // 2. Single-range B+Tree driver path: preserves sort key (`Asc` or `Desc`) and supports O(log N) KeysetCursor!
         if ranges.len() == 1 {
             let (field_id, ref range) = ranges[0];
             let has_tag_filters =
                 !tags.is_empty() || !not_tags.is_empty() || !any_slice.is_empty();
-            let has_extra = self.extra_include_bm.is_some()
-                || self.extra_exclude_bm.is_some()
-                || self.view_predicate.is_some();
+            let index_filter = |ord: RecordOrdinal| {
+                if has_tag_filters
+                    && !self
+                        .engine
+                        .tag_index()
+                        .matches_ordinal(ord, tags, not_tags, any_slice)
+                {
+                    return false;
+                }
+                !has_extra || self.check_extra(ord, exclude)
+            };
+            // The user predicate must not run under the range-index lock: collect index-level
+            // matches first (in sort order, after the cursor), then filter and window outside.
+            let (win_offset, win_limit) = if has_view { (0, None) } else { (offset, limit) };
             let (pairs, total) = self.engine.range_index().range_collect_paginated(
                 field_id,
                 *range.start(),
                 *range.end(),
                 self.order,
-                self.cursor,
-                self.offset,
-                self.limit,
-                |ord| {
-                    if has_tag_filters
-                        && !self
-                            .engine
-                            .tag_index()
-                            .matches_ordinal(ord, tags, not_tags, any_slice)
-                    {
-                        return false;
-                    }
-                    if has_extra && !self.check_extra_and_view(ord) {
-                        return false;
-                    }
-                    true
-                },
+                cursor,
+                win_offset,
+                win_limit,
+                index_filter,
             );
-            let out = pairs
-                .into_iter()
-                .map(|(k, ord)| (Some(k), ord))
-                .collect();
+            let out: Vec<(Option<i64>, RecordOrdinal)> =
+                pairs.into_iter().map(|(k, ord)| (Some(k), ord)).collect();
+            if has_view {
+                return self.window_with_view(out, windowed);
+            }
             return (out, total);
         }
 
@@ -717,12 +777,12 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
             && ranges.is_empty()
             && self.extra_include_bm.is_none()
         {
-            let has_extra = self.extra_exclude_bm.is_some() || self.view_predicate.is_some();
+            let (win_offset, win_limit) = if has_view { (0, None) } else { (offset, limit) };
             let (pairs, total) = self.engine.primary_index().scan_ordinals_paginated(
                 self.order == SortOrder::Desc,
-                self.cursor.map(|c| c.ordinal),
-                self.offset,
-                self.limit,
+                cursor.map(|c| c.ordinal),
+                win_offset,
+                win_limit,
                 |ord, _id| {
                     if !not_tags.is_empty()
                         && !self
@@ -732,13 +792,14 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
                     {
                         return false;
                     }
-                    if has_extra && !self.check_extra_and_view(ord) {
-                        return false;
-                    }
-                    true
+                    !has_extra || self.check_extra(ord, exclude)
                 },
             );
-            let out = pairs.into_iter().map(|(ord, _)| (None, ord)).collect();
+            let out: Vec<(Option<i64>, RecordOrdinal)> =
+                pairs.into_iter().map(|(ord, _)| (None, ord)).collect();
+            if has_view {
+                return self.window_with_view(out, windowed);
+            }
             return (out, total);
         }
 
@@ -798,7 +859,7 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
             }
         }
 
-        if let Some(ref exc) = self.extra_exclude_bm {
+        if let Some(exc) = exclude {
             bm.and_not_in_place(exc);
             if bm.is_empty() {
                 return (Vec::new(), 0);
@@ -806,42 +867,25 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
         }
 
         // If no custom `view_predicate` closure is attached, use hardware POPCNT windowing directly!
-        if self.view_predicate.is_none() {
+        if !has_view {
             let (ords, total) = bm.collect_window(
-                self.offset,
-                self.limit,
-                self.cursor.map(|c| c.ordinal),
+                offset,
+                limit,
+                cursor.map(|c| c.ordinal),
                 self.order == SortOrder::Desc,
             );
             let out = ords.into_iter().map(|ord| (None, ord)).collect();
             return (out, total);
         }
 
-        // When `view_predicate` is attached, evaluate `check_extra_and_view(ord)` before offset/limit
+        // When `view_predicate` is attached, evaluate it before offset/limit
         let (all_ords, _) = bm.collect_window(
             0,
             None,
-            self.cursor.map(|c| c.ordinal),
+            cursor.map(|c| c.ordinal),
             self.order == SortOrder::Desc,
         );
-        let max_items = self.limit.unwrap_or(usize::MAX);
-        let mut out = Vec::with_capacity(max_items.min(all_ords.len().min(256)));
-        let mut total_matched = 0usize;
-        let mut skipped = 0usize;
-        for ord in all_ords {
-            if !self.check_extra_and_view(ord) {
-                continue;
-            }
-            total_matched += 1;
-            if skipped < self.offset {
-                skipped += 1;
-                continue;
-            }
-            if out.len() < max_items {
-                out.push((None, ord));
-            }
-        }
-        (out, total_matched)
+        self.window_with_view(all_ords.into_iter().map(|o| (None, o)).collect(), windowed)
     }
 
     /// Resolves matching primary keys (`InlineId`s) from secondary indexes (and optional `.filter(...)`).
@@ -853,7 +897,8 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
     /// Executes the query and returns a `QueryPage<InlineId>` with `total_matched`, `has_more`,
     /// and an $O(\log N)$ `next_cursor` (`TASK-056`).
     pub fn execute_page_ids(&self) -> QueryPage<InlineId> {
-        let (pairs, total_matched) = self.resolve_paginated_ordinals();
+        let exclude = self.exclusion();
+        let (pairs, total_matched) = self.resolve_paginated_ordinals(exclude.as_ref(), true);
         let mut items = Vec::with_capacity(pairs.len());
         let mut last_cursor = None;
         for (sort_key, ord) in pairs {
@@ -876,7 +921,8 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
 
     /// Executes the query and returns a `QueryPage<(InlineId, RecordRef<T>)>` of zero-copy record guards (`TASK-056`).
     pub fn execute_page_refs(&self) -> Result<QueryPage<(InlineId, RecordRef<T>)>> {
-        let (pairs, total_matched) = self.resolve_paginated_ordinals();
+        let exclude = self.exclusion();
+        let (pairs, total_matched) = self.resolve_paginated_ordinals(exclude.as_ref(), true);
         let mut items = Vec::with_capacity(pairs.len());
         let mut last_cursor = None;
         for (sort_key, ord) in pairs {
@@ -961,7 +1007,10 @@ impl<'a, T: ZeroCopyRecord + Indexable> QueryBuilder<'a, T> {
         {
             None
         } else {
-            Some(self.resolve_ordinals())
+            // Vector search ranks ALL filter matches; `offset` / `limit` / cursor do not apply.
+            let exclude = self.exclusion();
+            let (all, _) = self.resolve_paginated_ordinals(exclude.as_ref(), false);
+            Some(all.into_iter().map(|(_, ord)| ord).collect::<Vec<_>>())
         };
 
         let hits = self
@@ -995,8 +1044,10 @@ mod tests {
         let dir = std::env::temp_dir().join("stge_test_query_filter_pagination");
         let _ = std::fs::remove_dir_all(&dir);
 
-        let mut cfg = EngineConfig::default();
-        cfg.background_flush = false;
+        let cfg = EngineConfig {
+            background_flush: false,
+            ..EngineConfig::default()
+        };
         let engine = StorageEngine::<AgentObjectRecord>::open(&dir, cfg).unwrap();
 
         let tag_alpha = InlineId::from_static("env:alpha");
@@ -1132,6 +1183,33 @@ mod tests {
                 InlineId::from_static("rec_04"),
             ]
         );
+
+        // 7. Unconstrained queries return every record, with or without ordering.
+        assert_eq!(engine.query().execute_ids().len(), 30);
+        assert_eq!(engine.query().limit(7).execute_ids().len(), 7);
+        assert_eq!(engine.query().order_desc().limit(7).execute_ids().len(), 7);
+
+        // 8. Expired TTL records never appear in query results.
+        let eph = InlineId::from_static("rec_ttl");
+        engine
+            .put_with_ttl(
+                eph,
+                &AgentObjectRecord::new(eph, "Ephemeral", 0, 155),
+                std::time::Duration::from_millis(1),
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let hits = engine.query().filter_range(FIELD_SCORE, 150..=155).execute_ids();
+        assert_eq!(hits, vec![InlineId::from_static("rec_15")]);
+        assert_eq!(engine.query().execute_ids().len(), 30);
+
+        // 9. A `.filter(...)` closure may call back into the engine (no index lock is held).
+        let reentrant = engine
+            .query()
+            .filter_range(FIELD_SCORE, 10..=50)
+            .filter(|view| engine.get_owned(view.id).is_ok())
+            .execute_ids();
+        assert_eq!(reentrant.len(), 5);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

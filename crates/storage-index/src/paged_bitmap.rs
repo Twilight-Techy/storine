@@ -1,50 +1,241 @@
-//! Disk-Backed Paged Bitmap Index, 64-Byte Split-Block Bloom Filter, and Tiered Cold Primary Index
-//! (`TASK-035`, `F-INDX-06`, `F-INDX-08`, `RULE-MEM-01`, `RULE-CPU-01`, `RULE-DATA-03`).
+//! Disk-Backed Paged Bitmap Tag Index (`TASK-035`, `TASK-083`, `F-PIDX-02`, `RULE-MEM-01`,
+//! `RULE-CONC-01`).
+//!
+//! Posting bitmaps of every `(field_id, tag)` live in 512-byte `[u64; 64]` blocks of an immutable,
+//! memory-mapped generation file; only a directory (`(field, tag) -> chunk refs`, 8 bytes per
+//! non-empty 4096-ordinal chunk) and small deltas live in RAM.
+//!
+//! ## Visibility
+//! For a key `k = (field_id, tag)` the posting set is
+//! `((base[k] - frozen.removed[k]) ∪ frozen.hot[k] - removed[k]) ∪ hot[k]`, where `frozen` is the
+//! delta being merged by a running checkpoint.
+//!
+//! ## Checkpoints
+//! Freeze the delta (`O(1)` under the lock), then — without any lock — stream-merge chunk by chunk
+//! (`O(512 B)` working memory per key, even for a tag covering every record) into a new
+//! generation file, publish it through the manifest, and swap it in under a brief lock.
+//!
+//! ## Generation file (`"BMX3"`)
+//! - `[0..4096)` header: `magic | block_count u32 | dir_offset u64 | dir_len u32 | 0 u32 |
+//!   dir_crc u64 | blocks_crc u64 | header_crc u64`;
+//! - blocks: `block_count` x 512 B starting at 4096;
+//! - directory at `dir_offset`: `tag_count u32`, then per key
+//!   `field u16 | tag [u8; 24] | chunk_count u32 | cardinality u64 | (chunk_id u32, block u32)*`
+//!   with strictly increasing chunk ids.
 
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::fs::{self, OpenOptions};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, RwLock};
 
 use storage_codec::checksum_payload;
-use storage_mmap::{atomic_write_replace, ArenaLocation, MmapRegion};
-use storage_types::{FastHashMap, FastHashSet, InlineId, RecordOrdinal, Result, StorageError, Version};
+use storage_mmap::MmapRegion;
+use storage_types::wire::{read_array_24, read_u16_le, read_u32_le, read_u64_le};
+use storage_types::{FastHashMap, InlineId, RecordOrdinal, Result, StorageError};
 
 use crate::bitmap::{BitmapTagIndex, CompressedBitmap};
-use crate::primary::DiskLocation;
+use crate::paged_files::{
+    generation_path, map_path_read_only, publish_generation, read_manifest,
+    remove_stale_generations, temp_generation_path, write_manifest,
+};
 
-const BITMAP_FILE_MAGIC: u32 = 0x424D_4958; // "BMIX"
-const BITMAP_BLOCK_BYTES: usize = 512; // 64 x u64 words = 512 bytes (8 blocks per 4 KiB page)
-const PAGE_SIZE_4KB: usize = 4096;
+const BITMAP_FILE_MAGIC: u32 = 0x424D_5833; // "BMX3"
+const BITMAP_MANIFEST_MAGIC: u32 = 0x424D_4D46; // "BMMF"
+const BITMAP_BLOCK_BYTES: usize = 512; // 64 x u64 words
+const HEADER_REGION: usize = 4096;
+const HEADER_LEN: usize = 48;
+const DIR_ENTRY_FIXED: usize = 2 + 24 + 4 + 8;
 
-/// Pointer to a 512-byte `[u64; 64]` chunk stored inside a 4 KiB page in `bitmap.idx` (`8` bytes).
+type Key = (u16, InlineId);
+type Words = [u64; 64];
+
+/// Pointer to a 512-byte `[u64; 64]` chunk stored in a generation file (`8` bytes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MappedChunkRef {
     pub chunk_id: u32,
     pub block_index: u32,
 }
 
-#[derive(Default)]
-struct PagedBitmapState {
-    /// Directory mapping `(field_id, tag)` to sorted `MappedChunkRef`s on disk.
-    directory: FastHashMap<(u16, InlineId), Vec<MappedChunkRef>>,
-    /// Memory-mapped `bitmap.idx` file.
-    mmap: Option<MmapRegion>,
-    /// Byte offset inside `mmap` where the 512-byte chunk array begins (4 KiB aligned).
-    blocks_base_offset: usize,
-    /// Hot in-memory delta additions since last checkpoint.
-    hot_added: BitmapTagIndex,
-    /// Hot tombstones removed since last checkpoint.
-    hot_removed: FastHashSet<(u16, InlineId, RecordOrdinal)>,
+#[derive(Debug)]
+struct DirEntry {
+    chunks: Vec<MappedChunkRef>,
+    cardinality: u64,
 }
 
-/// Disk-backed Paged Roaring-style Bitmap Tag Index (`TASK-035`, `F-INDX-06`).
-///
-/// Evaluates 64-bit word bitwise `AND` intersections directly over `MmapRegion` 512-byte chunk
-/// slices without loading untouched tag bitmaps into heap memory.
+struct BaseGeneration {
+    mmap: MmapRegion,
+    directory: FastHashMap<Key, DirEntry>,
+    path: PathBuf,
+}
+
+impl BaseGeneration {
+    #[inline]
+    fn block(&self, block_index: u32) -> Option<Words> {
+        let off = HEADER_REGION + block_index as usize * BITMAP_BLOCK_BYTES;
+        let bytes = self.mmap.as_slice().get(off..off + BITMAP_BLOCK_BYTES)?;
+        let mut words = [0u64; 64];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = read_u64_le(bytes, i * 8);
+        }
+        Some(words)
+    }
+
+    /// `true` if the base bitmap of `key` holds `ord` (one binary search + one word read).
+    fn contains(&self, key: &Key, ord: RecordOrdinal) -> bool {
+        let Some(entry) = self.directory.get(key) else {
+            return false;
+        };
+        let chunk_id = ord.0 / 4096;
+        let Ok(i) = entry.chunks.binary_search_by_key(&chunk_id, |c| c.chunk_id) else {
+            return false;
+        };
+        let bit = (ord.0 % 4096) as usize;
+        let off = HEADER_REGION
+            + entry.chunks[i].block_index as usize * BITMAP_BLOCK_BYTES
+            + (bit / 64) * 8;
+        self.mmap
+            .as_slice()
+            .get(off..off + 8)
+            .is_some_and(|w| (read_u64_le(w, 0) >> (bit % 64)) & 1 == 1)
+    }
+
+    /// Base chunks of `key`, ascending by chunk id.
+    fn chunks(&self, key: &Key) -> Vec<(u32, Words)> {
+        self.directory.get(key).map_or_else(Vec::new, |entry| {
+            entry
+                .chunks
+                .iter()
+                .filter_map(|c| self.block(c.block_index).map(|w| (c.chunk_id, w)))
+                .collect()
+        })
+    }
+}
+
+/// In-progress checkpoint returned by `begin_checkpoint` (holds the checkpoint lock).
+pub struct PendingBitmapCheckpoint<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
+    frozen: Arc<FrozenDelta>,
+    base: Option<Arc<BaseGeneration>>,
+    generation: u64,
+}
+
+impl core::fmt::Debug for PendingBitmapCheckpoint<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PendingBitmapCheckpoint")
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+#[derive(Default)]
+struct FrozenDelta {
+    hot: BitmapTagIndex,
+    removed: FastHashMap<Key, CompressedBitmap>,
+}
+
+#[derive(Default)]
+struct PagedBitmapState {
+    base: Option<Arc<BaseGeneration>>,
+    frozen: Option<Arc<FrozenDelta>>,
+    hot: BitmapTagIndex,
+    removed: FastHashMap<Key, CompressedBitmap>,
+    generation: u64,
+    stamp: u64,
+}
+
+impl PagedBitmapState {
+    /// The visible posting bitmap of `key` (see the module docs).
+    fn bitmap(&self, key: &Key) -> CompressedBitmap {
+        let mut bm = match self.base {
+            Some(ref base) => CompressedBitmap::from_raw_chunks(base.chunks(key)),
+            None => CompressedBitmap::new(),
+        };
+        if let Some(ref frozen) = self.frozen {
+            if let Some(r) = frozen.removed.get(key) {
+                bm.and_not_in_place(r);
+            }
+            let fh = frozen.hot.get_bitmap(key.0, key.1);
+            if !fh.is_empty() {
+                bm = bm.union(&fh);
+            }
+        }
+        if let Some(r) = self.removed.get(key) {
+            bm.and_not_in_place(r);
+        }
+        let hot = self.hot.get_bitmap(key.0, key.1);
+        if !hot.is_empty() {
+            bm = bm.union(&hot);
+        }
+        bm
+    }
+
+    /// `true` if `ord` is visible under `key`, without materializing any bitmap.
+    fn contains(&self, key: &Key, ord: RecordOrdinal) -> bool {
+        if self.hot.contains(key.0, key.1, ord) {
+            return true;
+        }
+        if self.removed.get(key).is_some_and(|r| r.contains(ord)) {
+            return false;
+        }
+        if let Some(ref frozen) = self.frozen {
+            if frozen.hot.contains(key.0, key.1, ord) {
+                return true;
+            }
+            if frozen.removed.get(key).is_some_and(|r| r.contains(ord)) {
+                return false;
+            }
+        }
+        self.base.as_ref().is_some_and(|b| b.contains(key, ord))
+    }
+
+    /// Upper bound of `bitmap(key).len()` without materializing it (never `0` for a non-empty
+    /// key, so cost-based short-circuits stay correct).
+    fn cardinality_upper_bound(&self, key: &Key) -> usize {
+        let base = self
+            .base
+            .as_ref()
+            .and_then(|b| b.directory.get(key))
+            .map_or(0, |e| e.cardinality as usize);
+        let frozen = self
+            .frozen
+            .as_ref()
+            .map_or(0, |f| f.hot.cardinality(key.0, key.1));
+        base + frozen + self.hot.cardinality(key.0, key.1)
+    }
+
+    /// Every key that may be non-empty, filtered by `keep`.
+    fn keys(&self, keep: impl Fn(&Key) -> bool) -> Vec<Key> {
+        let mut keys: Vec<Key> = self
+            .base
+            .as_ref()
+            .map(|b| b.directory.keys().copied().filter(|k| keep(k)).collect())
+            .unwrap_or_default();
+        if let Some(ref frozen) = self.frozen {
+            keys.extend(frozen.hot.keys().into_iter().filter(|k| keep(k)));
+        }
+        keys.extend(self.hot.keys().into_iter().filter(|k| keep(k)));
+        keys.sort_unstable();
+        keys.dedup();
+        keys
+    }
+
+    fn union_of(&self, keys: &[Key]) -> CompressedBitmap {
+        let mut acc = CompressedBitmap::new();
+        for key in keys {
+            let bm = self.bitmap(key);
+            if !bm.is_empty() {
+                acc = if acc.is_empty() { bm } else { acc.union(&bm) };
+            }
+        }
+        acc
+    }
+}
+
+/// Disk-backed Paged Bitmap Tag Index (`TASK-035`, `TASK-083`, `F-PIDX-02`).
 pub struct PagedBitmapIndex {
     path: PathBuf,
     state: RwLock<PagedBitmapState>,
+    checkpoint_lock: Mutex<()>,
 }
 
 impl core::fmt::Debug for PagedBitmapIndex {
@@ -57,625 +248,557 @@ impl core::fmt::Debug for PagedBitmapIndex {
 }
 
 impl PagedBitmapIndex {
-    /// Opens or creates a disk-backed `PagedBitmapIndex` at `path`.
+    /// Opens (or creates) the index whose manifest is `path`. A corrupted generation is an error
+    /// (the caller rebuilds); stale generation files are removed.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         let mut state = PagedBitmapState::default();
-        if path.exists() {
-            let meta = fs::metadata(&path).map_err(|e| StorageError::io("stat bitmap.idx", e))?;
-            if meta.len() >= PAGE_SIZE_4KB as u64 {
-                let mmap = map_path_read_only(&path)?;
-                let base_off = load_bitmap_directory(&mmap, &mut state.directory)?;
-                state.blocks_base_offset = base_off;
-                state.mmap = Some(mmap);
-            }
+        if let Some((generation, stamp)) = read_manifest(&path, BITMAP_MANIFEST_MAGIC)? {
+            let data_path = generation_path(&path, generation);
+            let mmap = map_path_read_only(&data_path)?;
+            let directory = load_generation(&mmap)?;
+            state.base = Some(Arc::new(BaseGeneration {
+                mmap,
+                directory,
+                path: data_path,
+            }));
+            state.generation = generation;
+            state.stamp = stamp;
         }
+        remove_stale_generations(&path, state.base.as_ref().map(|b| b.path.as_path()));
         Ok(Self {
             path,
             state: RwLock::new(state),
+            checkpoint_lock: Mutex::new(()),
         })
     }
 
+    #[inline]
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, PagedBitmapState> {
+        self.state.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[inline]
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, PagedBitmapState> {
+        self.state.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Stamp recorded by the last checkpoint (`0` if never checkpointed).
+    pub fn stamp(&self) -> u64 {
+        self.read().stamp
+    }
+
+    /// Number of `(field, tag)` keys in the mapped base generation.
     pub fn mapped_tag_count(&self) -> usize {
-        let guard = self
-            .state
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.directory.len()
+        self.read().base.as_ref().map_or(0, |b| b.directory.len())
     }
 
     pub fn insert(&self, field_id: u16, tag: InlineId, ord: RecordOrdinal) {
-        let mut guard = self
-            .state
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.hot_removed.remove(&(field_id, tag, ord));
-        guard.hot_added.insert(field_id, tag, ord);
+        let mut st = self.write();
+        if let Some(r) = st.removed.get_mut(&(field_id, tag)) {
+            r.remove(ord);
+        }
+        st.hot.insert(field_id, tag, ord);
     }
 
     pub fn remove(&self, field_id: u16, tag: InlineId, ord: RecordOrdinal) {
-        let mut guard = self
-            .state
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.hot_added.remove(field_id, tag, ord);
-        guard.hot_removed.insert((field_id, tag, ord));
+        let mut st = self.write();
+        st.hot.remove(field_id, tag, ord);
+        st.removed.entry((field_id, tag)).or_default().insert(ord);
     }
 
-    /// Loads or merges the `CompressedBitmap` for `(field_id, tag)` from the `MmapRegion` and hot delta.
     pub fn get_bitmap(&self, field_id: u16, tag: InlineId) -> CompressedBitmap {
-        let guard = self
-            .state
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.load_merged_bitmap_locked(&guard, field_id, tag)
+        self.read().bitmap(&(field_id, tag))
     }
 
-    /// Intersects multiple `(field_id, tag)` predicates in ascending chunk-count order
-    /// directly over the memory-mapped 512-byte chunk slices (`TASK-035`).
+    /// Upper-bound cardinality estimate for query planning (`0` only for empty keys).
+    pub fn cardinality(&self, field_id: u16, tag: InlineId) -> usize {
+        self.read().cardinality_upper_bound(&(field_id, tag))
+    }
+
+    /// Intersects `predicates`, smallest (estimated) posting list first.
     pub fn intersect_all(&self, predicates: &[(u16, InlineId)]) -> CompressedBitmap {
         if predicates.is_empty() {
             return CompressedBitmap::new();
         }
-        let guard = self
-            .state
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let mut bitmaps: Vec<CompressedBitmap> = Vec::with_capacity(predicates.len());
-        for &(fid, tag) in predicates {
-            let bm = self.load_merged_bitmap_locked(&guard, fid, tag);
-            if bm.is_empty() {
-                return CompressedBitmap::new();
-            }
-            bitmaps.push(bm);
-        }
-        bitmaps.sort_by_key(|b| b.len());
-        let mut acc = bitmaps[0].clone();
-        for bm in &bitmaps[1..] {
-            acc = acc.intersect(bm);
+        let st = self.read();
+        let mut keys = predicates.to_vec();
+        keys.sort_by_key(|k| st.cardinality_upper_bound(k));
+        let mut acc = st.bitmap(&keys[0]);
+        for key in &keys[1..] {
             if acc.is_empty() {
                 break;
             }
+            acc = acc.intersect(&st.bitmap(key));
         }
         acc
     }
 
-    fn load_merged_bitmap_locked(
+    /// Union of `tags` on `field_id` (`IN`).
+    pub fn union_tags(&self, field_id: u16, tags: &[InlineId]) -> CompressedBitmap {
+        let keys: Vec<Key> = tags.iter().map(|&t| (field_id, t)).collect();
+        self.read().union_of(&keys)
+    }
+
+    /// Union of every tag on `field_id` starting with `prefix`.
+    pub fn union_tag_prefix(&self, field_id: u16, prefix: &str) -> CompressedBitmap {
+        let st = self.read();
+        let keys = st.keys(|&(f, t)| f == field_id && t.starts_with_str(prefix));
+        st.union_of(&keys)
+    }
+
+    /// Union of every tag on `field_id` (`IS NOT NULL`).
+    pub fn all_on_field_bitmap(&self, field_id: u16) -> CompressedBitmap {
+        let st = self.read();
+        let keys = st.keys(|&(f, _)| f == field_id);
+        st.union_of(&keys)
+    }
+
+    /// `true` if `ord` has every `must_tags` key, none of `not_tags`, and at least one tag of
+    /// every `any_tag_groups` group (same semantics as `BitmapTagIndex::matches_ordinal`), using
+    /// point lookups only.
+    pub fn matches_ordinal(
         &self,
-        guard: &PagedBitmapState,
-        field_id: u16,
-        tag: InlineId,
-    ) -> CompressedBitmap {
-        let mut bm = if let (Some(ref mmap), Some(refs)) =
-            (&guard.mmap, guard.directory.get(&(field_id, tag)))
-        {
-            let slice = mmap.as_slice();
-            let mut raw_chunks = Vec::with_capacity(refs.len());
-            for cref in refs {
-                let off = guard.blocks_base_offset + (cref.block_index as usize) * BITMAP_BLOCK_BYTES;
-                if let Some(block_bytes) = slice.get(off..off + BITMAP_BLOCK_BYTES) {
-                    let mut words = [0u64; 64];
-                    for (i, w) in words.iter_mut().enumerate() {
-                        let b = i * 8;
-                        *w = u64::from_le_bytes([
-                            block_bytes[b],
-                            block_bytes[b + 1],
-                            block_bytes[b + 2],
-                            block_bytes[b + 3],
-                            block_bytes[b + 4],
-                            block_bytes[b + 5],
-                            block_bytes[b + 6],
-                            block_bytes[b + 7],
-                        ]);
-                    }
-                    raw_chunks.push((cref.chunk_id, words));
-                }
-            }
-            CompressedBitmap::from_raw_chunks(raw_chunks)
-        } else {
-            CompressedBitmap::new()
-        };
-
-        let hot = guard.hot_added.get_bitmap(field_id, tag);
-        if !hot.is_empty() {
-            bm = bm.union(&hot);
+        ord: RecordOrdinal,
+        must_tags: &[(u16, InlineId)],
+        not_tags: &[(u16, InlineId)],
+        any_tag_groups: &[(u16, &[InlineId])],
+    ) -> bool {
+        if must_tags.is_empty() && not_tags.is_empty() && any_tag_groups.is_empty() {
+            return true;
         }
-        if !guard.hot_removed.is_empty() {
-            for &(rfid, rtag, rord) in &guard.hot_removed {
-                if rfid == field_id && rtag == tag {
-                    bm.remove(rord);
-                }
-            }
-        }
-        bm
+        let st = self.read();
+        must_tags.iter().all(|k| st.contains(k, ord))
+            && !not_tags.iter().any(|k| st.contains(k, ord))
+            && any_tag_groups.iter().all(|&(field, group)| {
+                !group.is_empty() && group.iter().any(|&t| st.contains(&(field, t), ord))
+            })
     }
 
-    /// Checkpoints all mapped and hot-delta bitmap chunks into 4 KiB-aligned disk pages in `bitmap.idx`.
+    /// Removes every ordinal of `not_predicates` from `target` (`AND NOT`).
+    pub fn exclude_from_bitmap(&self, not_predicates: &[(u16, InlineId)], target: &mut CompressedBitmap) {
+        if not_predicates.is_empty() || target.is_empty() {
+            return;
+        }
+        let st = self.read();
+        for key in not_predicates {
+            target.and_not_in_place(&st.bitmap(key));
+            if target.is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// Keeps only the `candidates` present in every one of `predicates`.
+    pub fn filter_in_place(&self, predicates: &[(u16, InlineId)], candidates: &mut Vec<RecordOrdinal>) {
+        if predicates.is_empty() || candidates.is_empty() {
+            return;
+        }
+        let st = self.read();
+        for key in predicates {
+            let bm = st.bitmap(key);
+            candidates.retain(|&ord| bm.contains(ord));
+            if candidates.is_empty() {
+                return;
+            }
+        }
+    }
+
+    /// Checkpoints with the current stamp unchanged. Returns the number of blocks written.
+    #[inline]
     pub fn checkpoint_to_disk(&self) -> Result<usize> {
-        let mut guard = self
-            .state
-            .write()
+        let stamp = self.stamp();
+        self.checkpoint_with_stamp(stamp)
+    }
+
+    /// Stream-merges the base and the delta into a new generation tagged with `stamp`. Only the
+    /// freeze and swap take the state lock; on error the frozen delta is folded back.
+    pub fn checkpoint_with_stamp(&self, stamp: u64) -> Result<usize> {
+        let pending = self.begin_checkpoint();
+        self.finish_checkpoint(pending, stamp)
+    }
+
+    /// Freezes the current delta (`O(1)`, brief state lock). Pair with
+    /// [`Self::finish_checkpoint`]; the returned token serializes checkpoints. Callers that need a
+    /// consistent cut across several structures freeze them all while their writers are paused.
+    pub fn begin_checkpoint(&self) -> PendingBitmapCheckpoint<'_> {
+        let guard = self
+            .checkpoint_lock
+            .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-        let mut all_keys: BTreeMap<(u16, InlineId), CompressedBitmap> = BTreeMap::new();
-        let existing_keys: Vec<(u16, InlineId)> = guard.directory.keys().copied().collect();
-        for (fid, tag) in existing_keys {
-            let bm = self.load_merged_bitmap_locked(&guard, fid, tag);
-            if !bm.is_empty() {
-                all_keys.insert((fid, tag), bm);
-            }
-        }
-        for ((fid, tag), hot_bm) in guard.hot_added.snapshot_all() {
-            let entry = all_keys.entry((fid, tag)).or_default();
-            *entry = entry.union(&hot_bm);
-            for &(rfid, rtag, rord) in &guard.hot_removed {
-                if rfid == fid && rtag == tag {
-                    entry.remove(rord);
-                }
-            }
-            if entry.is_empty() {
-                all_keys.remove(&(fid, tag));
-            }
-        }
-
-        // Release old mmap before replacing file on Windows
-        guard.mmap = None;
-
-        // Serialize directory + 4 KiB-aligned 512-byte chunk blocks
-        let mut dir_payload = Vec::new();
-        let mut blocks_payload = Vec::new();
-        let mut new_dir: FastHashMap<(u16, InlineId), Vec<MappedChunkRef>> = FastHashMap::default();
-        let mut block_index = 0u32;
-
-        let tag_count = all_keys.len() as u32;
-        dir_payload.extend_from_slice(&tag_count.to_le_bytes());
-
-        for ((fid, tag), bm) in all_keys {
-            let chunks = bm.chunks_slice();
-            dir_payload.extend_from_slice(&fid.to_le_bytes());
-            dir_payload.extend_from_slice(&tag.to_raw_bytes());
-            dir_payload.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
-
-            let mut refs = Vec::with_capacity(chunks.len());
-            for &(chunk_id, ref words) in chunks {
-                dir_payload.extend_from_slice(&chunk_id.to_le_bytes());
-                dir_payload.extend_from_slice(&block_index.to_le_bytes());
-                for &w in words {
-                    blocks_payload.extend_from_slice(&w.to_le_bytes());
-                }
-                refs.push(MappedChunkRef {
-                    chunk_id,
-                    block_index,
-                });
-                block_index += 1;
-            }
-            new_dir.insert((fid, tag), refs);
-        }
-
-        let dir_crc = checksum_payload(&dir_payload);
-        let header_and_dir_len = 20 + dir_payload.len();
-        let blocks_base_offset = header_and_dir_len.next_multiple_of(PAGE_SIZE_4KB);
-
-        let mut full_file = Vec::with_capacity(blocks_base_offset + blocks_payload.len());
-        full_file.extend_from_slice(&BITMAP_FILE_MAGIC.to_le_bytes());
-        full_file.extend_from_slice(&(blocks_base_offset as u32).to_le_bytes());
-        full_file.extend_from_slice(&(dir_payload.len() as u32).to_le_bytes());
-        full_file.extend_from_slice(&dir_crc.to_le_bytes());
-        full_file.extend_from_slice(&dir_payload);
-        full_file.resize(blocks_base_offset, 0u8);
-        full_file.extend_from_slice(&blocks_payload);
-
-        if let Some(parent) = self.path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| StorageError::io("create paged bitmap dir", e))?;
-            }
-        }
-        atomic_write_replace(&self.path, &full_file, true)?;
-
-        let new_mmap = map_path_read_only(&self.path)?;
-        guard.mmap = Some(new_mmap);
-        guard.blocks_base_offset = blocks_base_offset;
-        guard.directory = new_dir;
-        guard.hot_added = BitmapTagIndex::new();
-        guard.hot_removed.clear();
-
-        Ok(block_index as usize)
-    }
-}
-
-fn map_path_read_only(path: &Path) -> Result<MmapRegion> {
-    let file = fs::File::open(path).map_err(|e| StorageError::io("open index file for mmap", e))?;
-    let len = file
-        .metadata()
-        .map_err(|e| StorageError::io("stat index file for mmap", e))?
-        .len() as usize;
-    MmapRegion::map_read_only(&file, len)
-}
-
-fn load_bitmap_directory(
-    mmap: &MmapRegion,
-    out: &mut FastHashMap<(u16, InlineId), Vec<MappedChunkRef>>,
-) -> Result<usize> {
-    let slice = mmap.as_slice();
-    if slice.len() < 20 {
-        return Err(StorageError::corrupted_header("bitmap.idx truncated"));
-    }
-    let magic = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
-    if magic != BITMAP_FILE_MAGIC {
-        return Err(StorageError::corrupted_header("bitmap.idx invalid magic"));
-    }
-    let blocks_base_offset = u32::from_le_bytes([slice[4], slice[5], slice[6], slice[7]]) as usize;
-    let dir_len = u32::from_le_bytes([slice[8], slice[9], slice[10], slice[11]]) as usize;
-    let expected_crc = u64::from_le_bytes([
-        slice[12], slice[13], slice[14], slice[15], slice[16], slice[17], slice[18], slice[19],
-    ]);
-    let dir_slice = slice
-        .get(20..20 + dir_len)
-        .ok_or_else(|| StorageError::corrupted_header("bitmap.idx directory out of bounds"))?;
-    let actual_crc = checksum_payload(dir_slice);
-    if actual_crc != expected_crc {
-        return Err(StorageError::checksum_mismatch(expected_crc, actual_crc));
-    }
-
-    if dir_slice.len() < 4 {
-        return Ok(blocks_base_offset);
-    }
-    let tag_count = u32::from_le_bytes([dir_slice[0], dir_slice[1], dir_slice[2], dir_slice[3]]) as usize;
-    let mut off = 4usize;
-
-    for _ in 0..tag_count {
-        if off + 30 > dir_slice.len() {
-            return Err(StorageError::corrupted_header("bitmap.idx tag entry truncated"));
-        }
-        let fid = u16::from_le_bytes([dir_slice[off], dir_slice[off + 1]]);
-        off += 2;
-        let mut raw_id = [0u8; 24];
-        raw_id.copy_from_slice(&dir_slice[off..off + 24]);
-        let tag = InlineId::from_raw_bytes(raw_id)?;
-        off += 24;
-        let chunk_count = u32::from_le_bytes([
-            dir_slice[off],
-            dir_slice[off + 1],
-            dir_slice[off + 2],
-            dir_slice[off + 3],
-        ]) as usize;
-        off += 4;
-
-        let mut refs = Vec::with_capacity(chunk_count);
-        for _ in 0..chunk_count {
-            if off + 8 > dir_slice.len() {
-                return Err(StorageError::corrupted_header("bitmap.idx chunk ref truncated"));
-            }
-            let chunk_id = u32::from_le_bytes([
-                dir_slice[off],
-                dir_slice[off + 1],
-                dir_slice[off + 2],
-                dir_slice[off + 3],
-            ]);
-            let block_index = u32::from_le_bytes([
-                dir_slice[off + 4],
-                dir_slice[off + 5],
-                dir_slice[off + 6],
-                dir_slice[off + 7],
-            ]);
-            off += 8;
-            refs.push(MappedChunkRef {
-                chunk_id,
-                block_index,
-            });
-        }
-        out.insert((fid, tag), refs);
-    }
-
-    Ok(blocks_base_offset)
-}
-
-/// 64-byte Cache-Line-Aligned Split-Block Bloom Filter (`TASK-035`, `F-INDX-08`, `RULE-CPU-01`).
-///
-/// Every key lookup touches **at most 1 single 64-byte CPU cache line**, testing 8 independent
-/// bit positions in parallel across `[u64; 8]` words with `< 1%` false-positive rate at 10 bits/key.
-#[repr(C, align(64))]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BloomCacheBlock {
-    pub words: [u64; 8],
-}
-
-#[derive(Clone, Debug)]
-pub struct SplitBlockBloomFilter {
-    blocks: Vec<BloomCacheBlock>,
-}
-
-const BLOOM_SALTS: [u64; 8] = [
-    0x47b6_137b_c570_83d5,
-    0x4497_4d91_a181_7e7f,
-    0x8824_ad5b_72f9_398d,
-    0xa2b7_289d_5d39_2e53,
-    0x7054_95c7_6786_48b9,
-    0x2df1_424b_9c8c_316d,
-    0x9efc_4947_5c6b_21e1,
-    0x5c6b_fb31_e3f5_9d47,
-];
-
-impl SplitBlockBloomFilter {
-    /// Creates a `SplitBlockBloomFilter` sized for `expected_items` (~10.24 bits per item).
-    pub fn with_capacity(expected_items: usize) -> Self {
-        // Each 64-byte block has 512 bits -> holds ~50 keys at ~10 bits/key (<1% FPR)
-        let num_blocks = (expected_items / 50).max(1).next_power_of_two();
-        Self {
-            blocks: vec![BloomCacheBlock::default(); num_blocks],
-        }
-    }
-
-    #[inline]
-    pub fn insert(&mut self, id: InlineId) {
-        let h = id.fast_hash();
-        let block_idx = ((h >> 32) as usize) & (self.blocks.len() - 1);
-        let block = &mut self.blocks[block_idx];
-        for (i, &salt) in BLOOM_SALTS.iter().enumerate() {
-            let bit = ((h.wrapping_mul(salt)) >> 58) as u32;
-            block.words[i] |= 1u64 << bit;
-        }
-    }
-
-    /// Returns `false` if `id` is **definitely not** in the set (in 1 single 64-byte cache line touch!).
-    #[inline]
-    pub fn may_contain(&self, id: InlineId) -> bool {
-        if self.blocks.is_empty() {
-            return false;
-        }
-        let h = id.fast_hash();
-        let block_idx = ((h >> 32) as usize) & (self.blocks.len() - 1);
-        let block = &self.blocks[block_idx];
-        for (i, &salt) in BLOOM_SALTS.iter().enumerate() {
-            let bit = ((h.wrapping_mul(salt)) >> 58) as u32;
-            if (block.words[i] & (1u64 << bit)) == 0 {
-                return false;
-            }
-        }
-        true
-    }
-
-    #[inline]
-    pub fn memory_bytes(&self) -> usize {
-        self.blocks.len() * core::mem::size_of::<BloomCacheBlock>()
-    }
-}
-
-const COLD_PRIMARY_MAGIC: u32 = 0x4350_4958; // "CPIX"
-const COLD_RECORD_STRIDE: usize = 64; // 64-byte cache-line-aligned cold primary entry
-const COLD_RECORDS_PER_PAGE: usize = (PAGE_SIZE_4KB - 32) / COLD_RECORD_STRIDE; // 63 entries per 4 KiB page
-
-/// Cold Primary Index separator entry (`24` bytes per 4 KiB page -> ~380 bytes per 1,000 cold records!).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ColdPageSeparator {
-    pub min_hash: u64,
-    pub max_hash: u64,
-    pub page_index: u32,
-    pub entry_count: u16,
-    pub _pad: u16,
-}
-
-/// Decoded cold primary record entry from a 4 KiB mmap page.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ColdPrimaryEntry {
-    pub id: InlineId,
-    pub ordinal: RecordOrdinal,
-    pub version: Version,
-    pub ttl_expires_at_ns: u64,
-    pub location: DiskLocation,
-}
-
-/// Tiered Cold Primary Index backed by 4 KiB `MmapRegion` pages and guarded by a 64-byte
-/// `SplitBlockBloomFilter` (`TASK-035`, `F-INDX-08`).
-#[derive(Debug)]
-pub struct ColdPrimaryIndex {
-    path: PathBuf,
-    bloom: SplitBlockBloomFilter,
-    separators: Vec<ColdPageSeparator>,
-    mmap: Option<MmapRegion>,
-}
-
-impl ColdPrimaryIndex {
-    /// Builds and maps a `ColdPrimaryIndex` at `path` from a slice of `ColdPrimaryEntry` items.
-    pub fn build(path: impl Into<PathBuf>, mut entries: Vec<ColdPrimaryEntry>) -> Result<Self> {
-        let path = path.into();
-        // Sort by `(id.fast_hash(), id)` for $O(\log B)$ binary search
-        entries.sort_unstable_by(|a, b| {
-            a.id.fast_hash()
-                .cmp(&b.id.fast_hash())
-                .then_with(|| a.id.cmp(&b.id))
+        let mut st = self.write();
+        let frozen = Arc::new(FrozenDelta {
+            hot: core::mem::take(&mut st.hot),
+            removed: core::mem::take(&mut st.removed),
         });
-
-        let mut bloom = SplitBlockBloomFilter::with_capacity(entries.len().max(64));
-        for e in &entries {
-            bloom.insert(e.id);
+        st.frozen = Some(Arc::clone(&frozen));
+        PendingBitmapCheckpoint {
+            _guard: guard,
+            frozen,
+            base: st.base.clone(),
+            generation: st.generation + 1,
         }
+    }
 
-        let mut pages_buf = Vec::new();
-        let mut separators = Vec::new();
-
-        for (page_idx, chunk) in entries.chunks(COLD_RECORDS_PER_PAGE).enumerate() {
-            let start = pages_buf.len();
-            pages_buf.resize(start + PAGE_SIZE_4KB, 0u8);
-            let page = &mut pages_buf[start..start + PAGE_SIZE_4KB];
-
-            let min_hash = chunk[0].id.fast_hash();
-            let max_hash = chunk[chunk.len() - 1].id.fast_hash();
-            let count = chunk.len() as u16;
-
-            page[0..4].copy_from_slice(&COLD_PRIMARY_MAGIC.to_le_bytes());
-            page[4..6].copy_from_slice(&count.to_le_bytes());
-            page[8..16].copy_from_slice(&min_hash.to_le_bytes());
-            page[16..24].copy_from_slice(&max_hash.to_le_bytes());
-
-            for (i, entry) in chunk.iter().enumerate() {
-                let off = 32 + i * COLD_RECORD_STRIDE;
-                encode_cold_entry(&mut page[off..off + COLD_RECORD_STRIDE], entry);
-            }
-            let crc = checksum_payload(&page[32..]);
-            page[24..32].copy_from_slice(&crc.to_le_bytes());
-
-            separators.push(ColdPageSeparator {
-                min_hash,
-                max_hash,
-                page_index: page_idx as u32,
-                entry_count: count,
-                _pad: 0,
-            });
-        }
-
-        let mmap = if !pages_buf.is_empty() {
-            if let Some(parent) = path.parent() {
-                if !parent.exists() {
-                    fs::create_dir_all(parent)
-                        .map_err(|e| StorageError::io("create cold primary dir", e))?;
+    /// Writes and publishes the generation frozen by [`Self::begin_checkpoint`] (no state lock is
+    /// held during I/O). Returns the number of blocks written. On error the frozen delta is
+    /// folded back, so no write is lost.
+    pub fn finish_checkpoint(&self, pending: PendingBitmapCheckpoint<'_>, stamp: u64) -> Result<usize> {
+        let PendingBitmapCheckpoint {
+            _guard,
+            frozen,
+            base,
+            generation,
+        } = pending;
+        match self.write_generation(&frozen, base.as_deref(), generation, stamp) {
+            Ok((new_base, written)) => {
+                let old = {
+                    let mut st = self.write();
+                    st.frozen = None;
+                    st.generation = generation;
+                    st.stamp = stamp;
+                    st.base.replace(Arc::new(new_base))
+                };
+                drop(base);
+                if let Some(old) = old {
+                    let old_path = old.path.clone();
+                    drop(old);
+                    // Best effort: a leftover generation is removed at the next open.
+                    let _ = fs::remove_file(old_path);
                 }
+                Ok(written)
             }
-            atomic_write_replace(&path, &pages_buf, true)?;
-            Some(map_path_read_only(&path)?)
-        } else {
-            None
+            Err(e) => {
+                self.unfreeze(&frozen);
+                Err(e)
+            }
+        }
+    }
+
+    /// Drops every entry and publishes an empty generation tagged with `stamp` (used before a
+    /// rebuild from the records).
+    pub fn clear_with_stamp(&self, stamp: u64) -> Result<()> {
+        let _one_at_a_time = self
+            .checkpoint_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (old, generation) = {
+            let mut st = self.write();
+            st.hot = Default::default();
+            st.removed = Default::default();
+            st.frozen = None;
+            (st.base.take(), st.generation + 1)
         };
-
-        Ok(Self {
-            path,
-            bloom,
-            separators,
-            mmap,
-        })
-    }
-
-    #[inline]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Looks up `id` in the cold primary index:
-    /// 1. Checks `SplitBlockBloomFilter` in 1 single 64-byte cache line (rejecting >99% of misses with 0 disk touches).
-    /// 2. Binary-searches `separators` in $O(\log P)$ to find candidate 4 KiB page(s).
-    /// 3. Binary-searches the 64-byte slots inside the 4 KiB `MmapRegion` page in $O(\log B)$ with 0 heap allocations!
-    pub fn get(&self, id: InlineId) -> Option<ColdPrimaryEntry> {
-        if !self.bloom.may_contain(id) {
-            return None;
+        let (new_base, _) = self.write_generation(&FrozenDelta::default(), None, generation, stamp)?;
+        {
+            let mut st = self.write();
+            st.generation = generation;
+            st.stamp = stamp;
+            st.base = Some(Arc::new(new_base));
         }
-        let mmap = self.mmap.as_ref()?;
-        let file_slice = mmap.as_slice();
-        let target_hash = id.fast_hash();
+        if let Some(old) = old {
+            let old_path = old.path.clone();
+            drop(old);
+            let _ = fs::remove_file(old_path);
+        }
+        Ok(())
+    }
 
-        let start_page = self.separators.partition_point(|s| s.max_hash < target_hash);
-        for sep in &self.separators[start_page..] {
-            if sep.min_hash > target_hash {
-                break;
+    /// Folds `frozen` back after a failed checkpoint: `hot' = hot ∪ (frozen.hot - removed)`,
+    /// `removed' = (removed ∪ frozen.removed) - hot'`, which preserves every visible set.
+    fn unfreeze(&self, frozen: &FrozenDelta) {
+        let mut st = self.write();
+        st.frozen = None;
+        for (key, mut bm) in frozen.hot.snapshot_all() {
+            if let Some(r) = st.removed.get(&key) {
+                bm.and_not_in_place(r);
             }
-            let page_off = (sep.page_index as usize) * PAGE_SIZE_4KB;
-            let page = file_slice.get(page_off..page_off + PAGE_SIZE_4KB)?;
-            let count = sep.entry_count as usize;
+            for ord in bm.to_vec() {
+                st.hot.insert(key.0, key.1, ord);
+            }
+        }
+        for (key, fr) in &frozen.removed {
+            let entry = st.removed.entry(*key).or_default();
+            *entry = entry.union(fr);
+        }
+        for (key, hot) in st.hot.snapshot_all() {
+            if let Some(r) = st.removed.get_mut(&key) {
+                r.and_not_in_place(&hot);
+            }
+        }
+    }
 
-            // Binary search within the 4 KiB page
-            let mut left = 0usize;
-            let mut right = count;
-            while left < right {
-                let mid = left + (right - left) / 2;
-                let off = 32 + mid * COLD_RECORD_STRIDE;
-                let mid_id = decode_cold_entry_id(&page[off..off + COLD_RECORD_STRIDE])?;
-                let ord = mid_id
-                    .fast_hash()
-                    .cmp(&target_hash)
-                    .then_with(|| mid_id.cmp(&id));
-                match ord {
-                    core::cmp::Ordering::Less => left = mid + 1,
-                    core::cmp::Ordering::Greater => right = mid,
-                    core::cmp::Ordering::Equal => {
-                        return decode_cold_entry(&page[off..off + COLD_RECORD_STRIDE]);
+    fn write_generation(
+        &self,
+        frozen: &FrozenDelta,
+        base: Option<&BaseGeneration>,
+        generation: u64,
+        stamp: u64,
+    ) -> Result<(BaseGeneration, usize)> {
+        let io = |what: &'static str| move |e: std::io::Error| StorageError::io(what, e);
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).map_err(io("create paged bitmap dir"))?;
+        }
+        let data_path = generation_path(&self.path, generation);
+        let tmp_path = temp_generation_path(&self.path, generation);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(io("create bitmap generation file"))?;
+        let mut writer = BufWriter::with_capacity(64 * BITMAP_BLOCK_BYTES, file);
+        writer
+            .write_all(&[0u8; HEADER_REGION])
+            .map_err(io("write bitmap header placeholder"))?;
+
+        let mut keys: Vec<Key> = base
+            .map(|b| b.directory.keys().copied().collect())
+            .unwrap_or_default();
+        keys.extend(frozen.hot.keys());
+        keys.sort_unstable();
+        keys.dedup();
+
+        let mut dir = Vec::new();
+        dir.extend_from_slice(&0u32.to_le_bytes()); // tag count, patched below
+        let mut tag_count = 0u32;
+        let mut block_index = 0u32;
+        let mut block_bytes = [0u8; BITMAP_BLOCK_BYTES];
+        for key in keys {
+            let base_chunks = base.map(|b| b.chunks(&key)).unwrap_or_default();
+            let removed = frozen.removed.get(&key);
+            let hot = frozen.hot.get_bitmap(key.0, key.1);
+            let mut refs: Vec<MappedChunkRef> = Vec::new();
+            let mut cardinality = 0u64;
+            let mut write_err = None;
+            merge_chunks(
+                &base_chunks,
+                removed.map_or(&[][..], |r| r.chunks_slice()),
+                hot.chunks_slice(),
+                |chunk_id, words| {
+                    for (i, w) in words.iter().enumerate() {
+                        block_bytes[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
                     }
+                    if write_err.is_none() {
+                        if let Err(e) = writer.write_all(&block_bytes) {
+                            write_err = Some(e);
+                        }
+                    }
+                    cardinality += words.iter().map(|w| u64::from(w.count_ones())).sum::<u64>();
+                    refs.push(MappedChunkRef { chunk_id, block_index });
+                    block_index += 1;
+                },
+            );
+            if let Some(e) = write_err {
+                return Err(StorageError::io("write bitmap block", e));
+            }
+            if refs.is_empty() {
+                continue;
+            }
+            tag_count += 1;
+            dir.extend_from_slice(&key.0.to_le_bytes());
+            dir.extend_from_slice(&key.1.to_raw_bytes());
+            dir.extend_from_slice(&(refs.len() as u32).to_le_bytes());
+            dir.extend_from_slice(&cardinality.to_le_bytes());
+            for r in &refs {
+                dir.extend_from_slice(&r.chunk_id.to_le_bytes());
+                dir.extend_from_slice(&r.block_index.to_le_bytes());
+            }
+        }
+        dir[0..4].copy_from_slice(&tag_count.to_le_bytes());
+        writer.write_all(&dir).map_err(io("write bitmap directory"))?;
+        let mut file = writer
+            .into_inner()
+            .map_err(|e| StorageError::io("flush bitmap generation file", e.into_error()))?;
+        file.sync_all().map_err(io("fsync bitmap generation file"))?;
+
+        // Checksums over the written regions (streamed writes cannot checksum incrementally).
+        let blocks_len = block_index as usize * BITMAP_BLOCK_BYTES;
+        let dir_offset = (HEADER_REGION + blocks_len) as u64;
+        let blocks_crc = {
+            let mapped = map_path_read_only(&tmp_path)?;
+            let region = mapped
+                .as_slice()
+                .get(HEADER_REGION..HEADER_REGION + blocks_len)
+                .ok_or_else(|| StorageError::corrupted_header("bitmap generation shorter than written"))?;
+            checksum_payload(region)
+        };
+        let mut header = [0u8; HEADER_LEN];
+        header[0..4].copy_from_slice(&BITMAP_FILE_MAGIC.to_le_bytes());
+        header[4..8].copy_from_slice(&block_index.to_le_bytes());
+        header[8..16].copy_from_slice(&dir_offset.to_le_bytes());
+        header[16..20].copy_from_slice(&(dir.len() as u32).to_le_bytes());
+        header[24..32].copy_from_slice(&checksum_payload(&dir).to_le_bytes());
+        header[32..40].copy_from_slice(&blocks_crc.to_le_bytes());
+        let header_crc = checksum_payload(&header[0..40]);
+        header[40..48].copy_from_slice(&header_crc.to_le_bytes());
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.write_all(&header))
+            .and_then(|()| file.sync_all())
+            .map_err(io("finalize bitmap generation file"))?;
+        drop(file);
+        publish_generation(&tmp_path, &data_path)?;
+        write_manifest(&self.path, BITMAP_MANIFEST_MAGIC, generation, stamp)?;
+
+        let mmap = map_path_read_only(&data_path)?;
+        let directory = load_generation(&mmap)?;
+        Ok((
+            BaseGeneration {
+                mmap,
+                directory,
+                path: data_path,
+            },
+            block_index as usize,
+        ))
+    }
+}
+
+/// Streams `(base - removed) ∪ hot` chunk by chunk in ascending chunk id, calling `emit` for every
+/// non-empty result chunk. All inputs are sorted by chunk id.
+fn merge_chunks(
+    base: &[(u32, Words)],
+    removed: &[(u32, Words)],
+    hot: &[(u32, Words)],
+    mut emit: impl FnMut(u32, &Words),
+) {
+    let (mut bi, mut ri, mut hi) = (0usize, 0usize, 0usize);
+    loop {
+        let next = [base.get(bi), hot.get(hi)]
+            .into_iter()
+            .flatten()
+            .map(|c| c.0)
+            .min();
+        let Some(chunk_id) = next else {
+            return;
+        };
+        let mut words = [0u64; 64];
+        if base.get(bi).is_some_and(|c| c.0 == chunk_id) {
+            words = base[bi].1;
+            bi += 1;
+            while removed.get(ri).is_some_and(|c| c.0 < chunk_id) {
+                ri += 1;
+            }
+            if removed.get(ri).is_some_and(|c| c.0 == chunk_id) {
+                for (w, r) in words.iter_mut().zip(removed[ri].1.iter()) {
+                    *w &= !r;
                 }
             }
         }
-        None
-    }
-
-    /// Total in-memory footprint (Bloom filter + page separators) in bytes.
-    pub fn ram_footprint_bytes(&self) -> usize {
-        self.bloom.memory_bytes()
-            + self.separators.len() * core::mem::size_of::<ColdPageSeparator>()
-    }
-}
-
-fn encode_cold_entry(slot: &mut [u8], entry: &ColdPrimaryEntry) {
-    slot[0..24].copy_from_slice(&entry.id.to_raw_bytes());
-    slot[24..28].copy_from_slice(&entry.ordinal.0.to_le_bytes());
-    slot[28..36].copy_from_slice(&entry.version.0.to_le_bytes());
-    slot[36..44].copy_from_slice(&entry.ttl_expires_at_ns.to_le_bytes());
-    match entry.location {
-        DiskLocation::Unflushed => {
-            slot[44] = 0;
+        if hot.get(hi).is_some_and(|c| c.0 == chunk_id) {
+            for (w, h) in words.iter_mut().zip(hot[hi].1.iter()) {
+                *w |= h;
+            }
+            hi += 1;
         }
-        DiskLocation::Arena(loc) => {
-            slot[44] = 1;
-            slot[48..52].copy_from_slice(&loc.segment_id.to_le_bytes());
-            slot[52..56].copy_from_slice(&loc.offset.to_le_bytes());
-            slot[56..60].copy_from_slice(&loc.len.to_le_bytes());
-        }
-        DiskLocation::DedicatedFile {
-            ping_pong_stride, ..
-        } => {
-            slot[44] = 2;
-            slot[48..52].copy_from_slice(&ping_pong_stride.to_le_bytes());
+        if words.iter().any(|&w| w != 0) {
+            emit(chunk_id, &words);
         }
     }
 }
 
-#[inline]
-fn decode_cold_entry_id(slot: &[u8]) -> Option<InlineId> {
-    let mut raw = [0u8; 24];
-    raw.copy_from_slice(&slot[0..24]);
-    InlineId::from_raw_bytes(raw).ok()
-}
+/// Validates a generation file once at open (`RULE-SAFE-04`): header checksum, directory and
+/// block region bounds and checksums, chunk refs inside the block region, strictly increasing
+/// chunk ids, unique keys. Allocations are bounded by the bytes present.
+fn load_generation(mmap: &MmapRegion) -> Result<FastHashMap<Key, DirEntry>> {
+    let corrupt = StorageError::corrupted_header;
+    let slice = mmap.as_slice();
+    if slice.len() < HEADER_REGION {
+        return Err(corrupt("bitmap generation truncated"));
+    }
+    if read_u32_le(slice, 0) != BITMAP_FILE_MAGIC {
+        return Err(corrupt("bitmap generation invalid magic or unsupported format version"));
+    }
+    let expected_header_crc = read_u64_le(slice, 40);
+    let actual_header_crc = checksum_payload(&slice[0..40]);
+    if expected_header_crc != actual_header_crc {
+        return Err(StorageError::checksum_mismatch(expected_header_crc, actual_header_crc));
+    }
+    let block_count = read_u32_le(slice, 4) as usize;
+    let dir_offset = usize::try_from(read_u64_le(slice, 8)).map_err(|_| corrupt("bitmap dir offset"))?;
+    let dir_len = read_u32_le(slice, 16) as usize;
+    let blocks_end = block_count
+        .checked_mul(BITMAP_BLOCK_BYTES)
+        .and_then(|len| HEADER_REGION.checked_add(len))
+        .ok_or_else(|| corrupt("bitmap block region overflow"))?;
+    if blocks_end != dir_offset {
+        return Err(corrupt("bitmap directory does not follow the block region"));
+    }
+    let blocks = slice
+        .get(HEADER_REGION..blocks_end)
+        .ok_or_else(|| corrupt("bitmap block region out of bounds"))?;
+    let dir = dir_offset
+        .checked_add(dir_len)
+        .and_then(|end| slice.get(dir_offset..end))
+        .ok_or_else(|| corrupt("bitmap directory out of bounds"))?;
+    for (expected, region) in [(read_u64_le(slice, 24), dir), (read_u64_le(slice, 32), blocks)] {
+        let actual = checksum_payload(region);
+        if actual != expected {
+            return Err(StorageError::checksum_mismatch(expected, actual));
+        }
+    }
 
-fn decode_cold_entry(slot: &[u8]) -> Option<ColdPrimaryEntry> {
-    let id = decode_cold_entry_id(slot)?;
-    let ordinal = RecordOrdinal(u32::from_le_bytes([slot[24], slot[25], slot[26], slot[27]]));
-    let version = Version(u64::from_le_bytes([
-        slot[28], slot[29], slot[30], slot[31], slot[32], slot[33], slot[34], slot[35],
-    ]));
-    let ttl_expires_at_ns = u64::from_le_bytes([
-        slot[36], slot[37], slot[38], slot[39], slot[40], slot[41], slot[42], slot[43],
-    ]);
-    let location = match slot[44] {
-        1 => DiskLocation::Arena(ArenaLocation {
-            segment_id: u32::from_le_bytes([slot[48], slot[49], slot[50], slot[51]]),
-            offset: u32::from_le_bytes([slot[52], slot[53], slot[54], slot[55]]),
-            len: u32::from_le_bytes([slot[56], slot[57], slot[58], slot[59]]),
-        }),
-        2 => DiskLocation::DedicatedFile {
-            parent_group: None,
-            ping_pong_stride: u32::from_le_bytes([slot[48], slot[49], slot[50], slot[51]]),
-        },
-        _ => DiskLocation::Unflushed,
-    };
-    Some(ColdPrimaryEntry {
-        id,
-        ordinal,
-        version,
-        ttl_expires_at_ns,
-        location,
-    })
+    let mut out = FastHashMap::default();
+    if dir.len() < 4 {
+        return Err(corrupt("bitmap directory truncated"));
+    }
+    let tag_count = read_u32_le(dir, 0) as usize;
+    let mut off = 4usize;
+    for _ in 0..tag_count {
+        let fixed = dir
+            .get(off..off + DIR_ENTRY_FIXED)
+            .ok_or_else(|| corrupt("bitmap tag entry truncated"))?;
+        let field = read_u16_le(fixed, 0);
+        let tag = InlineId::from_raw_bytes(read_array_24(fixed, 2))?;
+        let chunk_count = read_u32_le(fixed, 26) as usize;
+        let cardinality = read_u64_le(fixed, 30);
+        off += DIR_ENTRY_FIXED;
+        let refs_bytes = chunk_count
+            .checked_mul(8)
+            .and_then(|len| off.checked_add(len))
+            .and_then(|end| dir.get(off..end))
+            .ok_or_else(|| corrupt("bitmap chunk refs truncated"))?;
+        let mut chunks = Vec::with_capacity(chunk_count);
+        let mut prev: Option<u32> = None;
+        for raw in refs_bytes.chunks_exact(8) {
+            let chunk_id = read_u32_le(raw, 0);
+            let block_index = read_u32_le(raw, 4);
+            if block_index as usize >= block_count {
+                return Err(corrupt("bitmap chunk ref points past the last block"));
+            }
+            if prev.is_some_and(|p| chunk_id <= p) {
+                return Err(corrupt("bitmap chunk ids are not strictly increasing"));
+            }
+            prev = Some(chunk_id);
+            chunks.push(MappedChunkRef { chunk_id, block_index });
+        }
+        off += refs_bytes.len();
+        if out.insert((field, tag), DirEntry { chunks, cardinality }).is_some() {
+            return Err(corrupt("bitmap duplicate (field, tag) directory entry"));
+        }
+    }
+    if off != dir.len() {
+        return Err(corrupt("trailing bytes after bitmap directory"));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn temp_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("storine_paged_bitmap_{name}_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("bitmap.idx")
+    }
+
     #[test]
     fn test_paged_bitmap_index_checkpoint_and_mmap_intersection() -> Result<()> {
-        let path = std::env::temp_dir().join("storine_test_paged_bitmap.idx");
-        let _ = fs::remove_file(&path);
-
+        let path = temp_path("basic");
         let tag_a = InlineId::new("tag_alpha")?;
         let tag_b = InlineId::new("tag_beta")?;
-
         let idx = PagedBitmapIndex::open(&path)?;
         for i in (0..8_000u32).step_by(2) {
             idx.insert(1, tag_a, RecordOrdinal(i));
@@ -683,52 +806,84 @@ mod tests {
         for i in (0..8_000u32).step_by(3) {
             idx.insert(1, tag_b, RecordOrdinal(i));
         }
-        let blocks = idx.checkpoint_to_disk()?;
+        let blocks = idx.checkpoint_with_stamp(3)?;
         assert!(blocks >= 4);
-
         let reopened = PagedBitmapIndex::open(&path)?;
+        assert_eq!(reopened.stamp(), 3);
         let both = reopened.intersect_all(&[(1, tag_a), (1, tag_b)]);
         assert_eq!(both.len(), 1334); // multiples of 6 in 0..8000
-
-        let _ = fs::remove_file(&path);
         Ok(())
     }
 
+    /// Every query matches the in-memory `BitmapTagIndex` across random writes, checkpoints
+    /// and a reopen.
     #[test]
-    fn test_split_block_bloom_and_cold_primary_index() -> Result<()> {
-        let path = std::env::temp_dir().join("storine_test_cold_primary.idx");
-        let _ = fs::remove_file(&path);
-
-        let mut entries = Vec::with_capacity(1_000);
-        for i in 0..1_000u32 {
-            let id = InlineId::new(&format!("id_{:06}", i + 1))?;
-            entries.push(ColdPrimaryEntry {
-                id,
-                ordinal: RecordOrdinal(i),
-                version: Version(1),
-                ttl_expires_at_ns: 0,
-                location: DiskLocation::Arena(ArenaLocation {
-                    segment_id: 1,
-                    offset: i * 128,
-                    len: 128,
-                }),
-            });
+    fn test_paged_bitmap_matches_in_memory_index_through_checkpoints() -> Result<()> {
+        use storage_types::testing::SweepRng;
+        let path = temp_path("parity");
+        let paged = PagedBitmapIndex::open(&path)?;
+        let mem = BitmapTagIndex::new();
+        let tags: Vec<InlineId> = ["red", "green", "greenish", "blue", "black"]
+            .iter()
+            .map(|t| InlineId::new(t).unwrap())
+            .collect();
+        let mut rng = SweepRng::new(9);
+        let check = |paged: &PagedBitmapIndex, rng: &mut SweepRng| {
+            for field in 1..=2u16 {
+                for &t in &tags {
+                    assert_eq!(paged.get_bitmap(field, t).to_vec(), mem.get_bitmap(field, t).to_vec());
+                    assert!(paged.cardinality(field, t) >= mem.cardinality(field, t));
+                    if mem.cardinality(field, t) > 0 {
+                        assert!(paged.cardinality(field, t) > 0);
+                    }
+                }
+                let a = tags[rng.below(tags.len())];
+                let b = tags[rng.below(tags.len())];
+                assert_eq!(paged.intersect_all(&[(field, a), (field, b)]).to_vec(), mem.intersect_all(&[(field, a), (field, b)]).to_vec());
+                assert_eq!(paged.union_tags(field, &[a, b]).to_vec(), mem.union_tags(field, &[a, b]).to_vec());
+                assert_eq!(paged.union_tag_prefix(field, "gre").to_vec(), mem.union_tag_prefix(field, "gre").to_vec());
+                assert_eq!(paged.all_on_field_bitmap(field).to_vec(), mem.all_on_field_bitmap(field).to_vec());
+                let mut t1 = mem.all_on_field_bitmap(field);
+                let mut t2 = t1.clone();
+                paged.exclude_from_bitmap(&[(field, a)], &mut t1);
+                mem.exclude_from_bitmap(&[(field, a)], &mut t2);
+                assert_eq!(t1.to_vec(), t2.to_vec());
+                let mut c1: Vec<RecordOrdinal> = (0..9_000).step_by(7).map(RecordOrdinal).collect();
+                let mut c2 = c1.clone();
+                paged.filter_in_place(&[(field, b)], &mut c1);
+                mem.filter_in_place(&[(field, b)], &mut c2);
+                assert_eq!(c1, c2);
+                let group = [a, b];
+                for o in (0..9_000u32).step_by(13).map(RecordOrdinal) {
+                    assert_eq!(
+                        paged.matches_ordinal(o, &[(field, a)], &[(field, b)], &[(field, &group)]),
+                        mem.matches_ordinal(o, &[(field, a)], &[(field, b)], &[(field, &group)])
+                    );
+                }
+            }
+        };
+        for round in 0..6u64 {
+            for _ in 0..3_000 {
+                let field = 1 + rng.below(2) as u16;
+                let tag = tags[rng.below(tags.len())];
+                let ord = RecordOrdinal(rng.below(9_000) as u32);
+                if rng.below(3) == 0 {
+                    paged.remove(field, tag, ord);
+                    mem.remove(field, tag, ord);
+                } else {
+                    paged.insert(field, tag, ord);
+                    mem.insert(field, tag, ord);
+                }
+            }
+            check(&paged, &mut rng);
+            if round % 2 == 1 {
+                paged.checkpoint_with_stamp(round)?;
+                check(&paged, &mut rng);
+            }
         }
-
-        let cold = ColdPrimaryIndex::build(&path, entries)?;
-        // Verify compact RAM footprint (< 3 bytes per record!)
-        assert!(cold.ram_footprint_bytes() < 3_000);
-
-        // Positive lookup hits the exact entry via O(log B) page binary search
-        let hit = cold
-            .get(InlineId::new("id_000500")?)
-            .expect("must find id 500");
-        assert_eq!(hit.ordinal, RecordOrdinal(499));
-
-        // Negative lookups short-circuit via SplitBlockBloomFilter
-        assert!(cold.get(InlineId::new("id_999999")?).is_none());
-
-        let _ = fs::remove_file(&path);
+        drop(paged);
+        let reopened = PagedBitmapIndex::open(&path)?;
+        check(&reopened, &mut rng);
         Ok(())
     }
 }

@@ -35,10 +35,10 @@
 | Feature ID | Feature Name | Description | Target Tier |
 | :--- | :--- | :--- | :--- |
 | **F-DURA-01** | **Group-Commit Write-Ahead Log (WAL)** | Batches concurrent mutations from multiple threads into a single sequential WAL write and `fsync` (`GroupCommitWal`). | v0.3 |
-| **F-DURA-02** | **Configurable Durability Modes** | Supports `SyncMode::Coalesced` (memory-first with background flush), `SyncMode::Durable` (group-committed WAL `fsync`), and `SyncMode::MemoryOnly`. | v0.3 |
-| **F-DURA-03** | **Hardware-Accelerated Dual Checksums** | Every `RecordHeader` (`header_checksum`) and payload (`payload_checksum`) is protected by 4-way `XXH3-64` + hardware SSE4.2 `CRC32C` (`~1.84 GB/s`). | v0.1 |
+| **F-DURA-02** | **Configurable Durability Modes** | `SyncPolicy::Immediate` (`fsync` per write), `SyncPolicy::GroupCommit` (one `fsync` per concurrent batch), and `SyncPolicy::AsyncMemoryFirst` (buffered in RAM, written to the OS by the background flusher, never `fsync`ed; a crash can lose the last flush interval). | v0.3 |
+| **F-DURA-03** | **Hardware-Accelerated Dual Checksums** | Every `RecordHeader` (`header_checksum`) and payload (`payload_checksum`) is protected by a 4-lane XXH64-family hash combined with a dual-lane `CRC32C` (SSE4.2 instruction when available, bit-identical portable table otherwise, so the on-disk format never depends on build flags). | v0.1 |
 | **F-DURA-04** | **Torn-Frame Crash Recovery & Replay** | On startup, scans WAL frames, truncates trailing torn frames from power loss, replays committed transactions, and cleans up orphaned `.tmp` files. | v0.3 |
-| **F-DURA-05** | **Once-Per-Map Archive Verification** | Validates untrusted disk bytes once when mapped (`MmapRegion::verified`), then sets an embedded `AtomicBool` so all subsequent hot reads run in 1–2 CPU cycles (`3 ns`). | v0.1 |
+| **F-DURA-05** | **Once-Per-Map Archive Verification** | Validates untrusted disk bytes once when mapped (`MmapRegion::verified`), then sets an embedded `AtomicBool`; later hot reads use the safe O(1) `RecordCodec::decode_fast` (header, bounds and alignment checks only, no checksum). | v0.1 |
 
 ---
 
@@ -47,7 +47,7 @@
 | Feature ID | Feature Name | Description | Target Tier |
 | :--- | :--- | :--- | :--- |
 | **F-INDX-01** | **64-Shard Cache-Padded Primary Index & $O(1)$ Ordinal Recycling** | Maps `InlineId -> PrimaryEntry` (`96 bytes`) across 64 cache-line-aligned shards with strict $O(1)$ deleted `RecordOrdinal` recycling (`Some(InlineId::EMPTY)` sentinel). | v0.1 |
-| **F-INDX-02** | **Compact Varint Primary Checkpoints (`STGEIDX2`)** | Persists `PrimaryIndex` to `primary.idx` at **`19.0 bytes/record`** (`4.63x` smaller via LEB128 varints + 64B-unit arena offsets). | v0.2 |
+| **F-INDX-02** | **Compact Varint Primary Checkpoints (`STGEIDX3`)** | Persists `PrimaryIndex` to `primary.idx` at **`~21 bytes/record`** (LEB128 varints + 64B-unit arena offsets), including each record's ordinal so ordinal-keyed persisted indexes stay valid across restarts. | v0.2 |
 | **F-INDX-03** | **Order-Preserving B+Tree Numeric Range Index** | Indexes `i64`, `u64` (`sortable_u64_to_i64`), `f64` (`sortable_f64_to_i64`), and `bool` fields for fast `[min, max]` range scans. | v0.4 |
 | **F-INDX-04** | **Word-Aligned `CompressedBitmap` Tag Index** | Maps categorical tags to 64-bit word-aligned bitmaps, driving multi-tag `AND`/`OR` intersections from the smallest posting list via hardware `TZCNT`. | v0.4 |
 | **F-INDX-05** | **Zero-Copy Differential Index Maintenance** | Extracts old `IndexSnapshot` (`264B` stack SoA struct) directly from `&T::Archived` (`0` heap maps) and mutates secondary indexes only when indexed fields actually change. | v0.4 |
@@ -105,7 +105,7 @@
 | Feature ID | Feature Name | Description | Target Tier |
 | :--- | :--- | :--- | :--- |
 | **F-PITR-01** | **Segmented WAL Rotation (`wal_XXXXXX.log`) & LSN Tracking** | Rotates WAL files at configurable size limits (e.g., `64 MiB`), assigns monotonic 64-bit Log Sequence Numbers (`LSN`), and deletes/archives old WAL segments automatically once their `max_lsn <= checkpoint_lsn`. | v1.0 |
-| **F-PITR-02** | **Online Hot Backup & Point-in-Time Recovery (PITR)** | Creates consistent online backups (`.bak` manifest + hardlinked/copied arena segments + WAL stream) without pausing foreground reads/writes, and supports replaying WAL frames up to any target `stop_at_timestamp_ns` (`PITR`). | v1.0 |
+| **F-PITR-02** | **Online Hot Backup & Point-in-Time Recovery (PITR)** | Creates consistent online backups (`.bak` manifest + hardlinked/copied arena segments + WAL stream) (readers continue; writers pause only while dirty records are flushed and files are copied), and replays the archived WAL prefix up to a target timestamp (`PITR`, requires `EngineConfig::wal_archive = true`). | v1.0 |
 
 ### 6.6 Kernel Event Polling, Complete Wire Protocol & Security (`F-NET-*` & `F-SEC-*`)
 
@@ -120,7 +120,7 @@
 
 | Feature ID | Feature Name | Description | Target Tier |
 | :--- | :--- | :--- | :--- |
-| **F-DIST-01** | **Consistent-Hash Virtual Shards (`1,024 vshards`) & Cluster Router** | Maps keys to `1,024` deterministic virtual shards (`vshard = hash64(id) & 1023`) with a compact cluster topology map (`ClusterMap`) routing client requests to the owning physical node in $O(1)$ time. | v1.0 |
+| **F-DIST-01** | **Consistent-Hash Virtual Shards (`1,024 vshards`) & Cluster Router** | Maps keys to `1,024` deterministic virtual shards (`vshard = hash64(id) >> 54`, the high 10 bits, independent of the low bits that pick in-node shards) with a compact cluster topology map (`ClusterMap`) routing client requests to the owning physical node in $O(1)$ time. | v1.0 |
 | **F-DIST-02** | **Raft Consensus Replication & Pipelined WAL Streaming** | Replicates `GroupCommitWal` batches across a multi-node replica group (`Leader`, `Follower`, `Learner`) with term/vote persistence, heartbeat election timeouts, and read-scale follower queries. | v1.0 |
 | **F-DIST-03** | **Online Zero-Downtime Shard Migration** | Streams a virtual shard's arena records and incremental WAL tail from a source node to a target node while live traffic continues, atomically flipping shard ownership on completion. | v1.0 |
 
@@ -130,3 +130,41 @@
 | :--- | :--- | :--- | :--- |
 | **F-OPT-01** | **Cardinality-Aware Cost-Based Query Planner & `EXPLAIN`** | Estimates predicate selectivity across `BitmapTagIndex`, `NumericRangeIndex`, and `HNSW` vector index in `< 200 ns` to choose the lowest-cost execution plan and exposes structured `QueryExplain` diagnostics. | v1.0 |
 | **F-OPT-02** | **Lock-Free HDR-Style Latency Histograms & Prometheus Exporter** | Records power-of-two bucketed latency histograms (`read`, `write`, `query`, `wal_sync`, `rpc`) using thread-local / sharded atomic counters (`0` allocations) and exports Prometheus/OpenMetrics text format via `OP_METRICS` and CLI. | v1.0 |
+
+
+### 6.9 Operations, Observability & Supplementary Features (implemented; referenced from code)
+
+| Feature ID | Feature Name | Description | Target Tier |
+| :--- | :--- | :--- | :--- |
+| **F-OPS-01** | **Schema Migration Hooks** | `register_migration` / `SchemaRegistry` upcasters upgrade older `schema_version` frames on read and during compaction. | v0.8 |
+| **F-OPS-02** | **Record TTL & Expiry Sweeps** | `put_with_ttl` stores `ttl_expires_at_ns`; expired records are invisible to reads and removed by `sweep_expired`. | v0.8 |
+| **F-OPS-03** | **Cold LZ4 Record Compression** | `compress_cold_record` stores cold records LZ4-compressed (`RecordFlags::COMPRESSED_LZ4`); they are read via `get_owned`. | v0.8 |
+| **F-OPS-04** | **Consistent Snapshots & Online Backups** | `create_snapshot_with_lsn` / `create_online_backup` copy a consistent database image tagged with its WAL LSN into a fresh directory. | v0.8 |
+| **F-OPS-05** | **Hybrid Metadata + Vector Top-K** | `QueryBuilder::top_k_similar` intersects index filters with SIMD cosine scoring (HNSW above 256 vectors). | v0.8 |
+| **F-OPS-06** | **Engine Telemetry (`EngineStats`)** | Live record, read/write, coalescing, WAL and mmap-pool counters via `StorageEngine::stats`. | v0.8 |
+| **F-OPS-07** | **`storage-cli` Operations Utility** | CRUD, stats, compaction, backup / WAL archive / PITR restore, and remote admin commands. | v0.8 |
+| **F-OBS-01** | **Lock-Free Latency Histograms** | 64-bucket logarithmic `LatencyHistogram` (`[AtomicU64; 64]`), `0` allocations per record. | v1.0 |
+| **F-OBS-02** | **Prometheus Text Exporter** | `EngineStats::to_prometheus_text` served over `OP_METRICS`. | v1.0 |
+| **F-OBS-03** | **Bounded Slow-Operation Log** | Fixed-capacity ring buffer of operations slower than a threshold. | v1.0 |
+| **F-CONC-08** | **Snapshot-Isolation Read Guards** | `begin_read_snapshot` returns a `ReadSnapshot` that sees a consistent `read_ts` view; writers keep prior versions while it is alive. | v1.0 |
+| **F-DIST-04** | **Follower Reads at Commit Index** | `read_at_commit_index` serves reads from followers only up to the replicated commit index. | v1.0 |
+| **F-INDX-07** | **HNSW + Exact Re-Ranking Search** | Multi-layer HNSW candidate search followed by exact `f32` re-ranking of the top `2K` candidates. | v1.0 |
+| **F-INDX-08** | **Split-Block Bloom Filter** | 64-byte cache-line-aligned split-block Bloom filter used by the paged/cold index directories. | v1.0 |
+| **F-REL-05** | **Relationship Integrity Auditor** | `verify_relationships` reports every dangling relationship edge. | v0.5 |
+| **F-SEC-03** | **Per-Connection Token-Bucket Rate Limiting** | Zero-allocation `TokenBucket` applied at the request-header stage, before the body is read. | v1.0 |
+| **F-SEC-04** | **Constant-Time Auth & Confined Admin Paths** | Constant-time token comparison and `backup_root` confinement of client-supplied backup names. | v1.0 |
+
+---
+
+## 7. Verified Implementation Status (full-project audits, 2026-10-20/21, `TASK-067` – `TASK-081`)
+
+The tables above are the target specification. The following rows are **not** fully realized in the engine as of this audit; everything not listed here is implemented and covered by tests.
+
+| Feature ID | Status |
+| :--- | :--- |
+| **F-SEC-02** | Wired as `EngineConfig::encryption_key` (`TASK-084`): record frames in arena segments, record files and WAL bodies are ChaCha20-Poly1305 sealed. Not encrypted: record ids / locations (`primary.idx`), indexed tag and numeric values (secondary-index files), quantized vectors (`hnsw.idx`). Must be enabled at database creation. |
+| **F-PIDX-01 / 02** | Wired as `EngineConfig::index_tier = IndexTier::Paged` (`TASK-083`). Rebuilt from the records after a crash; reused after a clean shutdown. |
+| **F-PIDX-03** | `ColdPrimaryIndex` (bloom filter + 4 KiB pages) exists and is tested, but the engine's primary hash map and ordinal table are always in RAM (`96 B` + `32 B` per record); tiering them requires a paged ordinal table. |
+| **F-NET-01** | Readiness polling uses `WSAPoll` / `poll` (not `epoll` / `IOCP`). Idle workers block indefinitely (a per-shard self-wake socket delivers new connections, admin results and shutdown), so idle CPU is `0%` with zero timer wake-ups, but each wake-up is O(connections per shard) in the kernel. |
+| **F-SEC-01** | Bearer tokens only (no HMAC). An unauthenticated server refuses to bind a non-loopback address. Configure tokens with `STORAGE_AUTH_TOKENS=token:role,...` (tokens of at least 16 characters). |
+| **F-DIST-02** | Raft persists term/vote and an append-only log (`RaftStorage`), enforces the vote and log-matching safety rules, and compacts its log (§7) with the engine as the snapshot. Elections and replication are driven by the caller (no internal timers or transport of its own beyond the `OP_RAFT_*` RPCs), and there is no `InstallSnapshot` RPC yet: a follower behind the compaction point must be reseeded from a backup. |

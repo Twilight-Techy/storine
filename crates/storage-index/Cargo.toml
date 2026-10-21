@@ -2,6 +2,7 @@
 name = "storage-index"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 description = "64-shard XXH3 primary index, mmap index checkpoints, B+Tree range index, Roaring-style compressed bitmap tag index, and SIMD vector index"

@@ -114,21 +114,21 @@ fn test_production_v1_end_to_end_verification_gate() {
     // =========================================================================
     let eng_dir = root.join("main_engine");
     let engine =
-        StorageEngine::<AgentObjectRecord>::open(&eng_dir, EngineConfig::default()).unwrap();
+        StorageEngine::<AgentObjectRecord>::open(&eng_dir, EngineConfig { wal_archive: true, ..EngineConfig::default() }).unwrap();
     let hist = LatencyHistogram::new();
     let slow_log = SlowOperationLog::new(1, 16);
 
     for i in 0..300u32 {
         let id = InlineId::new(&format!("vec_rec_{i:04}")).unwrap();
         let mut rec =
-            AgentObjectRecord::new(id, format!("Vec {i}"), 1_000 + i as i64, i as i64);
+            AgentObjectRecord::new(id, format!("Vec {i}"), 1_000 + i64::from(i), i64::from(i));
         if i % 10 == 0 {
             rec.tags.push(tag_ai);
         }
         let angle = (i as f32) * 0.01;
         rec.embedding = vec![angle.cos(), angle.sin(), 0.5, 0.25];
         engine.put(id, &rec).unwrap();
-        hist.record_ns(120 + (i as u64));
+        hist.record_ns(120 + u64::from(i));
     }
     slow_log.record_if_slow("compaction_check", 500, || "gate test".to_string());
 
@@ -191,7 +191,7 @@ fn test_production_v1_end_to_end_verification_gate() {
     let restored = restore_point_in_time::<AgentObjectRecord>(
         &backup_dir,
         &restore_dir,
-        EngineConfig::default(),
+        EngineConfig { wal_archive: true, ..EngineConfig::default() },
         pitr_cutoff_ns,
     )
     .unwrap();
@@ -203,11 +203,11 @@ fn test_production_v1_end_to_end_verification_gate() {
     // 5. Stage 13: 1,024-vshard ClusterRouter + 3-Node Raft Consensus Failover
     // =========================================================================
     let s1 = Arc::new(
-        StorageEngine::<AgentObjectRecord>::open(&root.join("shard1"), EngineConfig::default())
+        StorageEngine::<AgentObjectRecord>::open(root.join("shard1"), EngineConfig::default())
             .unwrap(),
     );
     let s2 = Arc::new(
-        StorageEngine::<AgentObjectRecord>::open(&root.join("shard2"), EngineConfig::default())
+        StorageEngine::<AgentObjectRecord>::open(root.join("shard2"), EngineConfig::default())
             .unwrap(),
     );
     let router = ClusterRouter::new(vec![(1, Arc::clone(&s1)), (2, Arc::clone(&s2))]).unwrap();
@@ -229,24 +229,24 @@ fn test_production_v1_end_to_end_verification_gate() {
     let r1 = Arc::new(RaftNode::new(
         1,
         Arc::new(
-            StorageEngine::<AgentObjectRecord>::open(&root.join("raft1"), EngineConfig::default())
+            StorageEngine::<AgentObjectRecord>::open(root.join("raft1"), EngineConfig::default())
                 .unwrap(),
         ),
-    ));
+    ).unwrap());
     let r2 = Arc::new(RaftNode::new(
         2,
         Arc::new(
-            StorageEngine::<AgentObjectRecord>::open(&root.join("raft2"), EngineConfig::default())
+            StorageEngine::<AgentObjectRecord>::open(root.join("raft2"), EngineConfig::default())
                 .unwrap(),
         ),
-    ));
+    ).unwrap());
     let r3 = Arc::new(RaftNode::new(
         3,
         Arc::new(
-            StorageEngine::<AgentObjectRecord>::open(&root.join("raft3"), EngineConfig::default())
+            StorageEngine::<AgentObjectRecord>::open(root.join("raft3"), EngineConfig::default())
                 .unwrap(),
         ),
-    ));
+    ).unwrap());
     let raft_group =
         RaftReplicationGroup::new(vec![Arc::clone(&r1), Arc::clone(&r2), Arc::clone(&r3)]).unwrap();
     raft_group.elect_leader(1).unwrap();
