@@ -899,14 +899,15 @@ impl RecordCodec {
         })
     }
 
-    /// Encrypts `frame` for record `id` at rest (`F-SEC-02`): the payload becomes
-    /// `[12 B nonce | ChaCha20 ciphertext | 16 B Poly1305 tag]`, the header gains
-    /// `RecordFlags::ENCRYPTED`, and the authenticated data binds the ciphertext to `id` and to
-    /// every header field that is not recomputed on decryption (schema, version, timestamps, TTL,
-    /// flags, root offset, lengths), so frames cannot be swapped between records or have their
+    /// Encrypts `frame` for record `id` at rest (`F-SEC-02`) with key `key_id`: the payload becomes
+    /// `[key_id u32 | 12 B nonce | ChaCha20 ciphertext | 16 B Poly1305 tag]`, the header gains
+    /// `RecordFlags::ENCRYPTED`, and the authenticated data binds the ciphertext to `id`, `key_id`
+    /// and every header field that is not recomputed on decryption (schema, version, timestamps,
+    /// TTL, flags, root offset, lengths), so frames cannot be swapped between records or have their
     /// metadata edited without detection.
     pub fn encrypt_frame(
         key: &crate::crypto::EncryptionKey,
+        key_id: u32,
         id: InlineId,
         frame: &[u8],
     ) -> Result<AlignedBytes> {
@@ -918,35 +919,195 @@ impl RecordCodec {
             .checked_add(hdr.payload_len as usize)
             .and_then(|end| frame.get(HEADER_SIZE..end))
             .ok_or_else(|| StorageError::corrupted_header("frame truncated before payload_len"))?;
-        let aad = frame_aad(&hdr, id);
-        let sealed = crate::crypto::seal(key.bytes(), &aad, payload);
-        let sealed_len = u32::try_from(sealed.len())
+        let aad = sealed_frame_aad(&hdr, id, key_id);
+        let nonce = crate::crypto::generate_unique_nonce();
+        let body_len = SEALED_OVERHEAD + payload.len();
+        let body_len_u32 = u32::try_from(body_len)
             .map_err(|_| StorageError::invalid_archive("encrypted payload exceeds u32"))?;
-        let enc_hdr = RecordHeader::new(
+        // Built in place in the final buffer: `[header | key_id | nonce | ciphertext | tag]`.
+        AlignedBytes::try_build(HEADER_SIZE + body_len, |out| {
+            let (head, body) = split_mut(out, HEADER_SIZE)?;
+            {
+                let (kid, rest) = split_mut(body, 4)?;
+                kid.copy_from_slice(&key_id.to_le_bytes());
+                let (nonce_out, rest) = split_mut(rest, crate::crypto::AEAD_NONCE_LEN)?;
+                nonce_out.copy_from_slice(&nonce);
+                let (ct, tag_out) = split_mut(rest, payload.len())?;
+                ct.copy_from_slice(payload);
+                tag_out.copy_from_slice(&crate::crypto::seal_in_place(key.bytes(), &nonce, &aad, ct));
+            }
+            let enc_hdr = RecordHeader::new(
+                hdr.schema_version,
+                Version(hdr.record_version),
+                hdr.updated_at_ns,
+                checksum_payload(body),
+                body_len_u32,
+                hdr.uncompressed_len,
+                hdr.root_offset,
+                hdr.flags_typed().with(RecordFlags::ENCRYPTED),
+                hdr.collection_id,
+                hdr.ttl_expires_at_ns,
+            );
+            head.copy_from_slice(&enc_hdr.to_bytes());
+            Ok(())
+        })
+    }
+
+    /// Authenticates `frame` without encrypting it (`F-SEC-02`, authenticated-only protection):
+    /// the payload stays plaintext and in place, the header gains `RecordFlags::AUTHENTICATED`,
+    /// and a 32-byte trailer `[key_id u32 | 12 B nonce | 16 B Poly1305 tag]` follows the payload.
+    /// The tag covers the record id, the key id, every header field and the whole payload.
+    pub fn authenticate_frame(
+        key: &crate::crypto::EncryptionKey,
+        key_id: u32,
+        id: InlineId,
+        frame: &[u8],
+    ) -> Result<AlignedBytes> {
+        let hdr = RecordHeader::from_slice_verified(frame)?;
+        let flags = hdr.flags_typed();
+        if flags.contains(RecordFlags::ENCRYPTED) || flags.contains(RecordFlags::AUTHENTICATED) {
+            return Err(StorageError::invalid_archive("frame is already protected"));
+        }
+        let payload = HEADER_SIZE
+            .checked_add(hdr.payload_len as usize)
+            .and_then(|end| frame.get(HEADER_SIZE..end))
+            .ok_or_else(|| StorageError::corrupted_header("frame truncated before payload_len"))?;
+        let auth_hdr = RecordHeader::new(
             hdr.schema_version,
             Version(hdr.record_version),
             hdr.updated_at_ns,
-            checksum_payload(&sealed),
-            sealed_len,
+            hdr.payload_checksum,
+            hdr.payload_len,
             hdr.uncompressed_len,
             hdr.root_offset,
-            hdr.flags_typed().with(RecordFlags::ENCRYPTED),
+            flags.with(RecordFlags::AUTHENTICATED),
             hdr.collection_id,
             hdr.ttl_expires_at_ns,
         );
-        let mut out = Vec::new();
-        out.try_reserve_exact(HEADER_SIZE + sealed.len())
-            .map_err(|_| StorageError::resource_exhausted("heap memory (encrypted frame)"))?;
-        out.extend_from_slice(&enc_hdr.to_bytes());
-        out.extend_from_slice(&sealed);
-        AlignedBytes::try_copy_from_slice(&out)
+        let nonce = crate::crypto::generate_unique_nonce();
+        let aad = sealed_frame_aad(&auth_hdr, id, key_id);
+        let tag = crate::crypto::aead_tag(key.bytes(), &nonce, &aad, payload);
+        AlignedBytes::try_build(HEADER_SIZE + payload.len() + AUTH_TRAILER_LEN, |out| {
+            let (head, rest) = split_mut(out, HEADER_SIZE)?;
+            head.copy_from_slice(&auth_hdr.to_bytes());
+            let (body, trailer) = split_mut(rest, payload.len())?;
+            body.copy_from_slice(payload);
+            let (kid, rest) = split_mut(trailer, 4)?;
+            kid.copy_from_slice(&key_id.to_le_bytes());
+            let (nonce_out, tag_out) = split_mut(rest, crate::crypto::AEAD_NONCE_LEN)?;
+            nonce_out.copy_from_slice(&nonce);
+            tag_out.copy_from_slice(&tag);
+            Ok(())
+        })
+    }
+
+    /// Verifies a frame produced by [`Self::authenticate_frame`] for record `id` (constant-time
+    /// tag comparison) and returns the plain frame (flag and trailer removed).
+    pub fn strip_authentication(
+        keys: &crate::crypto::KeyRing,
+        id: InlineId,
+        frame: &[u8],
+    ) -> Result<AlignedBytes> {
+        let hdr = RecordHeader::from_slice_verified(frame)?;
+        if !hdr.flags_typed().contains(RecordFlags::AUTHENTICATED) {
+            return Err(StorageError::invalid_archive("frame is not authenticated"));
+        }
+        let payload_end = HEADER_SIZE
+            .checked_add(hdr.payload_len as usize)
+            .ok_or_else(|| StorageError::corrupted_header("frame length overflow"))?;
+        let payload = frame
+            .get(HEADER_SIZE..payload_end)
+            .ok_or_else(|| StorageError::corrupted_header("frame truncated before payload_len"))?;
+        let trailer = frame
+            .get(payload_end..payload_end + AUTH_TRAILER_LEN)
+            .ok_or_else(|| StorageError::corrupted_header("authenticated frame missing its MAC trailer"))?;
+        let key_id = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&trailer[4..16]);
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(&trailer[16..32]);
+        let key = keys
+            .get(key_id)
+            .ok_or_else(|| StorageError::invalid_key("frame authenticated with a key id not in the key ring"))?;
+        let aad = sealed_frame_aad(&hdr, id, key_id);
+        let expected = crate::crypto::aead_tag(key.bytes(), &nonce, &aad, payload);
+        if !crate::crypto::verify_mac_tag_ct(&tag, &expected) {
+            return Err(StorageError::corrupted_header(
+                "record authentication tag mismatch (tampered frame or wrong key)",
+            ));
+        }
+        let plain_hdr = RecordHeader::new(
+            hdr.schema_version,
+            Version(hdr.record_version),
+            hdr.updated_at_ns,
+            hdr.payload_checksum,
+            hdr.payload_len,
+            hdr.uncompressed_len,
+            hdr.root_offset,
+            hdr.flags_typed().without(RecordFlags::AUTHENTICATED),
+            hdr.collection_id,
+            hdr.ttl_expires_at_ns,
+        );
+        AlignedBytes::try_build(HEADER_SIZE + payload.len(), |out| {
+            let (head, body) = split_mut(out, HEADER_SIZE)?;
+            head.copy_from_slice(&plain_hdr.to_bytes());
+            body.copy_from_slice(payload);
+            Ok(())
+        })
+    }
+
+    /// How `frame` is protected at rest (no verification).
+    pub fn frame_protection(frame: &[u8]) -> FrameProtection {
+        let Ok(hdr) = Self::header_ref(frame) else {
+            return FrameProtection::Plain;
+        };
+        let flags = hdr.flags_typed();
+        if flags.contains(RecordFlags::ENCRYPTED) {
+            return Self::sealed_key_id(frame).map_or(FrameProtection::Plain, FrameProtection::Encrypted);
+        }
+        if flags.contains(RecordFlags::AUTHENTICATED) {
+            let at = HEADER_SIZE + hdr.payload_len as usize;
+            return frame
+                .get(at..at + 4)
+                .map_or(FrameProtection::Plain, |b| {
+                    FrameProtection::Authenticated(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                });
+        }
+        FrameProtection::Plain
+    }
+
+    /// Returns the plain frame of `frame` whatever its protection: decrypts `ENCRYPTED` frames,
+    /// verifies and strips `AUTHENTICATED` ones, and returns plaintext frames unchanged (as a
+    /// copy) — callers decide whether plaintext is acceptable.
+    pub fn unprotect_frame(
+        keys: &crate::crypto::KeyRing,
+        id: InlineId,
+        frame: &[u8],
+    ) -> Result<AlignedBytes> {
+        match Self::frame_protection(frame) {
+            FrameProtection::Encrypted(_) => Self::decrypt_frame(keys, id, frame),
+            FrameProtection::Authenticated(_) => Self::strip_authentication(keys, id, frame),
+            FrameProtection::Plain => AlignedBytes::try_copy_from_slice(frame),
+        }
+    }
+
+    /// Id of the key that sealed `frame` (`None` for a frame that is not encrypted).
+    pub fn sealed_key_id(frame: &[u8]) -> Option<u32> {
+        let hdr = Self::header_ref(frame).ok()?;
+        if !hdr.flags_typed().contains(RecordFlags::ENCRYPTED) {
+            return None;
+        }
+        frame
+            .get(HEADER_SIZE..HEADER_SIZE + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     /// Authenticates and decrypts a frame produced by [`Self::encrypt_frame`] for record `id`,
-    /// returning the original plaintext frame (validate it with [`Self::validate_frame`] before
-    /// zero-copy use). Fails on a wrong key, a wrong `id`, or any modified byte.
+    /// using the key it names from `keys`, and returns the original plaintext frame (validate it
+    /// with [`Self::validate_frame`] before zero-copy use). Fails on an unknown key id, a wrong
+    /// key, a wrong `id`, or any modified byte.
     pub fn decrypt_frame(
-        key: &crate::crypto::EncryptionKey,
+        keys: &crate::crypto::KeyRing,
         id: InlineId,
         frame: &[u8],
     ) -> Result<AlignedBytes> {
@@ -954,34 +1115,45 @@ impl RecordCodec {
         if !hdr.flags_typed().contains(RecordFlags::ENCRYPTED) {
             return Err(StorageError::invalid_archive("frame is not encrypted"));
         }
-        let sealed = HEADER_SIZE
+        let body = HEADER_SIZE
             .checked_add(hdr.payload_len as usize)
             .and_then(|end| frame.get(HEADER_SIZE..end))
             .ok_or_else(|| StorageError::corrupted_header("frame truncated before payload_len"))?;
+        let (id_bytes, sealed) = body
+            .split_first_chunk::<4>()
+            .ok_or_else(|| StorageError::corrupted_header("encrypted payload missing key id"))?;
+        let key_id = u32::from_le_bytes(*id_bytes);
+        let key = keys
+            .get(key_id)
+            .ok_or_else(|| StorageError::invalid_key("frame sealed with a key id not in the key ring"))?;
         let plain_flags = hdr.flags_typed().without(RecordFlags::ENCRYPTED);
         let plain_hdr_for_aad = RecordHeader { flags: plain_flags.0, ..hdr };
-        let aad = frame_aad(&plain_hdr_for_aad, id);
-        let payload = crate::crypto::open(key.bytes(), &aad, sealed)?;
-        let payload_len = u32::try_from(payload.len())
+        let aad = sealed_frame_aad(&plain_hdr_for_aad, id, key_id);
+        let short = || StorageError::corrupted_header("sealed payload shorter than nonce + authentication tag");
+        let (nonce, rest) = sealed.split_first_chunk::<12>().ok_or_else(short)?;
+        let (ciphertext, tag) = rest.split_last_chunk::<16>().ok_or_else(short)?;
+        let payload_len = u32::try_from(ciphertext.len())
             .map_err(|_| StorageError::invalid_archive("decrypted payload exceeds u32"))?;
-        let plain_hdr = RecordHeader::new(
-            hdr.schema_version,
-            Version(hdr.record_version),
-            hdr.updated_at_ns,
-            checksum_payload(&payload),
-            payload_len,
-            hdr.uncompressed_len,
-            hdr.root_offset,
-            plain_flags,
-            hdr.collection_id,
-            hdr.ttl_expires_at_ns,
-        );
-        let mut out = Vec::new();
-        out.try_reserve_exact(HEADER_SIZE + payload.len())
-            .map_err(|_| StorageError::resource_exhausted("heap memory (decrypted frame)"))?;
-        out.extend_from_slice(&plain_hdr.to_bytes());
-        out.extend_from_slice(&payload);
-        AlignedBytes::try_copy_from_slice(&out)
+        // Verified and decrypted in place in the final buffer (no intermediate plaintext copy).
+        AlignedBytes::try_build(HEADER_SIZE + ciphertext.len(), |out| {
+            let (head, body) = split_mut(out, HEADER_SIZE)?;
+            body.copy_from_slice(ciphertext);
+            crate::crypto::open_in_place(key.bytes(), nonce, &aad, body, tag)?;
+            let plain_hdr = RecordHeader::new(
+                hdr.schema_version,
+                Version(hdr.record_version),
+                hdr.updated_at_ns,
+                checksum_payload(body),
+                payload_len,
+                hdr.uncompressed_len,
+                hdr.root_offset,
+                plain_flags,
+                hdr.collection_id,
+                hdr.ttl_expires_at_ns,
+            );
+            head.copy_from_slice(&plain_hdr.to_bytes());
+            Ok(())
+        })
     }
 
     /// `true` if `frame`'s header carries `RecordFlags::ENCRYPTED` (no other validation).
@@ -1052,10 +1224,36 @@ impl RecordCodec {
     }
 }
 
-/// Authenticated data of an encrypted frame: the record id plus every plaintext-frame header
-/// field that decryption does not recompute (`flags` must be the plaintext flags).
-fn frame_aad(hdr: &RecordHeader, id: InlineId) -> [u8; 62] {
-    let mut aad = [0u8; 62];
+/// Bytes an encrypted payload adds to the plaintext: `key_id | nonce | ... | tag`.
+const SEALED_OVERHEAD: usize = 4 + crate::crypto::AEAD_NONCE_LEN + crate::crypto::AEAD_TAG_LEN;
+
+/// `split_at_mut` that reports a short buffer as corruption instead of panicking.
+#[inline]
+fn split_mut(buf: &mut [u8], at: usize) -> Result<(&mut [u8], &mut [u8])> {
+    buf.split_at_mut_checked(at)
+        .ok_or_else(|| StorageError::corrupted_header("frame buffer shorter than its layout"))
+}
+
+/// Size of the MAC trailer of an `AUTHENTICATED` frame (`key_id | nonce | tag`).
+pub const AUTH_TRAILER_LEN: usize = 4 + 12 + 16;
+
+/// How a stored frame is protected at rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameProtection {
+    /// Neither encrypted nor authenticated.
+    Plain,
+    /// `RecordFlags::ENCRYPTED`, sealed with key id `.0`.
+    Encrypted(u32),
+    /// `RecordFlags::AUTHENTICATED` (plaintext payload, MAC trailer) with key id `.0`.
+    Authenticated(u32),
+}
+
+/// Authenticated data of an encrypted frame: the record id, the sealing key id, and every
+/// plaintext-frame header field that decryption does not recompute (`flags` must be the
+/// plaintext flags).
+fn sealed_frame_aad(hdr: &RecordHeader, id: InlineId, key_id: u32) -> [u8; 66] {
+    let mut aad = [0u8; 66];
+    aad[62..66].copy_from_slice(&key_id.to_le_bytes());
     aad[0..24].copy_from_slice(&id.to_raw_bytes());
     aad[24..26].copy_from_slice(&hdr.collection_id.to_le_bytes());
     aad[26..28].copy_from_slice(&hdr.schema_version.to_le_bytes());
@@ -1221,9 +1419,15 @@ mod tests {
         let _ = view.get_slice(&view.tags).len();
         let _ = view.to_owned_record();
         let key = crate::crypto::EncryptionKey::from_bytes([1u8; 32]);
+        let ring = crate::crypto::KeyRing::new().with_key(1, key.clone());
         let id = InlineId::new("user:hostile").unwrap();
-        let _ = RecordCodec::encrypt_frame(&key, id, frame);
-        let _ = RecordCodec::decrypt_frame(&key, id, frame);
+        let _ = RecordCodec::encrypt_frame(&key, 1, id, frame);
+        let _ = RecordCodec::decrypt_frame(&ring, id, frame);
+        let _ = RecordCodec::sealed_key_id(frame);
+        let _ = RecordCodec::authenticate_frame(&key, 1, id, frame);
+        let _ = RecordCodec::strip_authentication(&ring, id, frame);
+        let _ = RecordCodec::unprotect_frame(&ring, id, frame);
+        let _ = RecordCodec::frame_protection(frame);
     }
 
     #[test]
@@ -1243,7 +1447,8 @@ mod tests {
 
             // 0. Hostile encrypted frames: truncations and mutations must fail authentication.
             let key = crate::crypto::EncryptionKey::from_bytes([1u8; 32]);
-            let enc = RecordCodec::encrypt_frame(&key, user.id, &frame).unwrap();
+            let ring = crate::crypto::KeyRing::new().with_key(1, key.clone());
+            let enc = RecordCodec::encrypt_frame(&key, 1, user.id, &frame).unwrap();
             for cut in (0..enc.len()).step_by(7) {
                 decode_all(&enc.as_slice()[..cut]);
             }
@@ -1252,7 +1457,21 @@ mod tests {
                 rng.mutate(&mut bad);
                 let bad = AlignedBytes::copy_from_slice(&bad);
                 if bad.as_slice() != enc.as_slice() {
-                    assert!(RecordCodec::decrypt_frame(&key, user.id, &bad).is_err());
+                    assert!(RecordCodec::decrypt_frame(&ring, user.id, &bad).is_err());
+                }
+            }
+
+            // 0b. Hostile authenticated frames.
+            let auth = RecordCodec::authenticate_frame(&key, 1, user.id, &frame).unwrap();
+            for cut in (0..auth.len()).step_by(5) {
+                decode_all(&auth.as_slice()[..cut]);
+            }
+            for _ in 0..500 {
+                let mut bad = auth.as_slice().to_vec();
+                rng.mutate(&mut bad);
+                let bad = AlignedBytes::copy_from_slice(&bad);
+                if bad.as_slice() != auth.as_slice() {
+                    assert!(RecordCodec::strip_authentication(&ring, user.id, &bad).is_err());
                 }
             }
 
@@ -1322,8 +1541,9 @@ mod tests {
 
     #[test]
     fn test_frame_encryption_roundtrip_and_tamper_detection() {
-        use crate::crypto::EncryptionKey;
+        use crate::crypto::{EncryptionKey, KeyRing};
         let key = EncryptionKey::from_bytes([7u8; 32]);
+        let ring = KeyRing::new().with_key(1, key.clone());
         let id = InlineId::new("secret_user").unwrap();
         let user = SampleUser {
             id,
@@ -1334,7 +1554,8 @@ mod tests {
         };
         for flags in [RecordFlags::NONE, RecordFlags::COMPRESSED_LZ4] {
             let plain = RecordCodec::encode_aligned(&user, Version(3), 77, flags, 123);
-            let enc = RecordCodec::encrypt_frame(&key, id, &plain).unwrap();
+            let enc = RecordCodec::encrypt_frame(&key, 1, id, &plain).unwrap();
+            assert_eq!(RecordCodec::sealed_key_id(&enc), Some(1));
             assert!(RecordCodec::is_encrypted(&enc));
             // The plaintext is not visible in the ciphertext.
             assert!(!enc.windows(12).any(|w| w == b"confidential"));
@@ -1343,19 +1564,20 @@ mod tests {
             assert!(RecordCodec::decode_fast::<SampleUser>(&enc).is_err());
             assert!(RecordCodec::decode_owned::<SampleUser>(&enc).is_err());
             // Round trip restores the exact frame.
-            let dec = RecordCodec::decrypt_frame(&key, id, &enc).unwrap();
+            let dec = RecordCodec::decrypt_frame(&ring, id, &enc).unwrap();
             assert_eq!(dec.as_slice(), plain.as_slice());
             assert_eq!(RecordCodec::decode_owned::<SampleUser>(&dec).unwrap().1, user);
             // Fresh nonce per encryption.
-            let enc2 = RecordCodec::encrypt_frame(&key, id, &plain).unwrap();
+            let enc2 = RecordCodec::encrypt_frame(&key, 1, id, &plain).unwrap();
             assert_ne!(enc.as_slice(), enc2.as_slice());
             // Wrong key, wrong record id (frame swap), tampered ciphertext all fail.
-            assert!(RecordCodec::decrypt_frame(&EncryptionKey::from_bytes([8u8; 32]), id, &enc).is_err());
-            assert!(RecordCodec::decrypt_frame(&key, InlineId::new("other").unwrap(), &enc).is_err());
+            assert!(RecordCodec::decrypt_frame(&KeyRing::new().with_key(1, EncryptionKey::from_bytes([8u8; 32])), id, &enc).is_err());
+            assert!(RecordCodec::decrypt_frame(&KeyRing::new().with_key(2, key.clone()), id, &enc).is_err(), "unknown key id");
+            assert!(RecordCodec::decrypt_frame(&ring, InlineId::new("other").unwrap(), &enc).is_err());
             let mut bad = enc.as_slice().to_vec();
             let last = bad.len() - 20;
             bad[last] ^= 1;
-            assert!(RecordCodec::decrypt_frame(&key, id, &AlignedBytes::copy_from_slice(&bad)).is_err());
+            assert!(RecordCodec::decrypt_frame(&ring, id, &AlignedBytes::copy_from_slice(&bad)).is_err());
             // Editing an authenticated header field (TTL) with a re-sealed header checksum fails.
             let h = *RecordCodec::header_ref(&enc).unwrap();
             let forged = RecordHeader::new(
@@ -1372,8 +1594,54 @@ mod tests {
             );
             let mut f = forged.to_bytes().to_vec();
             f.extend_from_slice(&enc.as_slice()[HEADER_SIZE..]);
-            assert!(RecordCodec::decrypt_frame(&key, id, &AlignedBytes::copy_from_slice(&f)).is_err());
+            assert!(RecordCodec::decrypt_frame(&ring, id, &AlignedBytes::copy_from_slice(&f)).is_err());
         }
+    }
+
+    #[test]
+    fn test_authenticated_frames_stay_readable_and_detect_tampering() {
+        use crate::crypto::{EncryptionKey, KeyRing};
+        let key = EncryptionKey::from_bytes([9u8; 32]);
+        let ring = KeyRing::new().with_key(4, key.clone());
+        let id = InlineId::new("public_user").unwrap();
+        let user = SampleUser {
+            id,
+            age: 30,
+            score: 5,
+            name: "visible but tamper-proof".to_string(),
+            tags: vec![],
+        };
+        let plain = RecordCodec::encode_aligned(&user, Version(2), 9, RecordFlags::NONE, 0);
+        let auth = RecordCodec::authenticate_frame(&key, 4, id, &plain).unwrap();
+        assert_eq!(RecordCodec::frame_protection(&auth), FrameProtection::Authenticated(4));
+        assert_eq!(RecordCodec::frame_protection(&plain), FrameProtection::Plain);
+        // Payload is still plaintext and zero-copy readable in place.
+        assert_eq!(RecordCodec::decode_fast::<SampleUser>(&auth).unwrap().score, 5);
+        assert!(RecordCodec::validate_frame::<SampleUser>(&auth).is_ok());
+        // Stripping restores the exact plain frame.
+        assert_eq!(RecordCodec::strip_authentication(&ring, id, &auth).unwrap().as_slice(), plain.as_slice());
+        assert_eq!(RecordCodec::unprotect_frame(&ring, id, &auth).unwrap().as_slice(), plain.as_slice());
+        // Any modification, wrong record id, wrong or unknown key: rejected.
+        let reject = |bytes: &[u8]| {
+            assert!(RecordCodec::strip_authentication(&ring, id, &AlignedBytes::copy_from_slice(bytes)).is_err());
+        };
+        let mut b = auth.as_slice().to_vec();
+        b[HEADER_SIZE + 3] ^= 1; // payload
+        let h = *RecordCodec::header_ref(&auth).unwrap();
+        let forged = RecordHeader::new(h.schema_version, Version(h.record_version), h.updated_at_ns,
+            checksum_payload(&b[HEADER_SIZE..HEADER_SIZE + h.payload_len as usize]), h.payload_len,
+            h.uncompressed_len, h.root_offset, h.flags_typed(), h.collection_id, h.ttl_expires_at_ns);
+        b[..HEADER_SIZE].copy_from_slice(&forged.to_bytes());
+        reject(&b);
+        let mut b = auth.as_slice().to_vec();
+        let n = b.len();
+        b[n - 1] ^= 1; // tag
+        reject(&b);
+        assert!(RecordCodec::strip_authentication(&ring, InlineId::new("x").unwrap(), &auth).is_err());
+        assert!(RecordCodec::strip_authentication(&KeyRing::new().with_key(4, EncryptionKey::from_bytes([1; 32])), id, &auth).is_err());
+        assert!(RecordCodec::strip_authentication(&KeyRing::new(), id, &auth).is_err());
+        // Cannot double-protect.
+        assert!(RecordCodec::authenticate_frame(&key, 4, id, &auth).is_err());
     }
 
     #[test]

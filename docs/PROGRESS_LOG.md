@@ -330,3 +330,71 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - Cold decrypt-per-read `2.9 µs`, `6` allocs.
   - The gate caught one regression in this task: an extra WAL body copy on the unencrypted write path (`update` `5.00 -> 6.00` allocs/op). Fixed by borrowing the frame unless it must be sealed; back to `5.00`.
 - **Verification**: `95` tests passing, `0` clippy warnings (native and portable).
+
+#### `TASK-085`: Key Ring, Online Enable / Disable, Rotation
+- **Design**: key ids are stored in each sealed frame and bound by the AEAD; settings are swappable at runtime (atomic fast-path flag plus `RwLock<Arc<..>>`). `reseal_all` is WAL-backed and keeps versions; superseded frames are scrubbed (all segments evacuated; ping-pong double write).
+- **Findings**:
+  - Data remanence: re-sealing alone left old plaintext in dead arena slots, and segment dead-byte counters do not survive restarts. Fixed with the full evacuation.
+  - The ping-pong same-version write targeted the slot readers ignore. Fixed, with a dedicated regression test.
+- **Limits (documented)**: deleting a file does not guarantee physical erasure on SSDs, so rotating away from a compromised key protects future data only. WAL segments archived for PITR keep their original keys.
+- **Verification**: `97` tests passing, `0` warnings; allocation gates unchanged; encrypted warm read `275 ns` `0.00` allocs.
+
+#### `TASK-086`: Per-Record Protection Policy
+- **Design**: the record type decides per record, zero-copy, through `Indexable::protection`: `Encrypt` (confidentiality + integrity) or `Authenticate` (integrity only: plaintext payload plus a `32 B` MAC trailer). Both forms share the AAD that binds id, key id and header metadata. The engine's single `desired_protection` drives writes, WAL bodies and `reseal_all`, so a policy change is applied online by the existing WAL-backed, scrubbing re-seal.
+- **Security audit**: no downgrade (plain frames still rejected with a key configured); tag comparison is constant time; the trailer is located from the authenticated `payload_len`; the hostile sweep covers flipped bits and truncations of authenticated frames. Authenticated frames are verified on every cold read into the cache rather than read zero-copy, because a cached "verified" bit could outlive a key revocation.
+- **Complexity / footprint**: authenticated write = one Poly1305 pass (`O(n)`, no ChaCha20 over the payload); `+32 B` per authenticated record vs `+32 B` (`key_id + nonce + tag`) per encrypted record.
+- **Verification**: `99` tests passing, `0` warnings (native and portable); benchmark allocation gates unchanged (encrypted warm `with_ref` `0.00` allocs/op).
+
+#### `TASK-087`: Faster Cold Decryption
+- **Implementation**:
+  - ChaCha20 keystream in vertical SIMD layout (each register = one state word of 4 / 8 blocks), transposed only for the final XOR. AVX2 is selected at runtime; SSE2 is the x86-64 baseline.
+  - Poly1305 moved to radix 2^44.
+  - Frames built in place in their final aligned buffer.
+- **Measured** (isolated A/B, 4 KiB, loaded machine; ratios are what count): ChaCha20 old `41–64 µs` → SSE2 `18–32 µs` → AVX2 `8–15 µs`; Poly1305 `16–18 µs` → `11.5–13 µs`. A portable lane-array attempt measured slower than the old loop and was dropped.
+- **Engine gate**: encrypted cold read `6.1 µs` → `4.2 µs` p50 and `6` → `4` allocs/op. Warm reads unchanged at `0` allocs.
+- **Safety audit**: `unsafe` only for the intrinsics and unaligned 16-byte loads and stores, each with a `SAFETY` note. The AVX2 path runs only after `is_x86_feature_detected!`. Every SIMD path is checked against the scalar reference at all lengths and near counter wrap. MSRV 1.82: no `as_chunks`, and `#[target_feature]` only on `unsafe fn`.
+
+#### `TASK-088`: Index Files Encrypted at Rest
+- **Design**:
+  - The sealed unit's AAD = magic | key id | position | file name.
+  - Paged generations: one streamed AEAD region with random-access decryption. The open-time verification piggybacks on the existing full validation pass, so reads pay only the keystream (a 4 KiB page ≈ one SIMD ChaCha20 pass), not the MAC.
+  - Delta frames are bound to their offset (sealed appends are serialized).
+- **Security audit**: no downgrade (plaintext index files refused with keys configured); constant-time tags; truncation, flips, swapped files and reordered frames are all detected; tampered paged generations are rebuilt, never served. Limits are documented: file names and sizes, WAL frame headers, and record file names stay visible; there is no rollback protection against restoring an entire older directory.
+- **Complexity / footprint**:
+  - `+40 B` per sealed file and `+52 B` per sealed delta frame.
+  - Paged reads: `+1` keystream pass per page or block touched, on stack buffers (no allocations).
+  - Open: one extra MAC pass over each paged generation.
+- **Verification**: `108` tests passing; `0` clippy warnings (native and portable).
+
+#### `TASK-089`: Raft InstallSnapshot
+- **Implementation**: wire types `InstallSnapshotReq` / `InstallSnapshotResp`; snapshot file format with a per-record checksum binding id and frame; leader generation via an MVCC point-in-time read; follower staging, two-pass install (verify, then apply), crash marker and recovery; automatic use in `RaftReplicationGroup`; TCP opcode `0x15`.
+- **Correctness audit**:
+  - Lock order is `snapshot_lock` → `apply_lock` everywhere.
+  - The snapshot point is consistent: `last_applied` and the read snapshot are taken together under `apply_lock`.
+  - Log entries after `last_included_index` are kept only on a term match (Raft §7).
+  - `commit_index` never moves backwards.
+  - Corruption is caught before the engine changes. Unknown or failed installs never leave a readable half state.
+- **Complexity / footprint**:
+  - Leader: `O(N)` snapshot write, `O(ids)` memory.
+  - Follower: `O(largest frame)` streaming memory plus an `O(ids)` set.
+  - Network: `≤ 1 MiB` per RPC, resumable.
+- **Verification**: raft tests (4) and server tests pass; `0` clippy warnings.
+
+#### `TASK-092`: Cold Primary Tier
+- **Design**:
+  - The primary index becomes two layers: an immutable cold generation (the state at the last checkpoint) and a RAM delta (entries changed since, tombstones, overridden ordinal slots).
+  - Checkpoints are stream-merges into a new generation followed by a per-shard install that evicts whatever did not change since the cut.
+  - The ordinal table moved to disk as a dense array, so `RecordOrdinal` resolution stays `O(1)`.
+- **Correctness audit**:
+  - The invariant tombstones ∩ RAM = ∅ prevents a re-created record from being hidden by its own tombstone after eviction.
+  - Removes always tombstone, because a checkpoint in progress may be writing the id into the next tier; stale tombstones are pruned at install.
+  - The tier pointer is re-checked under the write lock (`with_tier_copy`), so a swap between the lock-free tier read and the update retries instead of miscounting.
+  - Ordinal slots in the new tier are derived from the same cut as the entries, so allocations and removals in flight can never make them disagree. `ColdTier::write` also re-checks that live slots equal the number of entries.
+  - A crash before the manifest switch keeps the previous generation, and the WAL is only truncated after the checkpoint completes.
+- **Complexity / footprint**:
+  - RAM per record: about `100 B` + `25 B` ordinal slot (memory tier) → about `1.25 B` Bloom filter + `8 B` per page (≈ 50 records) + only the records changed since the last checkpoint.
+  - Disk: about `25–30 B` per record for entries + `24 B` per ordinal slot.
+  - Lookups miss RAM at the cost of one page decode (4 KiB; decrypted when sealed).
+  - Open: `O(file)` validation pass, no entries loaded.
+- **Benchmark finding, fixed in this task**: the first page format decoded a page's varint entries sequentially to find one id; the new benchmark row showed `44 µs` p50 per tier read. Adding a `u16` slot-offset array at the page end (`2 B` per entry) lets lookups binary-search by decoding only about 6 ids: an isolated probe went from `25.6 µs` to `1.7–2.6 µs` on the loaded machine.
+- **Limits (documented)**: a reader holding a superseded generation keeps it mapped until it finishes (on Windows its file is deleted at the next open); scans over tier-only records re-validate frames.

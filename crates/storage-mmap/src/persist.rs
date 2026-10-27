@@ -151,25 +151,35 @@ pub fn write_ping_pong_slot(
     }
 
     // Inspect existing headers in Slot 0 and Slot 1
-    let mut hdr_buf = [0u8; HEADER_SIZE];
-    let v0 = file
-        .seek(SeekFrom::Start(0))
-        .ok()
-        .and_then(|_| file.read_exact(&mut hdr_buf).ok())
-        .and_then(|_| RecordHeader::from_slice_verified(&hdr_buf).ok())
-        .map(|h| h.record_version)
-        .unwrap_or(0);
+    let mut read_header = |offset: u64| -> ([u8; HEADER_SIZE], u64) {
+        let mut buf = [0u8; HEADER_SIZE];
+        let version = file
+            .seek(SeekFrom::Start(offset))
+            .ok()
+            .and_then(|_| file.read_exact(&mut buf).ok())
+            .and_then(|_| RecordHeader::from_slice_verified(&buf).ok())
+            .map_or(0, |h| h.record_version);
+        (buf, version)
+    };
+    let (_, v0) = read_header(0);
+    let (hdr1, v1) = read_header(stride as u64);
 
-    let v1 = file
-        .seek(SeekFrom::Start(stride as u64))
-        .ok()
-        .and_then(|_| file.read_exact(&mut hdr_buf).ok())
-        .and_then(|_| RecordHeader::from_slice_verified(&hdr_buf).ok())
-        .map(|h| h.record_version)
-        .unwrap_or(0);
-
-    // Choose the older/inactive slot to overwrite
-    let target_offset = if v0 <= v1 { 0 } else { stride };
+    // Overwrite the older slot. On a version tie (a same-version rewrite: WAL replay, re-seal)
+    // overwrite the slot readers pick (`read_ping_pong_active` prefers slot 1), unless it already
+    // holds exactly this frame — then the other slot, so two identical rewrites always reach both
+    // slots. Every overwrite leaves a same-or-newer valid version in the other slot, so a torn
+    // write (which fails its checksum) never loses the record.
+    let target_offset = if v0 == v1 {
+        if frame.get(..HEADER_SIZE) == Some(&hdr1[..]) {
+            0
+        } else {
+            stride
+        }
+    } else if v0 < v1 {
+        0
+    } else {
+        stride
+    };
 
     // Write payload first (after 64-byte header), then write the 64-byte header last so
     // `header_checksum` commits the slot atomically.
@@ -422,6 +432,52 @@ fn platform_unlock(file: &fs::File) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame(version: u64, fill: u8) -> Vec<u8> {
+        let payload = vec![fill; 128];
+        let hdr = RecordHeader::new(
+            1,
+            storage_types::Version(version),
+            1,
+            storage_codec::checksum_payload(&payload),
+            payload.len() as u32,
+            payload.len() as u32,
+            0,
+            storage_types::RecordFlags::NONE,
+            1,
+            0,
+        );
+        let mut f = hdr.to_bytes().to_vec();
+        f.extend_from_slice(&payload);
+        f
+    }
+
+    #[test]
+    fn test_ping_pong_same_version_rewrite_is_visible_and_reaches_both_slots() {
+        let dir = std::env::temp_dir().join(format!("stge_pingpong_tie_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("r.rec");
+        let read = |path: &Path| {
+            let bytes = fs::read(path).unwrap();
+            let (_, slice) = read_ping_pong_active(&bytes, 4096).unwrap();
+            slice[HEADER_SIZE]
+        };
+        write_ping_pong_slot(&path, &frame(1, 0xA1), 4096, false).unwrap();
+        write_ping_pong_slot(&path, &frame(2, 0xA2), 4096, false).unwrap();
+        assert_eq!(read(&path), 0xA2);
+        // Same-version rewrite (replay / re-seal): readers must see the new bytes.
+        write_ping_pong_slot(&path, &frame(2, 0xB2), 4096, false).unwrap();
+        assert_eq!(read(&path), 0xB2);
+        // A second same-version rewrite leaves no slot holding the old bytes.
+        write_ping_pong_slot(&path, &frame(2, 0xB2), 4096, false).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes[HEADER_SIZE], 0xB2, "slot 0 payload");
+        assert_eq!(bytes[4096 + HEADER_SIZE], 0xB2, "slot 1 payload");
+        // A newer version still goes to the inactive slot and wins.
+        write_ping_pong_slot(&path, &frame(3, 0xC3), 4096, false).unwrap();
+        assert_eq!(read(&path), 0xC3);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_directory_lock_prevents_concurrent_open_and_releases_on_drop() {

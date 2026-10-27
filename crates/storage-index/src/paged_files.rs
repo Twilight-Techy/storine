@@ -100,3 +100,151 @@ pub(crate) fn map_path_read_only(path: &Path) -> Result<MmapRegion> {
         .len() as usize;
     MmapRegion::map_read_only(&file, len)
 }
+
+// ---------------------------------------------------------------------------------------------
+// Encryption of generation files (`TASK-088`, `F-SEC-02`)
+// ---------------------------------------------------------------------------------------------
+//
+// Everything after the 4 KiB header page (pages, blocks, directory) is one ChaCha20-Poly1305
+// region sealed with the active key while it is streamed to disk. The header page carries an
+// encryption section `magic | key_id | nonce | tag` at `ENC_SECTION_OFFSET`; the tag covers the
+// whole region and the generation file's name. Open verifies the tag once (the region is read
+// in full there anyway for validation); afterwards a page or block is decrypted on access by
+// random-access keystream (`chacha20_xor_at`), with no MAC work on the read path.
+
+use storage_codec::{chacha20_xor_at, generate_unique_nonce, EncryptionKey, FileSeal, KeyRing, RegionSealer};
+
+/// Offset of the encryption section in a generation file's header page.
+pub(crate) const ENC_SECTION_OFFSET: usize = 128;
+/// `magic u32 | key_id u32 | nonce [12] | tag [16]`.
+pub(crate) const ENC_SECTION_LEN: usize = 4 + 4 + 12 + 16;
+const ENC_MAGIC: u32 = 0x434E_4550; // "PENC"
+
+/// Owned copy of the index-file protection settings (the engine can change them at runtime).
+#[derive(Clone, Debug)]
+pub(crate) struct SealSettings {
+    keys: Option<KeyRing>,
+    active_key: Option<u32>,
+    accept_plain: bool,
+}
+
+impl Default for SealSettings {
+    fn default() -> Self {
+        Self::from_seal(&FileSeal::PLAIN)
+    }
+}
+
+impl SealSettings {
+    pub(crate) fn from_seal(seal: &FileSeal<'_>) -> Self {
+        Self {
+            keys: seal.keys.cloned(),
+            active_key: seal.active_key,
+            accept_plain: seal.accept_plain,
+        }
+    }
+
+    pub(crate) fn as_seal(&self) -> FileSeal<'_> {
+        FileSeal {
+            keys: self.keys.as_ref(),
+            active_key: self.active_key,
+            accept_plain: self.accept_plain,
+        }
+    }
+}
+
+/// Key and nonce of a sealed generation: decrypts any range of its region on demand.
+pub(crate) struct PageCipher {
+    key: EncryptionKey,
+    nonce: [u8; 12],
+}
+
+impl PageCipher {
+    /// Decrypts `buf`, which holds the region bytes starting at region offset `at`.
+    #[inline]
+    pub(crate) fn decrypt_at(&self, at: usize, buf: &mut [u8]) -> Result<()> {
+        chacha20_xor_at(&self.key, &self.nonce, at as u64, buf)
+    }
+
+    /// A verifier for the region's tag (absorbs the ciphertext in file order).
+    pub(crate) fn verifier(&self, data_path: &Path) -> RegionSealer {
+        RegionSealer::new(&self.key, self.nonce, seal_context(data_path))
+    }
+}
+
+/// The authenticated name of a generation file (binds the region to its index and generation).
+fn seal_context(data_path: &Path) -> &[u8] {
+    data_path.file_name().map_or(&[][..], |n| n.as_encoded_bytes())
+}
+
+/// Encrypts a generation's region while it is streamed to disk.
+pub(crate) struct GenerationSealer {
+    sealer: RegionSealer,
+    key: EncryptionKey,
+    key_id: u32,
+    nonce: [u8; 12],
+}
+
+impl GenerationSealer {
+    /// `Some` when `seal` seals new files.
+    pub(crate) fn begin(seal: &FileSeal<'_>, data_path: &Path) -> Option<Self> {
+        let (ring, key_id) = (seal.keys?, seal.active_key?);
+        let key = ring.get(key_id)?.clone();
+        let nonce = generate_unique_nonce();
+        Some(Self {
+            sealer: RegionSealer::new(&key, nonce, seal_context(data_path)),
+            key,
+            key_id,
+            nonce,
+        })
+    }
+
+    /// Encrypts the next piece of the region in place (pieces in file order; every piece but
+    /// the last a multiple of 64 bytes).
+    pub(crate) fn seal(&mut self, piece: &mut [u8]) -> std::io::Result<()> {
+        self.sealer
+            .seal_piece(piece)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
+    /// The header-page encryption section and the cipher that reads the sealed generation.
+    pub(crate) fn finish(self) -> ([u8; ENC_SECTION_LEN], PageCipher) {
+        let mut section = [0u8; ENC_SECTION_LEN];
+        section[0..4].copy_from_slice(&ENC_MAGIC.to_le_bytes());
+        section[4..8].copy_from_slice(&self.key_id.to_le_bytes());
+        section[8..20].copy_from_slice(&self.nonce);
+        section[20..36].copy_from_slice(&self.sealer.finish());
+        (section, PageCipher { key: self.key, nonce: self.nonce })
+    }
+}
+
+/// Reads the encryption section of a generation's header page: `Some((cipher, tag))` if the
+/// generation is sealed (its tag must still be verified over the region), `None` if it is
+/// plaintext and plaintext is acceptable under `seal`. Plaintext with keys configured is refused
+/// unless `accept_plain` (no downgrade); a sealed file needs its key in the ring.
+pub(crate) fn open_generation_cipher(
+    header: &[u8],
+    seal: &FileSeal<'_>,
+) -> Result<Option<(PageCipher, [u8; 16])>> {
+    let section = header
+        .get(ENC_SECTION_OFFSET..ENC_SECTION_OFFSET + ENC_SECTION_LEN)
+        .ok_or_else(|| StorageError::corrupted_header("generation header page truncated"))?;
+    if read_u32_le(section, 0) != ENC_MAGIC {
+        if seal.keys.is_some() && !seal.accept_plain {
+            return Err(StorageError::invalid_key(
+                "plaintext index generation rejected: encryption is configured (no downgrade)",
+            ));
+        }
+        return Ok(None);
+    }
+    let ring = seal.keys.ok_or_else(|| {
+        StorageError::invalid_key("index generation is encrypted but no encryption key is configured")
+    })?;
+    let key = ring
+        .get(read_u32_le(section, 4))
+        .ok_or_else(|| StorageError::invalid_key("index generation sealed with a key id not in the key ring"))?;
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&section[8..20]);
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&section[20..36]);
+    Ok(Some((PageCipher { key: key.clone(), nonce }, tag)))
+}

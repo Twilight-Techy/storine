@@ -22,13 +22,19 @@
 //! - DedicatedFile: `ping_pong_stride` varint, then optional compact parent `InlineId`
 //! - Arena: `segment_id` varint, `offset / 64` varint (offsets are 64-byte aligned), `len` varint
 //!
+//! ## Encryption at rest (`TASK-088`)
+//! With a [`FileSeal`] that seals, the whole file is one sealed unit (`storage_codec::sealed_file`,
+//! bound to the file name), and each delta frame is wrapped as `STGESDL3 | len u32 | sealed frame`
+//! (bound to the file name and the frame's byte offset, so frames cannot be reordered or replayed).
+//!
 //! v2 / v1 ordinals are not persisted: they are reassigned densely on load
 //! (`PrimaryIndex::restore_entry`). Legacy v1 (`STGEIDX1`, fixed 88-byte rows) is still readable.
 
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use storage_codec::checksum_payload;
+use std::sync::Mutex;
+use storage_codec::{checksum_payload, is_sealed, FileSeal};
 use storage_mmap::{atomic_write_replace, ArenaLocation};
 use storage_types::{InlineId, RecordOrdinal, Result, StorageError, Version, HEADER_SIZE};
 
@@ -39,6 +45,18 @@ const CHECKPOINT_MAGIC_V2: &[u8; 8] = b"STGEIDX2";
 const CHECKPOINT_MAGIC_V3: &[u8; 8] = b"STGEIDX3";
 const CHECKPOINT_DELTA_MAGIC_V2: &[u8; 8] = b"STGEDLT2";
 const CHECKPOINT_DELTA_MAGIC: &[u8; 8] = b"STGEDLT3";
+/// Wrapper of a sealed delta frame: `magic | sealed_len u32 | sealed STGEDLT3 frame`.
+const SEALED_DELTA_MAGIC: &[u8; 8] = b"STGESDL3";
+
+/// Serializes sealed delta appends: each sealed frame is bound to the offset it is written at.
+static SEALED_DELTA_APPEND: Mutex<()> = Mutex::new(());
+
+/// The authenticated context of an index file: its file name (binds a sealed file to its
+/// collection and kind).
+#[inline]
+pub(crate) fn seal_context(path: &Path) -> &[u8] {
+    path.file_name().map_or(&[][..], |n| n.as_encoded_bytes())
+}
 const V1_ENTRY_STRIDE: usize = 88;
 /// Smallest possible v2 entry: 2B id + 1B version + 1B ttl + 1B tag.
 const V2_MIN_ENTRY_LEN: usize = 5;
@@ -174,13 +192,13 @@ fn decode_v2_entry(body: &[u8], cursor: &mut usize) -> Result<PrimaryEntry> {
 
 /// v3 entry: the v2 encoding followed by the record's ordinal.
 #[inline]
-fn encode_v3_entry(buf: &mut Vec<u8>, entry: &PrimaryEntry) {
+pub(crate) fn encode_v3_entry(buf: &mut Vec<u8>, entry: &PrimaryEntry) {
     encode_v2_entry(buf, entry);
     write_varint(buf, u64::from(entry.ordinal.0));
 }
 
 #[inline]
-fn decode_v3_entry(body: &[u8], cursor: &mut usize) -> Result<PrimaryEntry> {
+pub(crate) fn decode_v3_entry(body: &[u8], cursor: &mut usize) -> Result<PrimaryEntry> {
     let mut entry = decode_v2_entry(body, cursor)?;
     let ordinal = read_varint_u32(body, cursor)?;
     if ordinal == RecordOrdinal::INVALID.0 {
@@ -204,7 +222,20 @@ pub fn save_primary_checkpoint_entries(
     path: &Path,
     stamp: u64,
 ) -> Result<usize> {
-    let mut buf = Vec::with_capacity(32 + entries.len() * 24);
+    save_primary_checkpoint_entries_sealed(entries, path, stamp, &FileSeal::PLAIN)
+}
+
+/// [`save_primary_checkpoint_entries`] that seals the file when `seal` says so (`TASK-088`).
+/// The file is built and encrypted in one buffer (no extra copy).
+pub fn save_primary_checkpoint_entries_sealed(
+    entries: &[PrimaryEntry],
+    path: &Path,
+    stamp: u64,
+    seal: &FileSeal<'_>,
+) -> Result<usize> {
+    let hl = seal.header_len();
+    let mut buf = Vec::with_capacity(hl + 48 + entries.len() * 24);
+    buf.resize(hl, 0);
     buf.extend_from_slice(CHECKPOINT_MAGIC_V3);
     buf.extend_from_slice(&(entries.len() as u64).to_le_bytes());
     buf.extend_from_slice(&stamp.to_le_bytes());
@@ -213,8 +244,9 @@ pub fn save_primary_checkpoint_entries(
         encode_v3_entry(&mut buf, entry);
     }
 
-    let sum = checksum_payload(&buf);
+    let sum = checksum_payload(&buf[hl..]);
     buf.extend_from_slice(&sum.to_le_bytes());
+    seal.seal_in_place(seal_context(path), 0, &mut buf)?;
 
     atomic_write_replace(path, &buf, true)?;
     let _ = std::fs::remove_file(delta_checkpoint_path(path));
@@ -228,6 +260,17 @@ pub fn append_primary_checkpoint_delta(
     base_idx_path: &Path,
     upserted_ids: &[InlineId],
     deleted_ids: &[InlineId],
+) -> Result<usize> {
+    append_primary_checkpoint_delta_sealed(index, base_idx_path, upserted_ids, deleted_ids, &FileSeal::PLAIN)
+}
+
+/// [`append_primary_checkpoint_delta`] that seals the frame when `seal` says so (`TASK-088`).
+pub fn append_primary_checkpoint_delta_sealed(
+    index: &PrimaryIndex,
+    base_idx_path: &Path,
+    upserted_ids: &[InlineId],
+    deleted_ids: &[InlineId],
+    seal: &FileSeal<'_>,
 ) -> Result<usize> {
     let mut upserts = Vec::with_capacity(upserted_ids.len());
     for &id in upserted_ids {
@@ -250,7 +293,10 @@ pub fn append_primary_checkpoint_delta(
     }
 
     let sum = checksum_payload(&payload);
-    let mut frame = Vec::with_capacity(20 + payload.len());
+    // Sealed: `[SEALED_DELTA_MAGIC | len | sealed header]` reserved in front of the plain frame.
+    let prefix = if seal.sealing() { 12 + seal.header_len() } else { 0 };
+    let mut frame = Vec::with_capacity(prefix + 20 + payload.len() + 16);
+    frame.resize(prefix, 0);
     frame.extend_from_slice(CHECKPOINT_DELTA_MAGIC);
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     frame.extend_from_slice(&sum.to_le_bytes());
@@ -263,11 +309,27 @@ pub fn append_primary_checkpoint_delta(
                 .map_err(|e| StorageError::io("create checkpoint delta directory", e))?;
         }
     }
+    let _serial = seal
+        .sealing()
+        .then(|| SEALED_DELTA_APPEND.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&delta_path)
         .map_err(|e| StorageError::io("open primary checkpoint delta file", e))?;
+    if prefix > 0 {
+        let offset = file
+            .metadata()
+            .map_err(|e| StorageError::io("stat primary checkpoint delta file", e))?
+            .len();
+        let mut sealed = frame.split_off(12);
+        seal.seal_in_place(seal_context(&delta_path), offset, &mut sealed)?;
+        let sealed_len = u32::try_from(sealed.len())
+            .map_err(|_| StorageError::invalid_archive("checkpoint delta frame exceeds u32"))?;
+        frame[..8].copy_from_slice(SEALED_DELTA_MAGIC);
+        frame[8..12].copy_from_slice(&sealed_len.to_le_bytes());
+        frame.extend_from_slice(&sealed);
+    }
     file.write_all(&frame)
         .map_err(|e| StorageError::io("write primary checkpoint delta frame", e))?;
     file.sync_data()
@@ -288,11 +350,23 @@ pub fn load_primary_checkpoint_with_stamp(
     index: &PrimaryIndex,
     path: &Path,
 ) -> Result<(usize, Option<u64>)> {
+    load_primary_checkpoint_with_stamp_sealed(index, path, &FileSeal::PLAIN)
+}
+
+/// [`load_primary_checkpoint_with_stamp`] for files that may be sealed (`TASK-088`). Plaintext
+/// files are rejected when `seal` forbids them (no downgrade).
+pub fn load_primary_checkpoint_with_stamp_sealed(
+    index: &PrimaryIndex,
+    path: &Path,
+    seal: &FileSeal<'_>,
+) -> Result<(usize, Option<u64>)> {
     let mut base_loaded = 0usize;
     let mut stamp = None;
     if path.exists() {
-        let bytes = std::fs::read(path)
+        let mut raw = std::fs::read(path)
             .map_err(|e| StorageError::io("read primary index checkpoint", e))?;
+        let plain = seal.open_in_place(seal_context(path), 0, &mut raw)?;
+        let bytes = &raw[plain];
         if bytes.len() < 24 {
             return Err(StorageError::corrupted_header(
                 "primary index checkpoint shorter than 24 bytes",
@@ -301,7 +375,7 @@ pub fn load_primary_checkpoint_with_stamp(
 
         let body_len = bytes.len() - 8;
         let body = &bytes[..body_len];
-        let expected_sum = storage_types::wire::read_u64_le(&bytes, body_len);
+        let expected_sum = storage_types::wire::read_u64_le(bytes, body_len);
         let actual_sum = checksum_payload(body);
         if actual_sum != expected_sum {
             return Err(StorageError::checksum_mismatch(expected_sum, actual_sum));
@@ -328,7 +402,7 @@ pub fn load_primary_checkpoint_with_stamp(
 
     let delta_path = delta_checkpoint_path(path);
     if delta_path.exists() {
-        let _ = replay_primary_checkpoint_deltas(index, &delta_path)?;
+        let _ = replay_primary_checkpoint_deltas(index, &delta_path, seal)?;
         index.finish_restore();
         return Ok((index.len(), None));
     }
@@ -337,30 +411,80 @@ pub fn load_primary_checkpoint_with_stamp(
     Ok((base_loaded, stamp))
 }
 
-fn replay_primary_checkpoint_deltas(index: &PrimaryIndex, delta_path: &Path) -> Result<usize> {
-    let raw = std::fs::read(delta_path)
+fn replay_primary_checkpoint_deltas(
+    index: &PrimaryIndex,
+    delta_path: &Path,
+    seal: &FileSeal<'_>,
+) -> Result<usize> {
+    let mut raw = std::fs::read(delta_path)
         .map_err(|e| StorageError::io("read primary checkpoint delta file", e))?;
+    let raw_len = raw.len();
     let mut pos = 0usize;
     let mut applied = 0usize;
 
-    while pos + 20 <= raw.len() {
+    while pos + 20 <= raw_len {
+        if &raw[pos..pos + 8] == SEALED_DELTA_MAGIC {
+            let sealed_len = storage_types::wire::read_u32_le(&raw, pos + 8) as usize;
+            let Some(frame_end) = (pos + 12).checked_add(sealed_len).filter(|&e| e <= raw_len) else {
+                break; // torn tail
+            };
+            let sealed = &mut raw[pos + 12..frame_end];
+            if !is_sealed(sealed) {
+                return Err(StorageError::corrupted_header("sealed delta frame missing its seal"));
+            }
+            let plain = match seal.open_in_place(seal_context(delta_path), pos as u64, sealed) {
+                Ok(r) => r,
+                // A torn final frame is a crash artefact; anything earlier is tampering.
+                Err(e) if frame_end < raw_len || matches!(e, StorageError::InvalidKey { .. }) => return Err(e),
+                Err(_) => break,
+            };
+            let inner = &raw[pos + 12 + plain.start..pos + 12 + plain.end];
+            if inner.len() < 20 || &inner[..8] != CHECKPOINT_DELTA_MAGIC {
+                return Err(StorageError::corrupted_header("sealed delta frame has an invalid body"));
+            }
+            let payload_len = storage_types::wire::read_u32_le(inner, 8) as usize;
+            let expected_sum = storage_types::wire::read_u64_le(inner, 12);
+            let payload = &inner[20..];
+            if payload.len() != payload_len || checksum_payload(payload) != expected_sum {
+                return Err(StorageError::corrupted_header("sealed delta frame checksum mismatch"));
+            }
+            applied += apply_delta_payload(index, payload, true)?;
+            pos = frame_end;
+            continue;
+        }
         let with_ordinals = match &raw[pos..pos + 8] {
             m if m == CHECKPOINT_DELTA_MAGIC => true,
             m if m == CHECKPOINT_DELTA_MAGIC_V2 => false,
             _ => break,
         };
+        if seal.keys.is_some() && !seal.accept_plain {
+            return Err(StorageError::invalid_key(
+                "plaintext checkpoint delta frame rejected: encryption is configured (no downgrade)",
+            ));
+        }
         let payload_len = storage_types::wire::read_u32_le(&raw, pos + 8) as usize;
         let expected_sum = storage_types::wire::read_u64_le(&raw, pos + 12);
         let Some(frame_end) = (pos + 20).checked_add(payload_len) else {
             break;
         };
-        if frame_end > raw.len() {
+        if frame_end > raw_len {
             break;
         }
         let payload = &raw[pos + 20..frame_end];
         if checksum_payload(payload) != expected_sum {
             break;
         }
+        applied += apply_delta_payload(index, payload, with_ordinals)?;
+        pos = frame_end;
+    }
+
+    Ok(applied)
+}
+
+/// Applies one verified delta frame payload; returns the number of entries applied.
+fn apply_delta_payload(index: &PrimaryIndex, payload: &[u8], with_ordinals: bool) -> Result<usize> {
+    let mut applied = 0usize;
+    {
 
         // A frame holds the final state of its window: `upserts` are records live when the frame
         // was written, `deletes` were removed at some point during the window (a key deleted and
@@ -395,9 +519,7 @@ fn replay_primary_checkpoint_deltas(index: &PrimaryIndex, delta_path: &Path) -> 
             }
             applied += 1;
         }
-        pos = frame_end;
     }
-
     Ok(applied)
 }
 
@@ -565,6 +687,84 @@ mod tests {
         load_primary_checkpoint(&loaded, &path).unwrap();
         assert_eq!(ordinals_of(&loaded), ordinals_of(&idx));
         assert_eq!(loaded.resolve_ordinal(m), Some(id("m")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_sealed_checkpoint_and_delta_frames_bind_file_and_position() {
+        use storage_codec::{EncryptionKey, KeyRing};
+        let dir = std::env::temp_dir().join(format!("stge_ckpt_sealed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c_primary.idx");
+        let ring = KeyRing::new().with_key(4, EncryptionKey::from_bytes([8; 32]));
+        let seal = FileSeal { keys: Some(&ring), active_key: Some(4), accept_plain: false };
+        let id = |s: &str| InlineId::new(s).unwrap();
+        let put = |idx: &PrimaryIndex, name: &str| {
+            let k = id(name);
+            let mut e = restored(k, Version(1), 0, DiskLocation::Unflushed);
+            e.ordinal = idx.allocate_ordinal(k);
+            idx.upsert(e);
+        };
+        let names = |idx: &PrimaryIndex| {
+            let mut v: Vec<InlineId> = idx.entries_snapshot().iter().map(|e| e.id).collect();
+            v.sort();
+            v
+        };
+
+        let idx = PrimaryIndex::new();
+        for i in 0..20 {
+            put(&idx, &format!("secret-key-{i}"));
+        }
+        save_primary_checkpoint_entries_sealed(&idx.entries_snapshot(), &path, 7, &seal).unwrap();
+        put(&idx, "delta-one");
+        append_primary_checkpoint_delta_sealed(&idx, &path, &[id("delta-one")], &[], &seal).unwrap();
+        put(&idx, "delta-two");
+        append_primary_checkpoint_delta_sealed(&idx, &path, &[id("delta-two")], &[id("secret-key-3")], &seal)
+            .unwrap();
+        let _ = idx.remove(id("secret-key-3"));
+
+        let delta = delta_checkpoint_path(&path);
+        for f in [&path, &delta] {
+            let bytes = std::fs::read(f).unwrap();
+            assert!(!bytes.windows(10).any(|w| w == b"secret-key"), "plaintext id in {}", f.display());
+            assert!(!bytes.windows(5).any(|w| w == b"delta"), "plaintext id in {}", f.display());
+        }
+
+        let loaded = PrimaryIndex::new();
+        let (_, stamp) = load_primary_checkpoint_with_stamp_sealed(&loaded, &path, &seal).unwrap();
+        assert_eq!(stamp, None, "deltas applied");
+        assert_eq!(names(&loaded), names(&idx));
+
+        // Plain readers, wrong keys and a moved file are refused.
+        assert!(load_primary_checkpoint(&PrimaryIndex::new(), &path).is_err());
+        let other = KeyRing::new().with_key(4, EncryptionKey::from_bytes([9; 32]));
+        let wrong = FileSeal { keys: Some(&other), ..seal };
+        assert!(load_primary_checkpoint_with_stamp_sealed(&PrimaryIndex::new(), &path, &wrong).is_err());
+        let moved = dir.join("d_primary.idx");
+        std::fs::copy(&path, &moved).unwrap();
+        assert!(load_primary_checkpoint_with_stamp_sealed(&PrimaryIndex::new(), &moved, &seal).is_err());
+
+        // Reordering the two delta frames breaks their position binding.
+        let raw = std::fs::read(&delta).unwrap();
+        let first_len = 12 + u32::from_le_bytes(raw[8..12].try_into().unwrap()) as usize;
+        let mut swapped = raw[first_len..].to_vec();
+        swapped.extend_from_slice(&raw[..first_len]);
+        std::fs::write(&delta, &swapped).unwrap();
+        assert!(load_primary_checkpoint_with_stamp_sealed(&PrimaryIndex::new(), &path, &seal).is_err());
+
+        // A torn final frame (crash mid-append) is dropped, like an unsealed torn frame.
+        std::fs::write(&delta, &raw[..raw.len() - 3]).unwrap();
+        let torn = PrimaryIndex::new();
+        load_primary_checkpoint_with_stamp_sealed(&torn, &path, &seal).unwrap();
+        assert!(torn.get(id("delta-one")).is_some() && torn.get(id("delta-two")).is_none());
+
+        // No downgrade: a plaintext delta frame is rejected once encryption is configured.
+        std::fs::remove_file(&delta).unwrap();
+        append_primary_checkpoint_delta(&idx, &path, &[id("delta-one")], &[]).unwrap();
+        assert!(load_primary_checkpoint_with_stamp_sealed(&PrimaryIndex::new(), &path, &seal).is_err());
+        let migrating = FileSeal { accept_plain: true, ..seal };
+        load_primary_checkpoint_with_stamp_sealed(&PrimaryIndex::new(), &path, &migrating).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

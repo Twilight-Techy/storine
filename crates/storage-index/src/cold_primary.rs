@@ -82,6 +82,37 @@ impl SplitBlockBloomFilter {
     pub fn memory_bytes(&self) -> usize {
         self.blocks.len() * core::mem::size_of::<BloomCacheBlock>()
     }
+
+    /// Serializes the filter: `blocks x 8 x u64 LE` (`64` bytes per block).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.blocks.len() * 64);
+        for block in &self.blocks {
+            for w in block.words {
+                out.extend_from_slice(&w.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// Restores a filter written by [`Self::to_bytes`] (a non-zero power-of-two block count).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let n = bytes.len() / 64;
+        if bytes.len() % 64 != 0 || !n.is_power_of_two() {
+            return Err(StorageError::corrupted_header("bloom filter size is not a power-of-two block count"));
+        }
+        let mut blocks = Vec::new();
+        blocks
+            .try_reserve_exact(n)
+            .map_err(|_| StorageError::resource_exhausted("bloom filter memory"))?;
+        for chunk in bytes.chunks_exact(64) {
+            let mut words = [0u64; 8];
+            for (i, w) in words.iter_mut().enumerate() {
+                *w = storage_types::wire::read_u64_le(chunk, i * 8);
+            }
+            blocks.push(BloomCacheBlock { words });
+        }
+        Ok(Self { blocks })
+    }
 }
 
 const COLD_PRIMARY_MAGIC: u32 = 0x4350_4958; // "CPIX"

@@ -120,7 +120,8 @@
 - Client-supplied paths (e.g. `OP_ADMIN_BACKUP` names) are confined to an operator-configured root (`backup_root`): only plain relative components are accepted, and admin backups are disabled when no root is configured. Backup and restore destinations must be fresh (empty or absent) and outside the database directory; existing data is never deleted.
 
 ### RULE-SAFE-07: Encryption at Rest Without Downgrade
-- With `EngineConfig::encryption_key` set, every record frame written to disk or the WAL is sealed (AEAD bound to the record id and header metadata), and any plaintext record frame read back is rejected, never trusted. Plaintext lives only in RAM (`hot_dirty`, MVCC history, the bounded decrypted-frame cache). Key material is never logged and is zeroed on drop.
+- With `EngineConfig::encryption` set, every record frame written to disk or the WAL is protected: encrypted, or (only where the record type's `Indexable::protection` policy says so) authenticated with a MAC. Both bind the record id, key id and header metadata. Any unprotected record frame read back is rejected, never trusted (the only exception is the explicit migration state `accept_unencrypted`). Plaintext of encrypted records lives only in RAM (`hot_dirty`, MVCC history, the bounded decrypted-frame cache). Key material is never logged and is zeroed on drop.
+- Index files follow the same settings: sealed with the active key, plaintext index files refused (no downgrade), and a tampered paged generation is rebuilt, never served.
 
 ### RULE-CONC-01: Canonical Lock Ordering & Lock-Free I/O
 - Never hold primary index shard locks across disk I/O (`WriteFile`/`fsync`).

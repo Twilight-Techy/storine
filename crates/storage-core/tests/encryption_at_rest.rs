@@ -24,7 +24,7 @@ fn key(byte: u8) -> EncryptionKey {
 fn cfg(layout: StorageLayoutMode, k: Option<EncryptionKey>) -> EngineConfig {
     EngineConfig {
         layout_mode: layout,
-        encryption_key: k,
+        encryption: k.map(|k| storage_core::EncryptionConfig::strict(1, k)),
         ..EngineConfig::default()
     }
 }
@@ -62,6 +62,18 @@ fn assert_no_plaintext(dir: &Path) {
     }
 }
 
+/// Index files (`TASK-088`) must not reveal record ids either: `s0123` is a record id.
+fn assert_index_files_sealed(dir: &Path) {
+    let mut files = Vec::new();
+    files_under(&dir.join("indexes"), &mut files);
+    assert!(!files.is_empty(), "index files written");
+    for f in files {
+        let bytes = fs::read(&f).unwrap_or_default();
+        assert!(bytes.starts_with(b"STGESEL1"), "index file not sealed: {}", f.display());
+        assert!(!bytes.windows(5).any(|w| w == b"s0123"), "record id in {}", f.display());
+    }
+}
+
 #[test]
 fn test_encrypted_engine_keeps_plaintext_off_disk_and_reads_back() {
     let layouts = [
@@ -86,6 +98,7 @@ fn test_encrypted_engine_keeps_plaintext_off_disk_and_reads_back() {
             engine.delete(record(5).id).unwrap();
         }
         assert_no_plaintext(&dir);
+        assert_index_files_sealed(&dir);
 
         // Right key: everything reads back, including secondary and vector indexes.
         {
@@ -104,15 +117,14 @@ fn test_encrypted_engine_keeps_plaintext_off_disk_and_reads_back() {
             assert!(!engine.query().top_k_similar(&[0.5; 8], 5).is_empty());
         }
 
-        // Wrong key or no key: reads fail instead of returning garbage.
+        // Wrong key or no key: the sealed primary index cannot be opened, so the engine refuses
+        // to open instead of serving errors or garbage.
+        assert!(StorageEngine::<AgentObjectRecord>::open(&dir, cfg(layout, Some(key(2)))).is_err());
+        assert!(StorageEngine::<AgentObjectRecord>::open(&dir, cfg(layout, None)).is_err());
+        // The key still works afterwards (failed opens changed nothing).
         {
-            let engine = StorageEngine::<AgentObjectRecord>::open(&dir, cfg(layout, Some(key(2)))).unwrap();
-            assert!(engine.get_owned(record(1).id).is_err());
-            assert!(engine.with_ref(record(1).id, |v| v.score).is_err());
-        }
-        {
-            let engine = StorageEngine::<AgentObjectRecord>::open(&dir, cfg(layout, None)).unwrap();
-            assert!(engine.get_owned(record(1).id).is_err());
+            let engine = StorageEngine::<AgentObjectRecord>::open(&dir, cfg(layout, Some(key(1)))).unwrap();
+            assert_eq!(engine.get_owned(record(1).id).unwrap().1, record(1));
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -148,5 +160,211 @@ fn test_tampered_ciphertext_is_detected() {
     }
     assert!(failures >= 1, "the corrupted record must fail authentication");
     drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn arena() -> StorageLayoutMode {
+    StorageLayoutMode::AdaptiveArena { arena_threshold_bytes: 4096, segment_capacity: 1 << 20 }
+}
+
+thread_local! {
+    static LAYOUT: std::cell::Cell<StorageLayoutMode> = std::cell::Cell::new(arena());
+}
+
+fn open_with(dir: &Path, enc: Option<storage_core::EncryptionConfig>) -> storage_types::Result<StorageEngine<AgentObjectRecord>> {
+    let layout_mode = LAYOUT.with(std::cell::Cell::get);
+    StorageEngine::<AgentObjectRecord>::open(dir, EngineConfig { layout_mode, encryption: enc, ..EngineConfig::default() })
+}
+
+fn assert_all_readable(engine: &StorageEngine<AgentObjectRecord>, n: u32) {
+    for i in 0..n {
+        assert_eq!(engine.get_owned(record(i).id).unwrap().1, record(i), "record {i}");
+    }
+}
+
+/// Plaintext database -> encrypted online -> key rotation -> back to plaintext, with every step
+/// verified on disk and every record readable throughout.
+#[test]
+fn test_enable_rotate_and_disable_encryption_online() {
+    for (i, layout) in [
+        arena(),
+        StorageLayoutMode::DedicatedFiles,
+        StorageLayoutMode::PingPongFiles { slot_stride: 4096 },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        LAYOUT.with(|l| l.set(layout));
+        lifecycle(&format!("lifecycle{i}"));
+    }
+}
+
+fn lifecycle(name: &str) {
+    use storage_codec::KeyRing;
+    use storage_core::EncryptionConfig;
+    let dir = temp_dir(name);
+    {
+        let engine = open_with(&dir, None).unwrap();
+        for i in 0..150 {
+            engine.put(record(i).id, &record(i)).unwrap();
+        }
+    }
+
+    // 1. Turn encryption on for existing plaintext data.
+    {
+        let engine = open_with(&dir, Some(EncryptionConfig {
+            keys: KeyRing::new().with_key(1, key(1)),
+            active_key: Some(1),
+            accept_unencrypted: true,
+        }))
+        .unwrap();
+        assert_all_readable(&engine, 150);
+        let report = engine.reseal_all().unwrap();
+        assert_eq!(report.resealed, 150);
+        assert_eq!(engine.reseal_all().unwrap().resealed, 0, "idempotent");
+        // Switch to strict at runtime: plaintext no longer accepted, everything still reads.
+        engine.set_encryption(Some(EncryptionConfig::strict(1, key(1)))).unwrap();
+        assert_all_readable(&engine, 150);
+    }
+    assert_no_plaintext(&dir);
+    assert_index_files_sealed(&dir);
+    assert_all_readable(&open_with(&dir, Some(EncryptionConfig::strict(1, key(1)))).unwrap(), 150);
+
+    // 2. Rotate 1 -> 2 online, with a concurrent writer.
+    {
+        let engine = std::sync::Arc::new(open_with(&dir, Some(EncryptionConfig {
+            keys: KeyRing::new().with_key(1, key(1)).with_key(2, key(2)),
+            active_key: Some(2),
+            accept_unencrypted: false,
+        }))
+        .unwrap());
+        let writer = {
+            let engine = std::sync::Arc::clone(&engine);
+            std::thread::spawn(move || {
+                for i in 150..250 {
+                    engine.put(record(i).id, &record(i)).unwrap();
+                }
+            })
+        };
+        let report = engine.reseal_all().unwrap();
+        writer.join().unwrap();
+        assert!(report.resealed > 0);
+        engine.reseal_all().unwrap();
+        assert_all_readable(&engine, 250);
+    }
+    assert_no_plaintext(&dir);
+    // Only key 2 is needed now.
+    {
+        let engine = open_with(&dir, Some(EncryptionConfig::strict(2, key(2)))).unwrap();
+        assert_all_readable(&engine, 250);
+    }
+    assert_index_files_sealed(&dir);
+    assert!(open_with(&dir, Some(EncryptionConfig::strict(1, key(1)))).is_err(), "retired key opens nothing");
+
+    // 3. Turn encryption off.
+    {
+        let engine = open_with(&dir, Some(EncryptionConfig {
+            keys: KeyRing::new().with_key(2, key(2)),
+            active_key: None,
+            accept_unencrypted: true,
+        }))
+        .unwrap();
+        assert_eq!(engine.reseal_all().unwrap().resealed, 250);
+    }
+    let mut index_files = Vec::new();
+    files_under(&dir.join("indexes"), &mut index_files);
+    assert!(index_files.iter().all(|f| !fs::read(f).unwrap_or_default().starts_with(b"STGESEL1")));
+    assert_all_readable(&open_with(&dir, None).unwrap(), 250);
+
+    // Invalid configurations are refused.
+    assert!(open_with(&dir, Some(EncryptionConfig {
+        keys: KeyRing::new().with_key(1, key(1)),
+        active_key: Some(9),
+        accept_unencrypted: false,
+    }))
+    .is_err());
+    assert!(open_with(&dir, Some(EncryptionConfig {
+        keys: KeyRing::new().with_key(1, key(1)),
+        active_key: None,
+        accept_unencrypted: false,
+    }))
+    .is_err());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// Paged secondary indexes (`TASK-088`): tag values, numeric keys and ordinals are encrypted in
+/// the generation files, reused after a clean restart, and rebuilt (never trusted) when a
+/// generation is tampered with.
+#[test]
+fn test_paged_secondary_indexes_are_encrypted_and_tamper_checked() {
+    use storage_core::{IndexTier, FIELD_PRIMARY_TAG};
+    const TAG: &str = "tagsecret-q7";
+    let dir = temp_dir("paged");
+    let config = || EngineConfig {
+        layout_mode: arena(),
+        index_tier: IndexTier::Paged,
+        encryption: Some(storage_core::EncryptionConfig::strict(1, key(1))),
+        ..EngineConfig::default()
+    };
+    let tagged = |i: u32| {
+        let mut r = record(i);
+        if i % 3 == 0 {
+            r.tags = vec![InlineId::new(TAG).unwrap()];
+        }
+        r
+    };
+    // Paged generation files are named `<manifest>.<generation as 16 hex digits>`.
+    let is_generation = |f: &Path| f.to_string_lossy().contains(".idx.");
+    let check = |engine: &StorageEngine<AgentObjectRecord>| {
+        let tag = InlineId::new(TAG).unwrap();
+        assert_eq!(engine.query().filter_tag(FIELD_PRIMARY_TAG, tag).execute_ids().len(), 100);
+        assert_eq!(engine.query().filter_range(FIELD_SCORE, 100..=149).execute_ids().len(), 50);
+    };
+    {
+        let engine = StorageEngine::<AgentObjectRecord>::open(&dir, config()).unwrap();
+        for i in 0..300 {
+            engine.put(tagged(i).id, &tagged(i)).unwrap();
+        }
+        engine.flush_all().unwrap();
+        check(&engine);
+    }
+
+    // Every index file is sealed (paged generations carry their encryption section); no tag
+    // text or record id appears anywhere on disk.
+    let mut files = Vec::new();
+    files_under(&dir.join("indexes"), &mut files);
+    let mut generations = 0;
+    for f in &files {
+        let bytes = fs::read(f).unwrap();
+        assert!(!bytes.windows(TAG.len()).any(|w| w == TAG.as_bytes()), "tag text in {}", f.display());
+        assert!(!bytes.windows(5).any(|w| w == b"s0123"), "record id in {}", f.display());
+        if is_generation(f) {
+            generations += 1;
+            assert!(bytes.get(128..132) == Some(&b"PENC"[..]), "unsealed generation {}", f.display());
+        }
+    }
+    assert_eq!(generations, 2, "range + tag generations");
+    assert_no_plaintext(&dir);
+
+    // Clean restart: the encrypted generations are verified and reused.
+    {
+        let engine = StorageEngine::<AgentObjectRecord>::open(&dir, config()).unwrap();
+        assert!(engine.secondary_indexes_reused());
+        check(&engine);
+    }
+
+    // A flipped ciphertext byte in a generation fails its tag: the index is rebuilt, answers stay exact.
+    // (The reopen above checkpointed into a new generation: list the files again.)
+    let mut files = Vec::new();
+    files_under(&dir.join("indexes"), &mut files);
+    let generation = files.iter().find(|f| is_generation(f)).unwrap();
+    let mut bytes = fs::read(generation).unwrap();
+    bytes[4096 + 10] ^= 0x01;
+    fs::write(generation, bytes).unwrap();
+    {
+        let engine = StorageEngine::<AgentObjectRecord>::open(&dir, config()).unwrap();
+        assert!(!engine.secondary_indexes_reused(), "tampered generation must not be trusted");
+        check(&engine);
+    }
     let _ = fs::remove_dir_all(&dir);
 }

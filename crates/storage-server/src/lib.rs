@@ -20,6 +20,7 @@
 //!     - `0x12 = AdminCompact` (no body)
 //!     - `0x13 = Health` (no body)
 //!     - `0x14 = AdminCheckpoint` (no body)
+//!     - `0x15 = RaftInstallSnapshot` (`[InstallSnapshotReq wire bytes]` -> `InstallSnapshotResp`)
 //!   - `id: [u8; 24]` (`InlineId` raw bytes)
 //!   - `body_len: u32`
 //!   - `body: [u8; body_len]`
@@ -61,7 +62,10 @@ use std::time::{Duration, Instant};
 use storage_codec::{AlignedBytes, RecordCodec, RecordView, ZeroCopyRecord};
 use storage_core::{
     backup::create_online_backup,
-    raft::{AppendEntriesReq, AppendEntriesResp, RaftNode, RequestVoteReq, RequestVoteResp},
+    raft::{
+        AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, RaftNode, RequestVoteReq,
+        RequestVoteResp, RAFT_SNAPSHOT_CHUNK,
+    },
     AgentObjectRecord, LatencyHistogram, RecordRef, SlowOpEntry, SlowOperationLog, StorageEngine,
 };
 use storage_index::Indexable;
@@ -91,6 +95,7 @@ pub const OP_ADMIN_BACKUP: u8 = 0x11;
 pub const OP_ADMIN_COMPACT: u8 = 0x12;
 pub const OP_HEALTH: u8 = 0x13;
 pub const OP_ADMIN_CHECKPOINT: u8 = 0x14;
+pub const OP_RAFT_SNAPSHOT: u8 = 0x15;
 
 pub const STATUS_OK: u8 = 0x00;
 pub const STATUS_NOT_FOUND: u8 = 0x01;
@@ -119,8 +124,8 @@ const fn required_role(op: u8) -> Option<RbacRole> {
             Some(RbacRole::ReadOnly)
         }
         OP_PUT_RAW_FRAME | OP_DELETE | OP_CAS_PUT | OP_BATCH_PUT => Some(RbacRole::ReadWrite),
-        OP_RAFT_VOTE | OP_RAFT_APPEND | OP_MIGRATE_VSHARD | OP_ADMIN_BACKUP | OP_ADMIN_COMPACT
-        | OP_ADMIN_CHECKPOINT => Some(RbacRole::Admin),
+        OP_RAFT_VOTE | OP_RAFT_APPEND | OP_RAFT_SNAPSHOT | OP_MIGRATE_VSHARD | OP_ADMIN_BACKUP
+        | OP_ADMIN_COMPACT | OP_ADMIN_CHECKPOINT => Some(RbacRole::Admin),
         _ => None,
     }
 }
@@ -135,6 +140,8 @@ const fn max_body_len(op: u8) -> usize {
         OP_RAFT_VOTE => 64,
         OP_PUT_RAW_FRAME | OP_CAS_PUT | OP_BATCH_GET | OP_BATCH_PUT | OP_RAFT_APPEND
         | OP_MIGRATE_VSHARD => MAX_PAYLOAD_SIZE as usize,
+        // One snapshot chunk plus its fixed header.
+        OP_RAFT_SNAPSHOT => RAFT_SNAPSHOT_CHUNK + 64,
         _ => 0,
     }
 }
@@ -891,6 +898,7 @@ const fn op_name(op: u8) -> &'static str {
         OP_METRICS => "metrics",
         OP_RAFT_VOTE => "raft_vote",
         OP_RAFT_APPEND => "raft_append",
+        OP_RAFT_SNAPSHOT => "raft_snapshot",
         OP_MIGRATE_VSHARD => "migrate_vshard",
         OP_ADMIN_BACKUP => "admin_backup",
         OP_ADMIN_COMPACT => "admin_compact",
@@ -1135,6 +1143,16 @@ fn execute_request<T: ZeroCopyRecord + Indexable>(
                     let resp: AppendEntriesResp = resp;
                     conn.send_or_queue_response(STATUS_OK, resp.term, &resp.to_wire_bytes())
                 }
+                Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
+            }
+        }
+        OP_RAFT_SNAPSHOT => {
+            let Some(ref raft) = shared.raft else {
+                let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"raft is not enabled on this server");
+                return ConnStep::Progress;
+            };
+            match InstallSnapshotReq::from_wire_bytes(&body).and_then(|req| raft.handle_install_snapshot(req)) {
+                Ok(resp) => conn.send_or_queue_response(STATUS_OK, resp.term, &resp.to_wire_bytes()),
                 Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
             }
         }
@@ -1641,6 +1659,13 @@ impl StorageClient {
         self.rpc(OP_RAFT_APPEND, NO_KEY, &wire)
     }
 
+    /// Sends one Raft `InstallSnapshot` chunk over TCP (`OP_RAFT_SNAPSHOT`, `TASK-089`); the body
+    /// of an `Ok` response is an `InstallSnapshotResp` (requires the `Admin` role).
+    pub fn raft_install_snapshot(&mut self, req: &InstallSnapshotReq) -> Result<(u8, u64, Vec<u8>)> {
+        let wire = req.to_wire_bytes();
+        self.rpc(OP_RAFT_SNAPSHOT, NO_KEY, &wire)
+    }
+
     /// Ships record frames for a virtual shard migration over TCP (`OP_MIGRATE_VSHARD`).
     pub fn migrate_vshard<T: ZeroCopyRecord>(
         &mut self,
@@ -2046,6 +2071,23 @@ mod tests {
         assert!(ae_resp.success);
         assert_eq!(ae_resp.match_index, 0);
 
+        // ── 5b. InstallSnapshot chunk: a transfer that does not start with a valid snapshot
+        //        header is refused (restart from offset 0), never applied ──
+        let snap_req = storage_core::raft::InstallSnapshotReq {
+            term: 5,
+            leader_id: 1,
+            last_included_index: 9,
+            last_included_term: 5,
+            offset: 0,
+            data: vec![0xAB; 64],
+            done: true,
+        };
+        let (status, term, resp_body) = client.raft_install_snapshot(&snap_req).unwrap();
+        assert_eq!((status, term), (STATUS_OK, 5));
+        let snap_resp = storage_core::raft::InstallSnapshotResp::from_wire_bytes(&resp_body).unwrap();
+        assert_eq!((snap_resp.next_offset, snap_resp.installed), (0, false));
+        assert_eq!(raft.last_applied(), 0);
+
         // ── 6. Shard migration RPC (Admin only) ───────────────────────────
         let mig_id = InlineId::from_static("migrated_rec_01");
         let mig_rec = AgentObjectRecord::new(mig_id, "Migrated Shard Record", 300, 77);
@@ -2137,6 +2179,7 @@ mod tests {
             (OP_METRICS, Vec::new()),
             (OP_RAFT_VOTE, vote),
             (OP_RAFT_APPEND, append),
+            (OP_RAFT_SNAPSHOT, vec![7u8; 45]),
             (OP_MIGRATE_VSHARD, migrate),
             (OP_ADMIN_BACKUP, b"nightly/one".to_vec()),
             (OP_HEALTH, Vec::new()),

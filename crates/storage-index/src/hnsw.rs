@@ -622,12 +622,20 @@ impl HnswVectorIndex {
 
     /// Persists the HNSW graph and `SQ8` quantized vectors to `path` (`hnsw.idx`) with CRC32C verification.
     pub fn save_to_disk(&self, path: &Path) -> Result<()> {
+        self.save_to_disk_sealed(path, &storage_codec::FileSeal::PLAIN)
+    }
+
+    /// [`Self::save_to_disk`] that seals the file when `seal` says so (`TASK-088`). The file is
+    /// built in one buffer (header reserved up front) and encrypted in place.
+    pub fn save_to_disk_sealed(&self, path: &Path, seal: &storage_codec::FileSeal<'_>) -> Result<()> {
         let g = self
             .graph
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let mut payload = Vec::new();
+        // `[seal header | magic u32 | crc u64 | payload]`, filled in once the payload is known.
+        let start = seal.header_len() + 12;
+        let mut payload = vec![0u8; start];
         let entry_raw = g.entry_point.unwrap_or(u32::MAX);
         payload.extend_from_slice(&entry_raw.to_le_bytes());
         payload.extend_from_slice(&(g.max_layer as u32).to_le_bytes());
@@ -652,11 +660,13 @@ impl HnswVectorIndex {
             }
         }
 
-        let crc = checksum_payload(&payload);
-        let mut full = Vec::with_capacity(12 + payload.len());
-        full.extend_from_slice(&HNSW_MAGIC.to_le_bytes());
-        full.extend_from_slice(&crc.to_le_bytes());
-        full.extend_from_slice(&payload);
+        drop(g);
+        let crc = checksum_payload(&payload[start..]);
+        let hl = seal.header_len();
+        payload[hl..hl + 4].copy_from_slice(&HNSW_MAGIC.to_le_bytes());
+        payload[hl + 4..start].copy_from_slice(&crc.to_le_bytes());
+        seal.seal_in_place(crate::checkpoint::seal_context(path), 0, &mut payload)?;
+        let full = payload;
 
         if let Some(parent) = path.parent() {
             if !parent.exists() {
@@ -671,10 +681,22 @@ impl HnswVectorIndex {
     /// Every length, count and neighbor id is bounds-checked, so a corrupted or crafted file is
     /// rejected with an error instead of panicking or over-allocating.
     pub fn load_from_disk(path: &Path, config: HnswConfig) -> Result<Self> {
+        Self::load_from_disk_sealed(path, config, &storage_codec::FileSeal::PLAIN)
+    }
+
+    /// [`Self::load_from_disk`] for files that may be sealed (`TASK-088`); plaintext files are
+    /// rejected when `seal` forbids them (no downgrade).
+    pub fn load_from_disk_sealed(
+        path: &Path,
+        config: HnswConfig,
+        seal: &storage_codec::FileSeal<'_>,
+    ) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::new(config));
         }
-        let bytes = fs::read(path).map_err(|e| StorageError::io("read hnsw.idx", e))?;
+        let mut raw = fs::read(path).map_err(|e| StorageError::io("read hnsw.idx", e))?;
+        let plain = seal.open_in_place(crate::checkpoint::seal_context(path), 0, &mut raw)?;
+        let bytes = &raw[plain];
         if bytes.len() < 32 {
             return Err(StorageError::corrupted_header("hnsw.idx truncated"));
         }

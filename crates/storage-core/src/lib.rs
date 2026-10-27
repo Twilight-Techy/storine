@@ -31,7 +31,7 @@ pub use backup::{
 };
 pub use catalog::{CatalogTransaction, CollectionMeta, DatabaseCatalog, ErasedCollectionEngine};
 pub use engine::{
-    IndexTier,
+    EncryptionConfig, IndexTier, PrimaryTier, ResealReport,
     EngineConfig, EngineStats, RecordRef, StorageEngine, StorageLayoutMode, TransactionBatch,
 };
 pub use migration::SchemaRegistry;

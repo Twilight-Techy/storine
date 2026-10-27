@@ -10,12 +10,16 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use storage_codec::{AlignedBytes, EncryptionKey, RecordCodec, RecordView, ZeroCopyRecord};
+use storage_codec::{
+    AlignedBytes, EncryptionKey, FrameProtection, KeyRing, RecordCodec, RecordView, ZeroCopyRecord,
+};
+use storage_codec::FileSeal;
+use storage_index::RecordProtection;
 
 use crate::decrypt_cache::DecryptedCache;
 use storage_graph::{DanglingEdge, OnDelete};
 use storage_index::{
-    append_primary_checkpoint_delta, cosine_similarity_f32, delta_checkpoint_path, load_primary_checkpoint_with_stamp, save_primary_checkpoint, save_primary_checkpoint_entries, BitmapTagIndex, CompressedBitmap, DiskLocation, HnswConfig, HnswVectorIndex, IndexDelta, IndexSnapshot, Indexable, NumericRangeIndex, PagedBTreeIndex, PagedBitmapIndex, PrimaryEntry, PrimaryIndex, RangeIndex, TagIndex, VectorTopKHit,
+    append_primary_checkpoint_delta_sealed, cosine_similarity_f32, delta_checkpoint_path, load_primary_checkpoint_with_stamp_sealed, save_primary_checkpoint_entries_sealed, BitmapTagIndex, CompressedBitmap, DiskLocation, ColdCheckpoint, HnswConfig, HnswVectorIndex, IndexDelta, IndexSnapshot, Indexable, NumericRangeIndex, PagedBTreeIndex, PagedBitmapIndex, PrimaryEntry, PrimaryIndex, RangeIndex, TagIndex, VectorTopKHit,
 };
 use storage_mmap::{
     atomic_write_replace, cleanup_temp_files, read_ping_pong_active, write_ping_pong_slot,
@@ -66,6 +70,86 @@ pub enum IndexTier {
     Paged,
 }
 
+/// Where the primary index (id -> location, ordinal table) lives (`F-PIDX-03`, `TASK-092`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrimaryTier {
+    /// Every entry and ordinal in RAM (`~100 B` per record), loaded from `primary.idx` at open.
+    #[default]
+    Memory,
+    /// The state as of the last checkpoint lives in an immutable, page-structured generation file
+    /// (`indexes/<stem>_primary.cold`); RAM holds only entries written, deleted or read-verified
+    /// since then, plus the tier's page separators (`8 B` per 4 KiB page) and Bloom filter
+    /// (~`10 bits` per record). Open maps the tier instead of loading every entry. Lookups that
+    /// miss RAM read one page (decrypted on access when encryption is on).
+    Cold,
+}
+
+/// Encryption at rest settings (`F-SEC-02`).
+///
+/// - **Encrypted (strict)**: `active_key: Some(id)`, `accept_unencrypted: false`. Every frame must be
+///   sealed with a key in `keys`; plaintext frames are rejected (no downgrade).
+/// - **Key rotation**: set the new `active_key`, keep the old key in `keys`, run
+///   [`StorageEngine::reseal_all`], then drop the old key.
+/// - **Turning encryption on for existing data**: `active_key: Some(id)` with
+///   `accept_unencrypted: true`, run `reseal_all`, then switch to strict.
+/// - **Turning it off**: `active_key: None`, `accept_unencrypted: true`, keep the old keys, run
+///   `reseal_all` (frames are rewritten in plaintext), then remove the configuration.
+///
+/// `accept_unencrypted: true` is a migration-only state: while it is set, plaintext frames are
+/// accepted unauthenticated.
+#[derive(Clone, Debug)]
+pub struct EncryptionConfig {
+    pub keys: KeyRing,
+    /// Key sealing new writes (`None`: new writes are plaintext).
+    pub active_key: Option<u32>,
+    /// Accept plaintext record frames (migration only).
+    pub accept_unencrypted: bool,
+}
+
+/// Index-file protection derived from the encryption settings (`TASK-088`): index files are
+/// sealed with the active key and, like record frames, plaintext ones are rejected unless
+/// `accept_unencrypted` (no downgrade).
+fn file_seal(enc: Option<&EncryptionConfig>) -> FileSeal<'_> {
+    enc.map_or(FileSeal::PLAIN, |e| FileSeal {
+        keys: Some(&e.keys),
+        active_key: e.active_key,
+        accept_plain: e.accept_unencrypted,
+    })
+}
+
+impl EncryptionConfig {
+    /// Strict encryption with a single key.
+    pub fn strict(key_id: u32, key: EncryptionKey) -> Self {
+        Self {
+            keys: KeyRing::new().with_key(key_id, key),
+            active_key: Some(key_id),
+            accept_unencrypted: false,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let Some(id) = self.active_key {
+            if self.keys.get(id).is_none() {
+                return Err(StorageError::invalid_key("active encryption key id is not in the key ring"));
+            }
+        } else if !self.accept_unencrypted {
+            return Err(StorageError::invalid_key(
+                "encryption without an active key must accept unencrypted frames (decryption-only migration)",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Outcome of [`StorageEngine::reseal_all`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResealReport {
+    /// Frames rewritten under the active key (or in plaintext when there is none).
+    pub resealed: usize,
+    /// Frames already in the target form.
+    pub unchanged: usize,
+}
+
 /// Configuration for `StorageEngine<T>`.
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -90,15 +174,20 @@ pub struct EngineConfig {
     pub wal_archive: bool,
     /// Storage tier of the secondary indexes (default [`IndexTier::Memory`]).
     pub index_tier: IndexTier,
-    /// Encryption at rest (`F-SEC-02`): when set, every record frame written to arena segments,
-    /// record files and the WAL is sealed with ChaCha20-Poly1305 under this key, bound to its
-    /// record id and header metadata. Must be set when the database is created: with a key, any
-    /// plaintext record frame found on disk or in the WAL is rejected (no downgrade).
+    /// Storage tier of the primary index (default [`PrimaryTier::Memory`]). Switching tiers is
+    /// supported in both directions; the next checkpoint converts the files.
+    pub primary_tier: PrimaryTier,
+    /// Encryption at rest (`F-SEC-02`, see [`EncryptionConfig`]): record frames written to arena
+    /// segments, record files and the WAL are sealed with ChaCha20-Poly1305 under the active key,
+    /// bound to their record id, key id and header metadata. Changeable at runtime with
+    /// [`StorageEngine::set_encryption`] plus [`StorageEngine::reseal_all`].
     ///
-    /// Not encrypted: record ids and locations in `primary.idx`, indexed tag / numeric values in
-    /// the secondary-index files, and quantized vectors in `hnsw.idx`.
-    pub encryption_key: Option<EncryptionKey>,
-    /// Byte budget of the decrypted-frame cache used when `encryption_key` is set
+    /// Index files are sealed with the active key too (`TASK-088`): `primary.idx` and its delta
+    /// frames, `hnsw.idx`, and the paged secondary-index generations. Still visible on disk: file
+    /// names and sizes, WAL frame headers (record ids, versions), and record file names in the
+    /// dedicated-file layouts (derived from record ids).
+    pub encryption: Option<EncryptionConfig>,
+    /// Byte budget of the decrypted-frame cache used when `encryption` is set
     /// (default 256 MiB). Warm reads of cached records allocate nothing.
     pub decrypted_cache_bytes: usize,
 }
@@ -118,7 +207,8 @@ impl Default for EngineConfig {
             max_hot_dirty_bytes: 64 * 1024 * 1024,
             wal_archive: false,
             index_tier: IndexTier::Memory,
-            encryption_key: None,
+            primary_tier: PrimaryTier::Memory,
+            encryption: None,
             decrypted_cache_bytes: 256 * 1024 * 1024,
         }
     }
@@ -291,6 +381,10 @@ struct SharedEngineInner<T: ZeroCopyRecord + Indexable> {
     indexes_reused: AtomicBool,
     /// Decrypted, validated frames of encrypted records (`F-SEC-02`).
     decrypted: DecryptedCache,
+    /// Current encryption settings (swappable at runtime).
+    crypto: RwLock<Option<Arc<EncryptionConfig>>>,
+    /// Fast-path flag: `true` while any encryption configuration is installed.
+    crypto_on: AtomicBool,
     vector_index: HnswVectorIndex,
     mvcc: MvccManager,
     migrations: RwLock<SchemaRegistry<T>>,
@@ -304,6 +398,8 @@ struct SharedEngineInner<T: ZeroCopyRecord + Indexable> {
     ttl_ordinals: RwLock<CompressedBitmap>,
     /// `<base>/indexes/<collection>_primary.idx`.
     idx_path: PathBuf,
+    /// Manifest of the cold primary tier (`indexes/<stem>_primary.cold`, `TASK-092`).
+    cold_manifest: PathBuf,
     /// Persisted HNSW graph (`indexes/<stem>_hnsw.idx`, `F-HNSW-02`), saved at checkpoints.
     hnsw_path: PathBuf,
     /// `HnswVectorIndex::generation` at the last save (`u64::MAX` = never saved).
@@ -443,6 +539,9 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                 .map_err(|e| StorageError::io("create engine base directory", e))?;
         }
         let stem = collection_file_stem(&config.collection_name)?;
+        if let Some(ref enc) = config.encryption {
+            enc.validate()?;
+        }
 
         // Acquire OS-level exclusive lock on `<base_dir>/<collection>.lock` (`TASK-059`)
         let lock_path = base_dir.join(format!("{stem}.lock"));
@@ -477,7 +576,9 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
 
         // Load primary index checkpoint if present
         let idx_path = base_dir.join("indexes").join(format!("{stem}_primary.idx"));
-        let (_, primary_stamp) = load_primary_checkpoint_with_stamp(&primary, &idx_path)?;
+        let cold_manifest = base_dir.join("indexes").join(format!("{stem}_primary.cold"));
+        let open_seal = file_seal(config.encryption.as_ref());
+        let primary_stamp = load_primary_state(&primary, &idx_path, &cold_manifest, config.primary_tier, &open_seal)?;
 
         // Secondary indexes. The paged tier may reuse its files only if they were written by the
         // same checkpoint as the primary index (equal stamps) and nothing happened afterwards (no
@@ -491,8 +592,8 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             IndexTier::Paged => {
                 let range_path = base_dir.join("indexes").join(format!("{stem}_range.idx"));
                 let tags_path = base_dir.join("indexes").join(format!("{stem}_tags.idx"));
-                let range = PagedBTreeIndex::open(&range_path).ok();
-                let tags = PagedBitmapIndex::open(&tags_path).ok();
+                let range = PagedBTreeIndex::open_sealed(&range_path, &open_seal).ok();
+                let tags = PagedBitmapIndex::open_sealed(&tags_path, &open_seal).ok();
                 let matches = match (&range, &tags, primary_stamp) {
                     (Some(r), Some(t), Some(stamp)) => {
                         stamp != 0 && r.stamp() == stamp && t.stamp() == stamp
@@ -501,7 +602,10 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                 };
                 let (range, tags) = match (range, tags) {
                     (Some(r), Some(t)) if matches => (r, t),
-                    _ => (fresh_paged_btree(&range_path)?, fresh_paged_bitmap(&tags_path)?),
+                    _ => (
+                        fresh_paged_btree(&range_path, &open_seal)?,
+                        fresh_paged_bitmap(&tags_path, &open_seal)?,
+                    ),
                 };
                 (RangeIndex::Paged(range), TagIndex::Paged(tags), matches)
             }
@@ -511,7 +615,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         // `rebuild_secondary_indexes`, so a missing, stale or corrupted file only costs rebuild work.
         let hnsw_path = base_dir.join("indexes").join(format!("{stem}_hnsw.idx"));
         let (vector_index, hnsw_saved_generation) =
-            match HnswVectorIndex::load_from_disk(&hnsw_path, HnswConfig::default()) {
+            match HnswVectorIndex::load_from_disk_sealed(&hnsw_path, HnswConfig::default(), &open_seal) {
                 Ok(loaded) if hnsw_path.exists() => {
                     let generation = loaded.generation();
                     (loaded, generation)
@@ -540,6 +644,8 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             checkpoint_serial: Mutex::new(()),
             indexes_reused: AtomicBool::new(false),
             decrypted: DecryptedCache::new(config.decrypted_cache_bytes),
+            crypto: RwLock::new(config.encryption.clone().map(Arc::new)),
+            crypto_on: AtomicBool::new(config.encryption.is_some()),
             vector_index,
             mvcc: MvccManager::new(),
             migrations: RwLock::new(SchemaRegistry::new()),
@@ -551,6 +657,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             coalesced_flushes: CachePadded::new(AtomicU64::new(0)),
             ttl_ordinals: RwLock::new(CompressedBitmap::new()),
             idx_path: idx_path.clone(),
+            cold_manifest,
             hnsw_path,
             hnsw_saved_generation: AtomicU64::new(hnsw_saved_generation),
             wal_archive_dir,
@@ -574,7 +681,8 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                 if let Some(ref arena) = inner.arena {
                     arena.sync_all()?;
                 }
-                save_primary_checkpoint(&inner.primary, &idx_path)?;
+                let cut = inner.primary_cut();
+                inner.save_primary_files(cut, 0)?;
                 replayed = true;
             }
         }
@@ -663,6 +771,106 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
     /// Bytes currently held by the decrypted-frame cache (`0` without encryption).
     pub fn decrypted_cache_bytes(&self) -> usize {
         self.inner.decrypted.bytes()
+    }
+
+    /// Installs new encryption settings at runtime (`None` removes encryption entirely; only do
+    /// that once [`Self::reseal_all`] has rewritten every frame in plaintext). Takes effect for
+    /// every subsequent read and write; existing frames are converted by [`Self::reseal_all`].
+    pub fn set_encryption(&self, config: Option<EncryptionConfig>) -> Result<()> {
+        if let Some(ref c) = config {
+            c.validate()?;
+        }
+        let on = config.is_some();
+        // Paged index generations written from now on follow the new settings (`TASK-088`).
+        let seal = file_seal(config.as_ref());
+        if let Some(range) = self.inner.range_index.as_paged() {
+            range.set_file_seal(&seal);
+        }
+        if let Some(tags) = self.inner.tag_index.as_paged() {
+            tags.set_file_seal(&seal);
+        }
+        *self
+            .inner
+            .crypto
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config.map(Arc::new);
+        self.inner.crypto_on.store(on, Ordering::Release);
+        Ok(())
+    }
+
+    /// Rewrites every on-disk record frame into the form the current settings require: sealed
+    /// with the active key, or plaintext when there is none (key rotation, turning encryption on
+    /// or off). Runs online: each record is converted under its own stripe lock, logged to the WAL
+    /// (same version: the content is unchanged, so readers and OCC versions are unaffected), and
+    /// flushed; a final checkpoint drops WAL frames sealed with the old keys.
+    ///
+    /// WAL segments archived for PITR keep their original keys: retain those keys while the
+    /// archive is needed.
+    pub fn reseal_all(&self) -> Result<ResealReport> {
+        let mut report = ResealReport::default();
+        let Some(enc) = self.inner.crypto() else {
+            return Ok(report);
+        };
+        let target = enc.active_key;
+        for entry in self.inner.primary.entries_snapshot() {
+            // `target` / policy decide each record's form (see `desired_protection`).
+            let _lock = self.inner.locks.lock_one(entry.id);
+            let Some(cur) = self.inner.primary.get(entry.id) else {
+                continue;
+            };
+            if cur.hot_dirty.is_some() {
+                // Will be sealed with the active key when flushed.
+                report.unchanged += 1;
+                continue;
+            }
+            let Some(raw) = self.inner.read_disk_bytes_for_entry(&cur) else {
+                continue;
+            };
+            let current = RecordCodec::frame_protection(raw.as_slice());
+            let plain = RecordCodec::unprotect_frame(&enc.keys, cur.id, raw.as_slice())?;
+            if current == self.inner.desired_protection(target, plain.as_slice()) {
+                report.unchanged += 1;
+                continue;
+            }
+            if let Some(ref wal) = self.inner.wal {
+                let sealed = self.inner.seal_for_disk(cur.id, plain.as_slice())?;
+                let body = sealed.as_ref().map_or(plain.as_slice(), |b| b.as_slice());
+                wal.append_single(T::COLLECTION_ID, WalOpKind::Upsert, cur.id, cur.version, body)?;
+            }
+            let ping_pong = matches!(
+                cur.location,
+                DiskLocation::DedicatedFile { ping_pong_stride, .. } if ping_pong_stride > 0
+            );
+            let sync = self.inner.data_sync();
+            // A ping-pong file keeps the previous version in its other slot: write twice so both
+            // slots hold the new form.
+            for _ in 0..if ping_pong { 2 } else { 1 } {
+                self.inner.primary.upsert(PrimaryEntry {
+                    hot_dirty: Some(plain.clone()),
+                    ..cur.clone()
+                });
+                self.inner.flush_single_record_impl(cur.id, sync, true, true)?;
+            }
+            report.resealed += 1;
+        }
+        // The final checkpoint rewrites the index files in the new form (`TASK-088`); force the
+        // vector graph to be rewritten even if it did not change.
+        self.inner.hnsw_saved_generation.store(u64::MAX, Ordering::Release);
+        self.flush_all()?;
+        // Superseded frames stay in dead arena slots until reclaimed: evacuate every segment so
+        // no copy in the old form (plaintext or an old key) remains in any segment file. Segment
+        // dead-byte counters do not survive restarts, so every segment is rewritten.
+        if report.resealed > 0 {
+            if let Some(ref arena) = self.inner.arena {
+                self.evacuate_segments(arena.segment_ids())?;
+            }
+        }
+        Ok(report)
+    }
+
+    /// Ids of every live record (each shard read at its own instant).
+    pub(crate) fn live_ids(&self) -> Vec<InlineId> {
+        self.inner.primary.ids_snapshot()
     }
 
     /// `true` if this open reused persisted paged secondary indexes (`IndexTier::Paged` after a
@@ -863,7 +1071,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                     return Ok(FastRead::Dirty(dirty.clone()));
                 }
             }
-            if self.inner.config.encryption_key.is_some() {
+            if self.inner.crypto_on.load(Ordering::Acquire) {
                 // Ciphertext is never read in place: serve the cached plaintext or go cold.
                 return Ok(match self.inner.decrypted.get(id, entry.version) {
                     Some(plain) => FastRead::Dirty(plain),
@@ -1431,11 +1639,13 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             arena.sync_all()?;
         }
         let idx_path = self.inner.idx_path.clone();
-        let written = append_primary_checkpoint_delta(
+        let enc = self.inner.crypto();
+        let written = append_primary_checkpoint_delta_sealed(
             &self.inner.primary,
             &idx_path,
             upserted_ids,
             deleted_ids,
+            &file_seal(enc.as_deref()),
         )?;
         let delta_path = delta_checkpoint_path(&idx_path);
         if let Ok(meta) = fs::metadata(&delta_path) {
@@ -1456,6 +1666,15 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             return Ok(0);
         };
         let frag_ids = arena.fragmented_segment_ids(min_fragmentation_ratio);
+        self.evacuate_segments(frag_ids)
+    }
+
+    /// Moves every live record out of `frag_ids` into a fresh segment and deletes those segment
+    /// files (also used by [`Self::reseal_all`] to scrub superseded frames).
+    fn evacuate_segments(&self, frag_ids: Vec<u32>) -> Result<usize> {
+        let Some(ref arena) = self.inner.arena else {
+            return Ok(0);
+        };
         if frag_ids.is_empty() {
             return Ok(0);
         }
@@ -1488,9 +1707,18 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                     let raw_hdr = RecordHeader::from_slice_verified(slice)?;
                     // Encrypted frames: authenticate (decrypt) before trusting them; migrations
                     // decode the plaintext and re-seal the upgraded frame.
-                    let plain = match self.inner.config.encryption_key {
-                        Some(ref key) => Some(RecordCodec::decrypt_frame(key, cur.id, slice)?),
-                        None => None,
+                    let plain = match self.inner.crypto() {
+                        Some(ref enc)
+                            if RecordCodec::frame_protection(slice) != FrameProtection::Plain =>
+                        {
+                            Some(RecordCodec::unprotect_frame(&enc.keys, cur.id, slice)?)
+                        }
+                        Some(ref enc) if !enc.accept_unencrypted => {
+                            return Err(StorageError::invalid_archive(
+                                "plaintext record frame found in an encrypted database",
+                            ));
+                        }
+                        _ => None,
                     };
                     let plain_slice = plain.as_ref().map_or(slice, |p| p.as_slice());
                     if raw_hdr.schema_version != T::SCHEMA_VERSION {
@@ -1498,7 +1726,8 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                         let flags = raw_hdr
                             .flags_typed()
                             .without(RecordFlags::COMPRESSED_LZ4)
-                            .without(RecordFlags::ENCRYPTED);
+                            .without(RecordFlags::ENCRYPTED)
+                            .without(RecordFlags::AUTHENTICATED);
                         let reencoded = RecordCodec::encode_aligned(
                             &upgraded,
                             cur.version,
@@ -1779,7 +2008,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             });
         }
 
-        if self.config.encryption_key.is_some() {
+        if self.crypto_on.load(Ordering::Acquire) {
             let (plain, current) = self.decrypted_disk_frame(&entry)?;
             if !current {
                 // Older schema: callers fall back to `get_owned` (which migrates).
@@ -1898,7 +2127,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         if let Some(ref dirty) = entry.hot_dirty {
             return self.decode_or_migrate_frame(dirty.as_slice());
         }
-        if self.config.encryption_key.is_some() {
+        if self.crypto_on.load(Ordering::Acquire) {
             let (plain, _) = self.decrypted_disk_frame(&entry)?;
             return self.decode_or_migrate_frame(plain.as_slice());
         }
@@ -1946,13 +2175,18 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             match entry.kind {
                 WalOpKind::Upsert => {
                     let mut aligned = AlignedBytes::try_copy_from_slice(&entry.frame_bytes)?;
-                    if let Some(ref key) = self.config.encryption_key {
-                        if !RecordCodec::is_encrypted(aligned.as_slice()) {
+                    if let Some(enc) = self.crypto() {
+                        if RecordCodec::frame_protection(aligned.as_slice()) != FrameProtection::Plain {
+                            aligned = RecordCodec::unprotect_frame(
+                                &enc.keys,
+                                entry.record_id,
+                                aligned.as_slice(),
+                            )?;
+                        } else if !enc.accept_unencrypted {
                             return Err(StorageError::invalid_archive(
                                 "plaintext WAL frame found in an encrypted database",
                             ));
                         }
-                        aligned = RecordCodec::decrypt_frame(key, entry.record_id, aligned.as_slice())?;
                     }
                     // WAL bytes are untrusted until validated for `T` (`RULE-SAFE-04`); frames of
                     // an older schema are migrated and re-encoded at the current schema.
@@ -2073,7 +2307,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         if let Some(ref dirty) = entry.hot_dirty {
             return Some(dirty.clone());
         }
-        if self.config.encryption_key.is_some() {
+        if self.crypto_on.load(Ordering::Acquire) {
             // MVCC history keeps plaintext in RAM, like `hot_dirty`.
             return self.decrypted_disk_frame(entry).ok().map(|(f, _)| f);
         }
@@ -2114,7 +2348,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
     /// The plaintext frame of an on-disk encrypted record and whether it validated as the current
     /// schema (`true` for every cached frame). Decrypts and authenticates on a cache miss.
     fn decrypted_disk_frame(&self, entry: &PrimaryEntry) -> Result<(AlignedBytes, bool)> {
-        let Some(ref key) = self.config.encryption_key else {
+        let Some(enc) = self.crypto() else {
             return Err(StorageError::invalid_key("encryption is not enabled"));
         };
         if let Some(plain) = self.decrypted.get(entry.id, entry.version) {
@@ -2123,12 +2357,15 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         let raw = self
             .read_disk_bytes_for_entry(entry)
             .ok_or_else(|| StorageError::not_found(entry.id))?;
-        if !RecordCodec::is_encrypted(raw.as_slice()) {
+        let plain = if RecordCodec::frame_protection(raw.as_slice()) != FrameProtection::Plain {
+            RecordCodec::unprotect_frame(&enc.keys, entry.id, raw.as_slice())?
+        } else if enc.accept_unencrypted {
+            raw
+        } else {
             return Err(StorageError::invalid_archive(
                 "plaintext record frame found in an encrypted database",
             ));
-        }
-        let plain = RecordCodec::decrypt_frame(key, entry.id, raw.as_slice())?;
+        };
         match RecordCodec::validate_frame::<T>(plain.as_slice()) {
             Ok(_) => {
                 self.decrypted.insert(entry.id, entry.version, plain.clone());
@@ -2141,10 +2378,46 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
 
     /// The bytes to store on disk or in the WAL for `frame`: sealed when encryption is enabled.
     fn seal_for_disk(&self, id: InlineId, frame: &[u8]) -> Result<Option<AlignedBytes>> {
-        match self.config.encryption_key {
-            Some(ref key) => RecordCodec::encrypt_frame(key, id, frame).map(Some),
-            None => Ok(None),
+        if !self.crypto_on.load(Ordering::Acquire) {
+            return Ok(None);
         }
+        let Some(enc) = self.crypto() else {
+            return Ok(None);
+        };
+        let Some((kid, key)) = enc.active_key.and_then(|kid| enc.keys.get(kid).map(|k| (kid, k)))
+        else {
+            return Ok(None);
+        };
+        match self.desired_protection(Some(kid), frame) {
+            FrameProtection::Authenticated(_) => {
+                RecordCodec::authenticate_frame(key, kid, id, frame).map(Some)
+            }
+            _ => RecordCodec::encrypt_frame(key, kid, id, frame).map(Some),
+        }
+    }
+
+    /// The protection a plain `frame` must have on disk under active key `active` and the record
+    /// type's [`Indexable::protection`] policy. Frames the policy cannot inspect (compressed,
+    /// tombstones, other schemas) are encrypted.
+    fn desired_protection(&self, active: Option<u32>, frame: &[u8]) -> FrameProtection {
+        let Some(kid) = active else {
+            return FrameProtection::Plain;
+        };
+        match RecordCodec::decode_fast::<T>(frame) {
+            Ok(view) if T::protection(view.archived(), view.payload()) == RecordProtection::Authenticate => {
+                FrameProtection::Authenticated(kid)
+            }
+            _ => FrameProtection::Encrypted(kid),
+        }
+    }
+
+    /// The installed encryption configuration, if any.
+    #[inline]
+    fn crypto(&self) -> Option<Arc<EncryptionConfig>> {
+        self.crypto
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// WAL body for an upsert of `id` with `frame` (sealed when encryption is enabled).
@@ -2161,7 +2434,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         if let Some(ref dirty) = entry.hot_dirty {
             return self.extract_snapshot_from_frame(dirty.as_slice(), true);
         }
-        if self.config.encryption_key.is_some() {
+        if self.crypto_on.load(Ordering::Acquire) {
             let (plain, current) = self.decrypted_disk_frame(entry).ok()?;
             return self.extract_snapshot_from_frame(plain.as_slice(), current);
         }
@@ -2649,7 +2922,8 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         // Persist the vector graph only when it changed since the last save.
         let generation = self.vector_index.generation();
         if generation != self.hnsw_saved_generation.load(Ordering::Acquire) {
-            self.vector_index.save_to_disk(&self.hnsw_path)?;
+            let enc = self.crypto();
+            self.vector_index.save_to_disk_sealed(&self.hnsw_path, &file_seal(enc.as_deref()))?;
             self.hnsw_saved_generation.store(generation, Ordering::Release);
         }
         if !self.shared_wal_mode {
@@ -2915,11 +3189,11 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (Some(range), Some(tags)) = (self.range_index.as_paged(), self.tag_index.as_paged())
         else {
-            save_primary_checkpoint(&self.primary, &self.idx_path)?;
-            return Ok(());
+            let cut = self.primary_cut();
+            return self.save_primary_files(cut, 0);
         };
         let stamp = next_checkpoint_stamp();
-        let entries = self.primary.entries_snapshot();
+        let cut = self.primary_cut();
         let pending_range = range.begin_checkpoint();
         let pending_tags = tags.begin_checkpoint();
         if let Some(ref wal) = self.wal {
@@ -2927,7 +3201,35 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         }
         range.finish_checkpoint(pending_range, stamp)?;
         tags.finish_checkpoint(pending_tags, stamp)?;
-        save_primary_checkpoint_entries(&entries, &self.idx_path, stamp)?;
+        self.save_primary_files(cut, stamp)
+    }
+
+    /// A consistent cut of the primary index for the next primary checkpoint file.
+    fn primary_cut(&self) -> PrimaryCut {
+        match self.config.primary_tier {
+            PrimaryTier::Memory => PrimaryCut::Entries(self.primary.entries_snapshot()),
+            PrimaryTier::Cold => PrimaryCut::Cold(self.primary.begin_cold_checkpoint()),
+        }
+    }
+
+    /// Persists `cut` in the configured primary tier's format (removing the other tier's files
+    /// and any delta log it supersedes), sealed per the current encryption settings.
+    fn save_primary_files(&self, cut: PrimaryCut, stamp: u64) -> Result<()> {
+        let enc = self.crypto();
+        let seal = file_seal(enc.as_deref());
+        match cut {
+            PrimaryCut::Entries(entries) => {
+                save_primary_checkpoint_entries_sealed(&entries, &self.idx_path, stamp, &seal)?;
+                if self.cold_manifest.exists() {
+                    PrimaryIndex::remove_cold_files(&self.cold_manifest);
+                }
+            }
+            PrimaryCut::Cold(cut) => {
+                self.primary.write_cold_checkpoint(cut, &self.cold_manifest, stamp, &seal)?;
+                let _ = fs::remove_file(delta_checkpoint_path(&self.idx_path));
+                let _ = fs::remove_file(&self.idx_path);
+            }
+        }
         Ok(())
     }
 
@@ -3023,16 +3325,62 @@ fn next_checkpoint_stamp() -> u64 {
     }
 }
 
+/// Primary index state captured for a checkpoint (see `PrimaryTier`).
+enum PrimaryCut {
+    Entries(Vec<PrimaryEntry>),
+    Cold(ColdCheckpoint),
+}
+
+/// Loads the persisted primary index into `primary` and returns the checkpoint stamp (`None`
+/// when delta frames were applied or no stamped checkpoint exists).
+///
+/// - A cold tier is attached as is (`PrimaryTier::Cold`), or materialized into RAM when the
+///   engine now runs the memory tier (the next checkpoint writes `primary.idx` again).
+/// - Otherwise `primary.idx` is loaded (also in the cold tier, which converts it at the next
+///   checkpoint). A `primary.idx` left next to a cold manifest predates it and is ignored.
+/// - Delta frames (`primary.idx.delta`) are replayed on top in every case.
+fn load_primary_state(
+    primary: &PrimaryIndex,
+    idx_path: &Path,
+    cold_manifest: &Path,
+    tier: PrimaryTier,
+    seal: &FileSeal<'_>,
+) -> Result<Option<u64>> {
+    let cold_stamp = if cold_manifest.exists() {
+        let stamp = match tier {
+            PrimaryTier::Cold => primary.attach_cold_manifest(cold_manifest, seal)?,
+            PrimaryTier::Memory => {
+                let staging = PrimaryIndex::new();
+                let stamp = staging.attach_cold_manifest(cold_manifest, seal)?;
+                for entry in staging.entries_snapshot() {
+                    primary.restore_entry_at(entry)?;
+                }
+                stamp
+            }
+        };
+        let _ = fs::remove_file(idx_path);
+        stamp
+    } else {
+        None
+    };
+    let had_delta = delta_checkpoint_path(idx_path).exists();
+    let (_, idx_stamp) = load_primary_checkpoint_with_stamp_sealed(primary, idx_path, seal)?;
+    if had_delta {
+        return Ok(None);
+    }
+    Ok(cold_stamp.or(idx_stamp))
+}
+
 /// Opens an empty paged range index at `path`, discarding any previous files.
-fn fresh_paged_btree(path: &Path) -> Result<PagedBTreeIndex> {
+fn fresh_paged_btree(path: &Path, seal: &FileSeal<'_>) -> Result<PagedBTreeIndex> {
     let _ = fs::remove_file(path);
-    PagedBTreeIndex::open(path)
+    PagedBTreeIndex::open_sealed(path, seal)
 }
 
 /// Opens an empty paged tag index at `path`, discarding any previous files.
-fn fresh_paged_bitmap(path: &Path) -> Result<PagedBitmapIndex> {
+fn fresh_paged_bitmap(path: &Path, seal: &FileSeal<'_>) -> Result<PagedBitmapIndex> {
     let _ = fs::remove_file(path);
-    PagedBitmapIndex::open(path)
+    PagedBitmapIndex::open_sealed(path, seal)
 }
 
 /// Multi-record Optimistic Concurrency Control (OCC) Transaction Batch (`TASK-024`, `F-CONC-07`).

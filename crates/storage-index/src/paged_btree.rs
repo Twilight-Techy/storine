@@ -26,14 +26,18 @@
 //!
 //! Generation files are never overwritten (a mapped file cannot be replaced on Windows); stale
 //! ones are deleted after the swap and at open.
+//!
+//! With encryption at rest (`TASK-088`) the leaf pages are sealed as one ChaCha20-Poly1305
+//! region (see `paged_files`): verified once at open, then each page is decrypted into a stack
+//! copy when read. Separator keys in RAM are plaintext, as are all in-RAM indexes.
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::ops::{Bound, RangeBounds};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use storage_codec::checksum_payload;
+use storage_codec::{checksum_payload, FileSeal};
 use storage_mmap::MmapRegion;
 use storage_types::wire::{read_u32_le, read_u64_le};
 use storage_types::{FastHashMap, FastHashSet, RecordOrdinal, Result, StorageError};
@@ -41,8 +45,9 @@ use storage_types::{FastHashMap, FastHashSet, RecordOrdinal, Result, StorageErro
 use crate::bitmap::CompressedBitmap;
 use crate::btree::{sortable_f64_to_i64, KeysetCursor, NumericRangeIndex, SortOrder};
 use crate::paged_files::{
-    generation_path, map_path_read_only, publish_generation, read_manifest,
-    remove_stale_generations, temp_generation_path, write_manifest,
+    generation_path, map_path_read_only, open_generation_cipher, publish_generation, read_manifest,
+    remove_stale_generations, temp_generation_path, write_manifest, GenerationSealer, PageCipher,
+    SealSettings, ENC_SECTION_LEN, ENC_SECTION_OFFSET,
 };
 
 /// Physical page size for disk-backed B+Tree leaf pages (4 KiB).
@@ -73,13 +78,23 @@ struct BaseGeneration {
     /// Per field, sorted by `(min_key, page_index)`; pages of a field are contiguous and sorted.
     separators: FastHashMap<u16, Vec<SeparatorEntry>>,
     path: PathBuf,
+    /// Set when the generation's pages are encrypted at rest.
+    cipher: Option<PageCipher>,
 }
 
 impl BaseGeneration {
+    /// The leaf page of `sep`: borrowed from the mapping, or (encrypted generation) decrypted
+    /// into the caller's stack buffer `plain`.
     #[inline]
-    fn page<'a>(&'a self, sep: &SeparatorEntry) -> Option<&'a [u8]> {
+    fn page<'a>(&'a self, sep: &SeparatorEntry, plain: &'a mut [u8; BTREE_PAGE_SIZE]) -> Option<&'a [u8]> {
         let off = (sep.page_index as usize + 1) * BTREE_PAGE_SIZE;
-        self.mmap.as_slice().get(off..off + BTREE_PAGE_SIZE)
+        let mapped = self.mmap.as_slice().get(off..off + BTREE_PAGE_SIZE)?;
+        let Some(ref cipher) = self.cipher else {
+            return Some(mapped);
+        };
+        plain.copy_from_slice(mapped);
+        cipher.decrypt_at(off - BTREE_PAGE_SIZE, plain).ok()?;
+        Some(plain)
     }
 
     /// `true` if the base holds `(field, key, ord)` (ignoring tombstones). `O(log P + log B)`.
@@ -92,7 +107,8 @@ impl BaseGeneration {
             if sep.min_key > key {
                 break;
             }
-            let Some(page) = self.page(sep) else {
+            let mut plain = [0u8; BTREE_PAGE_SIZE];
+            let Some(page) = self.page(sep, &mut plain) else {
                 continue;
             };
             let count = sep.entry_count as usize;
@@ -134,10 +150,12 @@ impl BaseGeneration {
             }
             Some(f(key, read_ordinal_at(page, count, idx)))
         };
+        // Decryption buffer for encrypted generations (unused for plaintext ones).
+        let mut plain = [0u8; BTREE_PAGE_SIZE];
         match order {
             SortOrder::Asc => {
                 for sep in window {
-                    let Some(page) = self.page(sep) else { continue };
+                    let Some(page) = self.page(sep, &mut plain) else { continue };
                     let count = sep.entry_count as usize;
                     let first = if lo <= sep.min_key {
                         0
@@ -156,7 +174,7 @@ impl BaseGeneration {
             }
             SortOrder::Desc => {
                 for sep in window.iter().rev() {
-                    let Some(page) = self.page(sep) else { continue };
+                    let Some(page) = self.page(sep, &mut plain) else { continue };
                     let count = sep.entry_count as usize;
                     let past = if hi >= sep.max_key {
                         count
@@ -309,6 +327,8 @@ impl PagedBTreeState {
 pub struct PagedBTreeIndex {
     path: PathBuf,
     state: RwLock<PagedBTreeState>,
+    /// Protection of generation files written from now on (`TASK-088`).
+    seal: RwLock<SealSettings>,
     /// Serializes checkpoints (never held together with `state` across I/O).
     checkpoint_lock: Mutex<()>,
 }
@@ -326,17 +346,31 @@ impl PagedBTreeIndex {
     /// Opens (or creates) the index whose manifest is `path`. Corrupted files are an error so
     /// the caller can decide to rebuild; stale generation files are removed.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_sealed(path, &FileSeal::PLAIN)
+    }
+
+    /// [`Self::open`] with encryption at rest (`TASK-088`): an encrypted generation is verified
+    /// with its key from `seal`; a plaintext one is refused when `seal` forbids plaintext. New
+    /// generations are written under `seal` (see [`Self::set_file_seal`]).
+    pub fn open_sealed(path: impl Into<PathBuf>, seal: &FileSeal<'_>) -> Result<Self> {
         let path = path.into();
         let mut state = PagedBTreeState::default();
         if let Some((generation, stamp)) = read_manifest(&path, BTREE_MANIFEST_MAGIC)? {
             let data_path = generation_path(&path, generation);
             let mmap = map_path_read_only(&data_path)?;
+            let header = mmap.as_slice().get(..BTREE_PAGE_SIZE).unwrap_or_default();
+            let enc = open_generation_cipher(header, seal)?;
             let mut separators = FastHashMap::default();
-            load_separators_from_mmap(&mmap, &mut separators)?;
+            load_separators_from_mmap(
+                &mmap,
+                &mut separators,
+                enc.as_ref().map(|(cipher, tag)| (cipher, tag, data_path.as_path())),
+            )?;
             state.base = Some(Arc::new(BaseGeneration {
                 mmap,
                 separators,
                 path: data_path,
+                cipher: enc.map(|(cipher, _)| cipher),
             }));
             state.generation = generation;
             state.stamp = stamp;
@@ -345,8 +379,15 @@ impl PagedBTreeIndex {
         Ok(Self {
             path,
             state: RwLock::new(state),
+            seal: RwLock::new(SealSettings::from_seal(seal)),
             checkpoint_lock: Mutex::new(()),
         })
+    }
+
+    /// Protection for generation files written from now on (the next checkpoint rewrites every
+    /// page under it, so a rotation or enable / disable reaches the whole index).
+    pub fn set_file_seal(&self, seal: &FileSeal<'_>) {
+        *self.seal.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = SealSettings::from_seal(seal);
     }
 
     #[inline]
@@ -710,6 +751,12 @@ impl PagedBTreeIndex {
         writer
             .write_all(&[0u8; BTREE_PAGE_SIZE])
             .map_err(|e| StorageError::io("write btree header placeholder", e))?;
+        let settings = self
+            .seal
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut sealer = GenerationSealer::begin(&settings.as_seal(), &data_path);
 
         let mut fields: Vec<u16> = base
             .map(|b| b.separators.keys().copied().collect())
@@ -736,7 +783,7 @@ impl PagedBTreeIndex {
                 pending.push((k, o));
                 if pending.len() == MAX_ENTRIES_PER_LEAF_PAGE && io_err.is_none() {
                     let sep = encode_leaf_page(&mut page_buf, field, page_index, pending);
-                    if let Err(e) = writer.write_all(&page_buf) {
+                    if let Err(e) = seal_and_write(&mut sealer, &mut writer, &mut page_buf) {
                         io_err = Some(e);
                     }
                     separators.entry(field).or_default().push(sep);
@@ -763,7 +810,7 @@ impl PagedBTreeIndex {
             }
             if !pending.is_empty() && io_err.is_none() {
                 let sep = encode_leaf_page(&mut page_buf, field, page_index, &pending);
-                if let Err(e) = writer.write_all(&page_buf) {
+                if let Err(e) = seal_and_write(&mut sealer, &mut writer, &mut page_buf) {
                     io_err = Some(e);
                 }
                 separators.entry(field).or_default().push(sep);
@@ -778,11 +825,16 @@ impl PagedBTreeIndex {
         let mut file = writer
             .into_inner()
             .map_err(|e| StorageError::io("flush btree generation file", e.into_error()))?;
-        let mut header = [0u8; 16];
+        let mut header = [0u8; ENC_SECTION_OFFSET + ENC_SECTION_LEN];
         header[0..4].copy_from_slice(&BTREE_FILE_MAGIC.to_le_bytes());
         header[4..8].copy_from_slice(&page_index.to_le_bytes());
         let hdr_crc = checksum_payload(&header[0..8]);
         header[8..16].copy_from_slice(&hdr_crc.to_le_bytes());
+        let cipher = sealer.map(|s| {
+            let (section, cipher) = s.finish();
+            header[ENC_SECTION_OFFSET..].copy_from_slice(&section);
+            cipher
+        });
         file.seek(SeekFrom::Start(0))
             .and_then(|_| file.write_all(&header))
             .and_then(|()| file.sync_all())
@@ -798,10 +850,23 @@ impl PagedBTreeIndex {
                 mmap,
                 separators,
                 path: data_path,
+                cipher,
             },
             page_index as usize,
         ))
     }
+}
+
+/// Encrypts `page` in place when the generation is sealed, then writes it.
+fn seal_and_write(
+    sealer: &mut Option<GenerationSealer>,
+    writer: &mut impl Write,
+    page: &mut [u8],
+) -> std::io::Result<()> {
+    if let Some(s) = sealer {
+        s.seal(page)?;
+    }
+    writer.write_all(page)
 }
 
 fn normalize_bounds<R: RangeBounds<i64>>(range: &R) -> (i64, i64) {
@@ -909,11 +974,16 @@ fn lower_bound_in_page(page: &[u8], min_key: i64, count: usize, target: i64) -> 
     left
 }
 
-/// Validates every page once at open (`RULE-SAFE-04`) and builds the separator directory.
+/// Validates every page once at open (`RULE-SAFE-04`) and builds the separator directory. For
+/// an encrypted generation (`enc` = cipher, tag, file path) each page is decrypted into a copy
+/// for validation and the region's tag is verified over the ciphertext.
 fn load_separators_from_mmap(
     mmap: &MmapRegion,
     out: &mut FastHashMap<u16, Vec<SeparatorEntry>>,
+    enc: Option<(&PageCipher, &[u8; 16], &Path)>,
 ) -> Result<()> {
+    let mut verifier = enc.map(|(cipher, _, path)| cipher.verifier(path));
+    let mut plain = [0u8; BTREE_PAGE_SIZE];
     let slice = mmap.as_slice();
     if slice.len() < BTREE_PAGE_SIZE {
         return Err(StorageError::corrupted_header("btree.idx smaller than 4 KiB"));
@@ -930,9 +1000,18 @@ fn load_separators_from_mmap(
 
     for page_idx in 0..page_count {
         let off = (page_idx as usize + 1) * BTREE_PAGE_SIZE;
-        let page = slice
+        let raw = slice
             .get(off..off + BTREE_PAGE_SIZE)
             .ok_or_else(|| StorageError::corrupted_header("btree.idx truncated leaf page"))?;
+        let page: &[u8] = match (enc, verifier.as_mut()) {
+            (Some((cipher, _, _)), Some(v)) => {
+                v.absorb_ciphertext(raw)?;
+                plain.copy_from_slice(raw);
+                cipher.decrypt_at(off - BTREE_PAGE_SIZE, &mut plain)?;
+                &plain
+            }
+            _ => raw,
+        };
         if read_u32_le(page, 0) != BTREE_PAGE_MAGIC {
             return Err(StorageError::corrupted_header("btree.idx invalid leaf magic"));
         }
@@ -974,12 +1053,60 @@ fn load_separators_from_mmap(
             max_key,
         });
     }
+    if let (Some(v), Some((_, tag, _))) = (verifier, enc) {
+        v.verify(tag)?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sealed_generations_roundtrip_refuse_downgrade_and_rotate() {
+        use storage_codec::{EncryptionKey, KeyRing};
+        let path = temp_path("sealed");
+        let ring = KeyRing::new().with_key(1, EncryptionKey::from_bytes([1; 32]));
+        let seal = FileSeal { keys: Some(&ring), active_key: Some(1), accept_plain: false };
+        let marker = 0x5EC2_E7AB_CDEF_0123_i64;
+        {
+            let idx = PagedBTreeIndex::open_sealed(&path, &seal).unwrap();
+            for i in 0..2000u32 {
+                idx.insert(3, marker + i64::from(i % 700), RecordOrdinal(i));
+            }
+            idx.checkpoint_with_stamp(5).unwrap();
+            assert_eq!(idx.count_in_range(3, marker..marker + 100), 2000 / 700 * 100 + 100);
+        }
+        let generation = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().contains("btree.idx."))
+            .unwrap();
+        let bytes = fs::read(&generation).unwrap();
+        assert_eq!(&bytes[128..132], b"PENC");
+        assert!(!bytes.windows(8).any(|w| w == marker.to_le_bytes()), "plaintext key on disk");
+
+        // Reopen with the key: verified, pages decrypted on access.
+        let idx = PagedBTreeIndex::open_sealed(&path, &seal).unwrap();
+        assert_eq!(idx.count_in_range(3, marker..marker + 100), 2000 / 700 * 100 + 100);
+        drop(idx);
+        // No key, or a plaintext-only reader: refused.
+        assert!(PagedBTreeIndex::open(&path).is_err());
+        // Rotate to plaintext: the next checkpoint rewrites every page in the clear.
+        let idx = PagedBTreeIndex::open_sealed(&path, &seal).unwrap();
+        idx.set_file_seal(&FileSeal { active_key: None, accept_plain: true, ..seal });
+        idx.insert(3, marker - 1, RecordOrdinal(5000));
+        idx.checkpoint_with_stamp(6).unwrap();
+        drop(idx);
+        let plain = PagedBTreeIndex::open(&path).unwrap();
+        assert_eq!(plain.count_in_range(3, marker - 1..marker + 100), 2000 / 700 * 100 + 101);
+        drop(plain);
+        // ... which a strict reader now refuses (no downgrade).
+        assert!(PagedBTreeIndex::open_sealed(&path, &seal).is_err());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
 
     fn temp_path(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("storine_paged_btree_{name}_{}", std::process::id()));

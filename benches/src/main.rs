@@ -171,7 +171,10 @@ fn main() -> storage_types::Result<()> {
         let enc_engine = StorageEngine::<AgentObjectRecord>::open(
             &enc_dir,
             EngineConfig {
-                encryption_key: Some(storage_codec::EncryptionKey::from_bytes([0x42; 32])),
+                encryption: Some(storage_core::EncryptionConfig::strict(
+                    1,
+                    storage_codec::EncryptionKey::from_bytes([0x42; 32]),
+                )),
                 decrypted_cache_bytes: cache_bytes,
                 ..cfg.clone()
             },
@@ -196,6 +199,29 @@ fn main() -> storage_types::Result<()> {
         }));
         drop(enc_engine);
         let _ = fs::remove_dir_all(&enc_dir);
+    }
+
+    // Cold primary tier (`TASK-092`): the record's index entry is read from the tier file (Bloom
+    // filter + one page decode), not RAM; the frame is re-validated on each read.
+    {
+        let cold_dir = std::env::temp_dir().join("storage_engine_bench_cold_tier");
+        let _ = fs::remove_dir_all(&cold_dir);
+        let cold_engine = StorageEngine::<AgentObjectRecord>::open(
+            &cold_dir,
+            EngineConfig { primary_tier: storage_core::PrimaryTier::Cold, ..cfg.clone() },
+        )?;
+        for (i, &k) in keys.iter().enumerate() {
+            let r = AgentObjectRecord::new(k, "Memory Node", 1_700_000_000 + i as i64, i as i64);
+            cold_engine.put(k, &r)?;
+        }
+        cold_engine.flush_all()?;
+        assert_eq!(cold_engine.primary_index().resident_entries(), 0, "entries live in the tier");
+        results.push(run_latency_bench("StorageEngine::with_ref (Cold primary tier)", 20_000, |i| {
+            let k = keys[i % keys.len()];
+            let _ = cold_engine.with_ref(k, |view| core::hint::black_box(view.score));
+        }));
+        drop(cold_engine);
+        let _ = fs::remove_dir_all(&cold_dir);
     }
 
     // Hot-key burst updates to measure Write Coalescing

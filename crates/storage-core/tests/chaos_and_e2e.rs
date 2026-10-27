@@ -494,6 +494,10 @@ fn crash_child_writer() {
             writeln!(out, "ACK PUT {n} {score}").unwrap();
         }
         out.flush().unwrap();
+        if layout_idx == 5 && i == abort_after / 2 {
+            // Build a cold tier mid-run, so the crash hits a tiered primary index.
+            engine.flush_all().unwrap();
+        }
         if i == abort_after {
             std::process::abort();
         }
@@ -501,15 +505,18 @@ fn crash_child_writer() {
 }
 
 /// Crash-test variants: the three storage layouts with in-memory indexes, the adaptive arena
-/// layout with the paged index tier, and the adaptive arena layout with encryption at rest.
-const CRASH_VARIANTS: usize = 5;
+/// layout with the paged index tier, the adaptive arena layout with encryption at rest, and
+/// everything combined with the cold primary tier (`TASK-092`).
+const CRASH_VARIANTS: usize = 6;
 
 fn crash_config(variant: usize) -> EngineConfig {
     EngineConfig {
         layout_mode: crash_layouts()[variant.min(2)],
-        index_tier: if variant == 3 { IndexTier::Paged } else { IndexTier::Memory },
-        encryption_key: (variant == 4)
-            .then(|| storage_codec::EncryptionKey::from_bytes([0x5A; 32])),
+        index_tier: if variant == 3 || variant == 5 { IndexTier::Paged } else { IndexTier::Memory },
+        primary_tier: if variant == 5 { storage_core::PrimaryTier::Cold } else { storage_core::PrimaryTier::Memory },
+        encryption: (variant >= 4).then(|| {
+            storage_core::EncryptionConfig::strict(1, storage_codec::EncryptionKey::from_bytes([0x5A; 32]))
+        }),
         ..EngineConfig::default()
     }
 }

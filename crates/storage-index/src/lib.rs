@@ -10,6 +10,7 @@ pub mod btree;
 pub mod checkpoint;
 pub mod hnsw;
 pub mod cold_primary;
+mod cold_tier;
 pub mod paged_bitmap;
 mod paged_files;
 pub mod paged_btree;
@@ -29,6 +30,8 @@ pub use btree::{
 pub use checkpoint::{
     append_primary_checkpoint_delta, delta_checkpoint_path, load_primary_checkpoint,
     save_primary_checkpoint, save_primary_checkpoint_entries, load_primary_checkpoint_with_stamp,
+    append_primary_checkpoint_delta_sealed, load_primary_checkpoint_with_stamp_sealed,
+    save_primary_checkpoint_entries_sealed,
 };
 pub use hnsw::{HnswConfig, HnswVectorIndex};
 pub use cold_primary::{
@@ -38,8 +41,8 @@ pub use paged_bitmap::{MappedChunkRef, PagedBitmapIndex, PendingBitmapCheckpoint
 pub use paged_btree::{
     PagedBTreeIndex, PendingBTreeCheckpoint, SeparatorEntry, BTREE_PAGE_SIZE, MAX_ENTRIES_PER_LEAF_PAGE,
 };
-pub use primary::{DiskLocation, PrimaryEntry, PrimaryIndex};
+pub use primary::{ColdCheckpoint, DiskLocation, PrimaryEntry, PrimaryIndex};
 pub use quantize::{dot_u8_unrolled, sq8_cosine_similarity, sq8_dot_product, QuantizedVecSq8};
 pub use tiered::{RangeIndex, TagIndex};
-pub use traits::{IndexDelta, IndexSnapshot, Indexable};
+pub use traits::{IndexDelta, IndexSnapshot, Indexable, RecordProtection};
 pub use vector::{cosine_similarity_f32, dot_product_f32, VectorTopKHit};

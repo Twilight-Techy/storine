@@ -25,25 +25,25 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use storage_codec::checksum_payload;
+use storage_codec::{checksum_payload, FileSeal};
 use storage_mmap::MmapRegion;
 use storage_types::wire::{read_array_24, read_u16_le, read_u32_le, read_u64_le};
 use storage_types::{FastHashMap, InlineId, RecordOrdinal, Result, StorageError};
 
 use crate::bitmap::{BitmapTagIndex, CompressedBitmap};
 use crate::paged_files::{
-    generation_path, map_path_read_only, publish_generation, read_manifest,
-    remove_stale_generations, temp_generation_path, write_manifest,
+    generation_path, map_path_read_only, open_generation_cipher, publish_generation, read_manifest,
+    remove_stale_generations, temp_generation_path, write_manifest, GenerationSealer, PageCipher,
+    SealSettings, ENC_SECTION_LEN, ENC_SECTION_OFFSET,
 };
 
 const BITMAP_FILE_MAGIC: u32 = 0x424D_5833; // "BMX3"
 const BITMAP_MANIFEST_MAGIC: u32 = 0x424D_4D46; // "BMMF"
 const BITMAP_BLOCK_BYTES: usize = 512; // 64 x u64 words
 const HEADER_REGION: usize = 4096;
-const HEADER_LEN: usize = 48;
 const DIR_ENTRY_FIXED: usize = 2 + 24 + 4 + 8;
 
 type Key = (u16, InlineId);
@@ -66,13 +66,24 @@ struct BaseGeneration {
     mmap: MmapRegion,
     directory: FastHashMap<Key, DirEntry>,
     path: PathBuf,
+    /// Set when the generation's blocks and directory are encrypted at rest (`TASK-088`).
+    cipher: Option<PageCipher>,
 }
 
 impl BaseGeneration {
     #[inline]
     fn block(&self, block_index: u32) -> Option<Words> {
         let off = HEADER_REGION + block_index as usize * BITMAP_BLOCK_BYTES;
-        let bytes = self.mmap.as_slice().get(off..off + BITMAP_BLOCK_BYTES)?;
+        let mapped = self.mmap.as_slice().get(off..off + BITMAP_BLOCK_BYTES)?;
+        let mut plain = [0u8; BITMAP_BLOCK_BYTES];
+        let bytes: &[u8] = match self.cipher {
+            Some(ref cipher) => {
+                plain.copy_from_slice(mapped);
+                cipher.decrypt_at(off - HEADER_REGION, &mut plain).ok()?;
+                &plain
+            }
+            None => mapped,
+        };
         let mut words = [0u64; 64];
         for (i, w) in words.iter_mut().enumerate() {
             *w = read_u64_le(bytes, i * 8);
@@ -93,10 +104,17 @@ impl BaseGeneration {
         let off = HEADER_REGION
             + entry.chunks[i].block_index as usize * BITMAP_BLOCK_BYTES
             + (bit / 64) * 8;
-        self.mmap
-            .as_slice()
-            .get(off..off + 8)
-            .is_some_and(|w| (read_u64_le(w, 0) >> (bit % 64)) & 1 == 1)
+        let Some(mapped) = self.mmap.as_slice().get(off..off + 8) else {
+            return false;
+        };
+        let mut word = [0u8; 8];
+        word.copy_from_slice(mapped);
+        if let Some(ref cipher) = self.cipher {
+            if cipher.decrypt_at(off - HEADER_REGION, &mut word).is_err() {
+                return false;
+            }
+        }
+        (u64::from_le_bytes(word) >> (bit % 64)) & 1 == 1
     }
 
     /// Base chunks of `key`, ascending by chunk id.
@@ -235,6 +253,8 @@ impl PagedBitmapState {
 pub struct PagedBitmapIndex {
     path: PathBuf,
     state: RwLock<PagedBitmapState>,
+    /// Protection of generation files written from now on (`TASK-088`).
+    seal: RwLock<SealSettings>,
     checkpoint_lock: Mutex<()>,
 }
 
@@ -251,16 +271,29 @@ impl PagedBitmapIndex {
     /// Opens (or creates) the index whose manifest is `path`. A corrupted generation is an error
     /// (the caller rebuilds); stale generation files are removed.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_sealed(path, &FileSeal::PLAIN)
+    }
+
+    /// [`Self::open`] with encryption at rest (`TASK-088`): an encrypted generation is verified
+    /// with its key from `seal`; a plaintext one is refused when `seal` forbids plaintext. New
+    /// generations are written under `seal` (see [`Self::set_file_seal`]).
+    pub fn open_sealed(path: impl Into<PathBuf>, seal: &FileSeal<'_>) -> Result<Self> {
         let path = path.into();
         let mut state = PagedBitmapState::default();
         if let Some((generation, stamp)) = read_manifest(&path, BITMAP_MANIFEST_MAGIC)? {
             let data_path = generation_path(&path, generation);
             let mmap = map_path_read_only(&data_path)?;
-            let directory = load_generation(&mmap)?;
+            let header = mmap.as_slice().get(..HEADER_REGION).unwrap_or_default();
+            let enc = open_generation_cipher(header, seal)?;
+            let directory = load_generation(
+                &mmap,
+                enc.as_ref().map(|(cipher, tag)| (cipher, tag, data_path.as_path())),
+            )?;
             state.base = Some(Arc::new(BaseGeneration {
                 mmap,
                 directory,
                 path: data_path,
+                cipher: enc.map(|(cipher, _)| cipher),
             }));
             state.generation = generation;
             state.stamp = stamp;
@@ -269,8 +302,15 @@ impl PagedBitmapIndex {
         Ok(Self {
             path,
             state: RwLock::new(state),
+            seal: RwLock::new(SealSettings::from_seal(seal)),
             checkpoint_lock: Mutex::new(()),
         })
+    }
+
+    /// Protection for generation files written from now on (the next checkpoint rewrites every
+    /// block and the directory under it).
+    pub fn set_file_seal(&self, seal: &FileSeal<'_>) {
+        *self.seal.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = SealSettings::from_seal(seal);
     }
 
     #[inline]
@@ -552,6 +592,12 @@ impl PagedBitmapIndex {
         writer
             .write_all(&[0u8; HEADER_REGION])
             .map_err(io("write bitmap header placeholder"))?;
+        let settings = self
+            .seal
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut sealer = GenerationSealer::begin(&settings.as_seal(), &data_path);
 
         let mut keys: Vec<Key> = base
             .map(|b| b.directory.keys().copied().collect())
@@ -581,7 +627,11 @@ impl PagedBitmapIndex {
                         block_bytes[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
                     }
                     if write_err.is_none() {
-                        if let Err(e) = writer.write_all(&block_bytes) {
+                        let sealed = match sealer.as_mut() {
+                            Some(s) => s.seal(&mut block_bytes),
+                            None => Ok(()),
+                        };
+                        if let Err(e) = sealed.and_then(|()| writer.write_all(&block_bytes)) {
                             write_err = Some(e);
                         }
                     }
@@ -607,6 +657,9 @@ impl PagedBitmapIndex {
             }
         }
         dir[0..4].copy_from_slice(&tag_count.to_le_bytes());
+        if let Some(s) = sealer.as_mut() {
+            s.seal(&mut dir).map_err(io("seal bitmap directory"))?;
+        }
         writer.write_all(&dir).map_err(io("write bitmap directory"))?;
         let mut file = writer
             .into_inner()
@@ -624,7 +677,7 @@ impl PagedBitmapIndex {
                 .ok_or_else(|| StorageError::corrupted_header("bitmap generation shorter than written"))?;
             checksum_payload(region)
         };
-        let mut header = [0u8; HEADER_LEN];
+        let mut header = [0u8; ENC_SECTION_OFFSET + ENC_SECTION_LEN];
         header[0..4].copy_from_slice(&BITMAP_FILE_MAGIC.to_le_bytes());
         header[4..8].copy_from_slice(&block_index.to_le_bytes());
         header[8..16].copy_from_slice(&dir_offset.to_le_bytes());
@@ -633,6 +686,13 @@ impl PagedBitmapIndex {
         header[32..40].copy_from_slice(&blocks_crc.to_le_bytes());
         let header_crc = checksum_payload(&header[0..40]);
         header[40..48].copy_from_slice(&header_crc.to_le_bytes());
+        let enc = sealer.map(|s| {
+            let (section, cipher) = s.finish();
+            header[ENC_SECTION_OFFSET..].copy_from_slice(&section);
+            let mut tag = [0u8; 16];
+            tag.copy_from_slice(&section[20..36]);
+            (cipher, tag)
+        });
         file.seek(SeekFrom::Start(0))
             .and_then(|_| file.write_all(&header))
             .and_then(|()| file.sync_all())
@@ -642,12 +702,16 @@ impl PagedBitmapIndex {
         write_manifest(&self.path, BITMAP_MANIFEST_MAGIC, generation, stamp)?;
 
         let mmap = map_path_read_only(&data_path)?;
-        let directory = load_generation(&mmap)?;
+        let directory = load_generation(
+            &mmap,
+            enc.as_ref().map(|(cipher, tag)| (cipher, tag, data_path.as_path())),
+        )?;
         Ok((
             BaseGeneration {
                 mmap,
                 directory,
                 path: data_path,
+                cipher: enc.map(|(cipher, _)| cipher),
             },
             block_index as usize,
         ))
@@ -700,7 +764,13 @@ fn merge_chunks(
 /// Validates a generation file once at open (`RULE-SAFE-04`): header checksum, directory and
 /// block region bounds and checksums, chunk refs inside the block region, strictly increasing
 /// chunk ids, unique keys. Allocations are bounded by the bytes present.
-fn load_generation(mmap: &MmapRegion) -> Result<FastHashMap<Key, DirEntry>> {
+///
+/// For an encrypted generation (`enc` = cipher, tag, file path) the tag is verified over the
+/// block region and the directory, and the directory is decrypted into a copy for parsing.
+fn load_generation(
+    mmap: &MmapRegion,
+    enc: Option<(&PageCipher, &[u8; 16], &Path)>,
+) -> Result<FastHashMap<Key, DirEntry>> {
     let corrupt = StorageError::corrupted_header;
     let slice = mmap.as_slice();
     if slice.len() < HEADER_REGION {
@@ -737,6 +807,23 @@ fn load_generation(mmap: &MmapRegion) -> Result<FastHashMap<Key, DirEntry>> {
             return Err(StorageError::checksum_mismatch(expected, actual));
         }
     }
+    let dir_plain;
+    let dir: &[u8] = match enc {
+        Some((cipher, tag, path)) => {
+            let mut verifier = cipher.verifier(path);
+            verifier.absorb_ciphertext(blocks)?;
+            verifier.absorb_ciphertext(dir)?;
+            verifier.verify(tag)?;
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(dir.len())
+                .map_err(|_| StorageError::resource_exhausted("bitmap directory memory"))?;
+            copy.extend_from_slice(dir);
+            cipher.decrypt_at(dir_offset - HEADER_REGION, &mut copy)?;
+            dir_plain = copy;
+            &dir_plain
+        }
+        None => dir,
+    };
 
     let mut out = FastHashMap::default();
     if dir.len() < 4 {
@@ -786,6 +873,51 @@ fn load_generation(mmap: &MmapRegion) -> Result<FastHashMap<Key, DirEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_sealed_generations_hide_tags_and_verify() {
+        use storage_codec::{EncryptionKey, KeyRing};
+        let path = temp_path("sealed");
+        let ring = KeyRing::new().with_key(2, EncryptionKey::from_bytes([2; 32]));
+        let seal = FileSeal { keys: Some(&ring), active_key: Some(2), accept_plain: false };
+        let tag = InlineId::new("very-secret-tag").unwrap();
+        {
+            let idx = PagedBitmapIndex::open_sealed(&path, &seal).unwrap();
+            for i in (0..20_000u32).step_by(3) {
+                idx.insert(1, tag, RecordOrdinal(i));
+            }
+            idx.checkpoint_with_stamp(9).unwrap();
+        }
+        let generation = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().contains(".idx."))
+            .unwrap();
+        let bytes = fs::read(&generation).unwrap();
+        assert_eq!(&bytes[128..132], b"PENC");
+        assert!(!bytes.windows(15).any(|w| w == b"very-secret-tag"), "tag text on disk");
+
+        let idx = PagedBitmapIndex::open_sealed(&path, &seal).unwrap();
+        assert_eq!(idx.get_bitmap(1, tag).len(), 6667);
+        // Word-level probes decrypt single words of the encrypted base.
+        for ord in [0u32, 3, 4, 4095, 4096, 4098, 19_998, 19_999] {
+            assert_eq!(idx.matches_ordinal(RecordOrdinal(ord), &[(1, tag)], &[], &[]), ord % 3 == 0, "ord {ord}");
+        }
+        idx.remove(1, tag, RecordOrdinal(3));
+        assert_eq!(idx.get_bitmap(1, tag).len(), 6666);
+        drop(idx);
+        assert!(PagedBitmapIndex::open(&path).is_err(), "no key: refused");
+
+        // Any flipped bit in the block region or directory fails the tag.
+        for at in [4096 + 7, bytes.len() - 3] {
+            let mut bad = bytes.clone();
+            bad[at] ^= 0x04;
+            fs::write(&generation, &bad).unwrap();
+            assert!(PagedBitmapIndex::open_sealed(&path, &seal).is_err(), "tamper at {at}");
+        }
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
 
     fn temp_path(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("storine_paged_bitmap_{name}_{}", std::process::id()));

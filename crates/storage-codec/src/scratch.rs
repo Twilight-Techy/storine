@@ -97,6 +97,28 @@ impl AlignedBytes {
         })
     }
 
+    /// Allocates a zero-filled aligned buffer of `len` bytes, lets `fill` write it, then freezes
+    /// it. Frames are built directly in their final buffer, with no intermediate `Vec` and no
+    /// second copy (`TASK-087`). The buffer is freed if `fill` fails.
+    pub fn try_build(
+        len: usize,
+        fill: impl FnOnce(&mut [u8]) -> storage_types::Result<()>,
+    ) -> storage_types::Result<Self> {
+        let oom = || storage_types::StorageError::resource_exhausted("heap memory (aligned buffer)");
+        let cap = aligned_cap(len).ok_or_else(oom)?;
+        // SAFETY: `layout_for(cap)` has a non-zero size (`cap >= 64`).
+        let raw = unsafe { alloc(layout_for(cap)) };
+        let ptr = NonNull::new(raw).ok_or_else(oom)?;
+        // SAFETY: `ptr` is valid for `cap` writable bytes; zeroing makes all of them initialized.
+        unsafe { core::ptr::write_bytes(ptr.as_ptr(), 0, cap) };
+        // Owns the allocation from here on, so an error in `fill` frees it (via `Drop`).
+        let storage = AlignedStorage { ptr, len, cap };
+        // SAFETY: `ptr` is valid for `len <= cap` initialized bytes and uniquely owned by `storage`;
+        // the mutable slice ends before `storage` is moved into the `Arc`.
+        fill(unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), len) })?;
+        Ok(Self { inner: Arc::new(storage) })
+    }
+
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
         // SAFETY: `inner.ptr` is valid for `inner.len` initialized bytes for the lifetime of `self`.

@@ -603,3 +603,102 @@ This document defines the strict chronological execution order for building the 
     - Codec hostile sweep over encrypted frames.
     - Benchmark gate: encrypted warm `with_ref` at `0.00` allocs/op.
     - `95` tests passing, `0` warnings.
+
+- [x] **TASK-085: Encryption Key Ring, Online Enable / Disable and Key Rotation (`F-SEC-02`, `RULE-SAFE-07`)**
+  - **Configuration**:
+    - `EncryptionConfig { keys: KeyRing, active_key, accept_unencrypted }` replaces the single key and is validated at open and on `set_encryption`.
+    - Sealed frames carry the id of the key that sealed them (in the payload, authenticated): old keys keep decrypting while the active key seals new writes.
+  - **Online conversion**: `StorageEngine::set_encryption` (runtime swap) + `reseal_all`.
+    - Every record is converted under its own stripe lock and WAL-logged at the same version (content unchanged, so indexes, MVCC and OCC versions are unaffected).
+    - A final checkpoint drops WAL frames in the old form.
+    - Superseded copies are scrubbed: every arena segment is evacuated, and ping-pong files are written twice so both slots hold the new form.
+    - `accept_unencrypted` is a migration-only state.
+  - **Bug found and fixed (`write_ping_pong_slot`)**: on a version tie the writer overwrote slot 0 while readers prefer slot 1, so a same-version rewrite (WAL replay, re-seal) was invisible. On ties the writer now overwrites the reader-preferred slot unless it already holds exactly that frame. Every overwrite still leaves a same-or-newer valid slot.
+  - **Exit Criteria**:
+    - `test_enable_rotate_and_disable_encryption_online`, for arena, dedicated-file and ping-pong layouts: plaintext → encrypted with no plaintext left in any file → rotation under a concurrent writer → only the new key needed → back to plaintext; invalid configurations refused.
+    - `test_ping_pong_same_version_rewrite_is_visible_and_reaches_both_slots`.
+    - `97` tests passing, `0` warnings; benchmark allocation gates unchanged.
+
+- [x] **TASK-086: Per-Record Protection Policy — Encrypt vs Authenticate-Only (`F-SEC-02`, `RULE-SAFE-07`)**
+  - **Policy hook**: `Indexable::protection(root, payload) -> RecordProtection { Encrypt (default), Authenticate }`, evaluated zero-copy on each plain frame as it is sealed for disk or the WAL. Frames the policy cannot inspect (compressed, tombstones) are encrypted.
+  - **Authenticated-only frame** (`RecordFlags::AUTHENTICATED`, bit 6): the payload stays plaintext and in place, followed by a `32 B` trailer `[key_id u32 | 12 B nonce | 16 B Poly1305 tag]`. The tag covers the record id, the key id, every header field and the payload (same AAD as encrypted frames), so tampering, frame swaps and metadata edits are detected. No cipher work: cheaper writes and cold reads for non-secret records that must not be forged.
+  - **No downgrade**: with a key configured, a frame that is neither encrypted nor authenticated is still rejected (unless `accept_unencrypted`). `reseal_all` converts records whose stored form differs from the current policy (policy changes apply online).
+  - **Documented limits**: authenticated frames are read through the decrypted-frame cache after verification (not zero-copy on the first read), so a runtime key change can never leave a stale "verified" mark. Without any key configured, an authenticated frame is readable as plaintext without verification (the same trust level as an unencrypted database).
+  - **Exit Criteria**:
+    - `test_policy_encrypts_secret_records_and_authenticates_public_ones`: secret plaintext never on disk; public plaintext on disk; correct reads after reopen; `reseal_all` is a no-op under an unchanged policy; one flipped byte in a public record fails exactly that record.
+    - `test_authenticated_frames_stay_readable_and_detect_tampering` (codec) and the hostile sweep over authenticated frames.
+    - `99` tests passing, `0` warnings (native and portable); benchmark allocation gates unchanged.
+
+- [x] **TASK-087: Faster Cold Decryption — SIMD ChaCha20, 64-bit Poly1305, In-Place Frames (`F-SEC-02`, `RULE-MEM-01`, `RULE-CPU-02`)**
+  - **ChaCha20**: x86-64 multi-block keystream: 8 blocks per step with AVX2 (runtime-detected), 4 with SSE2 (x86-64 baseline), one-block scalar tail and fallback on other targets. Word-wide XOR on the scalar path.
+  - **Poly1305**: radix 2^44 (three 64-bit limbs, 9 widening multiplies per block instead of 25).
+  - **Frames sealed / opened in place**: `seal_in_place` / `open_in_place` primitives and `AlignedBytes::try_build` write the final 64-byte-aligned frame directly. The intermediate plaintext / ciphertext `Vec`s are gone. A failed open never releases plaintext.
+  - **Rejected**: a portable `[u32; 4]`-lane version (the compiler did not vectorize it; slower than the one-block loop).
+  - **Exit Criteria**:
+    - RFC 8439 vectors.
+    - `test_chacha20_xor_matches_block_reference_at_all_lengths` (lengths 0–600, 4096, 4097, 65535; counters near wrap; covers the AVX2, SSE2 and scalar paths).
+    - `test_poly1305_radix44_matches_radix26_reference`: differential against the previous radix-2^26 implementation, including all-`0xFF` and all-zero keys and messages.
+    - `test_in_place_open_rejects_tampering_without_touching_the_buffer`.
+    - Benchmark: encrypted cold read `6.1 µs` / `6` allocs → `4.2 µs` / `4` allocs.
+    - `0` warnings (native and portable, MSRV 1.82 respected).
+
+- [x] **TASK-088: Index Files Encrypted at Rest (`F-SEC-02`, `RULE-SAFE-07`)**
+  - **Whole-file seal** (`storage_codec::sealed_file`): `primary.idx` and `hnsw.idx` are one ChaCha20-Poly1305 unit bound to the file name (no moving files between collections). They are built and encrypted in one buffer.
+  - **Delta frames**: each delta frame is wrapped and sealed, bound to its byte offset, so frames cannot be reordered or duplicated. A torn final frame is dropped as before; earlier corruption is an error.
+  - **Paged secondary indexes**: the whole region after the header page is sealed while streamed to disk (`RegionSealer`; tag in the header page). The tag is verified once at open. Pages, blocks and words are decrypted on access by random-access keystream (`chacha20_xor_at`) into stack buffers, with no MAC work on reads. A tampered generation is never trusted: the engine rebuilds it.
+  - **Follows the encryption settings**: written with the active key; plaintext refused unless `accept_unencrypted` (no downgrade); `set_encryption` updates the paged indexes; `reseal_all` rewrites every index file (forces an HNSW save).
+  - **Behavior change**: a wrong or missing key now fails at `open` instead of at the first read.
+  - **Still visible on disk (documented)**: file names and sizes, WAL frame headers (record ids, versions), record file names in the dedicated-file layouts. Separator keys and other in-RAM index data are plaintext in memory.
+  - **Exit Criteria**:
+    - `test_sealed_file_roundtrip_binding_and_no_downgrade` (every byte flip, every truncation, wrong context or position).
+    - `test_sealed_checkpoint_and_delta_frames_bind_file_and_position`.
+    - Paged B-tree / bitmap sealed tests (no plaintext key or tag bytes; verify; refuse without key; rotate to plaintext; tamper detection).
+    - Engine: `test_paged_secondary_indexes_are_encrypted_and_tamper_checked`; the encryption lifecycle asserts every index file is sealed after enable and rotation and plaintext after disable.
+    - `108` tests passing, `0` warnings.
+
+- [x] **TASK-089: Raft InstallSnapshot (`F-DIST-02`, Raft §7)**
+  - **Leader**:
+    - `build_install_snapshot(offset, max_chunk)` streams a snapshot file `<stem>_raft.snapshot`: `[magic | last_index | last_term | count | check]` + per record `[id | len | check | frame]`.
+    - The snapshot is taken at `last_applied` (cut under `apply_lock` with an MVCC read snapshot), then written without blocking applies. Memory is `O(ids)`.
+    - It is regenerated only when it no longer covers the compaction point.
+  - **Follower**:
+    - `handle_install_snapshot` stages chunks in `<stem>_raft.snapshot.recv`. Duplicates and gaps are answered with the expected offset; a transfer must start with the announced header.
+    - On the last chunk the whole file is verified before the engine is touched. The engine state is then replaced (upserts plus deletion of ids not in the snapshot), and the log is kept after `last_included_index` only if it agrees there.
+    - A damaged transfer is discarded and restarted, never applied.
+  - **Crash safety**: an `_raft.installing` marker brackets the engine update. At start the install is redone from the received file (it is idempotent). If that file is unusable, the replica resets to empty (engine and Raft state) and is rebuilt by the leader. A half-installed state is never served.
+  - **Transport**: `RaftReplicationGroup` sends snapshots automatically when `next_index` was compacted. TCP `OP_RAFT_SNAPSHOT = 0x15` (Admin role, body ≤ 1 MiB chunk) with `StorageClient::raft_install_snapshot`.
+  - **Documented limits**: assumes the replicated engine is written only through Raft. The final chunk applies the snapshot on the receiving reactor thread, like `RaftAppend` applies entries.
+  - **Exit Criteria**:
+    - `test_install_snapshot_catches_up_a_follower_behind_the_compacted_log`: catch-up through the group; stray local data removed; tiny chunks with duplicate and gap handling; a damaged final chunk restarts the transfer; crash recovery without a usable file resets to empty.
+    - TCP refusal of a headerless transfer.
+    - `0` warnings.
+
+- [x] **TASK-092: Cold Primary Tier — Disk-Resident Primary Index and Ordinal Table (`F-PIDX-03`, `RULE-MEM-03`, `RULE-MEM-04`)**
+  - **Format** (`cold_tier.rs`): one immutable generation per checkpoint behind an atomic manifest (`<stem>_primary.cold`). It holds 4 KiB entry pages sorted by `(hash, id)` (v3 varint entries, per-page checksums), a dense ordinal table (`24 B` per slot), page separators and a split-block Bloom filter.
+    - Sealed as one streamed region when encryption is on; pages and ordinal slots are decrypted on access.
+    - Fully validated at open (`RULE-SAFE-04`): checksums, order, ordinal ↔ entry agreement, tag.
+  - **`PrimaryIndex` tiers**:
+    - RAM holds entries changed since the last checkpoint, plus tombstones and overridden ordinal slots.
+    - Lookups go RAM → tombstones → tier (Bloom filter, one page decode, no shard lock held across tier reads, `RULE-CONC-01`).
+    - Checkpoints take a cut under all shard read locks, stream-merge it with the previous tier (`O(page + Bloom filter)` memory; ordinal slots derived per slot in `O(1)`, no `O(N)` map), then install it shard by shard while writers run. Entries unchanged since the cut are evicted, stale tombstones dropped, matching overrides released.
+    - The memory tier pays one relaxed atomic load on writes and an `Option` check on lookup misses.
+  - **Engine**:
+    - `EngineConfig::primary_tier`; open maps the tier (no entries loaded).
+    - Deltas and WAL replay apply on top; paged secondary-index reuse works against the tier's stamp.
+    - Switching to the memory tier materializes the tier and replaces it with `primary.idx` at the next checkpoint; switching back converts `primary.idx`.
+  - **Design decision**: reads do not promote tier-only entries into RAM (a scan would refill RAM). Their frames are re-validated on each read instead.
+  - **Exit Criteria**:
+    - `test_cold_tier_matches_memory_tier_through_checkpoints_and_restarts` (index level, plaintext and sealed): 6,000 random operations, 6 tier rebuilds, restarts from the tier alone, scans and bitmaps identical, any tampered byte rejected at open.
+    - `test_cold_primary_tier_matches_memory_tier_and_bounds_resident_entries` (engine): parity with a memory-tier engine through writes, deletes, checkpoints, restarts, WAL replay and tier switches in both directions; `0` resident entries after a clean open; with paged indexes + encryption.
+    - Crash variant 6 (cold tier + paged + encrypted, killed mid-run twice).
+    - Benchmark row `with_ref (Cold primary tier)`: `4.2 µs` p50, `0.00` allocs/op (it was `44 µs` before the slot-offset page index). All other allocation gates unchanged.
+    - `111` tests passing, `0` clippy warnings (native and portable).
+
+- [ ] **TASK-090: `epoll` Reactor on Linux (`RULE-CPU-03`, `F-NET-01`)** — *blocked: needs a Linux toolchain*
+  - Today `WSAPoll` / `poll` re-register every connection on each reactor cycle (`O(connections per shard)` per wake-up). `epoll` needs persistent registration (stable connection tokens instead of `swap_remove` indices).
+  - This Windows dev machine has no Linux target and no WSL distribution, so Linux-only code cannot even be compile-checked here. It will not be merged untested. It needs either `rustup target add x86_64-unknown-linux-gnu` (compile and clippy check only) or a Linux / WSL environment (tests).
+
+- [ ] **TASK-091: Release Binaries under `500 KiB` (`RULE-MEM-03`)** — *open: needs a decision*
+  - Measured (Windows x86-64, fat LTO, stripped): `storage-server` `829 KiB` / `storage-cli` `760 KiB` at `opt-level = 3`; `647` / `613 KiB` at `"s"`; `591.5` / `572 KiB` at `"z"`. No compiler setting alone meets the budget.
+  - Linker-map attribution (`.text` ≈ `692 KiB`): `storage_index` `134 KiB` (paged indexes, cold tier, HNSW), `storage_server` `107 KiB`, `core` `97 KiB` (sort monomorphizations, formatting), `storage_core` `97 KiB`, `std` `85 KiB` + `rustc_demangle` `17 KiB` (panic and backtrace machinery, removable only with nightly `build-std` + `panic_immediate_abort`).
+  - Options: (a) Cargo features for optional subsystems (Raft, encryption, paged / cold tiers, admin RPCs) so a minimal build fits; (b) nightly `build-std`; (c) revise the budget. Choosing among them is the user's call.

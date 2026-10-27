@@ -223,9 +223,28 @@ impl IndexDelta {
     }
 }
 
+/// How a record is protected at rest when encryption is enabled (`F-SEC-02`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecordProtection {
+    /// Confidentiality + integrity (ChaCha20-Poly1305). Read via the decrypted-frame cache.
+    #[default]
+    Encrypt,
+    /// Integrity only: the payload stays plaintext with a Poly1305 MAC trailer (cheaper; no
+    /// cipher work). For records whose contents are not secret but must not be forged.
+    Authenticate,
+}
+
 /// Implemented by domain records to declare secondary numeric/timestamp indexes, tag indexes,
 /// and optional AI vector embeddings.
 pub trait Indexable: storage_codec::ZeroCopyRecord {
+    /// Per-record protection policy when encryption is enabled (default: encrypt everything).
+    /// Evaluated zero-copy on each frame as it is written to disk or the WAL; changing the policy
+    /// applies to existing records through `StorageEngine::reseal_all`.
+    #[inline]
+    fn protection(_root: &Self::Archived, _payload: &[u8]) -> RecordProtection {
+        RecordProtection::Encrypt
+    }
+
     #[inline]
     fn extract_index_snapshot(&self) -> IndexSnapshot {
         IndexSnapshot::new()

@@ -34,6 +34,9 @@ impl RecordFlags {
     pub const HAS_TTL: Self = Self(1 << 4);
     /// Payload is encrypted at rest (`TASK-044`, `F-SEC-02`).
     pub const ENCRYPTED: Self = Self(1 << 5);
+    /// Payload is plaintext and followed by a 32-byte MAC trailer `[key_id | nonce | tag]`
+    /// authenticating it (`F-SEC-02`, authenticated-only protection).
+    pub const AUTHENTICATED: Self = Self(1 << 6);
 
     #[inline]
     pub const fn contains(self, other: Self) -> bool {

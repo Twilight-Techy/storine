@@ -28,8 +28,12 @@ It is engineered for workloads requiring **sub-microsecond reads (`~200 ns` p50)
   - **Vector Similarity Search**: 8-way unrolled SIMD cosine similarity (`87 ns` per 64-dim vector) paired with Hoare/Floyd-Rivest Quickselect (`select_nth_unstable_by`) for linear $O(N)$ top-$K$ partitioning.
 - **Deadlock-Free Bidirectional Relational Graph (`1:1`, `1:N`, `M:N`)**:
   - First-class `OneToOne`, `OneToMany`, and `ManyToMany` containers with canonical lock ordering (`StripedLockTable::lock_many`) that mathematically prevents AB-BA deadlocks during concurrent bidirectional link updates.
+- **Tiered Primary Index (optional)**:
+  - `EngineConfig::primary_tier = PrimaryTier::Cold` keeps the primary index and ordinal table as of the last checkpoint in an immutable on-disk generation; RAM holds only what changed since (plus a Bloom filter and page directory), and opening maps the tier instead of loading every entry.
 - **Encryption at Rest (optional)**:
-  - `EngineConfig::encryption_key` seals every record frame on disk and in the WAL with ChaCha20-Poly1305, authenticated against its record id and metadata. Warm reads stay zero-allocation via a bounded decrypted-frame cache. Ids and indexed values in index files are not encrypted.
+  - `EngineConfig::encryption` seals record frames on disk and in the WAL with ChaCha20-Poly1305, authenticated against their record id and metadata. Warm reads stay zero-allocation via a bounded decrypted-frame cache. Index files (`primary.idx`, `hnsw.idx`, paged secondary indexes) are sealed too; file names, sizes and WAL frame headers stay visible.
+  - Key ring with online enable / disable and key rotation (`set_encryption` + `reseal_all`, which also scrubs superseded copies).
+  - Per-record policy (`Indexable::protection`): encrypt confidential records, authenticate-only (plaintext + MAC, tamper-proof) the rest.
 - **Sharded Non-Blocking TCP Server (`StorageServer`)**:
   - Fixed pool of `ReactorShard` worker threads multiplexing non-blocking sockets (`NonBlockingConn`, `~88 bytes` per idle connection) with zero-allocation vectored `IoSlice` socket writes and dynamic `max_connections` admission control.
 

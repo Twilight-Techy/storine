@@ -9,20 +9,22 @@
 //!   the underlying `StorageEngine<T>`.
 //! - Follower reads (`read_at_commit_index`) with read-your-writes consistency (`F-DIST-04`).
 //! - Durable hard state (fsynced before any vote/ack) and an append-only checksummed log.
+//! - `InstallSnapshot` (Raft §7, `TASK-089`): a follower behind the leader's compacted log is
+//!   caught up by streaming a point-in-time snapshot of the leader's engine in chunks.
 //!
 //! Transport and election timers are driven by the caller: `RaftReplicationGroup` delivers
 //! messages in-process, and `storage-server` exposes `RequestVote` / `AppendEntries` over TCP
 //! when started with a `RaftNode`.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use storage_codec::{checksum_payload, AlignedBytes, RecordCodec, RecordView, ZeroCopyRecord};
 use storage_index::Indexable;
 use storage_mmap::atomic_write_replace;
-use storage_types::{InlineId, RecordFlags, Result, StorageError, Version};
+use storage_types::{FastHashSet, InlineId, RecordFlags, Result, StorageError, Version};
 use storage_types::wire::{read_u16_le, read_u32_le, read_u64_le, read_array_24};
 
 use crate::engine::StorageEngine;
@@ -190,6 +192,184 @@ impl AppendEntriesResp {
     }
 }
 
+/// Raft `InstallSnapshot` RPC request (Raft §7): one chunk of the leader's snapshot file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallSnapshotReq {
+    pub term: u64,
+    pub leader_id: NodeId,
+    /// The snapshot replaces every log entry up to and including this index.
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    /// Byte offset of `data` in the snapshot file.
+    pub offset: u64,
+    pub data: Vec<u8>,
+    /// `true` for the last chunk.
+    pub done: bool,
+}
+
+/// Fixed part of an `InstallSnapshotReq` on the wire.
+const INSTALL_SNAPSHOT_HEADER: usize = 8 + 2 + 8 + 8 + 8 + 1 + 4;
+
+impl InstallSnapshotReq {
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(INSTALL_SNAPSHOT_HEADER + self.data.len());
+        out.extend_from_slice(&self.term.to_le_bytes());
+        out.extend_from_slice(&self.leader_id.to_le_bytes());
+        out.extend_from_slice(&self.last_included_index.to_le_bytes());
+        out.extend_from_slice(&self.last_included_term.to_le_bytes());
+        out.extend_from_slice(&self.offset.to_le_bytes());
+        out.push(u8::from(self.done));
+        out.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.data);
+        out
+    }
+
+    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < INSTALL_SNAPSHOT_HEADER {
+            return Err(StorageError::corrupted_header("InstallSnapshotReq wire frame truncated"));
+        }
+        let len = read_u32_le(bytes, 35) as usize;
+        let data = bytes
+            .get(INSTALL_SNAPSHOT_HEADER..)
+            .filter(|d| d.len() == len)
+            .ok_or_else(|| StorageError::corrupted_header("InstallSnapshotReq data length mismatch"))?;
+        Ok(Self {
+            term: read_u64_le(bytes, 0),
+            leader_id: read_u16_le(bytes, 8),
+            last_included_index: read_u64_le(bytes, 10),
+            last_included_term: read_u64_le(bytes, 18),
+            offset: read_u64_le(bytes, 26),
+            done: bytes[34] != 0,
+            data: data.to_vec(),
+        })
+    }
+}
+
+/// Raft `InstallSnapshot` RPC response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstallSnapshotResp {
+    pub term: u64,
+    /// Offset of the next chunk the follower expects (`0`: restart the transfer).
+    pub next_offset: u64,
+    /// `true` once the follower's state covers the snapshot (installed now or already).
+    pub installed: bool,
+}
+
+impl InstallSnapshotResp {
+    pub fn to_wire_bytes(&self) -> [u8; 17] {
+        let mut out = [0u8; 17];
+        out[0..8].copy_from_slice(&self.term.to_le_bytes());
+        out[8..16].copy_from_slice(&self.next_offset.to_le_bytes());
+        out[16] = u8::from(self.installed);
+        out
+    }
+
+    pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 17 {
+            return Err(StorageError::corrupted_header("InstallSnapshotResp wire frame < 17B"));
+        }
+        Ok(Self {
+            term: read_u64_le(bytes, 0),
+            next_offset: read_u64_le(bytes, 8),
+            installed: bytes[16] != 0,
+        })
+    }
+}
+
+/// Largest snapshot chunk sent in one `InstallSnapshot` RPC (`1 MiB`).
+pub const RAFT_SNAPSHOT_CHUNK: usize = 1 << 20;
+
+// Snapshot file: `magic | last_index u64 | last_term u64 | count u64 | header_check u64`, then
+// `count` x `[id 24B | frame_len u32 | check u64 | frame]` with
+// `check = checksum(frame) ^ checksum(id).rotate_left(29)`.
+const SNAPSHOT_MAGIC: &[u8; 8] = b"STGESNP1";
+const SNAPSHOT_HEADER_LEN: usize = 40;
+const SNAPSHOT_RECORD_HEADER: usize = 24 + 4 + 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SnapshotMeta {
+    last_index: u64,
+    last_term: u64,
+    count: u64,
+}
+
+impl SnapshotMeta {
+    fn encode(&self) -> [u8; SNAPSHOT_HEADER_LEN] {
+        let mut out = [0u8; SNAPSHOT_HEADER_LEN];
+        out[0..8].copy_from_slice(SNAPSHOT_MAGIC);
+        out[8..16].copy_from_slice(&self.last_index.to_le_bytes());
+        out[16..24].copy_from_slice(&self.last_term.to_le_bytes());
+        out[24..32].copy_from_slice(&self.count.to_le_bytes());
+        let check = checksum_payload(&out[0..32]);
+        out[32..40].copy_from_slice(&check.to_le_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        let hdr = bytes
+            .get(..SNAPSHOT_HEADER_LEN)
+            .ok_or_else(|| StorageError::corrupted_header("raft snapshot header truncated"))?;
+        if &hdr[0..8] != SNAPSHOT_MAGIC || checksum_payload(&hdr[0..32]) != read_u64_le(hdr, 32) {
+            return Err(StorageError::corrupted_header("raft snapshot header invalid"));
+        }
+        Ok(Self {
+            last_index: read_u64_le(hdr, 8),
+            last_term: read_u64_le(hdr, 16),
+            count: read_u64_le(hdr, 24),
+        })
+    }
+
+    /// Header of the snapshot file at `path` (`None` if missing or unreadable).
+    fn read(path: &Path) -> Option<Self> {
+        let mut hdr = [0u8; SNAPSHOT_HEADER_LEN];
+        File::open(path).ok()?.read_exact(&mut hdr).ok()?;
+        Self::decode(&hdr).ok()
+    }
+}
+
+#[inline]
+fn snapshot_record_check(id: &[u8; 24], frame: &[u8]) -> u64 {
+    checksum_payload(frame) ^ checksum_payload(id).rotate_left(29)
+}
+
+/// Streams and verifies every record of the snapshot file at `path` (`O(largest frame)` memory),
+/// calling `f(id, frame)`; the frame is 64-byte aligned for zero-copy decoding. Fails on any
+/// truncation, checksum mismatch or trailing byte.
+fn for_each_snapshot_record(
+    path: &Path,
+    mut f: impl FnMut(InlineId, &AlignedBytes) -> Result<()>,
+) -> Result<SnapshotMeta> {
+    let io = |e| StorageError::io("read raft snapshot", e);
+    let mut r = BufReader::with_capacity(RAFT_SNAPSHOT_CHUNK, File::open(path).map_err(io)?);
+    let mut hdr = [0u8; SNAPSHOT_HEADER_LEN];
+    r.read_exact(&mut hdr).map_err(io)?;
+    let meta = SnapshotMeta::decode(&hdr)?;
+    let mut frame = Vec::new();
+    for _ in 0..meta.count {
+        let mut rh = [0u8; SNAPSHOT_RECORD_HEADER];
+        r.read_exact(&mut rh).map_err(io)?;
+        let id_raw = read_array_24(&rh, 0);
+        let len = read_u32_le(&rh, 24);
+        if len > storage_types::MAX_PAYLOAD_SIZE + storage_types::HEADER_SIZE as u32 {
+            return Err(StorageError::corrupted_header("raft snapshot frame too large"));
+        }
+        frame.clear();
+        frame
+            .try_reserve(len as usize)
+            .map_err(|_| StorageError::resource_exhausted("raft snapshot frame memory"))?;
+        frame.resize(len as usize, 0);
+        r.read_exact(&mut frame).map_err(io)?;
+        if snapshot_record_check(&id_raw, &frame) != read_u64_le(&rh, 28) {
+            return Err(StorageError::corrupted_header("raft snapshot record checksum mismatch"));
+        }
+        f(InlineId::from_raw_bytes(id_raw)?, &AlignedBytes::try_copy_from_slice(&frame)?)?;
+    }
+    if r.read(&mut [0u8; 1]).map_err(io)? != 0 {
+        return Err(StorageError::corrupted_header("trailing bytes after raft snapshot records"));
+    }
+    Ok(meta)
+}
+
 fn encode_log_entry(entry: &RaftLogEntry, out: &mut Vec<u8>) {
     out.extend_from_slice(&entry.term.to_le_bytes());
     out.extend_from_slice(&entry.index.to_le_bytes());
@@ -322,6 +502,12 @@ impl RaftState {
 struct RaftStorage {
     meta_path: PathBuf,
     log_path: PathBuf,
+    /// This node's snapshot (generated as leader, or the last one installed as follower).
+    snapshot_path: PathBuf,
+    /// Snapshot being received from the leader.
+    recv_path: PathBuf,
+    /// Present while a received snapshot is being applied to the engine.
+    installing_path: PathBuf,
 }
 
 impl RaftStorage {
@@ -487,6 +673,8 @@ pub struct RaftNode<T: ZeroCopyRecord + Indexable> {
     state: Mutex<RaftState>,
     /// Serializes applying committed entries to the engine, in log order.
     apply_lock: Mutex<()>,
+    /// Serializes snapshot generation (leader) and chunk reception (follower).
+    snapshot_lock: Mutex<()>,
 }
 
 impl<T: ZeroCopyRecord + Indexable> core::fmt::Debug for RaftNode<T> {
@@ -509,9 +697,13 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     /// in a term or forget committed entries.
     pub fn new(node_id: NodeId, engine: Arc<StorageEngine<T>>) -> Result<Self> {
         let stem = crate::engine::collection_file_stem(engine.collection_name())?;
+        let dir = engine.base_dir();
         let storage = RaftStorage {
-            meta_path: engine.base_dir().join(format!("{stem}_raft.meta")),
-            log_path: engine.base_dir().join(format!("{stem}_raft.log")),
+            meta_path: dir.join(format!("{stem}_raft.meta")),
+            log_path: dir.join(format!("{stem}_raft.log")),
+            snapshot_path: dir.join(format!("{stem}_raft.snapshot")),
+            recv_path: dir.join(format!("{stem}_raft.snapshot.recv")),
+            installing_path: dir.join(format!("{stem}_raft.installing")),
         };
         let initial_state = storage.load()?.unwrap_or_else(RaftState::new);
         let node = Self {
@@ -520,7 +712,11 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             storage,
             state: Mutex::new(initial_state),
             apply_lock: Mutex::new(()),
+            snapshot_lock: Mutex::new(()),
         };
+        if node.storage.installing_path.exists() {
+            node.recover_interrupted_install()?;
+        }
         // Finish applying entries that were committed but not yet applied before a restart.
         node.apply_committed()?;
         Ok(node)
@@ -679,7 +875,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         let prev_log_index = (from_index - 1).min(st.last_log_index());
         if prev_log_index < st.snapshot_index {
             return Err(StorageError::invalid_key(
-                "follower is behind the compacted Raft log (snapshot required): reseed it from a backup",
+                "follower is behind the compacted Raft log: send it a snapshot (build_install_snapshot)",
             ));
         }
         let prev_log_term = st.term_at(prev_log_index).unwrap_or(0);
@@ -860,8 +1056,8 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     /// recording it as the snapshot point (Raft §7). Applied entries live on in the engine, whose
     /// WAL is synced first, so nothing durable is lost. Returns the new compaction point.
     ///
-    /// A follower whose next needed entry was compacted can no longer catch up from this log and
-    /// must be reseeded from a backup.
+    /// A follower whose next needed entry was compacted catches up through `InstallSnapshot`
+    /// ([`Self::build_install_snapshot`]).
     pub fn compact_log_through(&self, index: u64) -> Result<u64> {
         let _apply = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
         self.compact_locked(index)
@@ -918,6 +1114,259 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             ));
         }
         self.engine.with_ref(id, f)
+    }
+
+    // ── InstallSnapshot (Raft §7, `TASK-089`) ──────────────────────────────────────────────
+
+    /// `true` if a follower whose next needed entry is `next_index` can only be caught up with a
+    /// snapshot (that entry was compacted away).
+    pub fn needs_snapshot(&self, next_index: u64) -> bool {
+        next_index <= self.lock_state().snapshot_index
+    }
+
+    /// Leader: chunk `[offset, offset + max_chunk)` of a snapshot covering at least the
+    /// compaction point. The snapshot is (re)generated when none covers it.
+    pub fn build_install_snapshot(&self, offset: u64, max_chunk: usize) -> Result<InstallSnapshotReq> {
+        let (term, needed) = {
+            let st = self.lock_state();
+            if st.role != RaftRole::Leader {
+                return Err(StorageError::invalid_key("node is not Raft Leader"));
+            }
+            (st.current_term, st.snapshot_index)
+        };
+        let _gen = self.snapshot_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let meta = match SnapshotMeta::read(&self.storage.snapshot_path) {
+            Some(m) if m.last_index >= needed => m,
+            _ => self.generate_snapshot()?,
+        };
+        let io = |e| StorageError::io("read raft snapshot chunk", e);
+        let mut file = File::open(&self.storage.snapshot_path).map_err(io)?;
+        let total = file.metadata().map_err(io)?.len();
+        if offset > total {
+            return Err(StorageError::invalid_key("snapshot chunk offset beyond the snapshot"));
+        }
+        let len = (total - offset).min(max_chunk.max(1) as u64) as usize;
+        let mut data = Vec::new();
+        data.try_reserve_exact(len)
+            .map_err(|_| StorageError::resource_exhausted("raft snapshot chunk memory"))?;
+        data.resize(len, 0);
+        file.seek(SeekFrom::Start(offset)).map_err(io)?;
+        file.read_exact(&mut data).map_err(io)?;
+        Ok(InstallSnapshotReq {
+            term,
+            leader_id: self.node_id,
+            last_included_index: meta.last_index,
+            last_included_term: meta.last_term,
+            offset,
+            done: offset + len as u64 == total,
+            data,
+        })
+    }
+
+    /// Writes a point-in-time snapshot of the engine at `last_applied` (caller holds
+    /// `snapshot_lock`). The cut is taken under `apply_lock` with an MVCC read snapshot, then
+    /// streamed to disk without blocking the apply path; memory is `O(ids)`.
+    ///
+    /// Assumes the replicated engine is written only through Raft (as replication requires).
+    fn generate_snapshot(&self) -> Result<SnapshotMeta> {
+        let (last_index, last_term, read, ids) = {
+            let _apply = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let st = self.lock_state();
+            let last_index = st.last_applied;
+            let last_term = st
+                .term_at(last_index)
+                .ok_or_else(|| StorageError::corrupted_header("raft snapshot point is missing"))?;
+            drop(st);
+            (last_index, last_term, self.engine.begin_read_snapshot(), self.engine.live_ids())
+        };
+        let mut tmp = self.storage.snapshot_path.as_os_str().to_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let io = |e| StorageError::io("write raft snapshot", e);
+        let mut w = BufWriter::with_capacity(RAFT_SNAPSHOT_CHUNK, File::create(&tmp).map_err(io)?);
+        w.write_all(&[0u8; SNAPSHOT_HEADER_LEN]).map_err(io)?;
+        let mut count = 0u64;
+        for id in ids {
+            let Some((version, record)) = read.get(id)? else {
+                continue;
+            };
+            let frame = RecordCodec::encode_aligned(&record, version, 0, RecordFlags::NONE, 0);
+            let id_raw = id.to_raw_bytes();
+            let len = u32::try_from(frame.len())
+                .map_err(|_| StorageError::invalid_archive("snapshot frame exceeds u32"))?;
+            w.write_all(&id_raw).map_err(io)?;
+            w.write_all(&len.to_le_bytes()).map_err(io)?;
+            w.write_all(&snapshot_record_check(&id_raw, &frame).to_le_bytes()).map_err(io)?;
+            w.write_all(&frame).map_err(io)?;
+            count += 1;
+        }
+        drop(read);
+        let meta = SnapshotMeta { last_index, last_term, count };
+        let mut file = w.into_inner().map_err(|e| io(e.into_error()))?;
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.write_all(&meta.encode()))
+            .and_then(|()| file.sync_all())
+            .map_err(io)?;
+        drop(file);
+        fs::rename(&tmp, &self.storage.snapshot_path).map_err(io)?;
+        Ok(meta)
+    }
+
+    /// Follower: stores one snapshot chunk; on the last one, verifies the whole snapshot and
+    /// installs it (engine state replaced, log discarded up to `last_included_index`, Raft §7).
+    pub fn handle_install_snapshot(&self, req: InstallSnapshotReq) -> Result<InstallSnapshotResp> {
+        let term = {
+            let mut st = self.lock_state();
+            if req.term < st.current_term {
+                return Ok(InstallSnapshotResp { term: st.current_term, next_offset: 0, installed: false });
+            }
+            if req.term > st.current_term {
+                st.current_term = req.term;
+                st.voted_for = None;
+                self.storage.save_hard_state(&st)?;
+            }
+            st.role = RaftRole::Follower;
+            st.leader_id = Some(req.leader_id);
+            if req.last_included_index <= st.last_applied {
+                // Our state already covers the snapshot.
+                return Ok(InstallSnapshotResp { term: st.current_term, next_offset: 0, installed: true });
+            }
+            st.current_term
+        };
+        let _recv = self.snapshot_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let path = &self.storage.recv_path;
+        let restart = InstallSnapshotResp { term, next_offset: 0, installed: false };
+        let staged_matches = || {
+            SnapshotMeta::read(path)
+                .is_some_and(|m| m.last_index == req.last_included_index && m.last_term == req.last_included_term)
+        };
+        let io = |e| StorageError::io("write received raft snapshot", e);
+        if req.offset == 0 {
+            // A new transfer must start with the header of the snapshot it announces.
+            match SnapshotMeta::decode(&req.data) {
+                Ok(m) if m.last_index == req.last_included_index && m.last_term == req.last_included_term => {}
+                _ => return Ok(restart),
+            }
+        } else {
+            let staged = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if !staged_matches() {
+                return Ok(restart);
+            }
+            if staged != req.offset {
+                return Ok(InstallSnapshotResp { term, next_offset: staged, installed: false });
+            }
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(req.offset == 0)
+            .open(path)
+            .map_err(io)?;
+        file.seek(SeekFrom::Start(req.offset))
+            .and_then(|_| file.write_all(&req.data))
+            .map_err(io)?;
+        let next_offset = req.offset + req.data.len() as u64;
+        if !req.done {
+            return Ok(InstallSnapshotResp { term, next_offset, installed: false });
+        }
+        file.sync_all().map_err(io)?;
+        drop(file);
+        match self.install_received_snapshot(req.last_included_index, req.last_included_term) {
+            Ok(()) => Ok(InstallSnapshotResp { term, next_offset, installed: true }),
+            Err(StorageError::CorruptedHeader { .. } | StorageError::ChecksumMismatch { .. } | StorageError::InvalidArchiveLayout { .. }) => {
+                // A damaged transfer is discarded and restarted, never applied.
+                let _ = fs::remove_file(path);
+                Ok(restart)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Verifies the received snapshot completely, then applies it. Idempotent, so an install
+    /// interrupted by a crash is simply redone at the next start.
+    fn install_received_snapshot(&self, last_index: u64, last_term: u64) -> Result<()> {
+        let _apply = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let recv = &self.storage.recv_path;
+        // 1. Verify everything before touching the engine.
+        let mut ids = FastHashSet::default();
+        let meta = for_each_snapshot_record(recv, |id, _| {
+            ids.insert(id);
+            Ok(())
+        })?;
+        if meta.last_index != last_index || meta.last_term != last_term {
+            return Err(StorageError::corrupted_header("raft snapshot does not match its announcement"));
+        }
+        // 2. The engine is about to hold a mix of old and snapshot state until step 4.
+        atomic_write_replace(&self.storage.installing_path, &last_index.to_le_bytes(), true)?;
+        // 3. Engine state := snapshot state.
+        for_each_snapshot_record(recv, |id, frame| {
+            let (_hdr, record) = RecordCodec::decode_owned::<T>(frame.as_slice())?;
+            self.engine.put(id, &record).map(|_| ())
+        })?;
+        for id in self.engine.live_ids() {
+            if !ids.contains(&id) {
+                let _ = self.engine.delete(id)?;
+            }
+        }
+        self.engine.sync_wal()?;
+        // 4. Raft state: keep log entries after the snapshot only if the log agrees at its end.
+        {
+            let mut st = self.lock_state();
+            match st.pos_of(last_index) {
+                Some(pos) if st.log.get(pos).is_some_and(|e| e.term == last_term) => {
+                    st.log.drain(..=pos);
+                }
+                _ => st.log.clear(),
+            }
+            st.snapshot_index = last_index;
+            st.snapshot_term = last_term;
+            st.commit_index = st.commit_index.max(last_index);
+            st.last_applied = last_index;
+            self.storage.save_hard_state(&st)?;
+            self.storage.rewrite_log(&st.log)?;
+        }
+        // 5. The installed snapshot becomes this node's own (served if it is elected leader).
+        fs::rename(recv, &self.storage.snapshot_path)
+            .map_err(|e| StorageError::io("keep installed raft snapshot", e))?;
+        fs::remove_file(&self.storage.installing_path)
+            .map_err(|e| StorageError::io("clear raft install marker", e))
+    }
+
+    /// Start-up after a crash during a snapshot install: redo it from the received file, or, if
+    /// that file is unusable, reset this replica to empty (engine and Raft state) so the leader
+    /// rebuilds it from scratch — never serve a half-installed state.
+    fn recover_interrupted_install(&self) -> Result<()> {
+        let applied = self.lock_state().snapshot_index;
+        let marker = fs::read(&self.storage.installing_path).unwrap_or_default();
+        let target = (marker.len() == 8).then(|| read_u64_le(&marker, 0));
+        if target.is_some_and(|t| t <= applied) {
+            // The install completed; only the marker removal was lost.
+            return fs::remove_file(&self.storage.installing_path)
+                .map_err(|e| StorageError::io("clear raft install marker", e));
+        }
+        if let Some(meta) = SnapshotMeta::read(&self.storage.recv_path).filter(|m| Some(m.last_index) == target) {
+            if self.install_received_snapshot(meta.last_index, meta.last_term).is_ok() {
+                return Ok(());
+            }
+        }
+        {
+            let _apply = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
+            for id in self.engine.live_ids() {
+                let _ = self.engine.delete(id)?;
+            }
+            self.engine.sync_wal()?;
+            let mut st = self.lock_state();
+            st.log.clear();
+            st.snapshot_index = 0;
+            st.snapshot_term = 0;
+            st.commit_index = 0;
+            st.last_applied = 0;
+            self.storage.save_hard_state(&st)?;
+            self.storage.rewrite_log(&st.log)?;
+        }
+        let _ = fs::remove_file(&self.storage.recv_path);
+        fs::remove_file(&self.storage.installing_path)
+            .map_err(|e| StorageError::io("clear raft install marker", e))
     }
 
     fn apply_entry_to_engine(&self, entry: &RaftLogEntry) -> Result<()> {
@@ -1008,6 +1457,10 @@ impl<T: ZeroCopyRecord + Indexable> RaftReplicationGroup<T> {
             .unwrap_or(leader_last + 1)
             .clamp(1, leader_last + 1);
         for _ in 0..=leader_last + 1 {
+            if leader.needs_snapshot(next) {
+                next = Self::send_snapshot(leader, peer)? + 1;
+                continue;
+            }
             let req = leader.build_append_entries_from(next).ok()?;
             let resp = peer.handle_append_entries(req).ok()?;
             if resp.term > leader.current_term() {
@@ -1024,6 +1477,31 @@ impl<T: ZeroCopyRecord + Indexable> RaftReplicationGroup<T> {
             next = (resp.match_index + 1).min(next.saturating_sub(1)).max(1);
         }
         None
+    }
+
+    /// Streams the leader's snapshot to `peer` chunk by chunk (resuming where the follower asks);
+    /// returns the snapshot's last included index once installed.
+    fn send_snapshot(leader: &RaftNode<T>, peer: &RaftNode<T>) -> Option<u64> {
+        let mut offset = 0u64;
+        let mut restarts = 0u32;
+        loop {
+            let req = leader.build_install_snapshot(offset, RAFT_SNAPSHOT_CHUNK).ok()?;
+            let last = req.last_included_index;
+            let resp = peer.handle_install_snapshot(req).ok()?;
+            if resp.term > leader.current_term() {
+                return None;
+            }
+            if resp.installed {
+                return Some(last);
+            }
+            if resp.next_offset == 0 {
+                restarts += 1;
+                if restarts > 3 {
+                    return None;
+                }
+            }
+            offset = resp.next_offset;
+        }
     }
 
     /// Runs a Raft election initiated by `candidate_node_id`.
@@ -1123,6 +1601,116 @@ mod tests {
     use super::*;
     use crate::engine::EngineConfig;
     use crate::model::AgentObjectRecord;
+
+    #[test]
+    fn test_install_snapshot_catches_up_a_follower_behind_the_compacted_log() {
+        let base = std::env::temp_dir().join(format!("stge_test_raft_snapshot_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let open = |name: &str| {
+            Arc::new(
+                StorageEngine::<AgentObjectRecord>::open(base.join(name), EngineConfig::default())
+                    .unwrap(),
+            )
+        };
+        let engines = [open("s1"), open("s2"), open("s3")];
+        let nodes: Vec<Arc<RaftNode<AgentObjectRecord>>> = engines
+            .iter()
+            .enumerate()
+            .map(|(i, e)| Arc::new(RaftNode::new(i as NodeId + 1, Arc::clone(e)).unwrap()))
+            .collect();
+        let group = RaftReplicationGroup::new(nodes.clone()).unwrap();
+        group.elect_leader(1).unwrap();
+        let id = |i: u32| InlineId::new(&format!("snap{i:04}")).unwrap();
+        let rec = |i: u32, v: i64| AgentObjectRecord::new(id(i), "v", 1, v);
+        for i in 0..20 {
+            group.replicate_put(id(i), &rec(i, 1)).unwrap();
+        }
+        // Node 3 falls behind; the others move on and compact their logs past it.
+        group.set_node_isolated(3, true);
+        for i in 0..300 {
+            group.replicate_put(id(i % 200), &rec(i % 200, i64::from(i))).unwrap();
+        }
+        for n in &nodes[..2] {
+            let applied = n.last_applied();
+            assert_eq!(n.compact_log_through(applied).unwrap(), applied);
+        }
+        // A stray local record on the lagging node must disappear with the install.
+        engines[2].put(InlineId::new("stray").unwrap(), &AgentObjectRecord::new(InlineId::new("stray").unwrap(), "x", 1, 0)).unwrap();
+        assert!(nodes[0].needs_snapshot(nodes[2].last_log_index() + 1));
+
+        group.set_node_isolated(3, false);
+        let last = group.replicate_put(id(500), &rec(500, 5)).unwrap();
+        assert_eq!(nodes[2].last_applied(), last, "snapshot installed, then the tail replicated");
+        assert!(nodes[2].snapshot_index() >= 320);
+        for i in (0..200).chain([500]) {
+            assert_eq!(
+                engines[2].get_owned(id(i)).unwrap().1,
+                engines[0].get_owned(id(i)).unwrap().1,
+                "record {i}"
+            );
+        }
+        assert!(engines[2].get_owned(InlineId::new("stray").unwrap()).is_err());
+        assert_eq!(engines[2].live_ids().len(), engines[0].live_ids().len());
+
+        // Chunked transfer by hand: tiny chunks, a duplicate and a gap are answered with the
+        // offset the follower expects; a corrupted transfer is restarted, never applied.
+        let follower = &nodes[2];
+        for n in &nodes {
+            let applied = n.last_applied();
+            n.compact_log_through(applied).unwrap();
+        }
+        let leader = &nodes[0];
+        group.set_node_isolated(3, true);
+        group.replicate_put(id(600), &rec(600, 6)).unwrap();
+        let applied = leader.last_applied();
+        leader.compact_log_through(applied).unwrap();
+        let fresh = |offset| leader.build_install_snapshot(offset, 700).unwrap();
+        let first = fresh(0);
+        let target = first.last_included_index;
+        assert!(target > follower.last_applied());
+        let r = follower.handle_install_snapshot(first.clone()).unwrap();
+        assert_eq!((r.next_offset, r.installed), (700, false));
+        assert_eq!(follower.handle_install_snapshot(first).unwrap().next_offset, 700, "duplicate");
+        assert_eq!(follower.handle_install_snapshot(fresh(2100)).unwrap().next_offset, 700, "gap");
+        let mut offset = 700;
+        let mut corrupted = false;
+        loop {
+            let mut req = fresh(offset);
+            if !corrupted && req.done {
+                // Damage the last chunk once: the whole transfer must restart.
+                req.data[0] ^= 0xFF;
+                corrupted = true;
+                let r = follower.handle_install_snapshot(req).unwrap();
+                assert_eq!((r.next_offset, r.installed), (0, false));
+                assert!(follower.last_applied() < target, "damaged snapshot not applied");
+                offset = 0;
+                continue;
+            }
+            let r = follower.handle_install_snapshot(req).unwrap();
+            if r.installed {
+                break;
+            }
+            offset = r.next_offset;
+        }
+        assert_eq!(follower.last_applied(), target);
+        assert_eq!(engines[2].get_owned(id(600)).unwrap().1.score, 6);
+        group.set_node_isolated(3, false);
+
+        // Crash during an install with no usable received file: the replica resets to empty
+        // (engine and Raft state) instead of serving a half-installed state.
+        let stem = crate::engine::collection_file_stem(engines[2].collection_name()).unwrap();
+        let marker = base.join("s3").join(format!("{stem}_raft.installing"));
+        std::fs::write(&marker, (target + 100).to_le_bytes()).unwrap();
+        drop(group);
+        let reopened = RaftNode::new(3, Arc::clone(&engines[2])).unwrap();
+        assert_eq!(reopened.last_applied(), 0);
+        assert!(engines[2].live_ids().is_empty());
+        assert!(!marker.exists());
+        drop(reopened);
+        drop(nodes);
+        drop(engines);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn test_raft_log_compaction_bounds_memory_and_survives_restart() {
