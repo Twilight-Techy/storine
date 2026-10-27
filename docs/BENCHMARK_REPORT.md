@@ -101,4 +101,6 @@ Two regressions found by this gate were fixed before sign-off: the per-call `is_
 | `storage-server` | `516.0 KiB` | `582.0 KiB` |
 | `storage-cli` | `537.5 KiB` | `582.0 KiB` |
 
-The earlier `370.5 KiB` figure was stale; the baseline already exceeded the `RULE-MEM-03` budget (`< 500 KiB`). Linker-map attribution of the `+59 KiB` `.text` growth: `storage-server` `+32 KiB` (header-stage admission, admin job pool, Raft RPC wiring, environment security config), `std` `+15 KiB` (threads and mpsc channels for the admin pool), WAL `+3.5 KiB`, mmap `+7 KiB`, index `+5 KiB`. Open item: bring the binaries back under budget without sacrificing hot-path speed (`opt-level` must stay `3`).
+After Stage 21 (encryption key ring, index-file sealing, SIMD crypto, Raft InstallSnapshot, cold primary tier): `storage-server` `903.0 KiB`, `storage-cli` `830.5 KiB`. On 2026-10-27 the `RULE-MEM-03` budget was raised to `< 1 MiB` (`TASK-091`); both binaries are within it.
+
+The earlier `370.5 KiB` figure was stale; the baseline already exceeded the `RULE-MEM-03` budget (`< 500 KiB`). Linker-map attribution of the `+59 KiB` `.text` growth: `storage-server` `+32 KiB` (header-stage admission, admin job pool, Raft RPC wiring, environment security config), `std` `+15 KiB` (threads and mpsc channels for the admin pool), WAL `+3.5 KiB`, mmap `+7 KiB`, index `+5 KiB`. Size is still minimized wherever it costs no hot-path speed (`opt-level` stays `3`).

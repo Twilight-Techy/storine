@@ -14,6 +14,8 @@ pub mod raw;
 
 pub use arena::{ArenaLocation, ArenaManager, ArenaSegment, DEFAULT_SEGMENT_CAPACITY};
 pub use net_poll::SocketPoller;
+#[cfg(target_os = "linux")]
+pub use net_poll::EpollPoller;
 pub use path::{PathResolver, StackRelPath};
 pub use persist::{
     atomic_write_replace, cleanup_temp_files, read_ping_pong_active, write_ping_pong_slot,

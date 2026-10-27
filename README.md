@@ -240,7 +240,7 @@ Ranges reflect run-to-run variance on the (shared) development machine; see the 
 - **Primary Index Checkpoint (`primary.idx`)**: `~21 bytes / record` (`4.2x` smaller than the fixed-row v1 format via varint + compact `InlineId` encoding).
 - **Persisted Vector Graph (`hnsw.idx`)**: saved at checkpoints and reused at open (reconciled against the records), so restarts do not rebuild the HNSW graph.
 - **Zero Duplicate In-RAM Index/Vector Maps**: Secondary index snapshots and float embeddings are read zero-copy directly from the memory-mapped `&T::Archived` frame (`0 bytes/record` of duplicate heap maps).
-- **Release Binaries**: `storage-server` is a self-contained **`582 KiB`** binary (Windows x86_64; `516 KiB` before the 2026-10-20 audit fixes).
+- **Release Binaries**: `storage-server` is a self-contained **`903 KiB`** binary and `storage-cli` **`830.5 KiB`** (Windows x86_64, fat LTO, stripped), within the `RULE-MEM-03` budget of `< 1 MiB`.
 
 See [`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) for the complete latency and footprint verification report.
 

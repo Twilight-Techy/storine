@@ -694,11 +694,15 @@ This document defines the strict chronological execution order for building the 
     - Benchmark row `with_ref (Cold primary tier)`: `4.2 µs` p50, `0.00` allocs/op (it was `44 µs` before the slot-offset page index). All other allocation gates unchanged.
     - `111` tests passing, `0` clippy warnings (native and portable).
 
-- [ ] **TASK-090: `epoll` Reactor on Linux (`RULE-CPU-03`, `F-NET-01`)** — *blocked: needs a Linux toolchain*
-  - Today `WSAPoll` / `poll` re-register every connection on each reactor cycle (`O(connections per shard)` per wake-up). `epoll` needs persistent registration (stable connection tokens instead of `swap_remove` indices).
-  - This Windows dev machine has no Linux target and no WSL distribution, so Linux-only code cannot even be compile-checked here. It will not be merged untested. It needs either `rustup target add x86_64-unknown-linux-gnu` (compile and clippy check only) or a Linux / WSL environment (tests).
+- [ ] **TASK-090: `epoll` Reactor on Linux (`RULE-CPU-03`, `F-NET-01`)** — *implemented; open until its tests have run on Linux*
+  - **`EpollPoller`** (`storage-mmap`, Linux only): persistent, level-triggered registration with caller tokens; `add` / `modify` / `delete` / `wait` over raw `epoll_*` syscalls (no external crates; `epoll_event` packed on x86-64 per the kernel ABI).
+  - **Reactor** (`reactor_worker_loop_epoll`): each socket is registered once (token = fd, with a token → index map that survives `swap_remove`). Write interest changes only when a connection's output state changes. A wake-up drives only the ready sockets plus connections awaiting an admin job: `O(active)` instead of `O(connections)` per wake-up. The timeout and waker policy are identical to the `poll` reactor. `STORINE_REACTOR=poll` falls back to `poll`.
+  - **Also found by the first Linux build**: three `ptr_as_ptr` clippy warnings in the Unix-only mmap code (`raw.rs`) that Windows builds never compile. Fixed.
+  - **Verification so far**: `cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu`: `0` warnings (type-checked and linted, not linked: no Linux linker on this Windows machine). Windows behavior unchanged (server tests pass; the `poll` path is untouched).
+  - **To close**: on Linux (or WSL), run `cargo test --workspace`. That runs `test_epoll_reports_only_ready_sockets_and_tracks_interest` and every server test through the epoll reactor. Then compare the TCP benchmark with `STORINE_REACTOR=poll`.
 
-- [ ] **TASK-091: Release Binaries under `500 KiB` (`RULE-MEM-03`)** — *open: needs a decision*
+- [x] **TASK-091: Release Binary Size Budget (`RULE-MEM-03`)** — *resolved 2026-10-27: budget raised to `< 1 MiB` by the user*
   - Measured (Windows x86-64, fat LTO, stripped): `storage-server` `829 KiB` / `storage-cli` `760 KiB` at `opt-level = 3`; `647` / `613 KiB` at `"s"`; `591.5` / `572 KiB` at `"z"`. No compiler setting alone meets the budget.
   - Linker-map attribution (`.text` ≈ `692 KiB`): `storage_index` `134 KiB` (paged indexes, cold tier, HNSW), `storage_server` `107 KiB`, `core` `97 KiB` (sort monomorphizations, formatting), `storage_core` `97 KiB`, `std` `85 KiB` + `rustc_demangle` `17 KiB` (panic and backtrace machinery, removable only with nightly `build-std` + `panic_immediate_abort`).
-  - Options: (a) Cargo features for optional subsystems (Raft, encryption, paged / cold tiers, admin RPCs) so a minimal build fits; (b) nightly `build-std`; (c) revise the budget. Choosing among them is the user's call.
+  - Options were: (a) Cargo features for optional subsystems; (b) nightly `build-std`; (c) revise the budget. The user chose (c): `< 1 MiB`, treated as a ceiling, with code size still minimized wherever it costs no hot-path speed.
+  - **Exit Criteria**: `storage-server` `903.0 KiB` and `storage-cli` `830.5 KiB` (after the cold primary tier), both `< 1 MiB`.

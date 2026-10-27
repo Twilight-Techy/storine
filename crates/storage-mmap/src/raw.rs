@@ -190,7 +190,7 @@ impl MmapRegion {
         if raw == MAP_FAILED {
             return Err(StorageError::io("mmap", std::io::Error::last_os_error()));
         }
-        let Some(ptr) = NonNull::new(raw as *mut u8) else {
+        let Some(ptr) = NonNull::new(raw.cast::<u8>()) else {
             return Err(StorageError::corrupted_header("mmap returned null pointer"));
         };
         Ok(Self {
@@ -215,7 +215,7 @@ impl MmapRegion {
         // SAFETY: `aligned_off` is page-aligned and within the mapped region.
         unsafe {
             let _ = libc_madvise(
-                self.ptr.as_ptr().add(aligned_off) as *mut core::ffi::c_void,
+                self.ptr.as_ptr().add(aligned_off).cast::<core::ffi::c_void>(),
                 aligned_len,
                 flag,
             );
@@ -238,7 +238,7 @@ impl Drop for MmapRegion {
         {
             // SAFETY: `self.ptr` and `self.len` were returned by `mmap` in `platform_map_read_only`.
             unsafe {
-                let _ = libc_munmap(self.ptr.as_ptr() as *mut core::ffi::c_void, self.len);
+                let _ = libc_munmap(self.ptr.as_ptr().cast::<core::ffi::c_void>(), self.len);
             }
         }
     }

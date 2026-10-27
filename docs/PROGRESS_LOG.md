@@ -398,3 +398,13 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - Open: `O(file)` validation pass, no entries loaded.
 - **Benchmark finding, fixed in this task**: the first page format decoded a page's varint entries sequentially to find one id; the new benchmark row showed `44 µs` p50 per tier read. Adding a `u16` slot-offset array at the page end (`2 B` per entry) lets lookups binary-search by decoding only about 6 ids: an isolated probe went from `25.6 µs` to `1.7–2.6 µs` on the loaded machine.
 - **Limits (documented)**: a reader holding a superseded generation keeps it mapped until it finishes (on Windows its file is deleted at the next open); scans over tier-only records re-validate frames.
+
+#### `TASK-091`: Binary Size Budget
+- **Decision (user, 2026-10-27)**: the `RULE-MEM-03` budget is raised from `500 KiB` to `< 1 MiB`. It is a ceiling, not a target: size keeps being minimized wherever it costs no hot-path speed.
+- **Measured** (Windows x86-64, fat LTO, stripped, `opt-level = 3`): `storage-server` `903.0 KiB`, `storage-cli` `830.5 KiB`. For reference, before the cold tier landed: `647` / `613 KiB` at `opt-level = "s"` and `591.5` / `572 KiB` at `"z"`. Neither was adopted: `opt-level` stays `3` for hot-path speed.
+
+#### `TASK-090`: `epoll` Reactor on Linux (implemented, Linux test run pending)
+- **Implementation**: an `EpollPoller` (raw syscalls, level-triggered, token per socket) and a Linux reactor loop that registers each socket once and drives only ready connections and those awaiting admin jobs. The per-wake-up cost goes from `O(connections per shard)` (`poll` rebuilds and scans the full descriptor list) to `O(ready)`. Fallback: `STORINE_REACTOR=poll`.
+- **Safety audit**: three `unsafe` FFI calls, each with a `SAFETY` note. The epoll descriptor is owned and closed once. Sockets are unregistered before they are closed, so a reused fd number can never inherit a stale registration. Tokens are mapped back through a map that is updated on `swap_remove`.
+- **Verification**: Linux type-check and clippy clean for the whole workspace (the Linux target was installed for this; there is no Linux linker or WSL here, so nothing Linux-specific has executed). The first Linux build also surfaced three latent clippy warnings in Unix-only mmap code, now fixed. **Not yet run on Linux**: the epoll unit test and the server tests must pass there before this task is closed.
+

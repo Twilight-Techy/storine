@@ -10,7 +10,7 @@
 2. **Minimal Memory, CPU, Code & On-Disk Data Footprint**:
    - **Memory**: No duplicate in-RAM index/vector maps; `~88 bytes` per idle TCP connection (`24,000x` smaller than thread-per-connection); hard `64 MiB` cap on `hot_dirty`; bounded `MmapPool` with Clock-PRO eviction; $O(1)$ ordinal recycling; fallible `try_reserve_exact` allocations to prevent OOM crashes.
    - **CPU**: Zero busy-spin loops; OS kernel readiness polling (`WSAPoll` / `poll`); 64-byte cache-line padding (`CachePadded<T>`) on all concurrent shards; hardware SSE4.2 `CRC32C` + 4-way `XXH3-64` checksums; 8-way unrolled SIMD cosine & `SQ8` quantized vector kernels.
-   - **Disk & Code**: `4 KiB`-growable arena segments (`seg_XXXXX.dat`); `19.0 bytes/record` varint checkpoint (`primary.idx`); `SQ8` 4x vector compression; paged on-disk secondary indexes; self-contained `< 500 KiB` release binaries.
+   - **Disk & Code**: `4 KiB`-growable arena segments (`seg_XXXXX.dat`); `19.0 bytes/record` varint checkpoint (`primary.idx`); `SQ8` 4x vector compression; paged on-disk secondary indexes; self-contained `< 1 MiB` release binaries.
 3. **Optimal Asymptotic Time & Space Complexity**:
    - $O(1)$ point lookups, updates, and ordinal recycling; $O(W_{\min} \cdot k)$ smallest-first bitmap intersections; $O(\log B + |R|)$ B+Tree range scans; $O(N + K \log K)$ Quickselect exact vector search; $O(\log N)$ HNSW approximate nearest-neighbor search; $O(\text{active})$ kernel socket readiness polling.
 4. **Massive Scaling & Concurrency (Users, Vertical Compute & Horizontal Compute)**:

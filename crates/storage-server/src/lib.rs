@@ -622,6 +622,12 @@ fn reactor_worker_loop<T: ZeroCopyRecord + Indexable>(
     shutdown: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
 ) {
+    #[cfg(target_os = "linux")]
+    if std::env::var("STORINE_REACTOR").map_or(true, |v| v != "poll") {
+        if let Ok(ep) = storage_mmap::EpollPoller::new(1024) {
+            return reactor_worker_loop_epoll(shard, shared, shutdown, active_connections, ep);
+        }
+    }
     let mut conns: Vec<NonBlockingConn> = Vec::with_capacity(64);
     let mut poller = SocketPoller::with_capacity(64);
     let mut idle_polls: u32 = 0;
@@ -709,6 +715,132 @@ fn reactor_worker_loop<T: ZeroCopyRecord + Indexable>(
                 ConnStep::Closed => {
                     conns.swap_remove(idx);
                     active_connections.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+/// Linux reactor (`TASK-090`): sockets are registered once with `epoll` (token = fd) and each
+/// wake-up drives only the ready connections plus those awaiting an admin job, so its cost is
+/// `O(active)` rather than `O(connections)`. Same timeout policy as the `poll` reactor; set
+/// `STORINE_REACTOR=poll` to use that one instead.
+#[cfg(target_os = "linux")]
+fn reactor_worker_loop_epoll<T: ZeroCopyRecord + Indexable>(
+    shard: Arc<ReactorShard>,
+    shared: Arc<ServerShared<T>>,
+    shutdown: Arc<AtomicBool>,
+    active_connections: Arc<AtomicUsize>,
+    mut ep: storage_mmap::EpollPoller,
+) {
+    use std::os::unix::io::AsRawFd;
+    const WAKER_TOKEN: u64 = u64::MAX;
+
+    let mut conns: Vec<NonBlockingConn> = Vec::with_capacity(64);
+    // token -> (index in `conns`, registered write interest)
+    let mut slots: storage_types::FastHashMap<u64, (usize, bool)> = storage_types::FastHashMap::default();
+    let mut pending_jobs: Vec<u64> = Vec::new();
+    let mut work: Vec<u64> = Vec::new();
+    let mut idle_polls: u32 = 0;
+    let mut made_progress = false;
+    if let Some(ref waker) = shard.waker {
+        let _ = ep.add(&waker.rx, WAKER_TOKEN, false);
+    }
+
+    while !shutdown.load(Ordering::Relaxed) {
+        if conns.is_empty() || shard.has_incoming.load(Ordering::Acquire) {
+            let mut inc = shard
+                .incoming
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while conns.is_empty() && inc.is_empty() && !shutdown.load(Ordering::Relaxed) {
+                inc = shard
+                    .wake_cv
+                    .wait(inc)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            for stream in inc.drain(..) {
+                let token = stream.as_raw_fd() as u64;
+                let conn = NonBlockingConn::new(stream, &shared.security);
+                if ep.add(&conn.stream, token, false).is_err() {
+                    // Not watchable: close it rather than leave it unserved.
+                    active_connections.fetch_sub(1, Ordering::Relaxed);
+                    continue;
+                }
+                slots.insert(token, (conns.len(), false));
+                conns.push(conn);
+            }
+            shard.has_incoming.store(false, Ordering::Release);
+        }
+        if conns.is_empty() {
+            continue;
+        }
+
+        // Same policy as the `poll` reactor (finished admin jobs write to the waker).
+        let poll_timeout_ms = if made_progress {
+            0
+        } else if idle_polls < 8 {
+            1
+        } else if idle_polls < 32 {
+            5
+        } else if shard.waker.is_some() {
+            -1
+        } else if !pending_jobs.is_empty() {
+            1
+        } else {
+            25
+        };
+        work.clear();
+        for &token in ep.wait(poll_timeout_ms) {
+            if token == WAKER_TOKEN {
+                if let Some(ref waker) = shard.waker {
+                    waker.drain();
+                }
+            } else {
+                work.push(token);
+            }
+        }
+        work.extend_from_slice(&pending_jobs);
+        work.sort_unstable();
+        work.dedup();
+        if work.is_empty() {
+            made_progress = false;
+            idle_polls = idle_polls.saturating_add(1);
+            continue;
+        }
+        idle_polls = 0;
+        made_progress = false;
+        pending_jobs.clear();
+
+        for &token in &work {
+            let Some(&(idx, registered_write)) = slots.get(&token) else {
+                continue;
+            };
+            match drive_connection(&mut conns[idx], &shared, &shard) {
+                ConnStep::Closed => {
+                    let _ = ep.delete(&conns[idx].stream);
+                    slots.remove(&token);
+                    conns.swap_remove(idx);
+                    if let Some(moved) = conns.get(idx) {
+                        let moved_token = moved.stream.as_raw_fd() as u64;
+                        if let Some(slot) = slots.get_mut(&moved_token) {
+                            slot.0 = idx;
+                        }
+                    }
+                    active_connections.fetch_sub(1, Ordering::Relaxed);
+                    continue;
+                }
+                ConnStep::Progress => made_progress = true,
+                ConnStep::WouldBlock => {}
+            }
+            let conn = &conns[idx];
+            if conn.pending_job.is_some() {
+                pending_jobs.push(token);
+            }
+            let want_write = conn.wants_write();
+            if want_write != registered_write && ep.modify(&conn.stream, token, want_write).is_ok() {
+                if let Some(slot) = slots.get_mut(&token) {
+                    slot.1 = want_write;
                 }
             }
         }
