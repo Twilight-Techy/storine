@@ -129,6 +129,7 @@ impl Engine {
             prepared: HashMap::new(),
             id,
             last_found_rows: 0,
+            last_row_count: 0,
         }
     }
 }
@@ -401,6 +402,8 @@ pub struct Session {
     pub prepared: HashMap<String, (Statement, usize)>,
     pub id: u64,
     pub last_found_rows: u64,
+    /// MySQL `ROW_COUNT()`: rows changed by the last DML statement, -1 after a query.
+    pub last_row_count: i64,
 }
 
 /// Nanoseconds since the epoch, now.
@@ -653,6 +656,16 @@ impl Session {
         self.txn.get_or_insert_with(Txn::default)
     }
 
+    /// Records a DML statement's affected rows for `ROW_COUNT()`.
+    fn count_changes(&mut self, out: SqlResult<Outcome>) -> SqlResult<Outcome> {
+        self.last_row_count = match &out {
+            Ok(Outcome::Command { affected, .. }) => *affected as i64,
+            Ok(Outcome::Rows(rs)) => rs.rows.len() as i64, // RETURNING
+            Err(_) => -1,
+        };
+        out
+    }
+
     fn run(&mut self, stmt: &Statement, params: &[Datum]) -> SqlResult<Outcome> {
         match stmt {
             Statement::Query(q) => {
@@ -665,11 +678,21 @@ impl Session {
                 let rs = ex.result_set(rel)?;
                 drop(ex);
                 self.last_found_rows = rs.rows.len() as u64;
+                self.last_row_count = -1;
                 Ok(Outcome::Rows(rs))
             }
-            Statement::Insert(i) => dml::insert(self, i, params),
-            Statement::Update(u) => dml::update(self, u, params),
-            Statement::Delete(d) => dml::delete(self, d, params),
+            Statement::Insert(i) => {
+                let out = dml::insert(self, i, params);
+                self.count_changes(out)
+            }
+            Statement::Update(u) => {
+                let out = dml::update(self, u, params);
+                self.count_changes(out)
+            }
+            Statement::Delete(d) => {
+                let out = dml::delete(self, d, params);
+                self.count_changes(out)
+            }
             Statement::CreateTable(c) => ddl::create_table(self, c, params),
             Statement::CreateIndex(c) => ddl::create_index(self, c),
             Statement::DropTable {

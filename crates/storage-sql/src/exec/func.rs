@@ -789,7 +789,8 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
         "current_catalog" => Datum::Text(ex.s.database.clone()),
         "pg_backend_pid" | "connection_id" => Datum::Int(ex.s.id as i64),
         "last_insert_id" | "lastval" | "scope_identity" => Datum::Int(ex.s.last_insert_id),
-        "row_count" | "found_rows" => Datum::Int(ex.s.last_found_rows as i64),
+        "row_count" => Datum::Int(ex.s.last_row_count),
+        "found_rows" => Datum::Int(ex.s.last_found_rows as i64),
         "gen_random_uuid" | "uuid_generate_v4" | "uuid" | "newid" | "uuid_v4" => {
             let mut b: [u8; 16] = crate::hash::random_bytes(16).try_into().unwrap_or([0; 16]);
             b[6] = (b[6] & 0x0f) | 0x40;

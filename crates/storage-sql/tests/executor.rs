@@ -319,6 +319,15 @@ fn mysql_dialect_and_parameters() {
         Outcome::Command { last_insert_id, .. } => assert_eq!(last_insert_id, Some(1)),
         o => panic!("{o:?}"),
     }
+    // ROW_COUNT() is the last DML's change count; FOUND_ROWS() the last query's rows.
+    ok(&mut s, "UPDATE items SET qty = qty + 1 WHERE sku = 'A1'");
+    assert_eq!(one(&mut s, "SELECT ROW_COUNT()"), "1");
+    assert_eq!(one(&mut s, "SELECT ROW_COUNT()"), "-1");
+    ok(&mut s, "UPDATE items SET qty = 0 WHERE sku = 'none'");
+    assert_eq!(one(&mut s, "SELECT ROW_COUNT()"), "0");
+    rows(&mut s, "SELECT * FROM items");
+    assert_eq!(one(&mut s, "SELECT FOUND_ROWS()"), "1");
+    ok(&mut s, "UPDATE items SET qty = 5 WHERE sku = 'A1'");
     ok(&mut s, "INSERT INTO items (sku, qty) VALUES ('B2', 1)");
     ok(&mut s, "INSERT INTO items (sku, qty) VALUES ('A1', 3) ON DUPLICATE KEY UPDATE qty = qty + VALUES(qty)");
     assert_eq!(one(&mut s, "SELECT qty FROM items WHERE sku = \"A1\""), "8");
