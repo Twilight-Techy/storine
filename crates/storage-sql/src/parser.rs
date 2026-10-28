@@ -41,6 +41,28 @@ pub fn parse_one(sql: &str, dialect: Dialect) -> SqlResult<(Statement, usize)> {
     }
 }
 
+/// Parses one expression (stored defaults and checks).
+pub fn parse_expr(sql: &str, dialect: Dialect) -> SqlResult<Expr> {
+    let (tokens, _) = tokenize(sql, dialect)?;
+    let mut p = Parser { tokens, pos: 0, dialect };
+    let e = p.expr()?;
+    if !p.at_end() {
+        return Err(p.unexpected("end of expression"));
+    }
+    Ok(e)
+}
+
+/// Parses a column type name such as `numeric(12,2)` or `timestamp with time zone`.
+pub fn parse_data_type(sql: &str) -> SqlResult<DataType> {
+    let (tokens, _) = tokenize(sql, Dialect::Postgres)?;
+    let mut p = Parser { tokens, pos: 0, dialect: Dialect::Postgres };
+    let (ty, _) = p.data_type()?;
+    if !p.at_end() {
+        return Err(p.unexpected("end of type"));
+    }
+    Ok(ty)
+}
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -696,14 +718,9 @@ impl Parser {
     /// Skips `USING BTREE`, `DEFERRABLE INITIALLY DEFERRED`, `COMMENT '..'` after a key.
     fn constraint_tail(&mut self) {
         loop {
-            if self.eat_kw("using") {
+            if self.eat_kw("using") || self.eat_kw("initially") || self.eat_kw("comment") {
                 let _ = self.next();
-            } else if self.eat_kw("deferrable") || self.eat_kws(&["not", "deferrable"]) {
-            } else if self.eat_kw("initially") {
-                let _ = self.next();
-            } else if self.eat_kw("comment") {
-                let _ = self.next();
-            } else {
+            } else if !(self.eat_kw("deferrable") || self.eat_kws(&["not", "deferrable"])) {
                 return;
             }
         }
@@ -964,7 +981,7 @@ impl Parser {
                 }
             }
             "bytea" | "blob" | "tinyblob" | "mediumblob" | "longblob" | "binary" | "varbinary" | "image" => {
-                if self.eat_kw("varying") {}
+                let _ = self.eat_kw("varying");
                 paren_numbers(self)?;
                 DataType::Bytes
             }
@@ -1336,7 +1353,7 @@ impl Parser {
             up.returning = self.output_items()?;
         }
         if self.eat_kw("from") {
-            up.from = self.from_list()?;
+            up.from = self.table_list()?;
         }
         if self.eat_kw("where") {
             up.where_ = Some(self.expr()?);
@@ -1366,7 +1383,7 @@ impl Parser {
             del.returning = self.output_items()?;
         }
         if self.eat_kw("using") {
-            del.using = self.from_list()?;
+            del.using = self.table_list()?;
         }
         if self.eat_kw("where") {
             del.where_ = Some(self.expr()?);
@@ -1550,7 +1567,7 @@ impl Parser {
             return Err(SqlError::unsupported("SELECT ... INTO"));
         }
         if self.eat_kw("from") {
-            sel.from = self.from_list()?;
+            sel.from = self.table_list()?;
         }
         if self.eat_kw("where") {
             sel.where_ = Some(self.expr()?);
@@ -1642,7 +1659,7 @@ impl Parser {
         Ok(out)
     }
 
-    fn from_list(&mut self) -> SqlResult<Vec<TableRef>> {
+    fn table_list(&mut self) -> SqlResult<Vec<TableRef>> {
         let mut out = vec![self.table_ref()?];
         while self.eat_op(",") {
             out.push(self.table_ref()?);
@@ -1937,9 +1954,7 @@ impl Parser {
         loop {
             let op = if self.is_op("|") {
                 BinaryOp::BitOr
-            } else if self.is_op("#") {
-                BinaryOp::BitXor
-            } else if self.is_op("^") && self.dialect == Dialect::MySql {
+            } else if self.is_op("#") || (self.is_op("^") && self.dialect == Dialect::MySql) {
                 BinaryOp::BitXor
             } else {
                 return Ok(left);

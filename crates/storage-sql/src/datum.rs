@@ -9,6 +9,7 @@ use crate::ast::DataType;
 use crate::error::{SqlError, SqlResult};
 
 /// Exact decimal from text (`1.50`, `-3`, `1e3`).
+#[allow(clippy::result_unit_err)]
 pub fn parse_dec(s: &str) -> Result<Decimal, ()> {
     s.parse::<Decimal>().map_err(|_| ())
 }
@@ -575,7 +576,7 @@ pub fn cast(d: &Datum, ty: &DataType) -> SqlResult<Datum> {
         }
         DataType::Enum(values) => {
             let s = d.as_text();
-            if !values.iter().any(|v| *v == s) {
+            if !values.contains(&s) {
                 return Err(SqlError::invalid_text(format!("invalid input value for enum: \"{s}\"")));
             }
             Text(s)

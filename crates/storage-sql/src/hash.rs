@@ -198,14 +198,14 @@ pub fn base64_encode(data: &[u8]) -> String {
 /// Decodes standard base64; `None` on malformed input.
 pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
     let val = |c: u8| -> Option<u32> {
-        Some(match c {
+        Some(u32::from(match c {
             b'A'..=b'Z' => c - b'A',
             b'a'..=b'z' => c - b'a' + 26,
             b'0'..=b'9' => c - b'0' + 52,
             b'+' => 62,
             b'/' => 63,
             _ => return None,
-        } as u32)
+        }))
     };
     let b = text.trim_end_matches('=').as_bytes();
     if text.len() % 4 != 0 || text.len() - b.len() > 2 {

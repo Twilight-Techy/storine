@@ -89,6 +89,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "storage-sql"
+version = "0.1.0"
+dependencies = [
+ "storage-core",
+ "storage-server",
+ "storage-types",
+ "storine",
+]
+
+[[package]]
 name = "storage-types"
 version = "0.1.0"
 
@@ -99,3 +109,7 @@ dependencies = [
  "storage-codec",
  "storage-types",
 ]
+
+[[package]]
+name = "storine"
+version = "0.1.0"
