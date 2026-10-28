@@ -87,9 +87,11 @@ public class MssqlTests
     {
         var modes = new List<string> { "Encrypt=Optional", "Encrypt=False", "Encrypt=Mandatory;TrustServerCertificate=true" };
         // TDS 8 strict mode verifies the certificate; on Linux SqlClient trusts it through
-        // OpenSSL's store (run with SSL_CERT_FILE=<server.crt>; it ignores ServerCertificate).
+        // OpenSSL's store (run with SSL_CERT_FILE naming a bundle that includes server.crt; it
+        // ignores ServerCertificate).
         var cert = Environment.GetEnvironmentVariable("STORINE_TLS_CERT");
-        if (cert != null && cert == Environment.GetEnvironmentVariable("SSL_CERT_FILE"))
+        if (cert != null && Environment.GetEnvironmentVariable("SSL_CERT_FILE") is { } bundle
+            && File.ReadAllText(bundle).Contains(File.ReadAllText(cert).Trim()))
             modes.Add("Encrypt=Strict;HostNameInCertificate=localhost");
         var big = new string('x', 100_000);
         foreach (var mode in modes)

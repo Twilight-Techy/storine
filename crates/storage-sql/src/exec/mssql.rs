@@ -1795,7 +1795,9 @@ pub fn return_type(name: &str) -> Option<DataType> {
         | "columnproperty" | "type_id" | "datepart" | "charindex" | "patindex" | "datalength"
         | "unicode" | "isdate" | "isnumeric" | "is_member" | "is_srvrolemember" | "user_id"
         | "xact_state" | "error_number" | "isjson" | "len" => DataType::Int,
-        "datediff_big" | "datediff" | "ident_current" => DataType::BigInt,
+        "datediff_big" | "ident_current" | "count_big" => DataType::BigInt,
+        // COUNT is `int` in SQL Server (COUNT_BIG is the `bigint` one).
+        "count" | "datediff" => DataType::Int,
         "dateadd" | "datetimefromparts" | "datetime2fromparts" | "sysutcdatetime"
         | "getutcdate" => DataType::Timestamp,
         "sysdatetimeoffset" => DataType::TimestampTz,

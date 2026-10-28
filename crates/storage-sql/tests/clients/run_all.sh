@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 # Runs every real-client compatibility suite against a running storine-sql.
 #
-#   storine-sql --data /tmp/db --pg 127.0.0.1:55432 --mysql 127.0.0.1:53306 &
+#   storine-sql --data /tmp/db --pg 127.0.0.1:55432 --mysql 127.0.0.1:53306 --mssql 127.0.0.1:51433 &
 #   tests/clients/run_all.sh
 #
 # Suites whose toolchain is missing are skipped with a note. Environment:
 #   PYTHON          python with psycopg2, psycopg, asyncpg, sqlalchemy[asyncio], pymysql, django
-#   NODE_PATH       node_modules with pg, mysql2, sequelize, knex (and prisma@6, @prisma/client@6)
+#                   (and pymssql for the SQL Server suite)
+#   NODE_PATH       node_modules with pg, mysql2, sequelize, knex (and prisma@6, @prisma/client@6,
+#                   typeorm, tedious, mssql)
 #   STORINE_SQL_BIN storine-sql binary for the private Prisma instance (default: target/release)
 #   STORINE_DATA    the server's --data directory (its TLS certificate is then verified)
 #   ELOQUENT_AUTOLOAD  vendor/autoload.php of `composer require illuminate/database:^11`
-#   GEM_HOME/GEM_PATH  with activerecord, pg, trilogy
+#   GEM_HOME/GEM_PATH  with activerecord, pg, trilogy (GEM_PATH also listing the default gems)
 set -u
 cd "$(dirname "$0")"
 PG=${STORINE_PG_PORT:-55432}
 MY=${STORINE_MYSQL_PORT:-53306}
-export STORINE_PG="127.0.0.1:$PG" STORINE_MYSQL="127.0.0.1:$MY"
+MS=${STORINE_MSSQL_PORT:-51433}
+export STORINE_PG="127.0.0.1:$PG" STORINE_MYSQL="127.0.0.1:$MY" STORINE_MSSQL="127.0.0.1:$MS"
 PYTHON=${PYTHON:-python3}
 # The server's certificate, for the suites that verify it (storine-sql --data DIR keeps it in DIR/tls).
 [ -n "${STORINE_DATA:-}" ] && [ -f "$STORINE_DATA/tls/server.crt" ] && export STORINE_TLS_CERT="$STORINE_DATA/tls/server.crt"
@@ -33,9 +36,23 @@ run django-postgres "$PYTHON" django/test_django.py postgres "$PG"
 run django-mysql "$PYTHON" django/test_django.py mysql "$MY"
 have node && run node node test_node.js "$PG" "$MY"
 have node && node -e 'require.resolve("typeorm")' 2>/dev/null && run typeorm-drizzle node test_typeorm_drizzle.js "$PG" "$MY"
+"$PYTHON" -c 'import pymssql' 2>/dev/null && run mssql-python "$PYTHON" test_mssql.py "$MS"
+have node && node -e 'require.resolve("tedious")' 2>/dev/null && run mssql-node node test_mssql.js "$MS"
 have go && run go bash -c "cd go && go test -count=1 ./..."
 have mvn && run java bash -c "cd java && mvn -q test"
-have dotnet && run dotnet bash -c "cd dotnet && dotnet test --nologo -v q"
+# SqlClient trusts the server certificate (TDS 8 strict mode) through OpenSSL's store: add it
+# to the usual CA bundle for the run.
+dotnet_tests() (
+  cd dotnet || exit 1
+  if [ -n "${STORINE_TLS_CERT:-}" ]; then
+    bundle=$(mktemp)
+    cat "${SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}" "$STORINE_TLS_CERT" >"$bundle" 2>/dev/null
+    SSL_CERT_FILE=$bundle dotnet test --nologo -v q; rc=$?
+    rm -f "$bundle"; exit $rc
+  fi
+  dotnet test --nologo -v q
+)
+have dotnet && run dotnet dotnet_tests
 have php && run php php php/test_php.php "$PG" "$MY"
 if have php && [ -n "${ELOQUENT_AUTOLOAD:-}" ]; then run eloquent php php/test_eloquent.php "$ELOQUENT_AUTOLOAD" "$PG" "$MY"; fi
 have ruby && run activerecord ruby ruby/test_activerecord.rb "$PG" "$MY"

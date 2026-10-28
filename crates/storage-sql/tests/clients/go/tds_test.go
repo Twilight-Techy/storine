@@ -10,6 +10,7 @@ import (
 	"time"
 
 	_ "github.com/microsoft/go-mssqldb"
+	"gorm.io/driver/sqlserver"
 )
 
 var msAddr = addr("STORINE_MSSQL", "127.0.0.1:51433")
@@ -119,4 +120,9 @@ func TestMSSQLTLS(t *testing.T) {
 		}
 		db.Close()
 	}
+}
+
+func TestGormSQLServer(t *testing.T) {
+	host, port, _ := strings.Cut(msAddr, ":")
+	gormSuite(t, sqlserver.Open("sqlserver://sa:x@"+host+":"+port+"?database=shop&encrypt=disable"))
 }

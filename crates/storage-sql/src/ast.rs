@@ -59,6 +59,8 @@ pub enum Statement {
         then: Box<Statement>,
         otherwise: Option<Box<Statement>>,
     },
+    /// `MERGE INTO target USING source ON ... WHEN [NOT] MATCHED ...` (SQL Server, PostgreSQL).
+    Merge(Box<Merge>),
     /// T-SQL `DECLARE @t TABLE (...)`: a table variable (named with its `@`).
     DeclareTable {
         name: String,
@@ -259,6 +261,43 @@ pub struct OrderBy {
     pub expr: Expr,
     pub desc: bool,
     pub nulls_first: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Merge {
+    pub target: String,
+    pub alias: Option<String>,
+    pub source: TableRef,
+    pub on: Expr,
+    pub clauses: Vec<MergeClause>,
+    /// T-SQL `OUTPUT` (qualified by `inserted` / `deleted` / the source alias).
+    pub output: Vec<SelectItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeWhen {
+    Matched,
+    NotMatchedByTarget,
+    NotMatchedBySource,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MergeClause {
+    pub when: MergeWhen,
+    pub cond: Option<Expr>,
+    pub action: MergeAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MergeAction {
+    Update(Vec<(String, Expr)>),
+    Delete,
+    /// `INSERT [(columns)] VALUES (...)`; `values: None` for `DEFAULT VALUES`.
+    Insert {
+        columns: Vec<String>,
+        values: Option<Vec<Expr>>,
+    },
+    DoNothing,
 }
 
 #[derive(Debug, Clone, PartialEq)]

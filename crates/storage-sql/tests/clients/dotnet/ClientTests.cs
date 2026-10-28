@@ -215,6 +215,7 @@ public class ClientTests
     {
         PostgresException p => p.SqlState is "40001" or "40P01",
         MySqlException m => m.ErrorCode is MySqlErrorCode.LockDeadlock or MySqlErrorCode.LockWaitTimeout,
+        Microsoft.Data.SqlClient.SqlException s => s.Number is 1205 or 1222,
         _ => e.InnerException is { } inner && IsRetryable(inner),
     };
 
@@ -225,6 +226,14 @@ public class ClientTests
     [Fact]
     public Task EfCoreMySql() =>
         EfSuite(new DbContextOptionsBuilder<Ledger>().UseMySql(MyConn, new MySqlServerVersion(new Version(8, 4, 3))).Options);
+
+    static string Ms => Environment.GetEnvironmentVariable("STORINE_MSSQL") ?? "127.0.0.1:51433";
+
+    [Fact]
+    public Task EfCoreSqlServer() =>
+        EfSuite(new DbContextOptionsBuilder<Ledger>()
+            .UseSqlServer($"Server=tcp:{Ms.Replace(':', ',')};Database=shop;User ID=sa;Password=x;Encrypt=False")
+            .Options);
 
     [Fact]
     public async Task TlsBothProtocols()

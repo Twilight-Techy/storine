@@ -379,6 +379,17 @@ impl Exec<'_> {
                     }
                     out.rows.push(vals);
                 }
+                // Column types follow the values (an integer literal is `int`).
+                for (c, col) in out.cols.iter_mut().enumerate() {
+                    if col.ty.is_none() {
+                        col.ty = unify_types(out.rows.iter().filter(|r| !r[c].is_null()).map(
+                            |r| match &r[c] {
+                                Datum::Int(v) if i32::try_from(*v).is_ok() => DataType::Int,
+                                d => d.natural_type(),
+                            },
+                        ));
+                    }
+                }
                 Ok(out)
             }
             SetExpr::SetOp {
@@ -546,6 +557,11 @@ impl Exec<'_> {
             cols: Vec::new(),
             rows: vec![Vec::new()],
         }))
+    }
+
+    /// One FROM item as a relation.
+    pub(crate) fn relation_of(&self, item: &TableRef, outer: Option<&Env<'_>>) -> SqlResult<Rel> {
+        self.eval_from_entry(item, &[], outer, None)
     }
 
     fn eval_from_entry(
@@ -1755,14 +1771,26 @@ impl Exec<'_> {
         }
         let mut out_rows: Vec<Row> = produced.into_iter().map(|(r, _)| r).collect();
         apply_limit(&mut out_rows, limit, offset);
-        // Untyped columns take the type of their first non-null value.
+        // Untyped columns take the type of their values (SQL Server: integers are `int`
+        // unless one does not fit, as for its expressions; elsewhere the first value's type).
+        let mssql = self.dialect() == Dialect::MsSql;
         for (i, c) in out_cols.iter_mut().enumerate() {
             if c.ty.is_none() {
-                c.ty = out_rows
-                    .iter()
-                    .map(|r| &r[i])
-                    .find(|d| !d.is_null())
-                    .map(Datum::natural_type);
+                c.ty =
+                    if mssql {
+                        unify_types(out_rows.iter().filter(|r| !r[i].is_null()).map(|r| {
+                            match &r[i] {
+                                Datum::Int(v) if i32::try_from(*v).is_ok() => DataType::Int,
+                                d => d.natural_type(),
+                            }
+                        }))
+                    } else {
+                        out_rows
+                            .iter()
+                            .map(|r| &r[i])
+                            .find(|d| !d.is_null())
+                            .map(Datum::natural_type)
+                    };
             }
         }
         Ok(Rel {
@@ -2101,6 +2129,15 @@ impl Exec<'_> {
                 name, args, star, ..
             } => (func::return_type(self, name, args, *star, cols), None),
             Expr::Str(_) => (Some(DataType::Text), None),
+            // T-SQL: an integer literal is `int` (`bigint` when it does not fit).
+            Expr::Number(n) if self.dialect() == Dialect::MsSql => (
+                Some(match n.parse::<i64>() {
+                    Ok(v) if i32::try_from(v).is_ok() => DataType::Int,
+                    Ok(_) => DataType::BigInt,
+                    Err(_) => DataType::Numeric(None),
+                }),
+                None,
+            ),
             // The first branch whose type is known (THEN true ELSE false is boolean).
             Expr::Case { whens, else_, .. } => (
                 whens
@@ -2174,6 +2211,30 @@ const SELECT_LIST_SRFS: &[&str] = &[
     "json_array_elements_text",
     "jsonb_array_elements_text",
 ];
+
+/// One type for a column whose values have these types: the widest numeric type, or the
+/// common type (`None` when they disagree).
+fn unify_types(types: impl Iterator<Item = DataType>) -> Option<DataType> {
+    let rank = |t: &DataType| match t {
+        DataType::Int => Some(0),
+        DataType::BigInt => Some(1),
+        DataType::Numeric(_) => Some(2),
+        DataType::Double => Some(3),
+        _ => None,
+    };
+    let mut acc: Option<DataType> = None;
+    for t in types {
+        acc = match acc {
+            None => Some(t),
+            Some(a) if a == t => Some(a),
+            Some(a) => match (rank(&a), rank(&t)) {
+                (Some(x), Some(y)) => Some(if x >= y { a } else { t }),
+                _ => return None,
+            },
+        };
+    }
+    acc
+}
 
 /// Upper bound on a join's intermediate rows.
 const MAX_JOIN_ROWS: usize = 20_000_000;

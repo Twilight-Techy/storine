@@ -142,6 +142,62 @@ pub fn parse(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Statement>, usize)> 
     Ok((out, params.count))
 }
 
+/// T-SQL `UPDATE e SET ... FROM t AS e [JOIN ...]` / `DELETE e FROM t AS e ...`: the target is
+/// named by an alias (or repeated) in FROM. Rewrites it to `UPDATE t AS e ... FROM <rest>`,
+/// moving the ON condition of a join the target took part in into WHERE.
+fn tsql_target(
+    table: &mut String,
+    alias: &mut Option<String>,
+    from: &mut Vec<TableRef>,
+    where_: &mut Option<Expr>,
+) {
+    fn names(r: &TableRef, target: &str) -> bool {
+        matches!(r, TableRef::Named { name, alias, .. }
+            if alias.as_ref().map_or(name.as_str(), |a| a.name.as_str()).eq_ignore_ascii_case(target))
+    }
+    let target = alias.clone().unwrap_or_else(|| table.clone());
+    let and = |w: &mut Option<Expr>, e: Expr| {
+        *w = Some(match w.take() {
+            Some(x) => Expr::binary(BinaryOp::And, e, x),
+            None => e,
+        });
+    };
+    for k in 0..from.len() {
+        if names(&from[k], &target) {
+            if let TableRef::Named { name, alias: a, .. } = from.remove(k) {
+                *table = name;
+                *alias = a.map(|a| a.name).or(Some(target));
+            }
+            return;
+        }
+        // The target as one side of an inner join: keep the other side, AND the condition.
+        if let TableRef::Join {
+            left,
+            right,
+            kind: JoinKind::Inner | JoinKind::Cross,
+            constraint,
+        } = &from[k]
+        {
+            let (hit, other) = if names(left, &target) {
+                (left.as_ref().clone(), right.as_ref().clone())
+            } else if names(right, &target) {
+                (right.as_ref().clone(), left.as_ref().clone())
+            } else {
+                continue;
+            };
+            if let JoinConstraint::On(on) = constraint {
+                and(where_, on.clone());
+            }
+            if let TableRef::Named { name, alias: a, .. } = hit {
+                *table = name;
+                *alias = a.map(|a| a.name).or(Some(target));
+            }
+            from[k] = other;
+            return;
+        }
+    }
+}
+
 /// Keywords that begin a new T-SQL statement after one ends without `;`.
 const TSQL_STATEMENT_STARTS: &[&str] = &[
     "select",
@@ -439,6 +495,7 @@ impl Parser {
             "select" | "with" | "values" | "table" => Ok(Statement::Query(Box::new(self.query()?))),
             "" if self.is_op("(") => Ok(Statement::Query(Box::new(self.query()?))),
             "insert" | "replace" => self.insert(),
+            "merge" => self.merge(),
             "update" => self.update(),
             "delete" => self.delete(),
             "create" => self.create(),
@@ -807,19 +864,9 @@ impl Parser {
                 if let Some(on) = ["on", "off"].into_iter().find(|w| self.is_kw(w)) {
                     self.pos += 1;
                     if self.statement_end() {
-                        // Implicit transactions are autocommit turned off.
-                        return Ok(if name == "implicit_transactions" {
-                            Statement::Set {
-                                name: "autocommit".into(),
-                                value: Some(Expr::Str(
-                                    if on == "on" { "off" } else { "on" }.into(),
-                                )),
-                            }
-                        } else {
-                            Statement::Set {
-                                name,
-                                value: Some(Expr::Str(on.into())),
-                            }
+                        return Ok(Statement::Set {
+                            name,
+                            value: Some(Expr::Str(on.into())),
                         });
                     }
                 }
@@ -2125,7 +2172,96 @@ impl Parser {
         Ok(Self::wrap_output(Statement::Insert(Box::new(ins)), into))
     }
 
-    /// T-SQL `OUTPUT INSERTED.a, INSERTED.*` → select items.
+    fn merge(&mut self) -> SqlResult<Statement> {
+        self.pos += 1; // MERGE
+        let _ = self.eat_kw("top") && self.ident_or_numbers_paren().is_ok();
+        self.eat_kw("into");
+        let target = self.table_name()?;
+        let alias = if self.eat_kw("as") || (!self.is_kw("using") && !self.is_kw("with")) {
+            Some(self.ident()?)
+        } else {
+            None
+        };
+        if self.eat_kw("with") {
+            self.ident_or_numbers_paren()?; // table hints: WITH (HOLDLOCK)
+        }
+        self.expect_kw("using")?;
+        let source = self.table_factor()?;
+        self.expect_kw("on")?;
+        let on = self.expr()?;
+        let mut clauses = Vec::new();
+        while self.eat_kw("when") {
+            let when = if self.eat_kw("matched") {
+                MergeWhen::Matched
+            } else {
+                self.expect_kw("not")?;
+                self.expect_kw("matched")?;
+                if self.eat_kw("by") {
+                    if self.eat_kw("source") {
+                        MergeWhen::NotMatchedBySource
+                    } else {
+                        self.expect_kw("target")?;
+                        MergeWhen::NotMatchedByTarget
+                    }
+                } else {
+                    MergeWhen::NotMatchedByTarget
+                }
+            };
+            let cond = if self.eat_kw("and") {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            self.expect_kw("then")?;
+            let action = if self.eat_kw("update") {
+                self.expect_kw("set")?;
+                MergeAction::Update(self.assignments()?)
+            } else if self.eat_kw("delete") {
+                MergeAction::Delete
+            } else if self.eat_kw("insert") {
+                let columns = if self.is_op("(") {
+                    self.ident_list()?
+                } else {
+                    Vec::new()
+                };
+                if self.eat_kws(&["default", "values"]) {
+                    MergeAction::Insert {
+                        columns,
+                        values: None,
+                    }
+                } else {
+                    self.expect_kw("values")?;
+                    let mut rows = self.values_rows()?;
+                    MergeAction::Insert {
+                        columns,
+                        values: Some(rows.remove(0)),
+                    }
+                }
+            } else if self.eat_kw("do") {
+                self.expect_kw("nothing")?;
+                MergeAction::DoNothing
+            } else {
+                return Err(self.unexpected("UPDATE, DELETE or INSERT"));
+            };
+            clauses.push(MergeClause { when, cond, action });
+        }
+        let output = if self.eat_kw("output") || self.eat_kw("returning") {
+            self.select_items()?
+        } else {
+            Vec::new()
+        };
+        let m = Statement::Merge(Box::new(Merge {
+            target,
+            alias,
+            source,
+            on,
+            clauses,
+            output,
+        }));
+        let into = self.output_into()?;
+        Ok(Self::wrap_output(m, into))
+    }
+
     /// `OUTPUT ... INTO @table [(columns)]`.
     fn output_into(&mut self) -> SqlResult<Option<(String, Vec<String>)>> {
         if !self.eat_kw("into") {
@@ -2151,6 +2287,7 @@ impl Parser {
         }
     }
 
+    /// T-SQL `OUTPUT INSERTED.a, INSERTED.*` → select items.
     fn output_items(&mut self) -> SqlResult<Vec<SelectItem>> {
         let items = self.select_items()?;
         Ok(items
@@ -2255,6 +2392,9 @@ impl Parser {
         if self.eat_kw("returning") {
             up.returning = self.select_items()?;
         }
+        if self.dialect == Dialect::MsSql {
+            tsql_target(&mut up.table, &mut up.alias, &mut up.from, &mut up.where_);
+        }
         Ok(Self::wrap_output(Statement::Update(Box::new(up)), into))
     }
 
@@ -2279,7 +2419,7 @@ impl Parser {
             del.returning = self.output_items()?;
             into = self.output_into()?;
         }
-        if self.eat_kw("using") {
+        if self.eat_kw("using") || (self.dialect == Dialect::MsSql && self.eat_kw("from")) {
             del.using = self.table_list()?;
         }
         if self.eat_kw("where") {
@@ -2293,6 +2433,14 @@ impl Parser {
         }
         if self.eat_kw("returning") {
             del.returning = self.select_items()?;
+        }
+        if self.dialect == Dialect::MsSql {
+            tsql_target(
+                &mut del.table,
+                &mut del.alias,
+                &mut del.using,
+                &mut del.where_,
+            );
         }
         Ok(Self::wrap_output(Statement::Delete(Box::new(del)), into))
     }

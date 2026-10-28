@@ -1334,7 +1334,7 @@ pub fn finish_aggregate(
     separator: Option<String>,
 ) -> SqlResult<Datum> {
     Ok(match name {
-        "count" => Datum::Int(if star { count } else { values.len() as i64 }),
+        "count" | "count_big" => Datum::Int(if star { count } else { values.len() as i64 }),
         "sum" => {
             if values.is_empty() {
                 return Ok(Datum::Null);
@@ -2110,7 +2110,7 @@ pub fn return_type(
         }
     }
     Some(match name {
-        "count" => DataType::BigInt,
+        "count" | "count_big" => DataType::BigInt,
         "sum" => match arg_ty(0) {
             Some(DataType::Real | DataType::Double) => DataType::Double,
             _ => DataType::Numeric(None),

@@ -13,6 +13,7 @@ mod ddl;
 mod dml;
 mod eval;
 mod func;
+mod merge;
 pub mod mssql;
 mod regex;
 mod select;
@@ -1118,6 +1119,7 @@ impl Session {
                 Ok(Outcome::command("DECLARE"))
             }
             Statement::If { .. } => unreachable!("IF is dispatched by execute"),
+            Statement::Merge(m) => merge::merge(self, m, params),
             Statement::DeclareTable { name, columns } => {
                 self.table_vars.insert(
                     name.clone(),
@@ -1347,6 +1349,18 @@ impl Session {
             "transaction_isolation" | "tx_isolation" => "transaction_isolation",
             other => other,
         };
+        if key == "implicit_transactions" {
+            // T-SQL: implicit transactions are autocommit turned off, but switching never
+            // commits or opens a transaction by itself (the next statement opens one).
+            let off = if text.eq_ignore_ascii_case("on") {
+                "0"
+            } else {
+                "1"
+            };
+            self.vars.insert("autocommit".into(), off.into());
+            self.vars.insert(key.into(), text);
+            return Ok(Outcome::command("SET"));
+        }
         if key == "autocommit"
             && ["0", "off", "false"]
                 .iter()

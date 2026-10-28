@@ -63,6 +63,7 @@ impl<'e> Env<'e> {
 }
 
 const AGGREGATES: &[&str] = &[
+    "count_big",
     "count",
     "sum",
     "avg",

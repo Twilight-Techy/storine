@@ -234,7 +234,13 @@ func gormSuite(t *testing.T, dial gorm.Dialector) {
 	}
 	// Upsert.
 	up := Product{Code: "P1", Price: decimal.RequireFromString("1.00"), Created: time.Now().UTC()}
-	if err := db.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "code"}}, DoUpdates: clause.AssignmentColumns([]string{"price"})}).Create(&up).Error; err != nil {
+	conflict := clause.OnConflict{Columns: []clause.Column{{Name: "code"}}, DoUpdates: clause.AssignmentColumns([]string{"price"})}
+	if db.Dialector.Name() == "sqlserver" {
+		// GORM's SQL Server driver upserts by primary key (a MERGE).
+		up.ID = p.ID
+		conflict.Columns = []clause.Column{{Name: "id"}}
+	}
+	if err := db.Clauses(conflict).Create(&up).Error; err != nil {
 		t.Fatal(err)
 	}
 	db.First(&got, "code = ?", "P1")
