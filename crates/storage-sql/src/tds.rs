@@ -27,6 +27,8 @@ use crate::parser::parse;
 #[derive(Debug)]
 pub struct Auth {
     pub users: HashMap<String, String>,
+    /// Accept OpenID Connect access tokens from this issuer.
+    pub oidc: Option<Arc<crate::oidc::Oidc>>,
     pub tls: Option<Arc<crate::tls::TlsConfig>>,
     pub require_tls: bool,
 }
@@ -66,6 +68,7 @@ const TK_COLMETADATA: u8 = 0x81;
 const TK_ERROR: u8 = 0xaa;
 const TK_RETURNVALUE: u8 = 0xac;
 const TK_LOGINACK: u8 = 0xad;
+const TK_FEATUREEXTACK: u8 = 0xae;
 const TK_ROW: u8 = 0xd1;
 const TK_ENVCHANGE: u8 = 0xe3;
 const TK_DONE: u8 = 0xfd;
@@ -715,21 +718,6 @@ impl Conn {
                 return c.send(PT_REPLY, &t.b);
             }
         };
-        if let Some(kind) = l.other_auth {
-            // Refuse clearly, in both modes: the client would otherwise wait for an
-            // authentication exchange that never comes.
-            let mut t = Tokens::default();
-            let e = SqlError::new(
-                "28000",
-                format!(
-                    "Login failed: {kind} authentication is not supported by Storine SQL; \
-                     use SQL Server authentication (User ID and Password in the connection string)."
-                ),
-            );
-            c.error_token(&mut t, &e, 1);
-            c.done(&mut t, TK_DONE, DONE_ERROR, 0, 0);
-            return c.send(PT_REPLY, &t.b);
-        }
         // TDS 8 (0x08000000) is TDS 7.4 inside TLS.
         c.version = if l.version == 0x0800_0000 {
             TDS74
@@ -737,24 +725,72 @@ impl Conn {
             l.version.min(TDS74)
         };
         c.packet_size = l.packet_size.clamp(512, 32_767);
-        if !auth.users.is_empty() {
-            let ok = auth
-                .users
-                .get(&l.user)
-                .is_some_and(|pw| crate::hash::ct_eq(pw.as_bytes(), l.password.as_bytes()));
-            if !ok {
-                let mut t = Tokens::default();
-                let e = SqlError::new("28000", format!("Login failed for user '{}'.", l.user));
-                c.error_token(&mut t, &e, 1);
-                c.done(&mut t, TK_DONE, DONE_ERROR, 0, 0);
-                return c.send(PT_REPLY, &t.b);
+        let refuse = |c: &mut Conn, message: String| {
+            if crate::log_enabled() {
+                eprintln!("[tds {}] login refused: {message}", c.session.id);
             }
-        }
-        c.session.user = if l.user.is_empty() {
-            "sa".into()
-        } else {
-            l.user.clone()
+            let mut t = Tokens::default();
+            c.error_token(&mut t, &SqlError::new("28000", message), 1);
+            c.done(&mut t, TK_DONE, DONE_ERROR, 0, 0);
+            c.send(PT_REPLY, &t.b)
         };
+        let mut fedauth_ack = false;
+        let user = if let Some(f) = &l.fedauth {
+            match (&auth.oidc, f.library) {
+                (Some(oidc), 0x01) => match oidc.verify(&f.token) {
+                    Ok(user) => {
+                        fedauth_ack = true;
+                        user
+                    }
+                    Err(why) => {
+                        return refuse(
+                            &mut c,
+                            format!("Login failed: the access token was rejected: {why}."),
+                        )
+                    }
+                },
+                (Some(_), _) => {
+                    return refuse(
+                        &mut c,
+                        "Login failed: only access tokens the client already holds are accepted \
+                         (pass the token as the connection's access token); sign-in workflows that \
+                         ask the server where to authenticate are not supported."
+                            .into(),
+                    )
+                }
+                (None, _) => return refuse(
+                    &mut c,
+                    "Login failed: access-token (OpenID Connect) authentication is not enabled \
+                         on this server; start storine-sql with --oidc-issuer, --oidc-audience and \
+                         --oidc-jwks, or use SQL Server authentication (User ID and Password)."
+                        .into(),
+                ),
+            }
+        } else if l.integrated.is_some() {
+            return refuse(
+                &mut c,
+                "Login failed: integrated (Windows / Kerberos / NTLM) authentication is not \
+                 supported by Storine SQL; use SQL Server authentication (User ID and Password in \
+                 the connection string)."
+                    .into(),
+            );
+        } else {
+            if !auth.users.is_empty() {
+                let ok = auth
+                    .users
+                    .get(&l.user)
+                    .is_some_and(|pw| crate::hash::ct_eq(pw.as_bytes(), l.password.as_bytes()));
+                if !ok {
+                    return refuse(&mut c, format!("Login failed for user '{}'.", l.user));
+                }
+            }
+            if l.user.is_empty() {
+                "sa".into()
+            } else {
+                l.user.clone()
+            }
+        };
+        c.session.user = user;
         let mut t = Tokens::default();
         if !l.database.is_empty() {
             if let Err(e) = c.session.use_database(&l.database) {
@@ -775,6 +811,13 @@ impl Conn {
             .b_varchar("Microsoft SQL Server")
             .bytes(&[16, 0, 0x03, 0xe8]);
         t.with_len(TK_LOGINACK, &ack);
+        if fedauth_ack {
+            // FEATUREEXTACK: FEDAUTH acknowledged (no nonce was offered, so no data).
+            t.u8(TK_FEATUREEXTACK)
+                .u8(0x02)
+                .bytes(&0u32.to_le_bytes())
+                .u8(0xff);
+        }
         let ps = c.packet_size.to_string();
         c.env_change(&mut t, 4, &ps, "4096");
         c.done(&mut t, TK_DONE, 0, 0, 0);
@@ -1407,9 +1450,16 @@ struct Login {
     user: String,
     password: String,
     database: String,
-    /// The client asked for a login method other than SQL Server authentication:
-    /// integrated (SSPI: Kerberos / NTLM) or federated (access token).
-    other_auth: Option<&'static str>,
+    /// Integrated security (SSPI) was requested, with this first security token.
+    integrated: Option<Vec<u8>>,
+    /// Federated authentication (FEDAUTH feature extension) was requested.
+    fedauth: Option<FedAuth>,
+}
+
+struct FedAuth {
+    /// 0x01: the client already holds an access token; 0x02: the MSAL / ADAL workflow.
+    library: u8,
+    token: String,
 }
 
 fn parse_login7(b: &[u8]) -> Result<Login, SqlError> {
@@ -1426,25 +1476,26 @@ fn parse_login7(b: &[u8]) -> Result<Login, SqlError> {
     let version = u32::from_be_bytes(u32_at(4).to_le_bytes());
     // OptionFlags2 bit 0x80: integrated security (an SSPI blob follows at ibSSPI / cbSSPI).
     let integrated = b[25] & 0x80 != 0 || u16_at(80) > 0;
+    let sspi = b
+        .get(u16_at(78)..u16_at(78) + u16_at(80))
+        .unwrap_or(&[])
+        .to_vec();
     // OptionFlags3 bit 0x10: a FeatureExt block, which may request FEDAUTH (feature 0x02).
-    let fedauth = b[27] & 0x10 != 0
-        && b.get(u16_at(56)..u16_at(56) + 4)
-            .map(|o| u32::from_le_bytes([o[0], o[1], o[2], o[3]]) as usize)
-            .is_some_and(|mut at| {
-                while let Some(&id) = b.get(at) {
-                    if id == 0xff {
-                        return false;
-                    }
-                    if id == 0x02 {
-                        return true;
-                    }
-                    let Some(len) = b.get(at + 1..at + 5) else {
-                        return false;
-                    };
-                    at += 5 + u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
-                }
-                false
-            });
+    let mut fedauth = None;
+    if b[27] & 0x10 != 0 {
+        let mut at = b.get(u16_at(56)..u16_at(56) + 4).map_or(usize::MAX, |o| {
+            u32::from_le_bytes([o[0], o[1], o[2], o[3]]) as usize
+        });
+        while let Some(&id) = b.get(at).filter(|&&id| id != 0xff) {
+            let len = b.get(at + 1..at + 5).ok_or_else(bad)?;
+            let len = u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
+            let data = b.get(at + 5..at + 5 + len).ok_or_else(bad)?;
+            if id == 0x02 {
+                fedauth = Some(parse_fedauth(data).ok_or_else(bad)?);
+            }
+            at += 5 + len;
+        }
+    }
     let user = from_utf16(field(40)?);
     let password: Vec<u8> = field(44)?
         .iter()
@@ -1460,13 +1511,26 @@ fn parse_login7(b: &[u8]) -> Result<Login, SqlError> {
         user,
         password: from_utf16(&password),
         database: from_utf16(field(68)?),
-        other_auth: if integrated {
-            Some("integrated (Windows / Kerberos / NTLM)")
-        } else if fedauth {
-            Some("access-token (federated)")
-        } else {
-            None
-        },
+        integrated: integrated.then_some(sspi),
+        fedauth,
+    })
+}
+
+/// FEDAUTH feature data (MS-TDS 2.2.6.4): options byte (library << 1 | echo), then for the
+/// security-token library a length-prefixed UTF-16LE token and an optional 32-byte nonce.
+fn parse_fedauth(d: &[u8]) -> Option<FedAuth> {
+    let options = *d.first()?;
+    let library = options >> 1;
+    if library != 0x01 {
+        return Some(FedAuth {
+            library,
+            token: String::new(),
+        });
+    }
+    let len = u32::from_le_bytes(d.get(1..5)?.try_into().ok()?) as usize;
+    Some(FedAuth {
+        library,
+        token: from_utf16(d.get(5..5 + len)?),
     })
 }
 

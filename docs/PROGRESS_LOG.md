@@ -498,3 +498,19 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Same API, adapted to each language** (`RULE-DX-*`): Ruby follows Python's keyword style (`Storine.add("balance", amount, min: 0)`, `if_version:`, `& | ~` filters, block transactions, Enumerator scans); PHP follows Java's static factories (`Filter::and(...)`, `FieldOp::add(...)->min(0)`, `updateIfVersion`, `requireExists`), with PHP 8 named arguments for options.
 - **Money**: neither language has a decimal type that keeps a scale (Ruby's `BigDecimal` turns `1234.50` into `1234.5`; PHP has none, and its integers are 64-bit), so each SDK has its own exact `Decimal` (128-bit mantissa, scale up to 38) with exact add / sub / mul and comparisons; PHP's 128-bit conversions are done in pure PHP (`BigInt`), with no extension required.
 - **Verification**: both pass every value, document, request and response vector byte for byte (Ruby 196 assertions, PHP 199), reject every truncation of a hostile value, and pass the shared end-to-end suite against a real server: CRUD and types, 800 concurrent exact deposits (Ruby threads, PHP forked processes), atomic transactions, queries and indexes, TTL, and the 3-node cluster with the leader killed (every deposit applied exactly once).
+
+### Stage 26 (continued): SQL Server logins beyond passwords (`TASK-119`) — 2026-10-28
+
+- **Why**: drivers offer two other login methods: integrated security (Kerberos) and access tokens. Both must work without tying a deployment to one cloud or to Windows. Access tokens are therefore accepted from any OpenID Connect issuer, and Kerberos (`TASK-120`) from any realm.
+- **Access tokens (`TASK-119`)**:
+  - LOGIN7's FEDAUTH feature extension carries the token (UTF-16LE).
+  - `oidc.rs` verifies it as a JWT: the header's `alg` must be RS256 / RS384 / RS512 or EdDSA (never `none` or HMAC), and must match the key's `kty` and `alg`. Keys are selected by `kid` from the issuer's JWKS file, which is re-read when its modification time changes.
+  - The claims checked are `iss`, `aud`, and `exp` / `nbf` with 60 s of leeway. `crit` headers are refused.
+  - The server replies with FEATUREEXTACK, which SqlClient requires before it accepts the login.
+  - RSA verification (`rsa.rs`) is in-house, to keep the zero-dependency rule: a limb big-integer type (schoolbook multiply, binary long division, square-and-multiply) and an EMSA-PKCS1-v1_5 comparison, with moduli of at least 2048 bits. It is checked against the RFC 7515 A.2 RS256 example.
+  - SHA-384 was added to `storage-codec`'s SHA-512 (FIPS 180-4 vector).
+- **Finding**: SqlClient's earlier early failure with an access token was its certificate check (`TrustServerCertificate` was not set), not a missing PRELOGIN option. With the certificate trusted, its LOGIN7 carries FEDAUTH as expected.
+- **Verification**:
+  - Unit tests cover RFC 7515 and EdDSA tokens: expired, not yet valid, foreign issuer, wrong audience, another key, a tampered payload, `alg: none`, an unknown `kid`, and JWKS rotation.
+  - `run_all.sh` starts a private storine-sql trusting a test issuer (`tests/clients/oidc/`). SqlClient (`AccessToken`), mssql-jdbc (`accessToken`), go-mssqldb (`NewAccessTokenConnector`) and tedious (`azure-active-directory-access-token`) each sign tokens with their platform's own crypto. They log in as the token's user, and are refused for a wrong audience, a foreign issuer, an expired token or a forged signature.
+  - A server without `--oidc-*` explains how to enable token logins.

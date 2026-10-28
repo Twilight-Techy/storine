@@ -12,7 +12,7 @@
 mod ddl;
 mod dml;
 mod eval;
-mod func;
+pub(crate) mod func;
 mod merge;
 pub mod mssql;
 mod regex;

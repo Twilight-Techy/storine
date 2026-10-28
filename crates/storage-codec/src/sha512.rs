@@ -1,4 +1,4 @@
-//! SHA-512 (FIPS 180-4), for Ed25519.
+//! SHA-512 and SHA-384 (FIPS 180-4), for Ed25519 and RSA signature checks.
 
 const K: [u64; 80] = [
     0x428a2f98d728ae22,
@@ -114,9 +114,28 @@ impl Default for Sha512 {
     }
 }
 
+const H0_384: [u64; 8] = [
+    0xcbbb9d5dc1059ed8,
+    0x629a292a367cd507,
+    0x9159015a3070dd17,
+    0x152fecd8f70e5939,
+    0x67332667ffc00b31,
+    0x8eb44a8768581511,
+    0xdb0c2e0d64f98fa7,
+    0x47b5481dbefa4fa4,
+];
+
 impl Sha512 {
     pub fn new() -> Sha512 {
         Sha512::default()
+    }
+
+    /// SHA-384: SHA-512 with its own initial state; keep the first 48 bytes of `finish`.
+    pub fn new_384() -> Sha512 {
+        Sha512 {
+            h: H0_384,
+            ..Sha512::default()
+        }
     }
 
     pub fn update(&mut self, mut data: &[u8]) -> &mut Self {
@@ -170,6 +189,16 @@ pub fn sha512(parts: &[&[u8]]) -> [u8; 64] {
         h.update(p);
     }
     h.finish()
+}
+
+/// SHA-384 of `data`.
+pub fn sha384(data: &[u8]) -> [u8; 48] {
+    let mut h = Sha512::new_384();
+    h.update(data);
+    let full = h.finish();
+    let mut out = [0u8; 48];
+    out.copy_from_slice(&full[..48]);
+    out
 }
 
 fn compress(h: &mut [u64; 8], block: &[u8; 128]) {
@@ -233,6 +262,10 @@ mod tests {
         assert_eq!(
             hex(&sha512(&[two_block])),
             "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909"
+        );
+        assert_eq!(
+            hex(&sha384(b"abc")),
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"
         );
         // Incremental updates of every split give the same digest.
         let data: Vec<u8> = (0..300u32).map(|i| (i * 7) as u8).collect();

@@ -9,7 +9,8 @@
 #                   (and pymssql for the SQL Server suite)
 #   NODE_PATH       node_modules with pg, mysql2, sequelize, knex (and prisma@6, @prisma/client@6,
 #                   typeorm, tedious, mssql)
-#   STORINE_SQL_BIN storine-sql binary for the private Prisma instance (default: target/release)
+#   STORINE_SQL_BIN storine-sql binary for the private Prisma and login-method instances
+#                   (default: target/release)
 #   STORINE_DATA    the server's --data directory (its TLS certificate is then verified)
 #   ELOQUENT_AUTOLOAD  vendor/autoload.php of `composer require illuminate/database:^11`
 #   GEM_HOME/GEM_PATH  with activerecord, pg, trilogy (GEM_PATH also listing the default gems)
@@ -23,6 +24,20 @@ PYTHON=${PYTHON:-python3}
 # The server's certificate, for the suites that verify it (storine-sql --data DIR keeps it in DIR/tls).
 [ -n "${STORINE_DATA:-}" ] && [ -f "$STORINE_DATA/tls/server.crt" ] && export STORINE_TLS_CERT="$STORINE_DATA/tls/server.crt"
 failed=()
+BIN=${STORINE_SQL_BIN:-../../../../target/release/storine-sql}
+
+# Login methods beyond passwords get a private storine-sql: OpenID Connect access tokens from
+# a test issuer whose signing key is oidc/test-key.pem.
+if [ -x "$BIN" ]; then
+  authdir=$(mktemp -d)
+  "$BIN" --data "$authdir" --no-pg --no-mysql --mssql 127.0.0.1:51633 --user sa:x \
+    --oidc-issuer https://id.storine.test/realms/test --oidc-audience storine \
+    --oidc-jwks "$PWD/oidc/jwks.json" >"$authdir.log" 2>&1 &
+  authpid=$!
+  trap 'kill $authpid 2>/dev/null; rm -rf "$authdir" "$authdir.log"' EXIT
+  for _ in $(seq 50); do (echo >/dev/tcp/127.0.0.1/51633) 2>/dev/null && break; sleep 0.2; done
+  export STORINE_MSSQL_AUTH=127.0.0.1:51633 STORINE_OIDC_KEY="$PWD/oidc/test-key.pem"
+fi
 
 run() {
   local name=$1; shift
@@ -58,7 +73,6 @@ if have php && [ -n "${ELOQUENT_AUTOLOAD:-}" ]; then run eloquent php php/test_e
 have ruby && run activerecord ruby ruby/test_activerecord.rb "$PG" "$MY"
 
 # Prisma's `db push` owns the whole database, so it gets a private, empty storine-sql.
-BIN=${STORINE_SQL_BIN:-../../../../target/release/storine-sql}
 if have node && [ -x "$BIN" ] && node -e 'require.resolve("prisma/package.json")' 2>/dev/null; then
   dir=$(mktemp -d)
   "$BIN" --data "$dir" --pg 127.0.0.1:55532 --mysql 127.0.0.1:53406 --mssql 127.0.0.1:51533 >"$dir.log" 2>&1 &

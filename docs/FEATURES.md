@@ -187,6 +187,7 @@
 | **F-SQL-03** | **Catalog Emulation** | `pg_catalog`, `information_schema`, `SHOW`, `sys.*` and the `sp_*` metadata procedures, faithful enough for ORM migrations and introspection (Django, Rails, Prisma, EF Core, Hibernate, TypeORM, ...). | v1.2 |
 | **F-SQL-04** | **Money-Safe Transactions** | Versioned writes (no lost updates), REPEATABLE READ / SERIALIZABLE read validation, row locks, constraints enforced by atomic preconditions (race-free foreign keys), exact decimals on every wire format. | v1.2 |
 | **F-SQL-05** | **Zero-Dependency TLS** | TLS 1.3 and 1.2 (ChaCha20-Poly1305, x25519, Ed25519) on all three endpoints, including every SQL Server encryption mode and TDS 8 strict. | v1.2 |
+| **F-SQL-07** | **Platform-Neutral SQL Server Logins** | SQL Server authentication plus OpenID Connect access tokens from any issuer (JWKS, RS256/384/512, EdDSA) and Kerberos from any realm (keytab), without tying deployments to a cloud or to Windows. | v1.2 |
 | **F-SQL-06** | **Real-Client Compatibility Matrix** | `tests/clients/run_all.sh`: 14 suites over Python, Node, Go, Java, .NET, PHP and Ruby drivers and ORMs. | v1.2 |
 
 ---

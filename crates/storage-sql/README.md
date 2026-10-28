@@ -58,6 +58,36 @@ Connector/J, mssql-jdbc), .NET (Npgsql, MySqlConnector, Microsoft.Data.SqlClient
 restricted to AES cipher suites or to RSA/ECDSA certificates (some FIPS configurations)
 cannot connect.
 
+## SQL Server: access-token (OpenID Connect) logins
+
+Besides user name and password, SQL Server clients can log in with an **access token from any
+OpenID Connect provider** (Keycloak, Dex, Authentik, Zitadel, Auth0, Okta, Entra ID, ...) —
+what the drivers call an access token (`SqlConnection.AccessToken`, mssql-jdbc's
+`accessToken`, go-mssqldb's `NewAccessTokenConnector`, tedious'
+`azure-active-directory-access-token`; the names are historical, nothing is tied to a cloud).
+Tell `storine-sql` which issuer to trust:
+
+```text
+storine-sql --data /var/lib/storine-sql \
+  --oidc-issuer https://id.example.com/realms/main \
+  --oidc-audience storine \
+  --oidc-jwks /etc/storine/jwks.json
+```
+
+- `--oidc-jwks` is the issuer's key set, the document at its `jwks_uri` (for Keycloak,
+  `<issuer>/protocol/openid-connect/certs`): `curl -o /etc/storine/jwks.json <jwks_uri>`. The
+  file is re-read whenever it changes, so key rotation is a periodic `curl`.
+- A token is accepted when its signature verifies (RS256, RS384, RS512 or EdDSA; `none` and
+  HMAC are refused), `iss` is the issuer, `aud` includes an `--oidc-audience` (repeatable), and
+  `exp` / `nbf` hold (60 s clock-skew allowance).
+- The session user (`SUSER_NAME()`, `CURRENT_USER`) is the token's `preferred_username`, else
+  `upn`, `email`, `sub`; `--oidc-user-claim NAME` (repeatable) picks other claims.
+- A rejected token fails the login with the reason (`token has expired`, `token audience ...`).
+  Workflows where the driver asks the server where to sign in
+  (`Authentication=ActiveDirectoryPassword` and similar) are not supported; acquire the token in
+  the application and pass it.
+- Use TLS (`Encrypt=true`, the default for these drivers), since the token is a bearer
+  credential.
 ## Tested clients
 
 Every suite below runs against a real `storine-sql` (`tests/clients/run_all.sh`):
@@ -156,6 +186,7 @@ commit fail instead of being overwritten. **No lost updates.**
   `INSERT` cannot leave an orphan.
 - `numeric` / `decimal` values are exact decimals end to end, including both binary wire formats.
 
+
 ## Databases
 
 `CREATE DATABASE` makes a separate namespace: its own tables, sequences, constraints and
@@ -168,10 +199,9 @@ what Django's and Rails' test databases and Prisma's shadow databases rely on.
 
 - **TLS**: TLS 1.3 and 1.2, ChaCha20-Poly1305 only, Ed25519 certificates only (see above). No
   client-certificate authentication.
-- **SQL Server**: SQL authentication only. Integrated (Windows / Kerberos / NTLM) and access-token
-  logins are refused with an error saying to use SQL authentication; Kerberos (any realm: MIT,
-  Heimdal, FreeIPA, Samba AD, Active Directory) and generic OpenID Connect tokens are the planned,
-  platform-neutral additions. One schema
+- **SQL Server**: SQL authentication and OpenID Connect access tokens. Integrated (Windows /
+  Kerberos / NTLM) logins are refused with an error saying so; Kerberos (any realm: MIT,
+  Heimdal, FreeIPA, Samba AD, Active Directory) is the planned, platform-neutral addition. One schema
   (`dbo`), no MARS (one active result per connection, as with `MultipleActiveResultSets=false`),
   no stored procedures of your own, cursors or temporary `#tables`; a statement error leaves the
   transaction open (`XACT_ABORT OFF`), as SQL Server does.

@@ -27,6 +27,31 @@ function tediousConnect(encrypt = false, extra = {}) {
   });
 }
 
+const ISSUER = "https://id.storine.test/realms/test";
+
+// A JWT signed with the test issuer's key (tests/clients/oidc/test-key.pem), as an OpenID
+// Connect provider would issue it.
+function mintToken(keyFile, claims) {
+  const crypto = require("crypto");
+  const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+  const body = { iss: ISSUER, aud: "storine", exp: Math.floor(Date.now() / 1000) + 300, sub: "u-1", ...claims };
+  const signed = `${b64({ alg: "RS256", kid: "storine-test", typ: "JWT" })}.${b64(body)}`;
+  return `${signed}.${crypto.sign("sha256", Buffer.from(signed), require("fs").readFileSync(keyFile)).toString("base64url")}`;
+}
+
+function tediousToken(port, token) {
+  const { Connection } = require("tedious");
+  return new Promise((resolve, reject) => {
+    const c = new Connection({
+      server: "127.0.0.1",
+      authentication: { type: "azure-active-directory-access-token", options: { token } },
+      options: { port, database: "shop", encrypt: true, trustServerCertificate: true, rowCollectionOnRequestCompletion: true },
+    });
+    c.on("connect", (err) => (err ? reject(err) : resolve(c)));
+    c.connect();
+  });
+}
+
 function exec(c, sql, params = []) {
   const { Request } = require("tedious");
   return new Promise((resolve, reject) => {
@@ -213,6 +238,23 @@ async function main() {
     const page = await wallets.find({ order: { id: "ASC" }, skip: 1, take: 1 });
     assert.deepStrictEqual(page.map((w) => w.owner), ["bob"]);
     await ds.destroy();
+  });
+
+  await section("tedious: OpenID Connect access-token logins", async () => {
+    // The main server has no issuer configured: the login is refused with an explanation.
+    await assert.rejects(tediousToken(PORT, "a.b.c"), /not enabled/);
+    const auth = process.env.STORINE_MSSQL_AUTH; // a storine-sql started with --oidc-* (run_all.sh)
+    if (!auth) return console.log("    (STORINE_MSSQL_AUTH not set: token logins skipped)");
+    const [port, key] = [Number(auth.split(":").pop()), process.env.STORINE_OIDC_KEY];
+    const c = await tediousToken(port, mintToken(key, { preferred_username: "ann" }));
+    const r = await exec(c, "SELECT SUSER_NAME(), CURRENT_USER");
+    assert.deepStrictEqual(r.rows, [["ann", "ann"]]);
+    c.close();
+    await assert.rejects(tediousToken(port, mintToken(key, { aud: "elsewhere" })), /audience/);
+    await assert.rejects(tediousToken(port, mintToken(key, { exp: Math.floor(Date.now() / 1000) - 3600 })), /expired/);
+    const forged = mintToken(key, {}).split(".");
+    forged[1] = Buffer.from(JSON.stringify({ iss: ISSUER, aud: "storine", exp: 9e9, sub: "root" })).toString("base64url");
+    await assert.rejects(tediousToken(port, forged.join(".")), /signature/);
   });
 
   console.log("all Node SQL Server client tests passed");

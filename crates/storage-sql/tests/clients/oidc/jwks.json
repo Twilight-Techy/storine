@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "use": "sig",
+      "alg": "RS256",
+      "kid": "storine-test",
+      "n": "wjShog6HiQbfzV4FV02ME9Ozl5PAeq2lMldC1uCqA2GIJCnDu_LbZcobHZftjXGyQbmCGhQe3Ss-qlXGShblJ3iJHExUqwaRH8yH_Qz-fUeV9BAsE_opbQ05c8n145tIdlbEF3eSCu8TxgHlVu5I2klauyNyT2-Dsej77FTQRgNKSglX5Igi41tOgC6laB8Q8u8DmbTJPJvvqDmumXx2py_3v8iXIZU0KcbXgxVxTblnQtwpu5G20kjDoD518VSOzNwhCCVTyBbZxoxi8EysTxvGcw2b8M9H30-7-pH0LhlK_1Ozf7f8QZeHd1QWZyMBLSRcG1Aa44Z_-QFuCIzH2w",
+      "e": "AQAB"
+    }
+  ]
+}

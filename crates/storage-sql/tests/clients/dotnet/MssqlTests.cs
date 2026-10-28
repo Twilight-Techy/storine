@@ -82,18 +82,53 @@ public class MssqlTests
         Assert.Equal(2627, dup.Number);
     }
 
-    // Token (federated) authentication is refused promptly, not left hanging. (SqlClient gives
-    // up before sending its login, so the server's explanatory message is not shown yet.)
-    [Fact]
-    public async Task AccessTokenIsRefusedPromptly()
+    // A JWT signed with the test issuer's key (tests/clients/oidc/test-key.pem), as an OpenID
+    // Connect provider would issue it.
+    static string MintToken(string keyFile, string extraClaims = "")
     {
-        await using var c = new SqlConnection($"Server=tcp:{Ms.Replace(':', ',')};Database=shop;Encrypt=Optional;Connect Timeout=10")
+        static string B64(byte[] b) => Convert.ToBase64String(b).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        var exp = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + 300;
+        var head = B64(System.Text.Encoding.UTF8.GetBytes("{\"alg\":\"RS256\",\"kid\":\"storine-test\",\"typ\":\"JWT\"}"));
+        var body = B64(System.Text.Encoding.UTF8.GetBytes(
+            $"{{\"iss\":\"https://id.storine.test/realms/test\",\"aud\":\"storine\",\"exp\":{exp},\"sub\":\"u-1\"{extraClaims}}}"));
+        using var rsa = System.Security.Cryptography.RSA.Create();
+        rsa.ImportFromPem(File.ReadAllText(keyFile));
+        var sig = rsa.SignData(System.Text.Encoding.ASCII.GetBytes($"{head}.{body}"),
+            System.Security.Cryptography.HashAlgorithmName.SHA256, System.Security.Cryptography.RSASignaturePadding.Pkcs1);
+        return $"{head}.{body}.{B64(sig)}";
+    }
+
+    static SqlConnection TokenConn(string server, string token) =>
+        new($"Server=tcp:{server.Replace(':', ',')};Database=shop;Encrypt=Optional;TrustServerCertificate=true;Connect Timeout=10")
         {
-            AccessToken = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0.",
+            AccessToken = token,
         };
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        await Assert.ThrowsAsync<SqlException>(() => c.OpenAsync());
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(8), $"took {sw.Elapsed}");
+
+    // OpenID Connect access tokens (SqlConnection.AccessToken). The main server has no issuer
+    // configured and says so; STORINE_MSSQL_AUTH names one started with --oidc-* (run_all.sh).
+    [Fact]
+    public async Task AccessTokenLogins()
+    {
+        await using (var off = TokenConn(Ms, "a.b.c"))
+        {
+            var e = await Assert.ThrowsAsync<SqlException>(() => off.OpenAsync());
+            Assert.Contains("not enabled", e.Message);
+        }
+        var auth = Environment.GetEnvironmentVariable("STORINE_MSSQL_AUTH");
+        var key = Environment.GetEnvironmentVariable("STORINE_OIDC_KEY");
+        if (auth == null || key == null) return;
+        await using (var c = TokenConn(auth, MintToken(key, ",\"preferred_username\":\"ann\"")))
+        {
+            await c.OpenAsync();
+            await using var q = new SqlCommand("SELECT SUSER_NAME()", c);
+            Assert.Equal("ann", await q.ExecuteScalarAsync());
+        }
+        SqlConnection.ClearAllPools();
+        await using (var c = TokenConn(auth, MintToken(key, ",\"aud\":\"elsewhere\"")))
+        {
+            var e = await Assert.ThrowsAsync<SqlException>(() => c.OpenAsync());
+            Assert.Contains("audience", e.Message);
+        }
     }
 
     [Fact]

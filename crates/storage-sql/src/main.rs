@@ -7,6 +7,8 @@
 //!             [--no-pg] [--no-mysql] [--no-mssql]
 //!             [--user name:password]... [--database name]
 //!             [--tls-cert chain.pem --tls-key key.pem | --no-tls] [--require-tls]
+//!             [--oidc-issuer URL --oidc-audience AUD... --oidc-jwks jwks.json
+//!              [--oidc-user-claim CLAIM]...]
 //! ```
 //!
 //! TLS is on by default: with `--data`, a self-signed Ed25519 certificate is created once in
@@ -23,7 +25,7 @@ use std::time::Duration;
 use storage_sql::exec::{Engine, EngineConfig};
 use storage_sql::store::Store;
 
-const USAGE: &str = "usage: storine-sql (--data DIR | --storine URL) [--pg ADDR] [--mysql ADDR] [--mssql ADDR] [--no-pg] [--no-mysql] [--no-mssql] [--user NAME:PASSWORD]... [--database NAME] [--tls-cert FILE --tls-key FILE | --no-tls] [--require-tls]";
+const USAGE: &str = "usage: storine-sql (--data DIR | --storine URL) [--pg ADDR] [--mysql ADDR] [--mssql ADDR] [--no-pg] [--no-mysql] [--no-mssql] [--user NAME:PASSWORD]... [--database NAME] [--tls-cert FILE --tls-key FILE | --no-tls] [--require-tls] [--oidc-issuer URL --oidc-audience AUD --oidc-jwks FILE [--oidc-user-claim CLAIM]]";
 
 fn main() -> ExitCode {
     match run() {
@@ -44,6 +46,8 @@ fn run() -> Result<(), String> {
     let mut mssql = Some("127.0.0.1:1433".to_owned());
     let mut users = HashMap::new();
     let mut config = EngineConfig::default();
+    let (mut oidc_issuer, mut oidc_audiences, mut oidc_jwks, mut oidc_claims) =
+        (None::<String>, Vec::new(), None::<PathBuf>, Vec::new());
     let (mut tls_cert, mut tls_key, mut no_tls, mut require_tls) =
         (None::<PathBuf>, None::<PathBuf>, false, false);
     while let Some(a) = args.next() {
@@ -65,6 +69,10 @@ fn run() -> Result<(), String> {
             "--tls-key" => tls_key = Some(PathBuf::from(value("--tls-key")?)),
             "--no-tls" => no_tls = true,
             "--require-tls" => require_tls = true,
+            "--oidc-issuer" => oidc_issuer = Some(value("--oidc-issuer")?),
+            "--oidc-audience" => oidc_audiences.push(value("--oidc-audience")?),
+            "--oidc-jwks" => oidc_jwks = Some(PathBuf::from(value("--oidc-jwks")?)),
+            "--oidc-user-claim" => oidc_claims.push(value("--oidc-user-claim")?),
             "--user" => {
                 let v = value("--user")?;
                 let (u, p) = v.split_once(':').ok_or("--user takes NAME:PASSWORD")?;
@@ -117,6 +125,16 @@ fn run() -> Result<(), String> {
         _ => return Err("--tls-cert and --tls-key go together".into()),
     }
     .map(Arc::new);
+    let oidc = match (oidc_issuer, oidc_jwks) {
+        (None, None) if oidc_audiences.is_empty() && oidc_claims.is_empty() => None,
+        (Some(issuer), Some(jwks)) => Some(Arc::new(storage_sql::oidc::Oidc::new(
+            issuer,
+            oidc_audiences,
+            jwks,
+            oidc_claims,
+        )?)),
+        _ => return Err("--oidc-issuer, --oidc-audience and --oidc-jwks go together".into()),
+    };
     let (engine, _embedded) = match (data, url) {
         (Some(dir), None) => {
             let e = storage_sql::embedded::start(&dir, config).map_err(|e| e.to_string())?;
@@ -169,6 +187,7 @@ fn run() -> Result<(), String> {
             Arc::clone(&engine),
             Arc::new(storage_sql::tds::Auth {
                 users: users.clone(),
+                oidc: oidc.clone(),
                 tls: tls.clone(),
                 require_tls,
             }),

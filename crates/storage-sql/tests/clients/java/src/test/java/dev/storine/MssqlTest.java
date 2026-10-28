@@ -28,6 +28,51 @@ class MssqlTest {
         assertTrue(e.getMessage().contains("use SQL Server authentication"), e.getMessage());
     }
 
+    /** A JWT signed with the test issuer's key (tests/clients/oidc/test-key.pem). */
+    static String mintToken(String keyFile, String extraClaims) throws Exception {
+        java.util.Base64.Encoder b64 = java.util.Base64.getUrlEncoder().withoutPadding();
+        long exp = System.currentTimeMillis() / 1000 + 300;
+        String head = b64.encodeToString("{\"alg\":\"RS256\",\"kid\":\"storine-test\",\"typ\":\"JWT\"}".getBytes());
+        String body = b64.encodeToString(("{\"iss\":\"https://id.storine.test/realms/test\",\"aud\":\"storine\",\"exp\":"
+            + exp + ",\"sub\":\"u-1\"" + extraClaims + "}").getBytes());
+        String pem = java.nio.file.Files.readString(java.nio.file.Path.of(keyFile))
+            .replaceAll("-----[A-Z ]+-----", "").replaceAll("\\s", "");
+        java.security.PrivateKey key = java.security.KeyFactory.getInstance("RSA")
+            .generatePrivate(new java.security.spec.PKCS8EncodedKeySpec(java.util.Base64.getDecoder().decode(pem)));
+        java.security.Signature sig = java.security.Signature.getInstance("SHA256withRSA");
+        sig.initSign(key);
+        sig.update((head + "." + body).getBytes());
+        return head + "." + body + "." + b64.encodeToString(sig.sign());
+    }
+
+    static Connection tokenConnection(String addr, String token) throws SQLException {
+        java.util.Properties p = new java.util.Properties();
+        p.setProperty("accessToken", token);
+        return DriverManager.getConnection(
+            "jdbc:sqlserver://" + addr + ";databaseName=shop;encrypt=true;trustServerCertificate=true;loginTimeout=10", p);
+    }
+
+    /**
+     * OpenID Connect access tokens (the accessToken property). The main server has no issuer
+     * configured and says so; STORINE_MSSQL_AUTH names one started with --oidc-* (run_all.sh).
+     */
+    @Test
+    void accessTokenLogins() throws Exception {
+        String a = System.getenv().getOrDefault("STORINE_MSSQL", "127.0.0.1:51433");
+        SQLException off = assertThrows(SQLException.class, () -> tokenConnection(a, "a.b.c").close());
+        assertTrue(off.getMessage().contains("not enabled"), off.getMessage());
+        String auth = System.getenv("STORINE_MSSQL_AUTH"), key = System.getenv("STORINE_OIDC_KEY");
+        if (auth == null || key == null) return;
+        try (Connection c = tokenConnection(auth, mintToken(key, ",\"preferred_username\":\"ann\""));
+             ResultSet rs = c.createStatement().executeQuery("SELECT SUSER_NAME()")) {
+            assertTrue(rs.next());
+            assertEquals("ann", rs.getString(1));
+        }
+        String expired = mintToken(key, ",\"exp\":1000");
+        SQLException e = assertThrows(SQLException.class, () -> tokenConnection(auth, expired).close());
+        assertTrue(e.getMessage().contains("expired"), e.getMessage());
+    }
+
     /** Full TLS inside TDS 7.4, and TDS 8 strict mode verifying the pinned certificate. */
     @Test
     void tls() throws Exception {
