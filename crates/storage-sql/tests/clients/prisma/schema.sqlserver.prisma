@@ -1,0 +1,27 @@
+// Prisma schema for the SQL Server endpoint of storine-sql (see test_prisma.js).
+generator client {
+  provider = "prisma-client-js"
+  output   = env("PRISMA_OUT_sqlserver")
+}
+
+datasource db {
+  provider = "sqlserver"
+  url      = env("DATABASE_URL_sqlserver")
+}
+
+model PrUser {
+  id      Int      @id @default(autoincrement())
+  email   String   @unique
+  balance Decimal  @default(0) @db.Decimal(12, 2)
+  joined  DateTime @default(now())
+  posts   PrPost[]
+}
+
+model PrPost {
+  id       Int     @id @default(autoincrement())
+  title    String
+  views    Int     @default(0)
+  author   PrUser  @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  authorId Int
+  @@index([authorId])
+}

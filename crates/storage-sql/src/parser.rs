@@ -452,6 +452,24 @@ impl Parser {
         Ok(self.object_name()?.1)
     }
 
+    /// `(a, t.b, s.t.c)`: column names, possibly qualified (the last part is the column).
+    fn column_name_list(&mut self) -> SqlResult<Vec<String>> {
+        self.expect_op("(")?;
+        let mut out = Vec::new();
+        loop {
+            let mut name = self.ident()?;
+            while self.eat_op(".") {
+                name = self.ident()?;
+            }
+            out.push(name);
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        self.expect_op(")")?;
+        Ok(out)
+    }
+
     fn ident_list(&mut self) -> SqlResult<Vec<String>> {
         self.expect_op("(")?;
         let mut out = Vec::new();
@@ -1276,6 +1294,7 @@ impl Parser {
         }
         if self.eat_kw("unique") {
             let _ = self.eat_kw("key") || self.eat_kw("index");
+            let _ = self.eat_kw("clustered") || self.eat_kw("nonclustered");
             let name = if !self.is_op("(") {
                 Some(self.ident()?)
             } else {
@@ -1630,6 +1649,8 @@ impl Parser {
             "text" | "tinytext" | "mediumtext" | "longtext" | "ntext" | "clob" | "citext"
             | "string" | "bpchar" | "unknown" => DataType::Text,
             "name" => DataType::Name,
+            // T-SQL `sysname`: nvarchar(128).
+            "sysname" => DataType::Varchar(Some(128)),
             "varchar" | "nvarchar" | "varchar2" | "nvarchar2" => {
                 let n = paren_numbers(self)?;
                 DataType::Varchar(n.first().copied().filter(|n| *n != u32::MAX))
@@ -1924,27 +1945,48 @@ impl Parser {
             }
             return Err(SqlError::unsupported("this ALTER statement"));
         }
-        let _ = self.eat_kws(&["if", "exists"]);
+        let if_exists = self.eat_kws(&["if", "exists"]);
         let _ = self.eat_kw("only");
         let table = self.table_name()?;
-        let mut ops = Vec::new();
+        let mut ops: Vec<AlterOp> = Vec::new();
         loop {
-            ops.push(self.alter_op()?);
+            // T-SQL `ADD a int, CONSTRAINT c DEFAULT 0 FOR b`: later items share the ADD.
+            let after_add = self.dialect == Dialect::MsSql
+                && matches!(
+                    ops.last(),
+                    Some(
+                        AlterOp::AddColumn { .. }
+                            | AlterOp::AddConstraint(_)
+                            | AlterOp::AlterColumn {
+                                change: AlterColumn::SetNamedDefault(..),
+                                ..
+                            }
+                    )
+                )
+                && !["add", "drop", "alter", "rename"]
+                    .iter()
+                    .any(|k| self.is_kw(k));
+            if after_add {
+                ops.push(self.add_item()?);
+            } else {
+                ops.push(self.alter_op()?);
+            }
             if !self.eat_op(",") {
                 break;
             }
         }
-        Ok(Statement::AlterTable { table, ops })
+        Ok(Statement::AlterTable {
+            table,
+            if_exists,
+            ops,
+        })
     }
 
-    fn alter_op(&mut self) -> SqlResult<AlterOp> {
-        // T-SQL `ADD [CONSTRAINT name] DEFAULT expr FOR column`.
+    /// What follows ADD: a column, a constraint, or T-SQL `[CONSTRAINT name] DEFAULT x FOR col`.
+    fn add_item(&mut self) -> SqlResult<AlterOp> {
         if self.dialect == Dialect::MsSql
-            && self.is_kw("add")
-            && (self.is_kw_at(1, "default")
-                || (self.is_kw_at(1, "constraint") && self.is_kw_at(3, "default")))
+            && (self.is_kw("default") || (self.is_kw("constraint") && self.is_kw_at(2, "default")))
         {
-            self.pos += 1;
             let name = if self.eat_kw("constraint") {
                 Some(self.ident()?)
             } else {
@@ -1959,25 +2001,29 @@ impl Parser {
                 change: AlterColumn::SetNamedDefault(name, e),
             });
         }
+        if self.is_kw("constraint")
+            || self.is_kw("primary")
+            || self.is_kw("foreign")
+            || self.is_kw("unique")
+            || self.is_kw("check")
+            || self.is_kw("index")
+            || self.is_kw("key")
+        {
+            return Ok(AlterOp::AddConstraint(self.table_constraint()?));
+        }
+        self.eat_kw("column");
+        let if_not_exists = self.eat_kws(&["if", "not", "exists"]);
+        let column = Box::new(self.column_def()?);
+        let _ = self.eat_kw("first") || (self.eat_kw("after") && self.ident().is_ok());
+        Ok(AlterOp::AddColumn {
+            column,
+            if_not_exists,
+        })
+    }
+
+    fn alter_op(&mut self) -> SqlResult<AlterOp> {
         if self.eat_kw("add") {
-            if self.is_kw("constraint")
-                || self.is_kw("primary")
-                || self.is_kw("foreign")
-                || self.is_kw("unique")
-                || self.is_kw("check")
-                || self.is_kw("index")
-                || self.is_kw("key")
-            {
-                return Ok(AlterOp::AddConstraint(self.table_constraint()?));
-            }
-            self.eat_kw("column");
-            let if_not_exists = self.eat_kws(&["if", "not", "exists"]);
-            let column = Box::new(self.column_def()?);
-            let _ = self.eat_kw("first") || (self.eat_kw("after") && self.ident().is_ok());
-            return Ok(AlterOp::AddColumn {
-                column,
-                if_not_exists,
-            });
+            return self.add_item();
         }
         if self.eat_kw("drop") {
             if self.eat_kw("constraint")
@@ -2103,7 +2149,16 @@ impl Parser {
             ins.alias = Some(self.ident()?);
         }
         if self.is_op("(") && !self.is_kw_at(1, "select") && !self.is_kw_at(1, "with") {
-            ins.columns = self.ident_list()?;
+            ins.columns = self.column_name_list()?;
+        }
+        // T-SQL `INSERT INTO t [(cols)] EXEC procedure ...`.
+        if self.dialect == Dialect::MsSql && (self.is_kw("exec") || self.is_kw("execute")) {
+            let exec = self.statement()?;
+            return Ok(Statement::InsertExec {
+                target: ins.table,
+                columns: ins.columns,
+                exec: Box::new(exec),
+            });
         }
         // T-SQL OUTPUT INSERTED.* (as RETURNING).
         let mut into = None;
@@ -3471,6 +3526,13 @@ impl Parser {
                         query: Box::new(q),
                         negated: false,
                     });
+                }
+                // T-SQL / standard `NEXT VALUE FOR seq`.
+                "next" if self.is_kw("value") && self.is_kw_at(1, "for") => {
+                    self.pos += 2;
+                    let (_, seq) = self.object_name()?;
+                    // Quoted: the sequence is named exactly as written (no case folding).
+                    return Ok(func("nextval", vec![Expr::Str(format!("\"{seq}\""))]));
                 }
                 "cast" | "try_cast" | "safe_cast" => {
                     self.expect_op("(")?;

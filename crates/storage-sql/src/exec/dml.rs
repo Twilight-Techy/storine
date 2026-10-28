@@ -1676,6 +1676,7 @@ pub fn create_sequence(
 ) -> SqlResult<Outcome> {
     let mut doc = Doc::new();
     doc.insert("next".into(), Value::Int(start));
+    doc.insert("start".into(), Value::Int(start));
     doc.insert("increment".into(), Value::Int(increment));
     let w = Write {
         collection: SEQUENCES.into(),
@@ -1763,4 +1764,34 @@ pub fn identity_current(engine: &Engine, t: &Table, column: usize) -> SqlResult<
             .unwrap_or(1);
         Some(next - step)
     }))
+}
+
+/// A `CREATE SEQUENCE` sequence, for the catalogs.
+pub struct SequenceInfo {
+    pub name: String,
+    pub start: i64,
+    pub increment: i64,
+    /// The value `nextval` hands out next.
+    pub next: i64,
+}
+
+/// The sequences made with `CREATE SEQUENCE` (not the ones behind identity columns).
+pub fn user_sequences(engine: &Engine) -> SqlResult<Vec<SequenceInfo>> {
+    let mut out = Vec::new();
+    for d in engine.store.scan(SEQUENCES, None)? {
+        let Some(name) = d.key.strip_prefix("seq:") else {
+            continue;
+        };
+        let int = |k: &str| d.fields.get(k).and_then(Value::as_i64);
+        let increment = int("increment").unwrap_or(1);
+        let next = int("next").unwrap_or(1);
+        out.push(SequenceInfo {
+            name: name.to_owned(),
+            start: int("start").unwrap_or(1),
+            increment,
+            next,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
 }

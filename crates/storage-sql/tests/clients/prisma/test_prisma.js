@@ -1,9 +1,9 @@
-// Prisma ORM against storine-sql on both endpoints: `prisma db push` (the schema engine's
+// Prisma ORM against storine-sql on all three endpoints: `prisma db push` (the schema engine's
 // introspection and DDL), then the generated client (relations, aggregates, atomic
 // increments, transactions, unique violations).
 //
 //   npm install prisma@6 @prisma/client@6
-//   node test_prisma.js [pg_port] [mysql_port]
+//   node test_prisma.js [pg_port] [mysql_port] [mssql_port]
 
 const { execFileSync, spawnSync } = require("child_process");
 const assert = require("assert");
@@ -12,14 +12,34 @@ const path = require("path");
 
 const PG = process.argv[2] || 55432;
 const MY = process.argv[3] || 53306;
+const MS = process.argv[4] || 51433;
 const urls = {
+  sqlserver: `sqlserver://127.0.0.1:${MS};database=shop;user=sa;password=x;encrypt=true;trustServerCertificate=true`,
   postgresql: `postgresql://app:x@127.0.0.1:${PG}/shop?schema=public`,
   mysql: `mysql://root@127.0.0.1:${MY}/shop`,
 };
 const prismaBin = path.join(path.dirname(require.resolve("prisma/package.json")), "build", "index.js");
 
+function tedious(sql) {
+  const { Connection, Request } = require("tedious");
+  return new Promise((resolve, reject) => {
+    const c = new Connection({
+      server: "127.0.0.1",
+      authentication: { type: "default", options: { userName: "sa", password: "x" } },
+      options: { port: Number(MS), database: "shop", encrypt: false },
+    });
+    c.on("connect", (err) => {
+      if (err) return reject(err);
+      c.execSql(new Request(sql, (e) => (c.close(), e ? reject(e) : resolve())));
+    });
+    c.connect();
+  });
+}
+
 async function dropTables(provider) {
-  if (provider === "mysql") {
+  if (provider === "sqlserver") {
+    await tedious("DROP TABLE IF EXISTS [PrPost]; DROP TABLE IF EXISTS [PrUser]");
+  } else if (provider === "mysql") {
     const c = await require("mysql2/promise").createConnection({ host: "127.0.0.1", port: MY, user: "root", database: "shop" });
     await c.query("DROP TABLE IF EXISTS `PrPost`, `PrUser`");
     await c.end();
@@ -89,14 +109,16 @@ async function suite(provider) {
   assert.strictEqual(up.balance.toFixed(2), "1.00");
   await db.prUser.delete({ where: { id: ada.id } });
   assert.strictEqual(await db.prPost.count(), 0);
-  const raw = await db.$queryRaw`SELECT count(*) AS n FROM ${Prisma.raw(provider === "mysql" ? "`PrUser`" : '"PrUser"')}`;
+  const raw = await db.$queryRaw`SELECT count(*) AS n FROM ${Prisma.raw({ mysql: "`PrUser`", sqlserver: "[PrUser]" }[provider] || '"PrUser"')}`;
   assert.strictEqual(Number(raw[0].n), 2);
   await db.$disconnect();
   console.log(`OK  Prisma (${provider})`);
 }
 
 (async () => {
-  for (const p of ["postgresql", "mysql"]) await suite(p);
+  const providers = ["postgresql", "mysql"];
+  if (process.argv[4]) providers.push("sqlserver");
+  for (const p of providers) await suite(p);
   console.log("all prisma tests passed");
 })().catch((e) => {
   console.error(e.stderr ? e.stderr.toString() : e);

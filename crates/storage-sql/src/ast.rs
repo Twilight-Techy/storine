@@ -20,6 +20,8 @@ pub enum Statement {
     },
     AlterTable {
         table: String,
+        /// `ALTER TABLE IF EXISTS`: nothing happens when the table is missing.
+        if_exists: bool,
         ops: Vec<AlterOp>,
     },
     Truncate {
@@ -65,6 +67,12 @@ pub enum Statement {
     DeclareTable {
         name: String,
         columns: Vec<ColumnDef>,
+    },
+    /// T-SQL `INSERT INTO target [(columns)] EXEC procedure ...`.
+    InsertExec {
+        target: String,
+        columns: Vec<String>,
+        exec: Box<Statement>,
     },
     /// T-SQL `INSERT / UPDATE / DELETE ... OUTPUT ... INTO @t [(columns)]`.
     OutputInto {

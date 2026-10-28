@@ -228,6 +228,12 @@ class JdbcTest {
             }));
             BigDecimal r = sf.fromSession(s -> s.find(Author.class, id).royalties);
             assertEquals(new BigDecimal("1.00"), r);
+            // Schema validation reads the tables back through JDBC metadata.
+            cfg.setProperty("hibernate.hbm2ddl.auto", "validate");
+            try (SessionFactory check = cfg.buildSessionFactory()) {
+                Long n = check.fromSession(s -> s.createQuery("select count(a) from Author a", Long.class).getSingleResult());
+                assertEquals(2L, n.longValue());
+            }
         }
     }
 
@@ -239,6 +245,12 @@ class JdbcTest {
     @Test
     void hibernateMySql() {
         hibernateSuite("jdbc:mysql://" + my() + "/shop?useSSL=false&allowPublicKeyRetrieval=true", "root", null);
+    }
+
+    @Test
+    void hibernateSqlServer() {
+        String a = System.getenv().getOrDefault("STORINE_MSSQL", "127.0.0.1:51433");
+        hibernateSuite("jdbc:sqlserver://" + a + ";databaseName=shop;encrypt=false", "sa", null);
     }
 
     // TLS through Java's own JSSE stack on both protocols.

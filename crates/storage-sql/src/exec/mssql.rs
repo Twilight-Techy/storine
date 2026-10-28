@@ -220,6 +220,22 @@ pub fn type_sql(c: &Column) -> String {
 
 /// A column default as SQL Server reports it: wrapped in parentheses, numbers twice.
 pub fn default_sql(e: &crate::ast::Expr) -> String {
+    use crate::ast::Expr;
+    // Functions read back in SQL Server's spelling (CURRENT_TIMESTAMP is stored as getdate()).
+    if let Expr::Function { name, args, .. } = e {
+        if args.is_empty() {
+            let n = match name.as_str() {
+                "now" | "current_timestamp" | "getdate" | "localtimestamp" => "getdate",
+                "sysdatetime" => "sysdatetime",
+                "getutcdate" | "utc_timestamp" => "getutcdate",
+                "sysutcdatetime" => "sysutcdatetime",
+                "newid" | "gen_random_uuid" | "uuid" => "newid",
+                "newsequentialid" => "newsequentialid",
+                other => other,
+            };
+            return format!("({n}())");
+        }
+    }
     let s = e.to_string();
     if s.parse::<f64>().is_ok() {
         format!("(({s}))")
@@ -1093,7 +1109,29 @@ pub fn sys_catalog(ex: &Exec<'_>, n: &str, tables: &[Arc<Table>]) -> SqlResult<R
                 ("system_type_id", I4),
                 ("user_type_id", I4),
             ]);
-            Builder::new(&spec).done()
+            let mut bd = Builder::new(&spec);
+            for q in super::dml::user_sequences(&ex.s.engine)? {
+                let mut r = object_row(
+                    &q.name,
+                    object_id("SO", &q.name),
+                    0,
+                    "SO",
+                    "SEQUENCE_OBJECT",
+                );
+                r.extend([
+                    i(q.start),
+                    i(q.increment),
+                    i(i64::MIN),
+                    i(i64::MAX),
+                    b(false),
+                    b(false),
+                    i(q.next - q.increment),
+                    i(127),
+                    i(127),
+                ]);
+                bd.row(r);
+            }
+            bd.done()
         }
         "system_views" | "all_views" => {
             let mut bd = Builder::new(&[
@@ -1213,6 +1251,50 @@ fn object_by_id(ex: &Exec<'_>, id: i64) -> SqlResult<Option<(String, Option<Arc<
     for v in ex.s.engine.view_names()? {
         if object_id("V", &v) == id {
             return Ok(Some((v, None)));
+        }
+    }
+    Ok(None)
+}
+
+/// The definition of the default or check constraint with this `object_id`.
+fn constraint_definition(ex: &Exec<'_>, id: i64) -> SqlResult<Option<String>> {
+    ex.s.engine.refresh_catalog(false)?;
+    for tb in ex.s.engine.catalog.all() {
+        for c in &tb.columns {
+            if let Some(d) = &c.default {
+                if object_id("D", &default_name(&tb.name, c)) == id {
+                    return Ok(Some(default_sql(d)));
+                }
+            }
+        }
+        for c in &tb.checks {
+            if object_id("C", &c.name) == id {
+                return Ok(Some(format!("({})", c.expr)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The name of the constraint (key, foreign key, check, default) with this `object_id`.
+fn constraint_by_id(ex: &Exec<'_>, id: i64) -> SqlResult<Option<String>> {
+    ex.s.engine.refresh_catalog(false)?;
+    for tb in ex.s.engine.catalog.all() {
+        let mut names: Vec<(&str, String)> = Vec::new();
+        if !tb.primary_key.is_empty() {
+            names.push(("PK", pk_name(&tb)));
+        }
+        names.extend(tb.uniques.iter().map(|u| ("UQ", u.name.clone())));
+        names.extend(tb.foreign_keys.iter().map(|f| ("F", f.name.clone())));
+        names.extend(tb.checks.iter().map(|c| ("C", c.name.clone())));
+        names.extend(
+            tb.columns
+                .iter()
+                .filter(|c| c.default.is_some())
+                .map(|c| ("D", default_name(&tb.name, c))),
+        );
+        if let Some((_, n)) = names.into_iter().find(|(k, n)| object_id(k, n) == id) {
+            return Ok(Some(n));
         }
     }
     Ok(None)
@@ -1406,10 +1488,31 @@ fn call(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Option<Datum>> {
                 _ => N,
             }
         }
-        "object_name" => match object_by_id(ex, a(0).as_i64().unwrap_or(0))? {
-            Some((n, _)) => t(n),
-            None => N,
+        "object_name" => {
+            let id = a(0).as_i64().unwrap_or(0);
+            match object_by_id(ex, id)? {
+                Some((n, _)) => t(n),
+                None => constraint_by_id(ex, id)?.map_or(N, t),
+            }
+        }
+        // Internal helper of the catalog views: the ODBC scale of a type.
+        "odbcscale" => match a(0).as_i64().unwrap_or(0) {
+            106 | 108 | 60 | 122 | 41 | 42 | 43 => a(1),
+            48 | 52 | 56 | 127 | 104 => i(0),
+            _ => N,
         },
+        "object_definition" => {
+            let id = a(0).as_i64().unwrap_or(0);
+            let mut def = constraint_definition(ex, id)?.map_or(N, t);
+            for v in ex.s.engine.view_names()? {
+                if object_id("V", &v) == id {
+                    if let Some((sql, _, _)) = ex.s.engine.view(&v)? {
+                        def = t(format!("CREATE VIEW [{v}] AS {sql}"));
+                    }
+                }
+            }
+            def
+        }
         "object_schema_name" => match object_by_id(ex, a(0).as_i64().unwrap_or(0))? {
             Some(_) => t("dbo"),
             None => N,
@@ -1458,7 +1561,16 @@ fn call(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Option<Datum>> {
                         "iscomputed" | "isrowguidcol" | "isfulltextindexed" => i(0),
                         "precision" => i(column_type(c).3),
                         "scale" => i(column_type(c).4),
-                        "columnid" => i(k as i64 + 1),
+                        "columnid" | "ordinal" => i(k as i64 + 1),
+                        "charmaxlen" => {
+                            let (ty, _, len, _, _) = column_type(c);
+                            match ty.as_str() {
+                                _ if len < 0 => i(-1),
+                                "nchar" | "nvarchar" => i(len / 2),
+                                "char" | "varchar" | "binary" | "varbinary" => i(len),
+                                _ => N,
+                            }
+                        }
                         _ => N,
                     }
                 }
@@ -1788,10 +1900,10 @@ fn call(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Option<Datum>> {
 pub fn return_type(name: &str) -> Option<DataType> {
     Some(match name {
         "schema_name" | "db_name" | "object_name" | "object_schema_name" | "col_name"
-        | "type_name" | "user_name" | "suser_name" | "original_login" | "host_name"
-        | "app_name" | "datename" | "replicate" | "space" | "stuff" | "quotename" | "nchar"
-        | "serverproperty" | "databasepropertyex" => DataType::Varchar(Some(4000)),
-        "schema_id" | "db_id" | "object_id" | "objectproperty" | "col_length"
+        | "object_definition" | "type_name" | "user_name" | "suser_name" | "original_login"
+        | "host_name" | "app_name" | "datename" | "replicate" | "space" | "stuff" | "quotename"
+        | "nchar" | "serverproperty" | "databasepropertyex" => DataType::Varchar(Some(4000)),
+        "odbcscale" | "schema_id" | "db_id" | "object_id" | "objectproperty" | "col_length"
         | "columnproperty" | "type_id" | "datepart" | "charindex" | "patindex" | "datalength"
         | "unicode" | "isdate" | "isnumeric" | "is_member" | "is_srvrolemember" | "user_id"
         | "xact_state" | "error_number" | "isjson" | "len" => DataType::Int,
@@ -1955,6 +2067,11 @@ pub fn exec_proc(
             };
             run_sql(s, &sql, Vec::new())
         }
+        "sp_tables" | "sp_columns" | "sp_columns_100" | "sp_pkeys" | "sp_fkeys"
+        | "sp_statistics" | "sp_statistics_100" => {
+            let ex = Exec::new(s, params);
+            metadata(&ex, name, &|n: &str, pos: usize| arg(n, pos))
+        }
         "sp_set_session_context"
         | "sp_reset_connection"
         | "sp_addextendedproperty"
@@ -1987,4 +2104,357 @@ pub fn exec_proc(
             format!("Could not find stored procedure '{other}' (not supported by Storine SQL)"),
         )),
     }
+}
+
+// ── JDBC / ODBC catalog procedures ──
+
+/// ODBC 3 type codes, as `sp_columns` reports them.
+fn odbc_type(name: &str) -> i64 {
+    match name {
+        "bit" => -7,
+        "tinyint" => -6,
+        "smallint" => 5,
+        "int" => 4,
+        "bigint" => -5,
+        "decimal" | "money" | "smallmoney" => 3,
+        "numeric" => 2,
+        "real" => 7,
+        "float" => 6,
+        "char" => 1,
+        "varchar" => 12,
+        "text" => -1,
+        "nchar" => -8,
+        "nvarchar" => -9,
+        "ntext" => -10,
+        "binary" => -2,
+        "varbinary" | "timestamp" => -3,
+        "image" => -4,
+        "uniqueidentifier" => -11,
+        "date" => 91,
+        "time" => -154,
+        "datetime" | "datetime2" | "smalldatetime" => 93,
+        "datetimeoffset" => -155,
+        "xml" => -152,
+        _ => 12,
+    }
+}
+
+/// T-SQL LIKE (`%`, `_`, `[x]` escapes) as the catalog procedures use it; NULL matches all.
+fn pattern_match(pattern: &Datum, s: &str) -> bool {
+    let Datum::Text(p) = pattern else {
+        return true;
+    };
+    let mut lit = String::new();
+    let mut chars = p.chars();
+    while let Some(c) = chars.next() {
+        if c == '[' {
+            let inner: String = chars.by_ref().take_while(|&x| x != ']').collect();
+            lit.push('\\');
+            lit.push_str(&inner);
+        } else {
+            lit.push(c);
+        }
+    }
+    super::eval::like(&s.to_lowercase(), &lit.to_lowercase(), Some('\\'))
+}
+
+/// `sp_tables`, `sp_columns[_100]`, `sp_pkeys`, `sp_fkeys`, `sp_statistics[_100]`: what
+/// mssql-jdbc's `DatabaseMetaData` (Hibernate schema validation, tools) reads.
+fn metadata(
+    ex: &Exec<'_>,
+    proc_name: &str,
+    arg: &dyn Fn(&str, usize) -> Datum,
+) -> SqlResult<super::Outcome> {
+    ex.s.engine.refresh_catalog(false)?;
+    let tables = ex.s.engine.catalog.all();
+    let db = ex.s.database.clone();
+    let named = |pat: &Datum| -> Vec<Arc<Table>> {
+        tables
+            .iter()
+            .filter(|t| pattern_match(pat, &t.name))
+            .cloned()
+            .collect()
+    };
+    const I2: DataType = DataType::SmallInt;
+    const MAXLEN: i64 = 2_147_483_647;
+    Ok(match proc_name {
+        "sp_tables" => {
+            let types = text(&arg("table_type", 3)).to_ascii_uppercase();
+            let want = |kind: &str| types.is_empty() || types.contains(kind);
+            let pat = arg("table_name", 0);
+            let mut out = Vec::new();
+            if want("TABLE") {
+                for tb in named(&pat) {
+                    out.push(vec![t(&db), t("dbo"), t(&tb.name), t("TABLE"), N]);
+                }
+            }
+            if want("VIEW") {
+                for v in ex.s.engine.view_names()? {
+                    if pattern_match(&pat, &v) {
+                        out.push(vec![t(&db), t("dbo"), t(v), t("VIEW"), N]);
+                    }
+                }
+            }
+            rows(
+                &[
+                    ("TABLE_QUALIFIER", T),
+                    ("TABLE_OWNER", T),
+                    ("TABLE_NAME", T),
+                    ("TABLE_TYPE", T),
+                    ("REMARKS", T),
+                ],
+                out,
+            )
+        }
+        "sp_columns" | "sp_columns_100" => {
+            let col_pat = arg("column_name", 3);
+            let mut out = Vec::new();
+            for tb in named(&arg("table_name", 0)) {
+                for (k, c) in tb.columns.iter().enumerate() {
+                    if !pattern_match(&col_pat, &c.name) {
+                        continue;
+                    }
+                    let (ty, id, len, p, sc) = column_type(c);
+                    let wide = matches!(ty.as_str(), "nchar" | "nvarchar" | "ntext");
+                    let chars_ty = wide || matches!(ty.as_str(), "char" | "varchar" | "text");
+                    let bytes_ty = matches!(ty.as_str(), "binary" | "varbinary" | "image");
+                    let length = if len < 0 { MAXLEN } else { len };
+                    let precision = if chars_ty {
+                        if len < 0 {
+                            MAXLEN / if wide { 2 } else { 1 }
+                        } else if wide {
+                            len / 2
+                        } else {
+                            len
+                        }
+                    } else if bytes_ty {
+                        length
+                    } else {
+                        p
+                    };
+                    let numeric = !(chars_ty
+                        || bytes_ty
+                        || matches!(ty.as_str(), "uniqueidentifier" | "xml"));
+                    let code = odbc_type(&ty);
+                    let (sql_type, sub) = match code {
+                        91 => (9, Some(1)),
+                        93 => (9, Some(3)),
+                        other => (other, None),
+                    };
+                    let type_name = if c.auto_increment {
+                        format!("{ty} identity")
+                    } else {
+                        ty.clone()
+                    };
+                    out.push(vec![
+                        t(&db),
+                        t("dbo"),
+                        t(&tb.name),
+                        t(&c.name),
+                        i(code),
+                        t(type_name),
+                        i(precision),
+                        i(length),
+                        if numeric { i(sc) } else { N },
+                        if numeric && !matches!(code, 91 | 93 | -154 | -155) {
+                            i(10)
+                        } else {
+                            N
+                        },
+                        i(i64::from(!c.not_null)),
+                        N,
+                        c.default.as_ref().map_or(N, |d| t(default_sql(d))),
+                        i(sql_type),
+                        sub.map_or(N, i),
+                        if chars_ty || bytes_ty { i(length) } else { N },
+                        i(k as i64 + 1),
+                        t(if c.not_null { "NO" } else { "YES" }),
+                        i(0),
+                        i(0),
+                        i(0),
+                        i(i64::from(c.auto_increment)),
+                        N,
+                        N,
+                        N,
+                        N,
+                        N,
+                        N,
+                        i(id),
+                    ]);
+                }
+            }
+            rows(
+                &[
+                    ("TABLE_QUALIFIER", T),
+                    ("TABLE_OWNER", T),
+                    ("TABLE_NAME", T),
+                    ("COLUMN_NAME", T),
+                    ("DATA_TYPE", I2),
+                    ("TYPE_NAME", T),
+                    ("PRECISION", I4),
+                    ("LENGTH", I4),
+                    ("SCALE", I2),
+                    ("RADIX", I2),
+                    ("NULLABLE", I2),
+                    ("REMARKS", T),
+                    ("COLUMN_DEF", T),
+                    ("SQL_DATA_TYPE", I2),
+                    ("SQL_DATETIME_SUB", I2),
+                    ("CHAR_OCTET_LENGTH", I4),
+                    ("ORDINAL_POSITION", I4),
+                    ("IS_NULLABLE", T),
+                    ("SS_IS_SPARSE", I2),
+                    ("SS_IS_COLUMN_SET", I2),
+                    ("SS_IS_COMPUTED", I2),
+                    ("SS_IS_IDENTITY", I2),
+                    ("SS_UDT_CATALOG_NAME", T),
+                    ("SS_UDT_SCHEMA_NAME", T),
+                    ("SS_UDT_ASSEMBLY_TYPE_NAME", T),
+                    ("SS_XML_SCHEMACOLLECTION_CATALOG_NAME", T),
+                    ("SS_XML_SCHEMACOLLECTION_SCHEMA_NAME", T),
+                    ("SS_XML_SCHEMACOLLECTION_NAME", T),
+                    ("SS_DATA_TYPE", I2),
+                ],
+                out,
+            )
+        }
+        "sp_pkeys" => {
+            let mut out = Vec::new();
+            for tb in named(&arg("table_name", 0)) {
+                for (k, c) in tb.primary_key.iter().enumerate() {
+                    out.push(vec![
+                        t(&db),
+                        t("dbo"),
+                        t(&tb.name),
+                        t(&tb.columns[*c].name),
+                        i(k as i64 + 1),
+                        t(pk_name(&tb)),
+                    ]);
+                }
+            }
+            rows(
+                &[
+                    ("TABLE_QUALIFIER", T),
+                    ("TABLE_OWNER", T),
+                    ("TABLE_NAME", T),
+                    ("COLUMN_NAME", T),
+                    ("KEY_SEQ", I2),
+                    ("PK_NAME", T),
+                ],
+                out,
+            )
+        }
+        "sp_fkeys" => {
+            // @pktable_name (referenced) and/or @fktable_name (referencing).
+            let pk_pat = arg("pktable_name", 0);
+            let fk_pat = arg("fktable_name", 3);
+            let rule = |a: RefAction| match a {
+                RefAction::Cascade => 0,
+                RefAction::SetNull => 2,
+                RefAction::SetDefault => 4,
+                RefAction::NoAction | RefAction::Restrict => 1,
+            };
+            let mut out = Vec::new();
+            for tb in tables.iter().filter(|x| pattern_match(&fk_pat, &x.name)) {
+                for f in tb
+                    .foreign_keys
+                    .iter()
+                    .filter(|f| pattern_match(&pk_pat, &f.ref_table))
+                {
+                    let target = tables
+                        .iter()
+                        .find(|x| x.name.eq_ignore_ascii_case(&f.ref_table));
+                    let ref_cols: Vec<String> = match target {
+                        Some(rt) if f.ref_columns.is_empty() => rt
+                            .primary_key
+                            .iter()
+                            .map(|c| rt.columns[*c].name.clone())
+                            .collect(),
+                        _ => f.ref_columns.clone(),
+                    };
+                    let target_name = target.map_or(f.ref_table.clone(), |x| x.name.clone());
+                    for (k, c) in f.columns.iter().enumerate() {
+                        out.push(vec![
+                            t(&db),
+                            t("dbo"),
+                            t(&target_name),
+                            t(ref_cols.get(k).cloned().unwrap_or_default()),
+                            t(&db),
+                            t("dbo"),
+                            t(&tb.name),
+                            t(&tb.columns[*c].name),
+                            i(k as i64 + 1),
+                            i(rule(f.on_update)),
+                            i(rule(f.on_delete)),
+                            t(&f.name),
+                            target.map_or(N, |x| t(pk_name(x))),
+                            i(7),
+                        ]);
+                    }
+                }
+            }
+            rows(
+                &[
+                    ("PKTABLE_QUALIFIER", T),
+                    ("PKTABLE_OWNER", T),
+                    ("PKTABLE_NAME", T),
+                    ("PKCOLUMN_NAME", T),
+                    ("FKTABLE_QUALIFIER", T),
+                    ("FKTABLE_OWNER", T),
+                    ("FKTABLE_NAME", T),
+                    ("FKCOLUMN_NAME", T),
+                    ("KEY_SEQ", I2),
+                    ("UPDATE_RULE", I2),
+                    ("DELETE_RULE", I2),
+                    ("FK_NAME", T),
+                    ("PK_NAME", T),
+                    ("DEFERRABILITY", I2),
+                ],
+                out,
+            )
+        }
+        _ => {
+            // sp_statistics: one row per index column (TYPE 1 clustered, 3 other).
+            let mut out = Vec::new();
+            for tb in named(&arg("table_name", 0)) {
+                for (_, name, cols, unique, primary, _) in indexes(&tb) {
+                    for (k, c) in cols.iter().enumerate() {
+                        out.push(vec![
+                            t(&db),
+                            t("dbo"),
+                            t(&tb.name),
+                            i(i64::from(!unique)),
+                            t(&tb.name),
+                            t(&name),
+                            i(if primary { 1 } else { 3 }),
+                            i(k as i64 + 1),
+                            t(&tb.columns[*c].name),
+                            t("A"),
+                            N,
+                            N,
+                            N,
+                        ]);
+                    }
+                }
+            }
+            rows(
+                &[
+                    ("TABLE_QUALIFIER", T),
+                    ("TABLE_OWNER", T),
+                    ("TABLE_NAME", T),
+                    ("NON_UNIQUE", I2),
+                    ("INDEX_QUALIFIER", T),
+                    ("INDEX_NAME", T),
+                    ("TYPE", I2),
+                    ("SEQ_IN_INDEX", I2),
+                    ("COLUMN_NAME", T),
+                    ("COLLATION", T),
+                    ("CARDINALITY", I4),
+                    ("PAGES", I4),
+                    ("FILTER_CONDITION", T),
+                ],
+                out,
+            )
+        }
+    })
 }

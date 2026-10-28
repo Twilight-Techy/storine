@@ -1095,7 +1095,16 @@ impl Session {
                 table,
                 if_exists,
             } => ddl::drop_indexes(self, names, table.as_deref(), *if_exists),
-            Statement::AlterTable { table, ops } => ddl::alter_table(self, table, ops),
+            Statement::AlterTable {
+                table,
+                if_exists,
+                ops,
+            } => {
+                if *if_exists && self.engine.find_table(table)?.is_none() {
+                    return Ok(Outcome::command("ALTER TABLE"));
+                }
+                ddl::alter_table(self, table, ops)
+            }
             Statement::Truncate { tables } => ddl::truncate(self, tables),
             Statement::CreateSequence {
                 name,
@@ -1120,6 +1129,41 @@ impl Session {
             }
             Statement::If { .. } => unreachable!("IF is dispatched by execute"),
             Statement::Merge(m) => merge::merge(self, m, params),
+            Statement::InsertExec {
+                target,
+                columns,
+                exec,
+            } => {
+                let rows = match self.run(exec, params)? {
+                    Outcome::Rows(rs) => rs.rows,
+                    _ => Vec::new(),
+                };
+                let n = rows.len();
+                if target.starts_with('@') {
+                    self.table_var_append(target, columns, rows)?;
+                } else {
+                    for r in rows {
+                        let ins = crate::ast::Insert {
+                            table: target.clone(),
+                            alias: None,
+                            columns: columns.clone(),
+                            source: crate::ast::InsertSource::Values(vec![(0..r.len())
+                                .map(Expr::Param)
+                                .collect()]),
+                            on_conflict: None,
+                            returning: Vec::new(),
+                            ignore: false,
+                            replace: false,
+                        };
+                        dml::insert(self, &ins, &r)?;
+                    }
+                }
+                Ok(Outcome::Command {
+                    tag: format!("INSERT 0 {n}"),
+                    affected: n as u64,
+                    last_insert_id: None,
+                })
+            }
             Statement::DeclareTable { name, columns } => {
                 self.table_vars.insert(
                     name.clone(),

@@ -2162,10 +2162,43 @@ fn information_schema(
             }
             bd.done()
         }
-        "routines" | "triggers" | "sequences" | "parameters" | "events" | "partitions"
-        | "table_privileges" | "column_privileges" | "user_privileges" | "schema_privileges"
-        | "processlist" | "innodb_trx" | "role_table_grants" | "domains" | "element_types"
-        | "attributes" | "user_defined_types" | "column_statistics" | "plugins" => {
+        "sequences" => {
+            let mut bd = mk(&[
+                ("sequence_catalog", T),
+                ("sequence_schema", T),
+                ("sequence_name", T),
+                ("data_type", T),
+                ("numeric_precision", I8),
+                ("numeric_precision_radix", I8),
+                ("numeric_scale", I8),
+                ("start_value", T),
+                ("minimum_value", T),
+                ("maximum_value", T),
+                ("increment", T),
+                ("cycle_option", T),
+            ]);
+            for q in super::dml::user_sequences(&ex.s.engine)? {
+                bd.row(vec![
+                    t(&db),
+                    t(schema),
+                    t(&q.name),
+                    t("bigint"),
+                    i(64),
+                    i(2),
+                    i(0),
+                    t(q.start.to_string()),
+                    t("1"),
+                    t(i64::MAX.to_string()),
+                    t(q.increment.to_string()),
+                    t("NO"),
+                ]);
+            }
+            bd.done()
+        }
+        "routines" | "triggers" | "parameters" | "events" | "partitions" | "table_privileges"
+        | "column_privileges" | "user_privileges" | "schema_privileges" | "processlist"
+        | "innodb_trx" | "role_table_grants" | "domains" | "element_types" | "attributes"
+        | "user_defined_types" | "column_statistics" | "plugins" => {
             mk(&[("table_schema", T), ("table_name", T)]).done()
         }
         other => {

@@ -61,10 +61,10 @@ have ruby && run activerecord ruby ruby/test_activerecord.rb "$PG" "$MY"
 BIN=${STORINE_SQL_BIN:-../../../../target/release/storine-sql}
 if have node && [ -x "$BIN" ] && node -e 'require.resolve("prisma/package.json")' 2>/dev/null; then
   dir=$(mktemp -d)
-  "$BIN" --data "$dir" --pg 127.0.0.1:55532 --mysql 127.0.0.1:53406 >"$dir.log" 2>&1 &
+  "$BIN" --data "$dir" --pg 127.0.0.1:55532 --mysql 127.0.0.1:53406 --mssql 127.0.0.1:51533 >"$dir.log" 2>&1 &
   pid=$!
   for _ in $(seq 50); do (echo >/dev/tcp/127.0.0.1/55532) 2>/dev/null && break; sleep 0.2; done
-  run prisma node prisma/test_prisma.js 55532 53406
+  run prisma node prisma/test_prisma.js 55532 53406 51533
   kill "$pid"; wait "$pid" 2>/dev/null; rm -rf "$dir" "$dir.log"
 fi
 
