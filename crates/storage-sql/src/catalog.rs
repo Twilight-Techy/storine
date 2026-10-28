@@ -94,17 +94,25 @@ pub type Row = Vec<Datum>;
 impl Table {
     /// Column position by name (exact, then case-insensitive).
     pub fn column_index(&self, name: &str) -> Option<usize> {
-        self.columns.iter().position(|c| c.name == name).or_else(|| {
-            let mut it = self.columns.iter().enumerate().filter(|(_, c)| c.name.eq_ignore_ascii_case(name));
-            match (it.next(), it.next()) {
-                (Some((i, _)), None) => Some(i),
-                _ => None,
-            }
-        })
+        self.columns
+            .iter()
+            .position(|c| c.name == name)
+            .or_else(|| {
+                let mut it = self
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.name.eq_ignore_ascii_case(name));
+                match (it.next(), it.next()) {
+                    (Some((i, _)), None) => Some(i),
+                    _ => None,
+                }
+            })
     }
 
     pub fn column(&self, name: &str) -> SqlResult<usize> {
-        self.column_index(name).ok_or_else(|| SqlError::undefined_column(name))
+        self.column_index(name)
+            .ok_or_else(|| SqlError::undefined_column(name))
     }
 
     /// The document key of `row`, or `None` when the table has no primary key.
@@ -149,7 +157,11 @@ impl Table {
         let parts: Vec<&Datum> = k.columns.iter().map(|i| &row[*i]).collect();
         let raw = encode_key_unbounded(&parts);
         let prefix = format!("{}/{}/", self.collection, k.name);
-        let key = if prefix.len() + raw.len() > 1000 { format!("{prefix}#{}", hash::hex(&hash::sha256(raw.as_bytes()))) } else { prefix + &raw };
+        let key = if prefix.len() + raw.len() > 1000 {
+            format!("{prefix}#{}", hash::hex(&hash::sha256(raw.as_bytes())))
+        } else {
+            prefix + &raw
+        };
         Ok(Some(key))
     }
 
@@ -157,7 +169,10 @@ impl Table {
     pub fn all_unique_keys(&self) -> Vec<KeyDef> {
         let mut out = Vec::new();
         if !self.primary_key.is_empty() {
-            out.push(KeyDef { name: format!("{}_pkey", self.name), columns: self.primary_key.clone() });
+            out.push(KeyDef {
+                name: format!("{}_pkey", self.name),
+                columns: self.primary_key.clone(),
+            });
         }
         out.extend(self.uniques.iter().cloned());
         out
@@ -166,7 +181,13 @@ impl Table {
     // ── persistence ──
 
     pub fn to_catalog_doc(&self) -> Doc {
-        let names = |cols: &[usize]| Value::List(cols.iter().map(|i| Value::Text(self.columns[*i].name.clone())).collect());
+        let names = |cols: &[usize]| {
+            Value::List(
+                cols.iter()
+                    .map(|i| Value::Text(self.columns[*i].name.clone()))
+                    .collect(),
+            )
+        };
         let mut d = Doc::new();
         d.insert("name".into(), Value::Text(self.name.clone()));
         d.insert("collection".into(), Value::Text(self.collection.clone()));
@@ -182,8 +203,18 @@ impl Table {
                         m.insert("type".into(), Value::Text(datum::type_sql(&c.ty)));
                         m.insert("not_null".into(), Value::Bool(c.not_null));
                         m.insert("auto_increment".into(), Value::Bool(c.auto_increment));
-                        m.insert("default".into(), c.default.as_ref().map_or(Value::Null, |e| Value::Text(e.to_string())));
-                        m.insert("missing".into(), c.missing.as_ref().map_or(Value::Null, |d| datum::to_value(d, &c.ty)));
+                        m.insert(
+                            "default".into(),
+                            c.default
+                                .as_ref()
+                                .map_or(Value::Null, |e| Value::Text(e.to_string())),
+                        );
+                        m.insert(
+                            "missing".into(),
+                            c.missing
+                                .as_ref()
+                                .map_or(Value::Null, |d| datum::to_value(d, &c.ty)),
+                        );
                         Value::Map(m)
                     })
                     .collect(),
@@ -202,8 +233,14 @@ impl Table {
                     .collect(),
             )
         };
-        d.insert("uniques".into(), keys(self.uniques.iter().map(|k| (&k.name, &k.columns)).collect()));
-        d.insert("indexes".into(), keys(self.indexes.iter().map(|k| (&k.name, &k.columns)).collect()));
+        d.insert(
+            "uniques".into(),
+            keys(self.uniques.iter().map(|k| (&k.name, &k.columns)).collect()),
+        );
+        d.insert(
+            "indexes".into(),
+            keys(self.indexes.iter().map(|k| (&k.name, &k.columns)).collect()),
+        );
         d.insert(
             "foreign_keys".into(),
             Value::List(
@@ -214,9 +251,23 @@ impl Table {
                         m.insert("name".into(), Value::Text(f.name.clone()));
                         m.insert("columns".into(), names(&f.columns));
                         m.insert("ref_table".into(), Value::Text(f.ref_table.clone()));
-                        m.insert("ref_columns".into(), Value::List(f.ref_columns.iter().map(|c| Value::Text(c.clone())).collect()));
-                        m.insert("on_delete".into(), Value::Text(action_name(f.on_delete).into()));
-                        m.insert("on_update".into(), Value::Text(action_name(f.on_update).into()));
+                        m.insert(
+                            "ref_columns".into(),
+                            Value::List(
+                                f.ref_columns
+                                    .iter()
+                                    .map(|c| Value::Text(c.clone()))
+                                    .collect(),
+                            ),
+                        );
+                        m.insert(
+                            "on_delete".into(),
+                            Value::Text(action_name(f.on_delete).into()),
+                        );
+                        m.insert(
+                            "on_update".into(),
+                            Value::Text(action_name(f.on_update).into()),
+                        );
                         Value::Map(m)
                     })
                     .collect(),
@@ -241,20 +292,36 @@ impl Table {
 
     pub fn from_catalog_doc(doc: &Doc, version: u64) -> SqlResult<Table> {
         let bad = || SqlError::internal("corrupt table schema document");
-        let text = |m: &Doc, k: &str| m.get(k).and_then(Value::as_str).map(str::to_owned).ok_or_else(bad);
-        let list = |m: &Doc, k: &str| -> Vec<Value> { m.get(k).and_then(Value::as_list).map(<[Value]>::to_vec).unwrap_or_default() };
+        let text = |m: &Doc, k: &str| {
+            m.get(k)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(bad)
+        };
+        let list = |m: &Doc, k: &str| -> Vec<Value> {
+            m.get(k)
+                .and_then(Value::as_list)
+                .map(<[Value]>::to_vec)
+                .unwrap_or_default()
+        };
         let mut columns = Vec::new();
         for c in list(doc, "columns") {
             let m = c.as_map().ok_or_else(bad)?;
             let ty = parse_data_type(&text(m, "type")?)?;
-            let missing = m.get("missing").filter(|v| !v.is_null()).map(|v| datum::from_value(v, Some(&ty)));
+            let missing = m
+                .get("missing")
+                .filter(|v| !v.is_null())
+                .map(|v| datum::from_value(v, Some(&ty)));
             columns.push(Column {
                 missing,
                 name: text(m, "name")?,
                 field: text(m, "field")?,
                 ty,
                 not_null: m.get("not_null").and_then(Value::as_bool).unwrap_or(false),
-                auto_increment: m.get("auto_increment").and_then(Value::as_bool).unwrap_or(false),
+                auto_increment: m
+                    .get("auto_increment")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 default: match m.get("default").and_then(Value::as_str) {
                     Some(sql) => Some(parse_expr(sql, Dialect::Postgres)?),
                     None => None,
@@ -273,18 +340,28 @@ impl Table {
             version,
         };
         let positions = |t: &Table, v: &Value| -> SqlResult<Vec<usize>> {
-            v.as_list().unwrap_or(&[]).iter().map(|n| t.column(n.as_str().unwrap_or_default())).collect()
+            v.as_list()
+                .unwrap_or(&[])
+                .iter()
+                .map(|n| t.column(n.as_str().unwrap_or_default()))
+                .collect()
         };
         t.primary_key = positions(&t, doc.get("primary_key").unwrap_or(&Value::Null))?;
         for k in list(doc, "uniques") {
             let m = k.as_map().ok_or_else(bad)?;
             let columns = positions(&t, m.get("columns").unwrap_or(&Value::Null))?;
-            t.uniques.push(KeyDef { name: text(m, "name")?, columns });
+            t.uniques.push(KeyDef {
+                name: text(m, "name")?,
+                columns,
+            });
         }
         for k in list(doc, "indexes") {
             let m = k.as_map().ok_or_else(bad)?;
             let columns = positions(&t, m.get("columns").unwrap_or(&Value::Null))?;
-            t.indexes.push(IndexDef { name: text(m, "name")?, columns });
+            t.indexes.push(IndexDef {
+                name: text(m, "name")?,
+                columns,
+            });
         }
         for f in list(doc, "foreign_keys") {
             let m = f.as_map().ok_or_else(bad)?;
@@ -293,14 +370,20 @@ impl Table {
                 name: text(m, "name")?,
                 columns,
                 ref_table: text(m, "ref_table")?,
-                ref_columns: list(m, "ref_columns").iter().filter_map(|v| v.as_str().map(str::to_owned)).collect(),
+                ref_columns: list(m, "ref_columns")
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect(),
                 on_delete: parse_action(&text(m, "on_delete")?),
                 on_update: parse_action(&text(m, "on_update")?),
             });
         }
         for c in list(doc, "checks") {
             let m = c.as_map().ok_or_else(bad)?;
-            t.checks.push(CheckDef { name: text(m, "name")?, expr: parse_expr(&text(m, "sql")?, Dialect::Postgres)? });
+            t.checks.push(CheckDef {
+                name: text(m, "name")?,
+                expr: parse_expr(&text(m, "sql")?, Dialect::Postgres)?,
+            });
         }
         Ok(t)
     }
@@ -365,7 +448,10 @@ fn encode_key_unbounded(parts: &[&Datum]) -> String {
 pub fn encode_key(parts: &[&Datum]) -> SqlResult<String> {
     let k = encode_key_unbounded(parts);
     if k.len() > 1000 {
-        return Err(SqlError::new("54000", "primary key value is too long (at most 1000 bytes)"));
+        return Err(SqlError::new(
+            "54000",
+            "primary key value is too long (at most 1000 bytes)",
+        ));
     }
     Ok(k)
 }
@@ -374,13 +460,29 @@ pub fn encode_key(parts: &[&Datum]) -> SqlResult<String> {
 pub fn collection_name(table: &str) -> String {
     let ok = !table.is_empty()
         && table.len() <= 200
-        && table.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && table
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
         && !table.starts_with("_sql_");
     if ok {
         return table.to_owned();
     }
-    let clean: String = table.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }).take(180).collect();
-    format!("{}_{}", clean.trim_start_matches("_sql"), &hash::hex(&hash::sha256(table.as_bytes()))[..12])
+    let clean: String = table
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(180)
+        .collect();
+    format!(
+        "{}_{}",
+        clean.trim_start_matches("_sql"),
+        &hash::hex(&hash::sha256(table.as_bytes()))[..12]
+    )
 }
 
 /// A document field name for a column (fields cannot contain `.`, which addresses nested maps).
@@ -409,12 +511,18 @@ const CATALOG_TTL: Duration = Duration::from_secs(2);
 
 impl Catalog {
     pub fn is_fresh(&self) -> bool {
-        self.inner.read().map(|s| s.loaded.is_some_and(|t| t.elapsed() < CATALOG_TTL)).unwrap_or(false)
+        self.inner
+            .read()
+            .map(|s| s.loaded.is_some_and(|t| t.elapsed() < CATALOG_TTL))
+            .unwrap_or(false)
     }
 
     pub fn replace_all(&self, tables: Vec<Table>) {
         if let Ok(mut s) = self.inner.write() {
-            s.tables = tables.into_iter().map(|t| (t.name.clone(), Arc::new(t))).collect();
+            s.tables = tables
+                .into_iter()
+                .map(|t| (t.name.clone(), Arc::new(t)))
+                .collect();
             s.loaded = Some(Instant::now());
         }
     }
@@ -431,7 +539,10 @@ impl Catalog {
         if let Some(t) = s.tables.get(name) {
             return Some(Arc::clone(t));
         }
-        let mut it = s.tables.values().filter(|t| t.name.eq_ignore_ascii_case(name));
+        let mut it = s
+            .tables
+            .values()
+            .filter(|t| t.name.eq_ignore_ascii_case(name));
         match (it.next(), it.next()) {
             (Some(t), None) => Some(Arc::clone(t)),
             _ => None,
@@ -439,7 +550,11 @@ impl Catalog {
     }
 
     pub fn all(&self) -> Vec<Arc<Table>> {
-        let mut v: Vec<Arc<Table>> = self.inner.read().map(|s| s.tables.values().cloned().collect()).unwrap_or_default();
+        let mut v: Vec<Arc<Table>> = self
+            .inner
+            .read()
+            .map(|s| s.tables.values().cloned().collect())
+            .unwrap_or_default();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
     }
@@ -464,21 +579,53 @@ mod tests {
     use storage_types::Decimal;
 
     fn table() -> Table {
-        let col = |name: &str, ty: DataType| Column { name: name.into(), field: field_name(name), ty, not_null: false, default: None, auto_increment: false, missing: None };
+        let col = |name: &str, ty: DataType| Column {
+            name: name.into(),
+            field: field_name(name),
+            ty,
+            not_null: false,
+            default: None,
+            auto_increment: false,
+            missing: None,
+        };
         Table {
             name: "Accounts".into(),
             collection: collection_name("Accounts"),
             columns: vec![
-                Column { auto_increment: true, not_null: true, ..col("id", DataType::BigInt) },
-                Column { default: Some(Expr::Number("0".into())), missing: Some(Datum::Numeric("0.00".parse::<Decimal>().unwrap())), ..col("balance", DataType::Numeric(Some((12, 2)))) },
+                Column {
+                    auto_increment: true,
+                    not_null: true,
+                    ..col("id", DataType::BigInt)
+                },
+                Column {
+                    default: Some(Expr::Number("0".into())),
+                    missing: Some(Datum::Numeric("0.00".parse::<Decimal>().unwrap())),
+                    ..col("balance", DataType::Numeric(Some((12, 2))))
+                },
                 col("email", DataType::Varchar(Some(255))),
                 col("tags", DataType::Array(Box::new(DataType::Text))),
             ],
             primary_key: vec![0],
-            uniques: vec![KeyDef { name: "accounts_email_key".into(), columns: vec![2] }],
-            indexes: vec![IndexDef { name: "ix_balance".into(), columns: vec![1] }],
-            foreign_keys: vec![FkDef { name: "fk".into(), columns: vec![0], ref_table: "users".into(), ref_columns: vec![], on_delete: RefAction::Cascade, on_update: RefAction::NoAction }],
-            checks: vec![CheckDef { name: "positive".into(), expr: parse_expr("balance >= 0", Dialect::Postgres).unwrap() }],
+            uniques: vec![KeyDef {
+                name: "accounts_email_key".into(),
+                columns: vec![2],
+            }],
+            indexes: vec![IndexDef {
+                name: "ix_balance".into(),
+                columns: vec![1],
+            }],
+            foreign_keys: vec![FkDef {
+                name: "fk".into(),
+                columns: vec![0],
+                ref_table: "users".into(),
+                ref_columns: vec![],
+                on_delete: RefAction::Cascade,
+                on_update: RefAction::NoAction,
+            }],
+            checks: vec![CheckDef {
+                name: "positive".into(),
+                expr: parse_expr("balance >= 0", Dialect::Postgres).unwrap(),
+            }],
             version: 3,
         }
     }
@@ -501,14 +648,23 @@ mod tests {
         ];
         assert_eq!(t.row_key(&row).unwrap().as_deref(), Some("5"));
         assert_eq!(t.from_doc(&t.to_doc(&row)), row);
-        assert_eq!(t.unique_marker(&t.uniques[0], &row).unwrap().as_deref(), Some("Accounts/accounts_email_key/a\\|b"));
+        assert_eq!(
+            t.unique_marker(&t.uniques[0], &row).unwrap().as_deref(),
+            Some("Accounts/accounts_email_key/a\\|b")
+        );
         let mut nulls = row.clone();
         nulls[2] = Datum::Null;
         assert_eq!(t.unique_marker(&t.uniques[0], &nulls).unwrap(), None);
         nulls[0] = Datum::Null;
         assert!(t.row_key(&nulls).is_err());
-        assert_eq!(encode_key(&[&Datum::Int(7), &Datum::Text("".into())]).unwrap(), "7|\\e");
-        assert_eq!(encode_key(&[&Datum::Numeric("5.00".parse::<Decimal>().unwrap())]).unwrap(), "5");
+        assert_eq!(
+            encode_key(&[&Datum::Int(7), &Datum::Text("".into())]).unwrap(),
+            "7|\\e"
+        );
+        assert_eq!(
+            encode_key(&[&Datum::Numeric("5.00".parse::<Decimal>().unwrap())]).unwrap(),
+            "5"
+        );
         assert_eq!(collection_name("orders"), "orders");
         assert!(collection_name("my table").starts_with("my_table_"));
         assert_eq!(field_name("a.b"), "a_b");

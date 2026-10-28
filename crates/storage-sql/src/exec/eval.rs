@@ -38,17 +38,46 @@ pub struct Env<'e> {
 }
 
 impl<'e> Env<'e> {
-    pub const EMPTY: Env<'static> = Env { cols: &[], row: &[], outer: None, aggs: None };
+    pub const EMPTY: Env<'static> = Env {
+        cols: &[],
+        row: &[],
+        outer: None,
+        aggs: None,
+    };
 
     pub fn new(cols: &'e [ColMeta], row: &'e [Datum]) -> Env<'e> {
-        Env { cols, row, outer: None, aggs: None }
+        Env {
+            cols,
+            row,
+            outer: None,
+            aggs: None,
+        }
     }
 }
 
 const AGGREGATES: &[&str] = &[
-    "count", "sum", "avg", "min", "max", "string_agg", "group_concat", "array_agg", "bool_and", "bool_or", "every",
-    "json_agg", "jsonb_agg", "bit_and", "bit_or", "stddev", "stddev_samp", "stddev_pop", "variance", "var_samp",
-    "var_pop", "listagg",
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "string_agg",
+    "group_concat",
+    "array_agg",
+    "bool_and",
+    "bool_or",
+    "every",
+    "json_agg",
+    "jsonb_agg",
+    "bit_and",
+    "bit_or",
+    "stddev",
+    "stddev_samp",
+    "stddev_pop",
+    "variance",
+    "var_samp",
+    "var_pop",
+    "listagg",
 ];
 
 pub fn is_aggregate(name: &str) -> bool {
@@ -59,7 +88,10 @@ pub fn is_aggregate(name: &str) -> bool {
 pub fn has_aggregate(e: &Expr) -> bool {
     let mut found = false;
     walk(e, &mut |x| {
-        if let Expr::Function { name, .. } = x {
+        if let Expr::Function {
+            name, over: None, ..
+        } = x
+        {
             if is_aggregate(name) {
                 found = true;
             }
@@ -72,15 +104,25 @@ pub fn has_aggregate(e: &Expr) -> bool {
 pub fn walk(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     f(e);
     match e {
-        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } | Expr::IsBool { expr, .. } | Expr::Extract { expr, .. } => {
-            walk(expr, f)
-        }
-        Expr::Binary { left, right, .. } | Expr::IsDistinctFrom { left, right, .. } | Expr::AnyAll { left, right, .. } => {
+        Expr::Unary { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::IsBool { expr, .. }
+        | Expr::Extract { expr, .. } => walk(expr, f),
+        Expr::Binary { left, right, .. }
+        | Expr::IsDistinctFrom { left, right, .. }
+        | Expr::AnyAll { left, right, .. } => {
             walk(left, f);
             walk(right, f);
         }
-        Expr::Function { args, .. } | Expr::Tuple(args) | Expr::Array(args) => args.iter().for_each(|a| walk(a, f)),
-        Expr::Case { operand, whens, else_ } => {
+        Expr::Function { args, .. } | Expr::Tuple(args) | Expr::Array(args) => {
+            args.iter().for_each(|a| walk(a, f))
+        }
+        Expr::Case {
+            operand,
+            whens,
+            else_,
+        } => {
             if let Some(o) = operand {
                 walk(o, f);
             }
@@ -92,7 +134,9 @@ pub fn walk(e: &Expr, f: &mut dyn FnMut(&Expr)) {
                 walk(x, f);
             }
         }
-        Expr::Between { expr, low, high, .. } => {
+        Expr::Between {
+            expr, low, high, ..
+        } => {
             walk(expr, f);
             walk(low, f);
             walk(high, f);
@@ -102,7 +146,12 @@ pub fn walk(e: &Expr, f: &mut dyn FnMut(&Expr)) {
             list.iter().for_each(|a| walk(a, f));
         }
         Expr::InSubquery { expr, .. } => walk(expr, f),
-        Expr::Like { expr, pattern, escape, .. } => {
+        Expr::Like {
+            expr,
+            pattern,
+            escape,
+            ..
+        } => {
             walk(expr, f);
             walk(pattern, f);
             if let Some(x) = escape {
@@ -148,16 +197,25 @@ impl<'a> Exec<'a> {
         }
         let has_exp = n.contains(['e', 'E']);
         if has_exp && self.dialect() == Dialect::MySql {
-            return n.parse::<f64>().map(Datum::Float).map_err(|_| SqlError::syntax(format!("bad number {n}")));
+            return n
+                .parse::<f64>()
+                .map(Datum::Float)
+                .map_err(|_| SqlError::syntax(format!("bad number {n}")));
         }
         match datum::parse_dec(n) {
             Ok(d) => Ok(Datum::Numeric(d)),
-            Err(()) => n.parse::<f64>().map(Datum::Float).map_err(|_| SqlError::syntax(format!("bad number {n}"))),
+            Err(()) => n
+                .parse::<f64>()
+                .map(Datum::Float)
+                .map_err(|_| SqlError::syntax(format!("bad number {n}"))),
         }
     }
 
     pub fn param(&self, i: usize) -> SqlResult<Datum> {
-        self.params.get(i).cloned().ok_or_else(|| SqlError::new("08P01", format!("there is no parameter ${}", i + 1)))
+        self.params
+            .get(i)
+            .cloned()
+            .ok_or_else(|| SqlError::new("08P01", format!("there is no parameter ${}", i + 1)))
     }
 
     /// Resolves a column reference in `env` (then enclosing rows).
@@ -188,20 +246,34 @@ impl<'a> Exec<'a> {
             Expr::Str(s) => Datum::Text(s.clone()),
             Expr::Blob(b) => Datum::Bytes(b.clone()),
             Expr::Param(i) => self.param(*i)?,
-            Expr::Default => return Err(SqlError::syntax("DEFAULT is not allowed in this context".into())),
+            Expr::Default => {
+                return Err(SqlError::syntax(
+                    "DEFAULT is not allowed in this context".into(),
+                ))
+            }
             Expr::Column(parts) => self.column(parts, env)?,
             Expr::Variable { name, system } => self.variable(name, *system),
             Expr::Unary { op, expr } => {
                 let v = self.eval(expr, env)?;
                 match op {
-                    UnaryOp::Neg => match v {
-                        Datum::Null => Datum::Null,
-                        Datum::Int(i) => Datum::Int(i.checked_neg().ok_or_else(|| SqlError::numeric_out_of_range("bigint out of range"))?),
-                        Datum::Float(f) => Datum::Float(-f),
-                        Datum::Numeric(d) => Datum::Numeric(d.checked_neg().map_err(|_| SqlError::numeric_out_of_range("numeric out of range"))?),
-                        Datum::Interval { months, days, ns } => Datum::Interval { months: -months, days: -days, ns: -ns },
-                        other => arith('-', &Datum::Int(0), &other)?,
-                    },
+                    UnaryOp::Neg => {
+                        match v {
+                            Datum::Null => Datum::Null,
+                            Datum::Int(i) => Datum::Int(i.checked_neg().ok_or_else(|| {
+                                SqlError::numeric_out_of_range("bigint out of range")
+                            })?),
+                            Datum::Float(f) => Datum::Float(-f),
+                            Datum::Numeric(d) => Datum::Numeric(d.checked_neg().map_err(|_| {
+                                SqlError::numeric_out_of_range("numeric out of range")
+                            })?),
+                            Datum::Interval { months, days, ns } => Datum::Interval {
+                                months: -months,
+                                days: -days,
+                                ns: -ns,
+                            },
+                            other => arith('-', &Datum::Int(0), &other)?,
+                        }
+                    }
                     UnaryOp::Not => match v.truthy()? {
                         None => Datum::Null,
                         Some(b) => Datum::Bool(!b),
@@ -213,8 +285,30 @@ impl<'a> Exec<'a> {
                 }
             }
             Expr::Binary { op, left, right } => self.binary(*op, left, right, env)?,
-            Expr::Function { name, args, star, distinct, .. } => {
-                if is_aggregate(name) && !(name == "min" || name == "max") || (matches!(name.as_str(), "min" | "max") && args.len() == 1) {
+            Expr::Function {
+                over: Some(_),
+                name,
+                ..
+            } => {
+                // Window values are computed before projection.
+                if let Some(v) = env.aggs.and_then(|a| a.iter().find(|(x, _)| x == e)) {
+                    return Ok(v.1.clone());
+                }
+                return Err(SqlError::new(
+                    "42P20",
+                    format!("window function {name}() is not allowed here"),
+                ));
+            }
+            Expr::Function {
+                name,
+                args,
+                star,
+                distinct,
+                ..
+            } => {
+                if is_aggregate(name) && !(name == "min" || name == "max")
+                    || (matches!(name.as_str(), "min" | "max") && args.len() == 1)
+                {
                     if let Some(aggs) = env.aggs {
                         if let Some((_, v)) = aggs.iter().find(|(x, _)| x == e) {
                             return Ok(v.clone());
@@ -229,11 +323,18 @@ impl<'a> Exec<'a> {
                         }
                         o = oe.outer;
                     }
-                    return Err(SqlError::new("42803", format!("aggregate function {name}() is not allowed here")));
+                    return Err(SqlError::new(
+                        "42803",
+                        format!("aggregate function {name}() is not allowed here"),
+                    ));
                 }
                 func::call(self, name, args, *star, *distinct, env)?
             }
-            Expr::Case { operand, whens, else_ } => {
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
                 let base = match operand {
                     Some(o) => Some(self.eval(o, env)?),
                     None => None,
@@ -262,12 +363,22 @@ impl<'a> Exec<'a> {
                 }
                 cast(&v, ty)?
             }
-            Expr::IsNull { expr, negated } => Datum::Bool(self.eval(expr, env)?.is_null() != *negated),
-            Expr::IsBool { expr, value, negated } => {
+            Expr::IsNull { expr, negated } => {
+                Datum::Bool(self.eval(expr, env)?.is_null() != *negated)
+            }
+            Expr::IsBool {
+                expr,
+                value,
+                negated,
+            } => {
                 let v = self.eval(expr, env)?.truthy()?;
                 Datum::Bool((v == Some(*value)) != *negated)
             }
-            Expr::IsDistinctFrom { left, right, negated } => {
+            Expr::IsDistinctFrom {
+                left,
+                right,
+                negated,
+            } => {
                 let (a, b) = (self.eval(left, env)?, self.eval(right, env)?);
                 let same = match (a.is_null(), b.is_null()) {
                     (true, true) => true,
@@ -276,7 +387,12 @@ impl<'a> Exec<'a> {
                 };
                 Datum::Bool(same == *negated)
             }
-            Expr::Between { expr, low, high, negated } => {
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
                 let v = self.eval(expr, env)?;
                 let (lo, hi) = (self.eval(low, env)?, self.eval(high, env)?);
                 let ge = sql_cmp(&v, &lo).map(|o| o != Ordering::Less);
@@ -284,7 +400,11 @@ impl<'a> Exec<'a> {
                 let r = and3(ge, le);
                 bool3(r.map(|b| b != *negated))
             }
-            Expr::InList { expr, list, negated } => {
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
                 let v = self.eval(expr, env)?;
                 let mut saw_null = v.is_null();
                 let mut hit = false;
@@ -303,14 +423,22 @@ impl<'a> Exec<'a> {
                 }
                 in_result(hit, saw_null, *negated)
             }
-            Expr::InSubquery { expr, query, negated } => {
+            Expr::InSubquery {
+                expr,
+                query,
+                negated,
+            } => {
                 let v = self.eval(expr, env)?;
                 let rel = self.subquery(query, env)?;
                 let mut saw_null = v.is_null();
                 let mut hit = false;
                 if !v.is_null() {
                     for r in &rel.rows {
-                        let x = if r.len() == 1 { r[0].clone() } else { Datum::Array(r.clone()) };
+                        let x = if r.len() == 1 {
+                            r[0].clone()
+                        } else {
+                            Datum::Array(r.clone())
+                        };
                         match self.equals(&v, &x) {
                             Some(true) => {
                                 hit = true;
@@ -323,10 +451,20 @@ impl<'a> Exec<'a> {
                 }
                 in_result(hit, saw_null, *negated)
             }
-            Expr::AnyAll { left, op, right, all } => {
+            Expr::AnyAll {
+                left,
+                op,
+                right,
+                all,
+            } => {
                 let v = self.eval(left, env)?;
                 let items: Vec<Datum> = match &**right {
-                    Expr::Subquery(q) => self.subquery(q, env)?.rows.iter().map(|r| r.first().cloned().unwrap_or(Datum::Null)).collect(),
+                    Expr::Subquery(q) => self
+                        .subquery(q, env)?
+                        .rows
+                        .iter()
+                        .map(|r| r.first().cloned().unwrap_or(Datum::Null))
+                        .collect(),
                     other => match self.eval(other, env)? {
                         Datum::Array(a) => a,
                         Datum::Null => return Ok(Datum::Null),
@@ -368,10 +506,21 @@ impl<'a> Exec<'a> {
                 match rel.rows.len() {
                     0 => Datum::Null,
                     1 => rel.rows[0].first().cloned().unwrap_or(Datum::Null),
-                    _ => return Err(SqlError::new("21000", "more than one row returned by a subquery used as an expression")),
+                    _ => {
+                        return Err(SqlError::new(
+                            "21000",
+                            "more than one row returned by a subquery used as an expression",
+                        ))
+                    }
                 }
             }
-            Expr::Like { expr, pattern, negated, case_insensitive, escape } => {
+            Expr::Like {
+                expr,
+                pattern,
+                negated,
+                case_insensitive,
+                escape,
+            } => {
                 let v = self.eval(expr, env)?;
                 let p = self.eval(pattern, env)?;
                 if v.is_null() || p.is_null() {
@@ -388,18 +537,32 @@ impl<'a> Exec<'a> {
                 };
                 Datum::Bool(like(&s, &p, esc) != *negated)
             }
-            Expr::Tuple(items) => Datum::Array(items.iter().map(|x| self.eval(x, env)).collect::<SqlResult<_>>()?),
-            Expr::Array(items) => Datum::Array(items.iter().map(|x| self.eval(x, env)).collect::<SqlResult<_>>()?),
+            Expr::Tuple(items) => Datum::Array(
+                items
+                    .iter()
+                    .map(|x| self.eval(x, env))
+                    .collect::<SqlResult<_>>()?,
+            ),
+            Expr::Array(items) => Datum::Array(
+                items
+                    .iter()
+                    .map(|x| self.eval(x, env))
+                    .collect::<SqlResult<_>>()?,
+            ),
             Expr::Index { expr, index } => {
                 let v = self.eval(expr, env)?;
                 let i = self.eval(index, env)?;
                 match (v, i) {
-                    (Datum::Array(a), Datum::Int(n)) => usize::try_from(n - 1).ok().and_then(|k| a.get(k).cloned()).unwrap_or(Datum::Null),
+                    (Datum::Array(a), Datum::Int(n)) => usize::try_from(n - 1)
+                        .ok()
+                        .and_then(|k| a.get(k).cloned())
+                        .unwrap_or(Datum::Null),
                     (Datum::Json(j), i) => func::json_get(&j, &i, false)?,
                     _ => Datum::Null,
                 }
             }
-            Expr::Interval(s) => datum::parse_interval(s).ok_or_else(|| SqlError::invalid_text(format!("invalid interval \"{s}\"")))?,
+            Expr::Interval(s) => datum::parse_interval(s)
+                .ok_or_else(|| SqlError::invalid_text(format!("invalid interval \"{s}\"")))?,
             Expr::Extract { field, expr } => func::extract(field, &self.eval(expr, env)?)?,
         })
     }
@@ -439,7 +602,12 @@ impl<'a> Exec<'a> {
             None => {
                 return Err(SqlError::new(
                     "42883",
-                    format!("operator does not exist: {} {} {}", a.type_name(), op_symbol(op), b.type_name()),
+                    format!(
+                        "operator does not exist: {} {} {}",
+                        a.type_name(),
+                        op_symbol(op),
+                        b.type_name()
+                    ),
                 ))
             }
         };
@@ -495,13 +663,18 @@ impl<'a> Exec<'a> {
             Mul => arith('*', &a, &b)?,
             Div => {
                 // MySQL `/` on integers gives a decimal (7 / 2 = 3.5000).
-                if self.dialect() == Dialect::MySql && matches!((&a, &b), (Datum::Int(_), Datum::Int(_))) {
+                if self.dialect() == Dialect::MySql
+                    && matches!((&a, &b), (Datum::Int(_), Datum::Int(_)))
+                {
                     let x = datum::to_decimal(&a).unwrap_or_default();
                     let y = datum::to_decimal(&b).unwrap_or_default();
                     if y.is_zero() {
                         return Ok(Datum::Null);
                     }
-                    Datum::Numeric(x.checked_div(y, 4, storage_types::RoundingMode::HalfUp).map_err(|_| SqlError::numeric_out_of_range("out of range"))?)
+                    Datum::Numeric(
+                        x.checked_div(y, 4, storage_types::RoundingMode::HalfUp)
+                            .map_err(|_| SqlError::numeric_out_of_range("out of range"))?,
+                    )
                 } else {
                     arith('/', &a, &b)?
                 }
@@ -510,7 +683,10 @@ impl<'a> Exec<'a> {
                 Datum::Null => Datum::Null,
                 v => Datum::Int(match v {
                     Datum::Float(f) => f.trunc() as i64,
-                    Datum::Numeric(d) => Datum::Numeric(d.rescale(0, storage_types::RoundingMode::Down).unwrap_or(d)).as_i64()?,
+                    Datum::Numeric(d) => {
+                        Datum::Numeric(d.rescale(0, storage_types::RoundingMode::Down).unwrap_or(d))
+                            .as_i64()?
+                    }
                     other => other.as_i64()?,
                 }),
             },
@@ -557,7 +733,10 @@ impl<'a> Exec<'a> {
                 Datum::Json(j) | Datum::Text(j) => func::json_get(&j, &b, op == JsonGetText)?,
                 _ => Datum::Null,
             },
-            Regex { case_insensitive, negated } => {
+            Regex {
+                case_insensitive,
+                negated,
+            } => {
                 if a.is_null() || b.is_null() {
                     Datum::Null
                 } else {
@@ -569,13 +748,21 @@ impl<'a> Exec<'a> {
                 let (big, small) = if op == Contains { (a, b) } else { (b, a) };
                 match (big, small) {
                     (Datum::Null, _) | (_, Datum::Null) => Datum::Null,
-                    (Datum::Array(x), Datum::Array(y)) => Datum::Bool(y.iter().all(|i| x.iter().any(|j| self.equals(i, j) == Some(true)))),
-                    (Datum::Json(x) | Datum::Text(x), Datum::Json(y) | Datum::Text(y)) => Datum::Bool(func::json_contains(&x, &y)?),
+                    (Datum::Array(x), Datum::Array(y)) => Datum::Bool(
+                        y.iter()
+                            .all(|i| x.iter().any(|j| self.equals(i, j) == Some(true))),
+                    ),
+                    (Datum::Json(x) | Datum::Text(x), Datum::Json(y) | Datum::Text(y)) => {
+                        Datum::Bool(func::json_contains(&x, &y)?)
+                    }
                     _ => return Err(SqlError::datatype_mismatch("@> needs arrays or JSON")),
                 }
             }
             Overlap => match (a, b) {
-                (Datum::Array(x), Datum::Array(y)) => Datum::Bool(x.iter().any(|i| y.iter().any(|j| self.equals(i, j) == Some(true)))),
+                (Datum::Array(x), Datum::Array(y)) => Datum::Bool(
+                    x.iter()
+                        .any(|i| y.iter().any(|j| self.equals(i, j) == Some(true))),
+                ),
                 (Datum::Null, _) | (_, Datum::Null) => Datum::Null,
                 _ => return Err(SqlError::datatype_mismatch("&& needs arrays")),
             },
@@ -588,7 +775,10 @@ impl<'a> Exec<'a> {
         if !system {
             return self.s.user_vars.get(&lower).cloned().unwrap_or(Datum::Null);
         }
-        let n = lower.trim_start_matches("session.").trim_start_matches("global.").trim_start_matches("local.");
+        let n = lower
+            .trim_start_matches("session.")
+            .trim_start_matches("global.")
+            .trim_start_matches("local.");
         match n {
             "version" => Datum::Text(crate::MYSQL_VERSION.into()),
             "version_comment" => Datum::Text("Storine".into()),
@@ -625,7 +815,9 @@ impl<'a> Exec<'a> {
             match self.query(q, None) {
                 Ok(rel) => {
                     let rel = Rc::new(rel);
-                    self.subquery_cache.borrow_mut().insert(key, Rc::clone(&rel));
+                    self.subquery_cache
+                        .borrow_mut()
+                        .insert(key, Rc::clone(&rel));
                     return Ok(rel);
                 }
                 Err(e) if e.code == "42703" || e.code == "42P01" => {
@@ -646,12 +838,19 @@ impl<'a> Exec<'a> {
             .map(|(i, c)| OutCol {
                 name: c.name.clone(),
                 ty: c.ty.clone().unwrap_or_else(|| {
-                    rel.rows.iter().map(|r| &r[i]).find(|d| !d.is_null()).map_or(DataType::Text, Datum::natural_type)
+                    rel.rows
+                        .iter()
+                        .map(|r| &r[i])
+                        .find(|d| !d.is_null())
+                        .map_or(DataType::Text, Datum::natural_type)
                 }),
                 table: c.table.clone(),
             })
             .collect();
-        Ok(ResultSet { columns, rows: rel.rows })
+        Ok(ResultSet {
+            columns,
+            rows: rel.rows,
+        })
     }
 }
 
@@ -670,7 +869,10 @@ fn op_symbol(op: BinaryOp) -> &'static str {
 pub fn find_column(cols: &[ColMeta], qual: Option<&str>, name: &str) -> SqlResult<Option<usize>> {
     let matches_q = |c: &ColMeta| match qual {
         None => true,
-        Some(q) => c.qual.as_deref().is_some_and(|cq| cq == q || cq.eq_ignore_ascii_case(q)),
+        Some(q) => c
+            .qual
+            .as_deref()
+            .is_some_and(|cq| cq == q || cq.eq_ignore_ascii_case(q)),
     };
     let mut found: Option<usize> = None;
     for (i, c) in cols.iter().enumerate() {

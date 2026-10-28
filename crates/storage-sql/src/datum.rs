@@ -33,7 +33,11 @@ pub enum Datum {
     Date(i32),
     /// Nanoseconds since midnight.
     Time(i64),
-    Interval { months: i64, days: i64, ns: i64 },
+    Interval {
+        months: i64,
+        days: i64,
+        ns: i64,
+    },
     Uuid([u8; 16]),
     Json(String),
     Array(Vec<Datum>),
@@ -52,8 +56,15 @@ impl Datum {
             Datum::Int(i) => Some(*i != 0),
             Datum::Numeric(d) => Some(!d.is_zero()),
             Datum::Float(f) => Some(*f != 0.0),
-            Datum::Text(s) => Some(parse_bool(s).ok_or_else(|| SqlError::invalid_text(format!("invalid input syntax for type boolean: \"{s}\"")))?),
-            other => return Err(SqlError::datatype_mismatch(format!("argument of WHERE must be type boolean, not {}", other.type_name()))),
+            Datum::Text(s) => Some(parse_bool(s).ok_or_else(|| {
+                SqlError::invalid_text(format!("invalid input syntax for type boolean: \"{s}\""))
+            })?),
+            other => {
+                return Err(SqlError::datatype_mismatch(format!(
+                    "argument of WHERE must be type boolean, not {}",
+                    other.type_name()
+                )))
+            }
         })
     }
 
@@ -91,7 +102,11 @@ impl Datum {
             Datum::Interval { .. } => DataType::Interval,
             Datum::Uuid(_) => DataType::Uuid,
             Datum::Json(_) => DataType::Json,
-            Datum::Array(a) => DataType::Array(Box::new(a.iter().find(|d| !d.is_null()).map_or(DataType::Text, Datum::natural_type))),
+            Datum::Array(a) => DataType::Array(Box::new(
+                a.iter()
+                    .find(|d| !d.is_null())
+                    .map_or(DataType::Text, Datum::natural_type),
+            )),
         }
     }
 
@@ -107,10 +122,22 @@ impl Datum {
             Datum::Float(f) if f.is_finite() && f.abs() < 9.2e18 => Ok(f.round() as i64),
             Datum::Text(s) => {
                 let t = s.trim();
-                t.parse::<i64>().or_else(|_| parse_dec(t).map_err(|_| ()).and_then(|d| Datum::Numeric(d).as_i64().map_err(|_| ())))
-                    .map_err(|_| SqlError::invalid_text(format!("invalid input syntax for type integer: \"{s}\"")))
+                t.parse::<i64>()
+                    .or_else(|_| {
+                        parse_dec(t)
+                            .map_err(|_| ())
+                            .and_then(|d| Datum::Numeric(d).as_i64().map_err(|_| ()))
+                    })
+                    .map_err(|_| {
+                        SqlError::invalid_text(format!(
+                            "invalid input syntax for type integer: \"{s}\""
+                        ))
+                    })
             }
-            other => Err(SqlError::datatype_mismatch(format!("cannot use {} as an integer", other.type_name()))),
+            other => Err(SqlError::datatype_mismatch(format!(
+                "cannot use {} as an integer",
+                other.type_name()
+            ))),
         }
     }
 
@@ -158,7 +185,10 @@ impl Datum {
                     match d {
                         Datum::Null => s.push_str("NULL"),
                         Datum::Text(t) => {
-                            let needs = t.is_empty() || t.chars().any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\' | ' ')) || t.eq_ignore_ascii_case("null");
+                            let needs = t.is_empty()
+                                || t.chars()
+                                    .any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\' | ' '))
+                                || t.eq_ignore_ascii_case("null");
                             if needs {
                                 s.push('"');
                                 for c in t.chars() {
@@ -196,7 +226,11 @@ pub fn compare(a: &Datum, b: &Datum) -> Ordering {
         (Datum::Null, Datum::Null) => Ordering::Equal,
         (Datum::Null, _) => Ordering::Greater,
         (_, Datum::Null) => Ordering::Less,
-        _ => sql_cmp(a, b).unwrap_or_else(|| rank(a).cmp(&rank(b)).then_with(|| a.as_text().cmp(&b.as_text()))),
+        _ => sql_cmp(a, b).unwrap_or_else(|| {
+            rank(a)
+                .cmp(&rank(b))
+                .then_with(|| a.as_text().cmp(&b.as_text()))
+        }),
     }
 }
 
@@ -269,7 +303,9 @@ fn coerce_text(s: &str, like: &Datum) -> Option<Datum> {
 fn interval_ns(d: &Datum) -> i128 {
     match d {
         Datum::Interval { months, days, ns } => {
-            i128::from(*months) * 30 * i128::from(NS_PER_DAY) + i128::from(*days) * i128::from(NS_PER_DAY) + i128::from(*ns)
+            i128::from(*months) * 30 * i128::from(NS_PER_DAY)
+                + i128::from(*days) * i128::from(NS_PER_DAY)
+                + i128::from(*ns)
         }
         _ => 0,
     }
@@ -288,7 +324,9 @@ pub fn to_decimal(d: &Datum) -> Option<Decimal> {
         Datum::Int(i) => Some(Decimal::from_i64(*i)),
         Datum::Numeric(x) => Some(*x),
         Datum::Bool(b) => Some(Decimal::from_i64(i64::from(*b))),
-        Datum::Float(f) => Decimal::from_f64_lossy(*f, 15, RoundingMode::HalfEven).ok().map(Decimal::normalize),
+        Datum::Float(f) => Decimal::from_f64_lossy(*f, 15, RoundingMode::HalfEven)
+            .ok()
+            .map(Decimal::normalize),
         Datum::Text(s) => parse_dec(s.trim()).ok(),
         _ => None,
     }
@@ -322,7 +360,9 @@ pub fn group_eq(a: &Datum, b: &Datum) -> bool {
 pub fn hash_key(d: &Datum) -> String {
     match d {
         Datum::Null => "\u{0}N".into(),
-        Datum::Int(_) | Datum::Numeric(_) => to_decimal(d).map(|x| format!("n{}", x.normalize())).unwrap_or_default(),
+        Datum::Int(_) | Datum::Numeric(_) => to_decimal(d)
+            .map(|x| format!("n{}", x.normalize()))
+            .unwrap_or_default(),
         Datum::Float(f) => {
             if f.fract() == 0.0 && f.abs() < 1e15 {
                 format!("n{}", *f as i64)
@@ -357,11 +397,31 @@ pub fn arith(op: char, a: &Datum, b: &Datum) -> SqlResult<Datum> {
         ('-', Date(x), Date(y)) => return Ok(Int(i64::from(*x) - i64::from(*y))),
         ('-', Timestamp(_) | Date(_), Timestamp(_) | Date(_)) => {
             let ns = to_ns(a).unwrap_or(0) - to_ns(b).unwrap_or(0);
-            return Ok(Interval { months: 0, days: ns / NS_PER_DAY, ns: ns % NS_PER_DAY });
+            return Ok(Interval {
+                months: 0,
+                days: ns / NS_PER_DAY,
+                ns: ns % NS_PER_DAY,
+            });
         }
-        ('+' | '-', Interval { months: m1, days: d1, ns: n1 }, Interval { months: m2, days: d2, ns: n2 }) => {
+        (
+            '+' | '-',
+            Interval {
+                months: m1,
+                days: d1,
+                ns: n1,
+            },
+            Interval {
+                months: m2,
+                days: d2,
+                ns: n2,
+            },
+        ) => {
             let s = if op == '+' { 1 } else { -1 };
-            return Ok(Interval { months: m1 + s * m2, days: d1 + s * d2, ns: n1 + s * n2 });
+            return Ok(Interval {
+                months: m1 + s * m2,
+                days: d1 + s * d2,
+                ns: n1 + s * n2,
+            });
         }
         _ => {}
     }
@@ -376,12 +436,17 @@ pub fn arith(op: char, a: &Datum, b: &Datum) -> SqlResult<Datum> {
                 } else if let Ok(f) = t.parse::<f64>() {
                     Ok(Float(f))
                 } else {
-                    Err(SqlError::invalid_text(format!("invalid input syntax for type numeric: \"{s}\"")))
+                    Err(SqlError::invalid_text(format!(
+                        "invalid input syntax for type numeric: \"{s}\""
+                    )))
                 }
             }
             Bool(b) => Ok(Int(i64::from(*b))),
             Int(_) | Numeric(_) | Float(_) => Ok(d.clone()),
-            other => Err(SqlError::datatype_mismatch(format!("operator does not exist: {} {op} ...", other.type_name()))),
+            other => Err(SqlError::datatype_mismatch(format!(
+                "operator does not exist: {} {op} ...",
+                other.type_name()
+            ))),
         }
     };
     let (a, b) = (num(a)?, num(b)?);
@@ -419,7 +484,10 @@ pub fn arith(op: char, a: &Datum, b: &Datum) -> SqlResult<Datum> {
             }))
         }
         _ => {
-            let (x, y) = (to_decimal(&a).ok_or_else(overflow)?, to_decimal(&b).ok_or_else(overflow)?);
+            let (x, y) = (
+                to_decimal(&a).ok_or_else(overflow)?,
+                to_decimal(&b).ok_or_else(overflow)?,
+            );
             let r = match op {
                 '+' => x.checked_add(y),
                 '-' => x.checked_sub(y),
@@ -431,14 +499,17 @@ pub fn arith(op: char, a: &Datum, b: &Datum) -> SqlResult<Datum> {
                     // PostgreSQL keeps at least 16 significant digits; use the larger input
                     // scale plus 16 (capped at 38) and round half away from zero.
                     let scale = (x.scale().max(y.scale()) + 16).min(20);
-                    x.checked_div(y, scale, RoundingMode::HalfUp).map(trim_division)
+                    x.checked_div(y, scale, RoundingMode::HalfUp)
+                        .map(trim_division)
                 }
                 _ => {
                     if y.is_zero() {
                         return Err(SqlError::division_by_zero());
                     }
                     // x - trunc(x / y) * y
-                    x.checked_div(y, 0, RoundingMode::Down).and_then(|q| q.checked_mul(y)).and_then(|p| x.checked_sub(p))
+                    x.checked_div(y, 0, RoundingMode::Down)
+                        .and_then(|q| q.checked_mul(y))
+                        .and_then(|p| x.checked_sub(p))
                 }
             };
             r.map(Numeric).map_err(|_| overflow())
@@ -459,13 +530,18 @@ fn trim_division(d: Decimal) -> Decimal {
 }
 
 fn add_interval(t: &Datum, iv: &Datum, sign: i64) -> SqlResult<Datum> {
-    let Datum::Interval { months, days, ns } = iv else { return Err(SqlError::internal("not an interval")) };
+    let Datum::Interval { months, days, ns } = iv else {
+        return Err(SqlError::internal("not an interval"));
+    };
     let base = to_ns(t).ok_or_else(|| SqlError::internal("not a timestamp"))?;
     let day = base.div_euclid(NS_PER_DAY);
     let rem = base.rem_euclid(NS_PER_DAY);
     let (y, m, d) = civil_from_days(day as i32);
     let total = i64::from(y) * 12 + i64::from(m - 1) + sign * months;
-    let (ny, nm) = (total.div_euclid(12) as i32, (total.rem_euclid(12) + 1) as u32);
+    let (ny, nm) = (
+        total.div_euclid(12) as i32,
+        (total.rem_euclid(12) + 1) as u32,
+    );
     let nd = d.min(days_in_month(ny, nm));
     let new_day = i64::from(days_from_civil(ny, nm, nd)) + sign * days;
     let out = new_day * NS_PER_DAY + rem + sign * ns;
@@ -491,7 +567,13 @@ pub fn cast(d: &Datum, ty: &DataType) -> SqlResult<Datum> {
     if d.is_null() {
         return Ok(Null);
     }
-    let bad = |d: &Datum| SqlError::invalid_text(format!("invalid input syntax for type {}: \"{}\"", type_sql(ty), d.as_text()));
+    let bad = |d: &Datum| {
+        SqlError::invalid_text(format!(
+            "invalid input syntax for type {}: \"{}\"",
+            type_sql(ty),
+            d.as_text()
+        ))
+    };
     Ok(match ty {
         DataType::Bool => match d {
             Bool(b) => Bool(*b),
@@ -522,7 +604,9 @@ pub fn cast(d: &Datum, ty: &DataType) -> SqlResult<Datum> {
                 _ => (i64::MIN, i64::MAX, "bigint"),
             };
             if v < lo || v > hi {
-                return Err(SqlError::numeric_out_of_range(format!("{name} out of range")));
+                return Err(SqlError::numeric_out_of_range(format!(
+                    "{name} out of range"
+                )));
             }
             Int(v)
         }
@@ -531,7 +615,9 @@ pub fn cast(d: &Datum, ty: &DataType) -> SqlResult<Datum> {
                 Text(s) => parse_dec(s.trim()).map_err(|_| bad(d))?,
                 Float(f) => {
                     if !f.is_finite() {
-                        return Err(SqlError::numeric_out_of_range("cannot convert infinity or NaN to numeric"));
+                        return Err(SqlError::numeric_out_of_range(
+                            "cannot convert infinity or NaN to numeric",
+                        ));
                     }
                     parse_dec(&format_float(*f)).map_err(|_| bad(d))?
                 }
@@ -552,7 +638,11 @@ pub fn cast(d: &Datum, ty: &DataType) -> SqlResult<Datum> {
             }
             Int(_) | Numeric(_) | Float(_) | Bool(_) => {
                 let f = to_f64(d).unwrap_or(0.0);
-                Float(if *ty == DataType::Real { f64::from(f as f32) } else { f })
+                Float(if *ty == DataType::Real {
+                    f64::from(f as f32)
+                } else {
+                    f
+                })
             }
             _ => return Err(cast_err(d, ty)),
         },
@@ -563,11 +653,16 @@ pub fn cast(d: &Datum, ty: &DataType) -> SqlResult<Datum> {
                 other => other.as_text(),
             };
             match ty {
-                DataType::Varchar(Some(n)) | DataType::Char(Some(n)) if s.chars().count() > *n as usize => {
+                DataType::Varchar(Some(n)) | DataType::Char(Some(n))
+                    if s.chars().count() > *n as usize =>
+                {
                     // Like PostgreSQL: trailing spaces beyond the limit are trimmed silently.
                     let trimmed: String = s.trim_end_matches(' ').to_owned();
                     if trimmed.chars().count() > *n as usize {
-                        return Err(SqlError::new("22001", format!("value too long for type {}", type_sql(ty))));
+                        return Err(SqlError::new(
+                            "22001",
+                            format!("value too long for type {}", type_sql(ty)),
+                        ));
                     }
                     Text(trimmed)
                 }
@@ -577,7 +672,9 @@ pub fn cast(d: &Datum, ty: &DataType) -> SqlResult<Datum> {
         DataType::Enum(values) => {
             let s = d.as_text();
             if !values.contains(&s) {
-                return Err(SqlError::invalid_text(format!("invalid input value for enum: \"{s}\"")));
+                return Err(SqlError::invalid_text(format!(
+                    "invalid input value for enum: \"{s}\""
+                )));
             }
             Text(s)
         }
@@ -596,7 +693,11 @@ pub fn cast(d: &Datum, ty: &DataType) -> SqlResult<Datum> {
         DataType::Date => match d {
             Date(x) => Date(*x),
             Timestamp(ns) => Date(ns.div_euclid(NS_PER_DAY) as i32),
-            Text(s) => Date(parse_timestamp(s).ok_or_else(|| bad(d))?.div_euclid(NS_PER_DAY) as i32),
+            Text(s) => Date(
+                parse_timestamp(s)
+                    .ok_or_else(|| bad(d))?
+                    .div_euclid(NS_PER_DAY) as i32,
+            ),
             _ => return Err(cast_err(d, ty)),
         },
         DataType::Time => match d {
@@ -622,21 +723,36 @@ pub fn cast(d: &Datum, ty: &DataType) -> SqlResult<Datum> {
             other => Json(json_of(other)),
         },
         DataType::Array(inner) => match d {
-            Array(items) => Array(items.iter().map(|x| cast(x, inner)).collect::<SqlResult<_>>()?),
-            Text(s) => Array(parse_array(s)?.into_iter().map(|x| cast(&x, inner)).collect::<SqlResult<_>>()?),
+            Array(items) => Array(
+                items
+                    .iter()
+                    .map(|x| cast(x, inner))
+                    .collect::<SqlResult<_>>()?,
+            ),
+            Text(s) => Array(
+                parse_array(s)?
+                    .into_iter()
+                    .map(|x| cast(&x, inner))
+                    .collect::<SqlResult<_>>()?,
+            ),
             other => Array(vec![cast(other, inner)?]),
         },
     })
 }
 
 fn cast_err(d: &Datum, ty: &DataType) -> SqlError {
-    SqlError::new("42846", format!("cannot cast type {} to {}", d.type_name(), type_sql(ty)))
+    SqlError::new(
+        "42846",
+        format!("cannot cast type {} to {}", d.type_name(), type_sql(ty)),
+    )
 }
 
 /// Rounds / checks a decimal against `NUMERIC(precision, scale)`.
 pub fn fit_numeric(x: Decimal, spec: Option<(u8, u8)>) -> SqlResult<Decimal> {
     let Some((p, s)) = spec else { return Ok(x) };
-    let r = x.rescale(s, RoundingMode::HalfUp).map_err(|_| SqlError::numeric_out_of_range("numeric field overflow"))?;
+    let r = x
+        .rescale(s, RoundingMode::HalfUp)
+        .map_err(|_| SqlError::numeric_out_of_range("numeric field overflow"))?;
     let digits = r.mantissa().unsigned_abs().to_string().len() as u32;
     if p > 0 && digits > u32::from(p) && !r.is_zero() {
         return Err(SqlError::numeric_out_of_range(format!(
@@ -671,7 +787,13 @@ pub fn type_sql(ty: &DataType) -> String {
         DataType::Interval => "interval".into(),
         DataType::Uuid => "uuid".into(),
         DataType::Json => "json".into(),
-        DataType::Enum(v) => format!("enum({})", v.iter().map(|s| format!("'{}'", s.replace('\'', "''"))).collect::<Vec<_>>().join(",")),
+        DataType::Enum(v) => format!(
+            "enum({})",
+            v.iter()
+                .map(|s| format!("'{}'", s.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
         DataType::Array(inner) => format!("{}[]", type_sql(inner)),
     }
 }
@@ -714,10 +836,14 @@ pub fn from_value(v: &storine::Value, ty: Option<&DataType>) -> Datum {
         V::Null => Datum::Null,
         V::Bool(b) => Datum::Bool(*b),
         V::Int(i) => Datum::Int(*i),
-        V::UInt(u) => i64::try_from(*u).map(Datum::Int).unwrap_or_else(|_| Datum::Numeric(Decimal::from_i128(i128::from(*u)))),
+        V::UInt(u) => i64::try_from(*u)
+            .map(Datum::Int)
+            .unwrap_or_else(|_| Datum::Numeric(Decimal::from_i128(i128::from(*u)))),
         V::Int128(i) => Datum::Numeric(Decimal::from_i128(*i)),
         V::Float(f) => Datum::Float(*f),
-        V::Decimal(d) => Decimal::new(d.mantissa(), d.scale()).map(Datum::Numeric).unwrap_or(Datum::Null),
+        V::Decimal(d) => Decimal::new(d.mantissa(), d.scale())
+            .map(Datum::Numeric)
+            .unwrap_or(Datum::Null),
         V::Timestamp(ns) => Datum::Timestamp(*ns),
         V::Uuid(u) => Datum::Uuid(*u),
         V::Id(id) => Datum::Bytes(id.to_vec()),
@@ -743,10 +869,14 @@ pub fn from_value(v: &storine::Value, ty: Option<&DataType>) -> Datum {
             (Datum::Timestamp(ns), DataType::Date) => Datum::Date(ns.div_euclid(NS_PER_DAY) as i32),
             (Datum::Text(s), DataType::Time) => parse_time(s).map(Datum::Time).unwrap_or(natural),
             (Datum::Text(s), DataType::Interval) => parse_interval(s).unwrap_or(natural),
-            (Datum::Text(s), DataType::Numeric(_)) => parse_dec(s).map(Datum::Numeric).unwrap_or(natural),
+            (Datum::Text(s), DataType::Numeric(_)) => {
+                parse_dec(s).map(Datum::Numeric).unwrap_or(natural)
+            }
             (Datum::Int(i), DataType::Bool) => Datum::Bool(*i != 0),
-            (Datum::Int(_), DataType::Numeric(_)) | (Datum::Numeric(_), DataType::Int | DataType::BigInt | DataType::SmallInt)
-            | (Datum::Float(_), DataType::Numeric(_)) | (Datum::Int(_), DataType::Real | DataType::Double) => {
+            (Datum::Int(_), DataType::Numeric(_))
+            | (Datum::Numeric(_), DataType::Int | DataType::BigInt | DataType::SmallInt)
+            | (Datum::Float(_), DataType::Numeric(_))
+            | (Datum::Int(_), DataType::Real | DataType::Double) => {
                 cast(&natural, t).unwrap_or(natural)
             }
             _ => natural,
@@ -766,10 +896,16 @@ fn json_of_value(v: &storine::Value) -> String {
         V::Decimal(d) => d.to_string(),
         V::Text(s) => json_string(s),
         V::Map(m) => {
-            let parts: Vec<String> = m.iter().map(|(k, x)| format!("{}:{}", json_string(k), json_of_value(x))).collect();
+            let parts: Vec<String> = m
+                .iter()
+                .map(|(k, x)| format!("{}:{}", json_string(k), json_of_value(x)))
+                .collect();
             format!("{{{}}}", parts.join(","))
         }
-        V::List(l) => format!("[{}]", l.iter().map(json_of_value).collect::<Vec<_>>().join(",")),
+        V::List(l) => format!(
+            "[{}]",
+            l.iter().map(json_of_value).collect::<Vec<_>>().join(",")
+        ),
         other => json_string(&from_value(other, None).as_text()),
     }
 }
@@ -783,7 +919,10 @@ pub fn json_of(d: &Datum) -> String {
         Datum::Numeric(x) => x.to_string(),
         Datum::Float(f) => format_float(*f),
         Datum::Json(s) => s.clone(),
-        Datum::Array(items) => format!("[{}]", items.iter().map(json_of).collect::<Vec<_>>().join(",")),
+        Datum::Array(items) => format!(
+            "[{}]",
+            items.iter().map(json_of).collect::<Vec<_>>().join(",")
+        ),
         other => json_string(&other.as_text()),
     }
 }
@@ -816,7 +955,11 @@ pub fn format_float(f: f64) -> String {
         return "NaN".into();
     }
     if f.is_infinite() {
-        return if f > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+        return if f > 0.0 {
+            "Infinity".into()
+        } else {
+            "-Infinity".into()
+        };
     }
     let s = format!("{f}");
     let a = f.abs();
@@ -881,7 +1024,12 @@ pub fn format_date(days: i32) -> String {
 pub fn format_time(ns: i64) -> String {
     let secs = ns.div_euclid(NS_PER_SEC);
     let frac = ns.rem_euclid(NS_PER_SEC);
-    let mut s = format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60);
+    let mut s = format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60
+    );
     let micros = frac / 1000;
     if micros > 0 {
         let f = format!("{micros:06}");
@@ -924,11 +1072,23 @@ fn format_interval(months: i64, days: i64, ns: i64) -> String {
 
 pub fn format_uuid(u: &[u8; 16]) -> String {
     let h = crate::hash::hex(u);
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    )
 }
 
 pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
-    let h: String = s.trim().trim_matches(|c| c == '{' || c == '}').chars().filter(|c| *c != '-').collect();
+    let h: String = s
+        .trim()
+        .trim_matches(|c| c == '{' || c == '}')
+        .chars()
+        .filter(|c| *c != '-')
+        .collect();
     if h.len() != 32 {
         return None;
     }
@@ -943,7 +1103,11 @@ pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
 pub fn parse_bytea(s: &str) -> Vec<u8> {
     if let Some(h) = s.strip_prefix("\\x") {
         if h.len() % 2 == 0 {
-            if let Some(v) = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).ok()).collect() {
+            if let Some(v) = (0..h.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&h[i..i + 2], 16).ok())
+                .collect()
+            {
                 return v;
             }
         }
@@ -980,8 +1144,15 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
     match s.to_ascii_lowercase().as_str() {
         "epoch" => return Some(0),
         "now" | "today" => {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos() as i64;
-            return Some(if s.eq_ignore_ascii_case("today") { now - now.rem_euclid(NS_PER_DAY) } else { now });
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos() as i64;
+            return Some(if s.eq_ignore_ascii_case("today") {
+                now - now.rem_euclid(NS_PER_DAY)
+            } else {
+                now
+            });
         }
         _ => {}
     }
@@ -1039,7 +1210,10 @@ pub fn parse_interval(s: &str) -> Option<Datum> {
             continue;
         }
         let n: f64 = t.parse().ok()?;
-        let unit = toks.get(i + 1).map(|u| u.to_ascii_lowercase()).unwrap_or_else(|| "second".into());
+        let unit = toks
+            .get(i + 1)
+            .map(|u| u.to_ascii_lowercase())
+            .unwrap_or_else(|| "second".into());
         let unit = unit.trim_end_matches(',').trim_end_matches('s');
         match unit {
             "year" | "yr" | "y" => months += (n * 12.0) as i64,
@@ -1118,27 +1292,67 @@ mod tests {
     #[test]
     fn exact_money_arithmetic() {
         assert_eq!(arith('+', &dec("0.1"), &dec("0.2")).unwrap(), dec("0.3"));
-        assert_eq!(arith('-', &dec("100.00"), &Datum::Int(25)).unwrap().as_text(), "75.00");
-        assert_eq!(arith('*', &dec("19.99"), &Datum::Int(3)).unwrap().as_text(), "59.97");
-        assert_eq!(arith('/', &Datum::Int(7), &Datum::Int(2)).unwrap(), Datum::Int(3));
+        assert_eq!(
+            arith('-', &dec("100.00"), &Datum::Int(25))
+                .unwrap()
+                .as_text(),
+            "75.00"
+        );
+        assert_eq!(
+            arith('*', &dec("19.99"), &Datum::Int(3)).unwrap().as_text(),
+            "59.97"
+        );
+        assert_eq!(
+            arith('/', &Datum::Int(7), &Datum::Int(2)).unwrap(),
+            Datum::Int(3)
+        );
         assert_eq!(arith('/', &dec("10"), &dec("4")).unwrap().as_text(), "2.5");
         assert!(arith('/', &Datum::Int(1), &Datum::Int(0)).is_err());
         assert!(arith('+', &Datum::Int(i64::MAX), &Datum::Int(1)).is_err());
-        assert_eq!(cast(&Datum::Text("12.345".into()), &DataType::Numeric(Some((10, 2)))).unwrap().as_text(), "12.35");
-        assert!(cast(&Datum::Text("123456".into()), &DataType::Numeric(Some((5, 2)))).is_err());
-        assert_eq!(cast(&Datum::Float(0.1), &DataType::Numeric(None)).unwrap().as_text(), "0.1");
+        assert_eq!(
+            cast(
+                &Datum::Text("12.345".into()),
+                &DataType::Numeric(Some((10, 2)))
+            )
+            .unwrap()
+            .as_text(),
+            "12.35"
+        );
+        assert!(cast(
+            &Datum::Text("123456".into()),
+            &DataType::Numeric(Some((5, 2)))
+        )
+        .is_err());
+        assert_eq!(
+            cast(&Datum::Float(0.1), &DataType::Numeric(None))
+                .unwrap()
+                .as_text(),
+            "0.1"
+        );
     }
 
     #[test]
     fn comparisons_and_coercion() {
         assert_eq!(sql_cmp(&Datum::Int(5), &dec("5.00")), Some(Ordering::Equal));
-        assert_eq!(sql_cmp(&Datum::Text("5".into()), &Datum::Int(5)), Some(Ordering::Equal));
-        assert_eq!(sql_cmp(&Datum::Float(1.5), &dec("1.5")), Some(Ordering::Equal));
+        assert_eq!(
+            sql_cmp(&Datum::Text("5".into()), &Datum::Int(5)),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(
+            sql_cmp(&Datum::Float(1.5), &dec("1.5")),
+            Some(Ordering::Equal)
+        );
         assert_eq!(sql_cmp(&Datum::Null, &Datum::Int(1)), None);
         assert_eq!(compare(&Datum::Null, &Datum::Int(1)), Ordering::Greater);
         assert_eq!(hash_key(&Datum::Int(2)), hash_key(&dec("2.0")));
         let ts = parse_timestamp("2024-05-01 12:30:00").unwrap();
-        assert_eq!(sql_cmp(&Datum::Timestamp(ts), &Datum::Text("2024-05-01T12:30:00Z".into())), Some(Ordering::Equal));
+        assert_eq!(
+            sql_cmp(
+                &Datum::Timestamp(ts),
+                &Datum::Text("2024-05-01T12:30:00Z".into())
+            ),
+            Some(Ordering::Equal)
+        );
     }
 
     #[test]
@@ -1146,16 +1360,37 @@ mod tests {
         let ts = parse_timestamp("2024-02-29T23:59:58.5+01:00").unwrap();
         assert_eq!(format_timestamp(ts, false), "2024-02-29 22:59:58.5");
         assert_eq!(format_date(days_from_civil(1970, 1, 1)), "1970-01-01");
-        assert_eq!(civil_from_days(days_from_civil(2000, 12, 31)), (2000, 12, 31));
-        let next = arith('+', &Datum::Date(days_from_civil(2024, 1, 31)), &parse_interval("1 month").unwrap()).unwrap();
+        assert_eq!(
+            civil_from_days(days_from_civil(2000, 12, 31)),
+            (2000, 12, 31)
+        );
+        let next = arith(
+            '+',
+            &Datum::Date(days_from_civil(2024, 1, 31)),
+            &parse_interval("1 month").unwrap(),
+        )
+        .unwrap();
         assert_eq!(next.as_text(), "2024-02-29");
-        assert_eq!(parse_interval("1 day 02:00:00").unwrap().as_text(), "1 day 02:00:00");
+        assert_eq!(
+            parse_interval("1 day 02:00:00").unwrap().as_text(),
+            "1 day 02:00:00"
+        );
         assert_eq!(format_float(0.1), "0.1");
         assert_eq!(format_float(1e20), "1e+20");
         assert_eq!(Datum::Bytes(vec![1, 255]).as_text(), "\\x01ff");
         assert_eq!(parse_bytea("\\x01ff"), vec![1, 255]);
-        assert_eq!(parse_array("{1,\"a b\",NULL}").unwrap(), vec![Datum::Text("1".into()), Datum::Text("a b".into()), Datum::Null]);
-        assert_eq!(Datum::Array(vec![Datum::Int(1), Datum::Text("a b".into())]).as_text(), "{1,\"a b\"}");
+        assert_eq!(
+            parse_array("{1,\"a b\",NULL}").unwrap(),
+            vec![
+                Datum::Text("1".into()),
+                Datum::Text("a b".into()),
+                Datum::Null
+            ]
+        );
+        assert_eq!(
+            Datum::Array(vec![Datum::Int(1), Datum::Text("a b".into())]).as_text(),
+            "{1,\"a b\"}"
+        );
         let u = parse_uuid("123e4567-e89b-12d3-a456-426614174000").unwrap();
         assert_eq!(format_uuid(&u), "123e4567-e89b-12d3-a456-426614174000");
     }
@@ -1166,8 +1401,14 @@ mod tests {
         let v = to_value(&dec("10.50"), &ty);
         assert_eq!(from_value(&v, Some(&ty)), dec("10.50"));
         let d = Datum::Date(days_from_civil(2024, 5, 1));
-        assert_eq!(from_value(&to_value(&d, &DataType::Date), Some(&DataType::Date)), d);
+        assert_eq!(
+            from_value(&to_value(&d, &DataType::Date), Some(&DataType::Date)),
+            d
+        );
         let t = Datum::Time(parse_time("12:30:00.25").unwrap());
-        assert_eq!(from_value(&to_value(&t, &DataType::Time), Some(&DataType::Time)), t);
+        assert_eq!(
+            from_value(&to_value(&t, &DataType::Time), Some(&DataType::Time)),
+            t
+        );
     }
 }

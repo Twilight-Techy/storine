@@ -6,17 +6,80 @@ use crate::lexer::{tokenize, Dialect, Token};
 
 /// Words that end an expression or a table reference, so they cannot be bare aliases.
 const RESERVED: &[&str] = &[
-    "select", "from", "where", "group", "order", "having", "limit", "offset", "union", "intersect", "except", "join",
-    "inner", "left", "right", "full", "cross", "natural", "on", "using", "and", "or", "not", "as", "into", "values", "set",
-    "returning", "when", "then", "else", "end", "is", "in", "between", "like", "ilike", "case", "null", "true", "false",
-    "for", "fetch", "window", "with", "lock", "outer", "default", "do", "collate", "escape", "asc", "desc", "nulls",
-    "rlike", "regexp", "xor", "div", "mod", "straight_join", "lateral", "only", "top", "returning",
+    "select",
+    "from",
+    "where",
+    "group",
+    "order",
+    "having",
+    "limit",
+    "offset",
+    "union",
+    "intersect",
+    "except",
+    "join",
+    "inner",
+    "left",
+    "right",
+    "full",
+    "cross",
+    "natural",
+    "on",
+    "using",
+    "and",
+    "or",
+    "not",
+    "as",
+    "into",
+    "values",
+    "set",
+    "returning",
+    "when",
+    "then",
+    "else",
+    "end",
+    "is",
+    "in",
+    "between",
+    "like",
+    "ilike",
+    "case",
+    "null",
+    "true",
+    "false",
+    "for",
+    "fetch",
+    "window",
+    "with",
+    "lock",
+    "outer",
+    "default",
+    "do",
+    "collate",
+    "escape",
+    "asc",
+    "desc",
+    "nulls",
+    "rlike",
+    "regexp",
+    "xor",
+    "div",
+    "mod",
+    "straight_join",
+    "lateral",
+    "only",
+    "top",
+    "returning",
 ];
 
 /// Parses a string that may hold several `;`-separated statements.
 pub fn parse(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Statement>, usize)> {
     let (tokens, params) = tokenize(sql, dialect)?;
-    let mut p = Parser { tokens, pos: 0, dialect };
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        dialect,
+    };
     let mut out = Vec::new();
     loop {
         while p.eat_op(";") {}
@@ -37,14 +100,20 @@ pub fn parse_one(sql: &str, dialect: Dialect) -> SqlResult<(Statement, usize)> {
     match stmts.len() {
         0 => Ok((Statement::Empty, n)),
         1 => Ok((stmts.remove(0), n)),
-        _ => Err(SqlError::syntax("cannot insert multiple commands into a prepared statement".into())),
+        _ => Err(SqlError::syntax(
+            "cannot insert multiple commands into a prepared statement".into(),
+        )),
     }
 }
 
 /// Parses one expression (stored defaults and checks).
 pub fn parse_expr(sql: &str, dialect: Dialect) -> SqlResult<Expr> {
     let (tokens, _) = tokenize(sql, dialect)?;
-    let mut p = Parser { tokens, pos: 0, dialect };
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        dialect,
+    };
     let e = p.expr()?;
     if !p.at_end() {
         return Err(p.unexpected("end of expression"));
@@ -55,7 +124,11 @@ pub fn parse_expr(sql: &str, dialect: Dialect) -> SqlResult<Expr> {
 /// Parses a column type name such as `numeric(12,2)` or `timestamp with time zone`.
 pub fn parse_data_type(sql: &str) -> SqlResult<DataType> {
     let (tokens, _) = tokenize(sql, Dialect::Postgres)?;
-    let mut p = Parser { tokens, pos: 0, dialect: Dialect::Postgres };
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        dialect: Dialect::Postgres,
+    };
     let (ty, _) = p.data_type()?;
     if !p.at_end() {
         return Err(p.unexpected("end of type"));
@@ -99,7 +172,9 @@ impl Parser {
             Some(Token::Str(s)) => format!("'{s}'"),
             Some(t) => format!("{t:?}"),
         };
-        SqlError::syntax(format!("syntax error at or near {found}: expected {wanted}"))
+        SqlError::syntax(format!(
+            "syntax error at or near {found}: expected {wanted}"
+        ))
     }
 
     fn is_kw(&self, kw: &str) -> bool {
@@ -283,7 +358,8 @@ impl Parser {
                 if kw == "start" {
                     self.expect_kw("transaction")?;
                 } else {
-                    let _ = self.eat_kw("transaction") || self.eat_kw("work") || self.eat_kw("tran");
+                    let _ =
+                        self.eat_kw("transaction") || self.eat_kw("work") || self.eat_kw("tran");
                 }
                 self.skip_to_end(); // isolation level / read write / deferrable
                 Ok(Statement::Begin)
@@ -352,9 +428,15 @@ impl Parser {
                 if let Some(Token::Str(s)) = self.peek().cloned() {
                     self.pos += 1;
                     let (stmt, _) = parse_one(&s, self.dialect)?;
-                    return Ok(Statement::Prepare { name, statement: Box::new(stmt) });
+                    return Ok(Statement::Prepare {
+                        name,
+                        statement: Box::new(stmt),
+                    });
                 }
-                Ok(Statement::Prepare { name, statement: Box::new(self.statement()?) })
+                Ok(Statement::Prepare {
+                    name,
+                    statement: Box::new(self.statement()?),
+                })
             }
             "execute" | "exec" => {
                 self.pos += 1;
@@ -386,23 +468,29 @@ impl Parser {
                 }
                 Ok(Statement::Deallocate(Some(self.ident()?)))
             }
-            "discard" | "listen" | "unlisten" | "notify" | "reset" | "lock" | "unlock" | "analyze" | "vacuum"
-            | "checkpoint" | "flush" | "pragma" | "comment" | "grant" | "revoke" | "optimize" | "kill" | "load" => {
+            "discard" | "listen" | "unlisten" | "notify" | "reset" | "lock" | "unlock"
+            | "analyze" | "vacuum" | "checkpoint" | "flush" | "pragma" | "comment" | "grant"
+            | "revoke" | "optimize" | "kill" | "load" => {
                 self.pos += 1;
                 self.skip_to_end();
                 Ok(Statement::NoOp(static_tag(&kw)))
             }
-            _ => Err(SqlError::unsupported(format!("statement starting with {}", match self.peek() {
-                Some(Token::Word { text, .. }) => text.to_ascii_uppercase(),
-                _ => "this token".to_owned(),
-            }))),
+            _ => Err(SqlError::unsupported(format!(
+                "statement starting with {}",
+                match self.peek() {
+                    Some(Token::Word { text, .. }) => text.to_ascii_uppercase(),
+                    _ => "this token".to_owned(),
+                }
+            ))),
         }
     }
 
     fn set(&mut self) -> SqlResult<Statement> {
         self.pos += 1; // SET
-        if self.is_kw("transaction") || self.eat_kws(&["session", "characteristics"])
-            || ((self.is_kw("session") || self.is_kw("global") || self.is_kw("local")) && self.is_kw_at(1, "transaction"))
+        if self.is_kw("transaction")
+            || self.eat_kws(&["session", "characteristics"])
+            || ((self.is_kw("session") || self.is_kw("global") || self.is_kw("local"))
+                && self.is_kw_at(1, "transaction"))
         {
             self.skip_to_end();
             return Ok(Statement::NoOp("SET"));
@@ -414,9 +502,15 @@ impl Parser {
                 Some(Token::Word { text, .. }) | Some(Token::Str(text)) => Some(Expr::Str(text)),
                 _ => None,
             };
-            return Ok(Statement::Set { name: "names".into(), value });
+            return Ok(Statement::Set {
+                name: "names".into(),
+                value,
+            });
         }
-        let _ = self.eat_kw("session") || self.eat_kw("local") || self.eat_kw("global") || self.eat_kw("persist");
+        let _ = self.eat_kw("session")
+            || self.eat_kw("local")
+            || self.eat_kw("global")
+            || self.eat_kw("persist");
         if self.eat_kws(&["time", "zone"]) {
             let value = if self.eat_kw("local") || self.eat_kw("default") {
                 None
@@ -430,13 +524,18 @@ impl Parser {
                 Some(self.expr()?)
             };
             self.skip_to_end();
-            return Ok(Statement::Set { name: "timezone".into(), value });
+            return Ok(Statement::Set {
+                name: "timezone".into(),
+                value,
+            });
         }
         // SET a = 1, b = 2 (MySQL) — keep the first; SET x TO a, b (search_path).
         let name = match self.next() {
             Some(Token::Variable { name, system }) => {
                 if system {
-                    name.trim_start_matches("session.").trim_start_matches("global.").to_ascii_lowercase()
+                    name.trim_start_matches("session.")
+                        .trim_start_matches("global.")
+                        .to_ascii_lowercase()
                 } else {
                     format!("@{name}")
                 }
@@ -469,11 +568,15 @@ impl Parser {
                     parts.push(self.set_value()?);
                 }
                 Some(Expr::Str(
-                    parts.iter().map(|e| match e {
-                        Expr::Str(s) => s.clone(),
-                        Expr::Column(p) => p.join("."),
-                        _ => String::new(),
-                    }).collect::<Vec<_>>().join(", "),
+                    parts
+                        .iter()
+                        .map(|e| match e {
+                            Expr::Str(s) => s.clone(),
+                            Expr::Column(p) => p.join("."),
+                            _ => String::new(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
                 ))
             } else {
                 Some(first)
@@ -485,13 +588,25 @@ impl Parser {
 
     /// A setting value: an expression, or a bare word such as `ON` / `utf8`.
     fn set_value(&mut self) -> SqlResult<Expr> {
-        if let Some(Token::Word { text, quoted: false }) = self.peek() {
+        if let Some(Token::Word {
+            text,
+            quoted: false,
+        }) = self.peek()
+        {
             let lower = text.to_ascii_lowercase();
-            if matches!(self.peek_at(1), None | Some(Token::Op(",")) | Some(Token::Op(";"))) && lower != "null" {
+            if matches!(
+                self.peek_at(1),
+                None | Some(Token::Op(",")) | Some(Token::Op(";"))
+            ) && lower != "null"
+            {
                 let t = text.clone();
                 self.pos += 1;
                 return Ok(match lower.as_str() {
-                    "true" | "on" => Expr::Str(if lower == "on" { "on".into() } else { "true".into() }),
+                    "true" | "on" => Expr::Str(if lower == "on" {
+                        "on".into()
+                    } else {
+                        "true".into()
+                    }),
                     "false" | "off" => Expr::Str(lower),
                     _ => Expr::Str(t),
                 });
@@ -520,7 +635,10 @@ impl Parser {
             if self.eat_kw("from") || self.eat_kw("in") {
                 self.ident()?;
             }
-            Show::Tables { full, like: like(self)? }
+            Show::Tables {
+                full,
+                like: like(self)?,
+            }
         } else if self.eat_kw("columns") || self.eat_kw("fields") {
             let _ = self.eat_kw("from") || self.eat_kw("in");
             let table = self.table_name()?;
@@ -540,7 +658,10 @@ impl Parser {
         } else if self.eat_kws(&["create", "table"]) {
             Show::CreateTable(self.table_name()?)
         } else if self.eat_kw("variables") {
-            Show::Variables { like: like(self)?, global: false }
+            Show::Variables {
+                like: like(self)?,
+                global: false,
+            }
         } else if self.eat_kw("status") {
             like(self)?;
             Show::Status
@@ -593,7 +714,11 @@ impl Parser {
         if self.eat_kw("index") {
             let _ = self.eat_kw("concurrently");
             let if_not_exists = self.eat_kws(&["if", "not", "exists"]);
-            let name = if self.is_kw("on") { None } else { Some(self.ident()?) };
+            let name = if self.is_kw("on") {
+                None
+            } else {
+                Some(self.ident()?)
+            };
             self.expect_kw("on")?;
             let _ = self.eat_kw("only");
             let table = self.table_name()?;
@@ -607,7 +732,9 @@ impl Parser {
                 let e = self.expr()?;
                 match e {
                     Expr::Column(p) => columns.push(p.last().cloned().unwrap_or_default()),
-                    Expr::Function { args, .. } if matches!(args.first(), Some(Expr::Column(_))) => {
+                    Expr::Function { args, .. }
+                        if matches!(args.first(), Some(Expr::Column(_))) =>
+                    {
                         columns.push(args[0].column_name().unwrap_or_default().to_owned())
                     }
                     _ => return Err(SqlError::unsupported("index on an expression")),
@@ -622,15 +749,73 @@ impl Parser {
             }
             self.expect_op(")")?;
             self.skip_to_end(); // INCLUDE / WHERE (partial) / WITH options
-            return Ok(Statement::CreateIndex(Box::new(CreateIndex { name, table, columns, unique, if_not_exists })));
+            return Ok(Statement::CreateIndex(Box::new(CreateIndex {
+                name,
+                table,
+                columns,
+                unique,
+                if_not_exists,
+            })));
         }
         if self.eat_kw("schema") || self.eat_kw("database") {
             let if_not_exists = self.eat_kws(&["if", "not", "exists"]);
             let name = self.ident()?;
             self.skip_to_end();
-            return Ok(Statement::CreateSchema { name, if_not_exists });
+            return Ok(Statement::CreateSchema {
+                name,
+                if_not_exists,
+            });
         }
-        if self.eat_kw("extension") || self.eat_kw("sequence") {
+        if self.eat_kw("sequence") {
+            let if_not_exists = self.eat_kws(&["if", "not", "exists"]);
+            let name = self.table_name()?;
+            let (mut start, mut increment) = (None, 1i64);
+            loop {
+                let num = |p: &mut Parser| -> SqlResult<i64> {
+                    let neg = p.eat_op("-");
+                    match p.next() {
+                        Some(Token::Number(n)) => n
+                            .parse::<i64>()
+                            .map(|v| if neg { -v } else { v })
+                            .map_err(|_| SqlError::syntax(format!("bad number {n}"))),
+                        _ => Err(p.unexpected("a number")),
+                    }
+                };
+                if self.eat_kw("start") {
+                    self.eat_kw("with");
+                    start = Some(num(self)?);
+                } else if self.eat_kw("increment") {
+                    self.eat_kw("by");
+                    increment = num(self)?;
+                } else if self.eat_kw("minvalue") || self.eat_kw("maxvalue") || self.eat_kw("cache")
+                {
+                    num(self)?;
+                } else if self.eat_kws(&["no", "minvalue"])
+                    || self.eat_kws(&["no", "maxvalue"])
+                    || self.eat_kws(&["no", "cycle"])
+                    || self.eat_kw("cycle")
+                {
+                } else if self.eat_kws(&["owned", "by"]) {
+                    self.object_name()?;
+                } else if self.eat_kw("as") {
+                    self.data_type()?;
+                } else {
+                    break;
+                }
+            }
+            if increment == 0 {
+                return Err(SqlError::syntax("INCREMENT must not be zero".into()));
+            }
+            self.skip_to_end();
+            let start = start.unwrap_or(if increment > 0 { 1 } else { -1 });
+            return Ok(Statement::CreateSequence {
+                name,
+                start,
+                increment,
+                if_not_exists,
+            });
+        }
+        if self.eat_kw("extension") {
             self.skip_to_end();
             return Ok(Statement::NoOp("CREATE"));
         }
@@ -646,7 +831,13 @@ impl Parser {
     fn create_table(&mut self) -> SqlResult<Statement> {
         let if_not_exists = self.eat_kws(&["if", "not", "exists"]);
         let name = self.table_name()?;
-        let mut ct = CreateTable { name, if_not_exists, columns: Vec::new(), constraints: Vec::new(), as_query: None };
+        let mut ct = CreateTable {
+            name,
+            if_not_exists,
+            columns: Vec::new(),
+            constraints: Vec::new(),
+            as_query: None,
+        };
         if self.eat_kw("as") {
             ct.as_query = Some(Box::new(self.query()?));
             return Ok(Statement::CreateTable(Box::new(ct)));
@@ -657,8 +848,17 @@ impl Parser {
                 || self.is_kw("primary")
                 || self.is_kw("foreign")
                 || self.is_kw("check")
-                || (self.is_kw("unique") && matches!(self.peek_at(1), Some(Token::Op("(")) | Some(Token::Word { .. })) && !self.is_column_def_ahead())
-                || ((self.is_kw("key") || self.is_kw("index") || self.is_kw("fulltext") || self.is_kw("spatial")) && !self.is_column_def_ahead())
+                || (self.is_kw("unique")
+                    && matches!(
+                        self.peek_at(1),
+                        Some(Token::Op("(")) | Some(Token::Word { .. })
+                    )
+                    && !self.is_column_def_ahead())
+                || ((self.is_kw("key")
+                    || self.is_kw("index")
+                    || self.is_kw("fulltext")
+                    || self.is_kw("spatial"))
+                    && !self.is_column_def_ahead())
             {
                 ct.constraints.push(self.table_constraint()?);
             } else {
@@ -677,7 +877,10 @@ impl Parser {
     fn is_column_def_ahead(&self) -> bool {
         // A column definition is `name type ...`: the next token is a type word, not `(` or KEY.
         match self.peek_at(1) {
-            Some(Token::Word { text, quoted: false }) => {
+            Some(Token::Word {
+                text,
+                quoted: false,
+            }) => {
                 let t = text.to_ascii_lowercase();
                 !matches!(t.as_str(), "key" | "index") && type_word(&t)
             }
@@ -687,7 +890,11 @@ impl Parser {
     }
 
     fn table_constraint(&mut self) -> SqlResult<TableConstraint> {
-        let name = if self.eat_kw("constraint") { Some(self.ident()?) } else { None };
+        let name = if self.eat_kw("constraint") {
+            Some(self.ident()?)
+        } else {
+            None
+        };
         if self.eat_kws(&["primary", "key"]) {
             let _ = self.eat_kw("clustered") || self.eat_kw("nonclustered");
             let columns = self.ident_list()?;
@@ -696,7 +903,11 @@ impl Parser {
         }
         if self.eat_kw("unique") {
             let _ = self.eat_kw("key") || self.eat_kw("index");
-            let name = if !self.is_op("(") { Some(self.ident()?) } else { name };
+            let name = if !self.is_op("(") {
+                Some(self.ident()?)
+            } else {
+                name
+            };
             let columns = self.ident_list()?;
             self.constraint_tail();
             return Ok(TableConstraint::Unique { name, columns });
@@ -718,7 +929,11 @@ impl Parser {
         }
         let _ = self.eat_kw("fulltext") || self.eat_kw("spatial");
         if self.eat_kw("key") || self.eat_kw("index") {
-            let name = if !self.is_op("(") { Some(self.ident()?) } else { name };
+            let name = if !self.is_op("(") {
+                Some(self.ident()?)
+            } else {
+                name
+            };
             let columns = self.ident_list()?;
             self.constraint_tail();
             return Ok(TableConstraint::Index { name, columns });
@@ -740,7 +955,11 @@ impl Parser {
     fn references(&mut self) -> SqlResult<ForeignKey> {
         self.expect_kw("references")?;
         let table = self.table_name()?;
-        let ref_columns = if self.is_op("(") { self.ident_list()? } else { Vec::new() };
+        let ref_columns = if self.is_op("(") {
+            self.ident_list()?
+        } else {
+            Vec::new()
+        };
         let mut fk = ForeignKey {
             columns: Vec::new(),
             table,
@@ -891,8 +1110,13 @@ impl Parser {
             if p.eat_op("(") {
                 loop {
                     match p.next() {
-                        Some(Token::Number(n)) => out.push(n.parse().map_err(|_| SqlError::syntax("bad type size".into()))?),
-                        Some(Token::Word { text, .. }) if text.eq_ignore_ascii_case("max") => out.push(u32::MAX),
+                        Some(Token::Number(n)) => out.push(
+                            n.parse()
+                                .map_err(|_| SqlError::syntax("bad type size".into()))?,
+                        ),
+                        Some(Token::Word { text, .. }) if text.eq_ignore_ascii_case("max") => {
+                            out.push(u32::MAX)
+                        }
                         _ => return Err(p.unexpected("a size")),
                     }
                     if !p.eat_op(",") {
@@ -964,7 +1188,14 @@ impl Parser {
                     }
                 }
             }
-            "money" | "smallmoney" => DataType::Numeric(Some((19, if word == "money" && self.dialect == Dialect::MsSql { 4 } else { 2 }))),
+            "money" | "smallmoney" => DataType::Numeric(Some((
+                19,
+                if word == "money" && self.dialect == Dialect::MsSql {
+                    4
+                } else {
+                    2
+                },
+            ))),
             "real" | "float4" => DataType::Real,
             "float" => {
                 let n = paren_numbers(self)?;
@@ -981,7 +1212,8 @@ impl Parser {
             }
             "float8" => DataType::Double,
             "oid" | "xid" | "cid" | "tid" | "regproc" | "regoper" | "regrole" => DataType::BigInt,
-            "text" | "tinytext" | "mediumtext" | "longtext" | "ntext" | "clob" | "citext" | "string" | "bpchar" | "unknown" => DataType::Text,
+            "text" | "tinytext" | "mediumtext" | "longtext" | "ntext" | "clob" | "citext"
+            | "string" | "bpchar" | "unknown" => DataType::Text,
             "name" => DataType::Name,
             "varchar" | "nvarchar" | "varchar2" | "nvarchar2" => {
                 let n = paren_numbers(self)?;
@@ -996,7 +1228,8 @@ impl Parser {
                     DataType::Char(Some(n.first().copied().unwrap_or(1)))
                 }
             }
-            "bytea" | "blob" | "tinyblob" | "mediumblob" | "longblob" | "binary" | "varbinary" | "image" => {
+            "bytea" | "blob" | "tinyblob" | "mediumblob" | "longblob" | "binary" | "varbinary"
+            | "image" => {
                 let _ = self.eat_kw("varying");
                 paren_numbers(self)?;
                 DataType::Bytes
@@ -1017,7 +1250,8 @@ impl Parser {
             "date" => DataType::Date,
             "time" | "timetz" => {
                 paren_numbers(self)?;
-                let _ = self.eat_kws(&["with", "time", "zone"]) || self.eat_kws(&["without", "time", "zone"]);
+                let _ = self.eat_kws(&["with", "time", "zone"])
+                    || self.eat_kws(&["without", "time", "zone"]);
                 DataType::Time
             }
             "interval" => {
@@ -1046,10 +1280,19 @@ impl Parser {
                 self.expect_op(")")?;
                 DataType::Enum(values)
             }
-            "set" | "geometry" | "point" | "polygon" | "xml" | "tsvector" | "hstore" | "inet" | "cidr" | "macaddr" => {
-                return Err(SqlError::unsupported(format!("column type {}", word.to_ascii_uppercase())))
+            "set" | "geometry" | "point" | "polygon" | "xml" | "tsvector" | "hstore" | "inet"
+            | "cidr" | "macaddr" => {
+                return Err(SqlError::unsupported(format!(
+                    "column type {}",
+                    word.to_ascii_uppercase()
+                )))
             }
-            other => return Err(SqlError::unsupported(format!("column type {}", other.to_ascii_uppercase()))),
+            other => {
+                return Err(SqlError::unsupported(format!(
+                    "column type {}",
+                    other.to_ascii_uppercase()
+                )))
+            }
         };
         // PostgreSQL arrays: text[] / integer ARRAY.
         if self.is_op("[") {
@@ -1080,7 +1323,11 @@ impl Parser {
             }
             let cascade = self.eat_kw("cascade");
             self.skip_to_end(); // RESTRICT
-            return Ok(Statement::DropTable { names, if_exists, cascade });
+            return Ok(Statement::DropTable {
+                names,
+                if_exists,
+                cascade,
+            });
         }
         if self.eat_kw("index") {
             let _ = self.eat_kw("concurrently");
@@ -1089,9 +1336,17 @@ impl Parser {
             while self.eat_op(",") {
                 names.push(self.table_name()?);
             }
-            let table = if self.eat_kw("on") { Some(self.table_name()?) } else { None };
+            let table = if self.eat_kw("on") {
+                Some(self.table_name()?)
+            } else {
+                None
+            };
             self.skip_to_end();
-            return Ok(Statement::DropIndex { names, table, if_exists });
+            return Ok(Statement::DropIndex {
+                names,
+                table,
+                if_exists,
+            });
         }
         if self.eat_kw("schema") || self.eat_kw("database") {
             let if_exists = self.eat_kws(&["if", "exists"]);
@@ -1099,7 +1354,16 @@ impl Parser {
             self.skip_to_end();
             return Ok(Statement::DropSchema { name, if_exists });
         }
-        if self.eat_kw("extension") || self.eat_kw("sequence") {
+        if self.eat_kw("sequence") {
+            let if_exists = self.eat_kws(&["if", "exists"]);
+            let mut names = vec![self.table_name()?];
+            while self.eat_op(",") {
+                names.push(self.table_name()?);
+            }
+            self.skip_to_end();
+            return Ok(Statement::DropSequence { names, if_exists });
+        }
+        if self.eat_kw("extension") {
             self.skip_to_end();
             return Ok(Statement::NoOp("DROP"));
         }
@@ -1130,8 +1394,13 @@ impl Parser {
 
     fn alter_op(&mut self) -> SqlResult<AlterOp> {
         if self.eat_kw("add") {
-            if self.is_kw("constraint") || self.is_kw("primary") || self.is_kw("foreign") || self.is_kw("unique") || self.is_kw("check")
-                || self.is_kw("index") || self.is_kw("key")
+            if self.is_kw("constraint")
+                || self.is_kw("primary")
+                || self.is_kw("foreign")
+                || self.is_kw("unique")
+                || self.is_kw("check")
+                || self.is_kw("index")
+                || self.is_kw("key")
             {
                 return Ok(AlterOp::AddConstraint(self.table_constraint()?));
             }
@@ -1139,17 +1408,27 @@ impl Parser {
             let if_not_exists = self.eat_kws(&["if", "not", "exists"]);
             let column = self.column_def()?;
             let _ = self.eat_kw("first") || (self.eat_kw("after") && self.ident().is_ok());
-            return Ok(AlterOp::AddColumn { column, if_not_exists });
+            return Ok(AlterOp::AddColumn {
+                column,
+                if_not_exists,
+            });
         }
         if self.eat_kw("drop") {
-            if self.eat_kw("constraint") || self.eat_kw("index") || self.eat_kw("key") || self.eat_kws(&["foreign", "key"]) {
+            if self.eat_kw("constraint")
+                || self.eat_kw("index")
+                || self.eat_kw("key")
+                || self.eat_kws(&["foreign", "key"])
+            {
                 let if_exists = self.eat_kws(&["if", "exists"]);
                 let name = self.ident()?;
                 self.skip_alter_tail();
                 return Ok(AlterOp::DropConstraint { name, if_exists });
             }
             if self.eat_kws(&["primary", "key"]) {
-                return Ok(AlterOp::DropConstraint { name: "PRIMARY".into(), if_exists: false });
+                return Ok(AlterOp::DropConstraint {
+                    name: "PRIMARY".into(),
+                    if_exists: false,
+                });
             }
             self.eat_kw("column");
             let if_exists = self.eat_kws(&["if", "exists"]);
@@ -1164,7 +1443,10 @@ impl Parser {
             self.eat_kw("column");
             let from = self.ident()?;
             self.expect_kw("to")?;
-            return Ok(AlterOp::RenameColumn { from, to: self.ident()? });
+            return Ok(AlterOp::RenameColumn {
+                from,
+                to: self.ident()?,
+            });
         }
         if self.eat_kw("alter") {
             self.eat_kw("column");
@@ -1189,17 +1471,27 @@ impl Parser {
             return Ok(AlterOp::AlterColumn { name, change });
         }
         if self.eat_kw("modify") || self.eat_kw("change") {
-            let changing = self.tokens.get(self.pos - 1).and_then(Token::keyword).as_deref() == Some("change");
+            let changing = self
+                .tokens
+                .get(self.pos - 1)
+                .and_then(Token::keyword)
+                .as_deref()
+                == Some("change");
             self.eat_kw("column");
             let old = if changing { Some(self.ident()?) } else { None };
             let column = self.column_def()?;
             let _ = self.eat_kw("first") || (self.eat_kw("after") && self.ident().is_ok());
             if let Some(old) = old {
                 if old != column.name {
-                    return Err(SqlError::unsupported("CHANGE COLUMN with a rename; use RENAME COLUMN"));
+                    return Err(SqlError::unsupported(
+                        "CHANGE COLUMN with a rename; use RENAME COLUMN",
+                    ));
                 }
             }
-            return Ok(AlterOp::AlterColumn { name: column.name.clone(), change: AlterColumn::Type(column.ty) });
+            return Ok(AlterOp::AlterColumn {
+                name: column.name.clone(),
+                change: AlterColumn::Type(column.ty),
+            });
         }
         Err(SqlError::unsupported("this ALTER TABLE operation"))
     }
@@ -1221,7 +1513,8 @@ impl Parser {
             ignore: false,
             replace: replace_kw,
         };
-        let _ = self.eat_kw("low_priority") || self.eat_kw("delayed") || self.eat_kw("high_priority");
+        let _ =
+            self.eat_kw("low_priority") || self.eat_kw("delayed") || self.eat_kw("high_priority");
         if self.eat_kw("ignore") {
             ins.ignore = true;
         }
@@ -1282,12 +1575,24 @@ impl Parser {
                 self.expect_kw("update")?;
                 self.expect_kw("set")?;
                 let sets = self.assignments()?;
-                let where_ = if self.eat_kw("where") { Some(self.expr()?) } else { None };
-                ins.on_conflict = Some(OnConflict::DoUpdate { target, sets, where_ });
+                let where_ = if self.eat_kw("where") {
+                    Some(self.expr()?)
+                } else {
+                    None
+                };
+                ins.on_conflict = Some(OnConflict::DoUpdate {
+                    target,
+                    sets,
+                    where_,
+                });
             }
         } else if self.eat_kws(&["on", "duplicate", "key", "update"]) {
             let sets = self.assignments()?;
-            ins.on_conflict = Some(OnConflict::DoUpdate { target: Vec::new(), sets, where_: None });
+            ins.on_conflict = Some(OnConflict::DoUpdate {
+                target: Vec::new(),
+                sets,
+                where_: None,
+            });
         }
         if self.eat_kw("returning") {
             ins.returning = self.select_items()?;
@@ -1301,12 +1606,18 @@ impl Parser {
         Ok(items
             .into_iter()
             .map(|it| match it {
-                SelectItem::Wildcard(Some(q)) if q.eq_ignore_ascii_case("inserted") || q.eq_ignore_ascii_case("deleted") => {
+                SelectItem::Wildcard(Some(q))
+                    if q.eq_ignore_ascii_case("inserted") || q.eq_ignore_ascii_case("deleted") =>
+                {
                     SelectItem::Wildcard(None)
                 }
-                SelectItem::Expr { expr: Expr::Column(p), alias } if p.len() == 2 => {
-                    SelectItem::Expr { expr: Expr::Column(vec![p[1].clone()]), alias }
-                }
+                SelectItem::Expr {
+                    expr: Expr::Column(p),
+                    alias,
+                } if p.len() == 2 => SelectItem::Expr {
+                    expr: Expr::Column(vec![p[1].clone()]),
+                    alias,
+                },
                 other => other,
             })
             .collect())
@@ -1320,7 +1631,11 @@ impl Parser {
             let mut row = Vec::new();
             if !self.is_op(")") {
                 loop {
-                    row.push(if self.eat_kw("default") { Expr::Default } else { self.expr()? });
+                    row.push(if self.eat_kw("default") {
+                        Expr::Default
+                    } else {
+                        self.expr()?
+                    });
                     if !self.eat_op(",") {
                         break;
                     }
@@ -1340,7 +1655,11 @@ impl Parser {
         loop {
             let (_, col) = self.object_name()?;
             self.expect_op("=")?;
-            let e = if self.eat_kw("default") { Expr::Default } else { self.expr()? };
+            let e = if self.eat_kw("default") {
+                Expr::Default
+            } else {
+                self.expr()?
+            };
             sets.push((col, e));
             if !self.eat_op(",") {
                 break;
@@ -1394,8 +1713,15 @@ impl Parser {
         let _ = self.eat_kw("only");
         let table = self.table_name()?;
         let alias = self.opt_alias()?;
-        let mut del =
-            Delete { table, alias, using: Vec::new(), where_: None, returning: Vec::new(), order_by: Vec::new(), limit: None };
+        let mut del = Delete {
+            table,
+            alias,
+            using: Vec::new(),
+            where_: None,
+            returning: Vec::new(),
+            order_by: Vec::new(),
+            limit: None,
+        };
         if self.eat_kw("output") {
             del.returning = self.output_items()?;
         }
@@ -1427,20 +1753,35 @@ impl Parser {
             }
             loop {
                 let name = self.ident()?;
-                let columns = if self.is_op("(") { self.ident_list()? } else { Vec::new() };
+                let columns = if self.is_op("(") {
+                    self.ident_list()?
+                } else {
+                    Vec::new()
+                };
                 self.expect_kw("as")?;
                 let _ = self.eat_kws(&["not", "materialized"]) || self.eat_kw("materialized");
                 self.expect_op("(")?;
                 let query = self.query()?;
                 self.expect_op(")")?;
-                ctes.push(Cte { name, columns, query });
+                ctes.push(Cte {
+                    name,
+                    columns,
+                    query,
+                });
                 if !self.eat_op(",") {
                     break;
                 }
             }
         }
         let (body, top) = self.set_expr()?;
-        let mut q = Query { ctes, body, order_by: Vec::new(), limit: top, offset: None, lock: None };
+        let mut q = Query {
+            ctes,
+            body,
+            order_by: Vec::new(),
+            limit: top,
+            offset: None,
+            lock: None,
+        };
         if self.eat_kws(&["order", "by"]) {
             q.order_by = self.order_list()?;
         }
@@ -1462,7 +1803,11 @@ impl Parser {
                 let _ = self.eat_kw("rows") || self.eat_kw("row");
             } else if self.eat_kw("fetch") {
                 let _ = self.eat_kw("first") || self.eat_kw("next");
-                q.limit = Some(if self.is_kw("row") || self.is_kw("rows") { Expr::Number("1".into()) } else { self.expr()? });
+                q.limit = Some(if self.is_kw("row") || self.is_kw("rows") {
+                    Expr::Number("1".into())
+                } else {
+                    self.expr()?
+                });
                 let _ = self.eat_kw("rows") || self.eat_kw("row");
                 if !self.eat_kw("only") {
                     self.expect_kws_with_ties()?;
@@ -1477,8 +1822,14 @@ impl Parser {
                     }
                     let nowait = self.eat_kw("nowait");
                     let skip_locked = self.eat_kws(&["skip", "locked"]);
-                    q.lock = Some(LockMode::Update { nowait, skip_locked });
-                } else if self.eat_kw("share") || self.eat_kws(&["no", "key", "update"]) || self.eat_kws(&["key", "share"]) {
+                    q.lock = Some(LockMode::Update {
+                        nowait,
+                        skip_locked,
+                    });
+                } else if self.eat_kw("share")
+                    || self.eat_kws(&["no", "key", "update"])
+                    || self.eat_kws(&["key", "share"])
+                {
                     if self.eat_kw("of") {
                         self.table_name()?;
                     }
@@ -1521,7 +1872,12 @@ impl Parser {
                 self.eat_kw("distinct");
             }
             let (right, _) = self.set_term()?;
-            left = SetExpr::SetOp { op, all, left: Box::new(left), right: Box::new(right) };
+            left = SetExpr::SetOp {
+                op,
+                all,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
         }
         Ok((left, top))
     }
@@ -1534,7 +1890,12 @@ impl Parser {
                 self.eat_kw("distinct");
             }
             let (right, _) = self.set_primary()?;
-            left = SetExpr::SetOp { op: SetOp::Intersect, all, left: Box::new(left), right: Box::new(right) };
+            left = SetExpr::SetOp {
+                op: SetOp::Intersect,
+                all,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
         }
         Ok((left, top))
     }
@@ -1552,7 +1913,11 @@ impl Parser {
             let (schema, name) = self.object_name()?;
             let sel = Select {
                 items: vec![SelectItem::Wildcard(None)],
-                from: vec![TableRef::Named { schema, name, alias: None }],
+                from: vec![TableRef::Named {
+                    schema,
+                    name,
+                    alias: None,
+                }],
                 ..Select::default()
             };
             return Ok((SetExpr::Select(Box::new(sel)), None));
@@ -1568,7 +1933,9 @@ impl Parser {
         } else {
             self.eat_kw("all");
         }
-        let _ = self.eat_kw("sql_calc_found_rows") || self.eat_kw("straight_join") || self.eat_kw("sql_no_cache");
+        let _ = self.eat_kw("sql_calc_found_rows")
+            || self.eat_kw("straight_join")
+            || self.eat_kw("sql_no_cache");
         if self.eat_kw("top") {
             let paren = self.eat_op("(");
             top = Some(self.primary()?);
@@ -1668,7 +2035,11 @@ impl Parser {
             } else {
                 None
             };
-            out.push(OrderBy { expr, desc, nulls_first });
+            out.push(OrderBy {
+                expr,
+                desc,
+                nulls_first,
+            });
             if !self.eat_op(",") {
                 break;
             }
@@ -1724,7 +2095,12 @@ impl Parser {
             } else {
                 JoinConstraint::None
             };
-            left = TableRef::Join { left: Box::new(left), right: Box::new(right), kind, constraint };
+            left = TableRef::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                kind,
+                constraint,
+            };
         }
         Ok(left)
     }
@@ -1734,18 +2110,27 @@ impl Parser {
             Some(n) => n,
             None => return Ok(None),
         };
-        let columns = if self.is_op("(") { self.ident_list()? } else { Vec::new() };
+        let columns = if self.is_op("(") {
+            self.ident_list()?
+        } else {
+            Vec::new()
+        };
         Ok(Some(TableAlias { name, columns }))
     }
 
     fn table_factor(&mut self) -> SqlResult<TableRef> {
         let lateral = self.eat_kw("lateral");
         if self.eat_op("(") {
-            if self.is_kw("select") || self.is_kw("with") || self.is_kw("values") || self.is_op("(") {
+            if self.is_kw("select") || self.is_kw("with") || self.is_kw("values") || self.is_op("(")
+            {
                 let query = self.query()?;
                 self.expect_op(")")?;
                 let alias = self.table_alias()?;
-                return Ok(TableRef::Derived { query: Box::new(query), alias, lateral });
+                return Ok(TableRef::Derived {
+                    query: Box::new(query),
+                    alias,
+                    lateral,
+                });
             }
             let inner = self.table_ref()?;
             self.expect_op(")")?;
@@ -1764,7 +2149,11 @@ impl Parser {
             }
             self.expect_op(")")?;
             let alias = self.table_alias()?;
-            return Ok(TableRef::Function { name: name.to_ascii_lowercase(), args, alias });
+            return Ok(TableRef::Function {
+                name: name.to_ascii_lowercase(),
+                args,
+                alias,
+            });
         }
         let alias = self.table_alias()?;
         // MySQL index hints / T-SQL table hints.
@@ -1774,7 +2163,9 @@ impl Parser {
             {
                 self.pos += 2;
                 if self.eat_kw("for") {
-                    let _ = self.eat_kw("join") || self.eat_kws(&["order", "by"]) || self.eat_kws(&["group", "by"]);
+                    let _ = self.eat_kw("join")
+                        || self.eat_kws(&["order", "by"])
+                        || self.eat_kws(&["group", "by"]);
                 }
                 self.ident_or_numbers_paren()?;
             } else if self.is_kw("with") && self.is_op_at(1, "(") {
@@ -1784,7 +2175,11 @@ impl Parser {
                 break;
             }
         }
-        Ok(TableRef::Named { schema, name, alias })
+        Ok(TableRef::Named {
+            schema,
+            name,
+            alias,
+        })
     }
 
     // ── expressions ──
@@ -1829,12 +2224,18 @@ impl Parser {
     fn not_expr(&mut self) -> SqlResult<Expr> {
         if self.eat_kw("not") {
             let e = self.not_expr()?;
-            return Ok(Expr::Unary { op: UnaryOp::Not, expr: Box::new(e) });
+            return Ok(Expr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(e),
+            });
         }
         if self.dialect == Dialect::MySql && self.is_op("!") {
             self.pos += 1;
             let e = self.not_expr()?;
-            return Ok(Expr::Unary { op: UnaryOp::Not, expr: Box::new(e) });
+            return Ok(Expr::Unary {
+                op: UnaryOp::Not,
+                expr: Box::new(e),
+            });
         }
         self.predicate()
     }
@@ -1846,25 +2247,46 @@ impl Parser {
             if self.eat_kw("is") {
                 let negated = self.eat_kw("not");
                 left = if self.eat_kw("null") || self.eat_kw("unknown") {
-                    Expr::IsNull { expr: Box::new(left), negated }
+                    Expr::IsNull {
+                        expr: Box::new(left),
+                        negated,
+                    }
                 } else if self.eat_kw("true") {
-                    Expr::IsBool { expr: Box::new(left), value: true, negated }
+                    Expr::IsBool {
+                        expr: Box::new(left),
+                        value: true,
+                        negated,
+                    }
                 } else if self.eat_kw("false") {
-                    Expr::IsBool { expr: Box::new(left), value: false, negated }
+                    Expr::IsBool {
+                        expr: Box::new(left),
+                        value: false,
+                        negated,
+                    }
                 } else if self.eat_kws(&["distinct", "from"]) {
                     let right = self.bit_or()?;
-                    Expr::IsDistinctFrom { left: Box::new(left), right: Box::new(right), negated }
+                    Expr::IsDistinctFrom {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        negated,
+                    }
                 } else {
                     return Err(self.unexpected("NULL, TRUE, FALSE or DISTINCT FROM"));
                 };
                 continue;
             }
             if self.eat_kw("isnull") {
-                left = Expr::IsNull { expr: Box::new(left), negated: false };
+                left = Expr::IsNull {
+                    expr: Box::new(left),
+                    negated: false,
+                };
                 continue;
             }
             if self.eat_kw("notnull") {
-                left = Expr::IsNull { expr: Box::new(left), negated: true };
+                left = Expr::IsNull {
+                    expr: Box::new(left),
+                    negated: true,
+                };
                 continue;
             }
             let negated = self.is_kw("not")
@@ -1883,7 +2305,12 @@ impl Parser {
                 let low = self.bit_or()?;
                 self.expect_kw("and")?;
                 let high = self.bit_or()?;
-                left = Expr::Between { expr: Box::new(left), low: Box::new(low), high: Box::new(high), negated };
+                left = Expr::Between {
+                    expr: Box::new(left),
+                    low: Box::new(low),
+                    high: Box::new(high),
+                    negated,
+                };
                 continue;
             }
             if self.eat_kw("in") {
@@ -1891,7 +2318,11 @@ impl Parser {
                 if self.is_kw("select") || self.is_kw("with") {
                     let q = self.query()?;
                     self.expect_op(")")?;
-                    left = Expr::InSubquery { expr: Box::new(left), query: Box::new(q), negated };
+                    left = Expr::InSubquery {
+                        expr: Box::new(left),
+                        query: Box::new(q),
+                        negated,
+                    };
                 } else {
                     let mut list = Vec::new();
                     if !self.is_op(")") {
@@ -1903,7 +2334,11 @@ impl Parser {
                         }
                     }
                     self.expect_op(")")?;
-                    left = Expr::InList { expr: Box::new(left), list, negated };
+                    left = Expr::InList {
+                        expr: Box::new(left),
+                        list,
+                        negated,
+                    };
                 }
                 continue;
             }
@@ -1918,13 +2353,30 @@ impl Parser {
                 // MySQL LIKE is case-insensitive under its default collations.
                 let ci = ci || self.dialect == Dialect::MySql;
                 let pattern = self.bit_or()?;
-                let escape = if self.eat_kw("escape") { Some(Box::new(self.primary()?)) } else { None };
-                left = Expr::Like { expr: Box::new(left), pattern: Box::new(pattern), negated, case_insensitive: ci, escape };
+                let escape = if self.eat_kw("escape") {
+                    Some(Box::new(self.primary()?))
+                } else {
+                    None
+                };
+                left = Expr::Like {
+                    expr: Box::new(left),
+                    pattern: Box::new(pattern),
+                    negated,
+                    case_insensitive: ci,
+                    escape,
+                };
                 continue;
             }
             if self.eat_kw("regexp") || self.eat_kw("rlike") {
                 let right = self.bit_or()?;
-                left = Expr::binary(BinaryOp::Regex { case_insensitive: true, negated }, left, right);
+                left = Expr::binary(
+                    BinaryOp::Regex {
+                        case_insensitive: true,
+                        negated,
+                    },
+                    left,
+                    right,
+                );
                 continue;
             }
             if self.is_kw("similar") {
@@ -1951,10 +2403,22 @@ impl Parser {
                     "<=" => BinaryOp::LtEq,
                     ">" => BinaryOp::Gt,
                     ">=" => BinaryOp::GtEq,
-                    "~" => BinaryOp::Regex { case_insensitive: false, negated: false },
-                    "~*" => BinaryOp::Regex { case_insensitive: true, negated: false },
-                    "!~" => BinaryOp::Regex { case_insensitive: false, negated: true },
-                    "!~*" => BinaryOp::Regex { case_insensitive: true, negated: true },
+                    "~" => BinaryOp::Regex {
+                        case_insensitive: false,
+                        negated: false,
+                    },
+                    "~*" => BinaryOp::Regex {
+                        case_insensitive: true,
+                        negated: false,
+                    },
+                    "!~" => BinaryOp::Regex {
+                        case_insensitive: false,
+                        negated: true,
+                    },
+                    "!~*" => BinaryOp::Regex {
+                        case_insensitive: true,
+                        negated: true,
+                    },
                     "||" => BinaryOp::Concat,
                     "+" => BinaryOp::Add,
                     "-" => BinaryOp::Sub,
@@ -1972,10 +2436,22 @@ impl Parser {
                 Some(Token::Op(">")) => BinaryOp::Gt,
                 Some(Token::Op(">=")) => BinaryOp::GtEq,
                 Some(Token::Op("<=>")) => BinaryOp::NullSafeEq,
-                Some(Token::Op("~")) if self.dialect == Dialect::Postgres => BinaryOp::Regex { case_insensitive: false, negated: false },
-                Some(Token::Op("~*")) => BinaryOp::Regex { case_insensitive: true, negated: false },
-                Some(Token::Op("!~")) => BinaryOp::Regex { case_insensitive: false, negated: true },
-                Some(Token::Op("!~*")) => BinaryOp::Regex { case_insensitive: true, negated: true },
+                Some(Token::Op("~")) if self.dialect == Dialect::Postgres => BinaryOp::Regex {
+                    case_insensitive: false,
+                    negated: false,
+                },
+                Some(Token::Op("~*")) => BinaryOp::Regex {
+                    case_insensitive: true,
+                    negated: false,
+                },
+                Some(Token::Op("!~")) => BinaryOp::Regex {
+                    case_insensitive: false,
+                    negated: true,
+                },
+                Some(Token::Op("!~*")) => BinaryOp::Regex {
+                    case_insensitive: true,
+                    negated: true,
+                },
                 _ => return Ok(left),
             };
             self.pos += 1;
@@ -1989,7 +2465,12 @@ impl Parser {
                     self.expr()?
                 };
                 self.expect_op(")")?;
-                left = Expr::AnyAll { left: Box::new(left), op, right: Box::new(right), all };
+                left = Expr::AnyAll {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                    all,
+                };
                 continue;
             }
             let right = self.bit_or()?;
@@ -2111,7 +2592,10 @@ impl Parser {
             let e = self.unary()?;
             return Ok(match e {
                 Expr::Number(n) if !n.starts_with('-') => Expr::Number(format!("-{n}")),
-                other => Expr::Unary { op: UnaryOp::Neg, expr: Box::new(other) },
+                other => Expr::Unary {
+                    op: UnaryOp::Neg,
+                    expr: Box::new(other),
+                },
             });
         }
         if self.eat_op("+") {
@@ -2119,7 +2603,10 @@ impl Parser {
         }
         if self.eat_op("~") {
             let e = self.unary()?;
-            return Ok(Expr::Unary { op: UnaryOp::BitNot, expr: Box::new(e) });
+            return Ok(Expr::Unary {
+                op: UnaryOp::BitNot,
+                expr: Box::new(e),
+            });
         }
         let mut e = self.primary()?;
         loop {
@@ -2129,7 +2616,10 @@ impl Parser {
                     continue;
                 }
                 let (ty, _) = self.data_type()?;
-                e = Expr::Cast { expr: Box::new(e), ty };
+                e = Expr::Cast {
+                    expr: Box::new(e),
+                    ty,
+                };
             } else if self.is_op("[") {
                 self.pos += 1;
                 let index = self.expr()?;
@@ -2137,13 +2627,22 @@ impl Parser {
                     return Err(SqlError::unsupported("array slices"));
                 }
                 self.expect_op("]")?;
-                e = Expr::Index { expr: Box::new(e), index: Box::new(index) };
+                e = Expr::Index {
+                    expr: Box::new(e),
+                    index: Box::new(index),
+                };
             } else if self.eat_kw("collate") {
                 self.object_name()?;
             } else if self.is_kw("at") && self.is_kw_at(1, "time") && self.is_kw_at(2, "zone") {
                 self.pos += 3;
                 let zone = self.primary()?;
-                e = Expr::Function { name: "timezone".into(), args: vec![zone, e], star: false, distinct: false, over: false };
+                e = Expr::Function {
+                    name: "timezone".into(),
+                    args: vec![zone, e],
+                    star: false,
+                    distinct: false,
+                    over: None,
+                };
             } else {
                 return Ok(e);
             }
@@ -2211,7 +2710,10 @@ impl Parser {
                     self.expect_op("(")?;
                     let q = self.query()?;
                     self.expect_op(")")?;
-                    return Ok(Expr::Exists { query: Box::new(q), negated: false });
+                    return Ok(Expr::Exists {
+                        query: Box::new(q),
+                        negated: false,
+                    });
                 }
                 "cast" | "try_cast" | "safe_cast" => {
                     self.expect_op("(")?;
@@ -2223,7 +2725,10 @@ impl Parser {
                     }
                     let ty = self.cast_type()?;
                     self.expect_op(")")?;
-                    return Ok(Expr::Cast { expr: Box::new(e), ty });
+                    return Ok(Expr::Cast {
+                        expr: Box::new(e),
+                        ty,
+                    });
                 }
                 "convert" if self.is_op("(") => {
                     self.pos += 1;
@@ -2235,7 +2740,10 @@ impl Parser {
                             self.expr()?;
                         }
                         self.expect_op(")")?;
-                        return Ok(Expr::Cast { expr: Box::new(e), ty });
+                        return Ok(Expr::Cast {
+                            expr: Box::new(e),
+                            ty,
+                        });
                     }
                     let e = self.expr()?;
                     if self.eat_kw("using") {
@@ -2246,9 +2754,15 @@ impl Parser {
                     self.expect_op(",")?;
                     let ty = self.cast_type()?;
                     self.expect_op(")")?;
-                    return Ok(Expr::Cast { expr: Box::new(e), ty });
+                    return Ok(Expr::Cast {
+                        expr: Box::new(e),
+                        ty,
+                    });
                 }
-                "array" if self.is_op("(") && (self.is_kw_at(1, "select") || self.is_kw_at(1, "with")) => {
+                "array"
+                    if self.is_op("(")
+                        && (self.is_kw_at(1, "select") || self.is_kw_at(1, "with")) =>
+                {
                     self.pos += 1;
                     let q = self.query()?;
                     self.expect_op(")")?;
@@ -2271,13 +2785,18 @@ impl Parser {
                 "extract" if self.is_op("(") => {
                     self.pos += 1;
                     let field = match self.next() {
-                        Some(Token::Word { text, .. }) | Some(Token::Str(text)) => text.to_ascii_lowercase(),
+                        Some(Token::Word { text, .. }) | Some(Token::Str(text)) => {
+                            text.to_ascii_lowercase()
+                        }
                         _ => return Err(self.unexpected("a date field")),
                     };
                     self.expect_kw("from")?;
                     let e = self.expr()?;
                     self.expect_op(")")?;
-                    return Ok(Expr::Extract { field, expr: Box::new(e) });
+                    return Ok(Expr::Extract {
+                        field,
+                        expr: Box::new(e),
+                    });
                 }
                 "interval" => {
                     let v = match self.next() {
@@ -2286,7 +2805,11 @@ impl Parser {
                         _ => return Err(self.unexpected("an interval literal")),
                     };
                     // MySQL INTERVAL 1 DAY / PostgreSQL INTERVAL '1' DAY.
-                    if let Some(Token::Word { text, quoted: false }) = self.peek() {
+                    if let Some(Token::Word {
+                        text,
+                        quoted: false,
+                    }) = self.peek()
+                    {
                         let unit = text.to_ascii_lowercase();
                         if is_interval_unit(&unit) {
                             self.pos += 1;
@@ -2295,15 +2818,22 @@ impl Parser {
                     }
                     return Ok(Expr::Interval(v));
                 }
-                "date" | "timestamp" | "time" | "timestamptz" | "datetime" if matches!(self.peek(), Some(Token::Str(_))) => {
-                    let Some(Token::Str(s)) = self.next() else { unreachable!() };
+                "date" | "timestamp" | "time" | "timestamptz" | "datetime"
+                    if matches!(self.peek(), Some(Token::Str(_))) =>
+                {
+                    let Some(Token::Str(s)) = self.next() else {
+                        unreachable!()
+                    };
                     let ty = match lower.as_str() {
                         "date" => DataType::Date,
                         "time" => DataType::Time,
                         "timestamptz" => DataType::TimestampTz,
                         _ => DataType::Timestamp,
                     };
-                    return Ok(Expr::Cast { expr: Box::new(Expr::Str(s)), ty });
+                    return Ok(Expr::Cast {
+                        expr: Box::new(Expr::Str(s)),
+                        ty,
+                    });
                 }
                 "position" if self.is_op("(") => {
                     self.pos += 1;
@@ -2369,10 +2899,15 @@ impl Parser {
                     args.extend(chars);
                     return Ok(func(mode, args));
                 }
-                "current_timestamp" | "current_date" | "current_time" | "localtimestamp" | "localtime" | "current_user"
-                | "session_user" | "current_schema" | "current_catalog" | "current_role" | "user" | "utc_timestamp"
-                | "sysdate" | "sysdatetime" | "getdate" | "getutcdate"
-                    if !self.is_op("(") || matches!(self.peek_at(1), Some(Token::Op(")")) | Some(Token::Number(_))) =>
+                "current_timestamp" | "current_date" | "current_time" | "localtimestamp"
+                | "localtime" | "current_user" | "session_user" | "current_schema"
+                | "current_catalog" | "current_role" | "user" | "utc_timestamp" | "sysdate"
+                | "sysdatetime" | "getdate" | "getutcdate"
+                    if !self.is_op("(")
+                        || matches!(
+                            self.peek_at(1),
+                            Some(Token::Op(")")) | Some(Token::Number(_))
+                        ) =>
                 {
                     if self.eat_op("(") {
                         if let Some(Token::Number(_)) = self.peek() {
@@ -2437,17 +2972,60 @@ impl Parser {
             if self.eat_kws(&["within", "group"]) {
                 return Err(SqlError::unsupported("WITHIN GROUP"));
             }
-            let over = self.is_kw("over");
-            if over {
-                return Err(SqlError::unsupported("window functions (OVER)"));
-            }
-            Ok(Expr::Function { name, args, star, distinct, over })
+            let over = if self.eat_kw("over") {
+                if !self.eat_op("(") {
+                    return Err(SqlError::unsupported("named windows (OVER name)"));
+                }
+                let mut w = Window {
+                    partition_by: Vec::new(),
+                    order_by: Vec::new(),
+                };
+                if self.eat_kws(&["partition", "by"]) {
+                    loop {
+                        w.partition_by.push(self.expr()?);
+                        if !self.eat_op(",") {
+                            break;
+                        }
+                    }
+                }
+                if self.eat_kws(&["order", "by"]) {
+                    w.order_by = self.order_list()?;
+                }
+                if self.is_kw("rows") || self.is_kw("range") || self.is_kw("groups") {
+                    // Frames: the default frame semantics are used.
+                    let mut depth = 0;
+                    while let Some(t) = self.peek() {
+                        match t {
+                            Token::Op("(") => depth += 1,
+                            Token::Op(")") if depth == 0 => break,
+                            Token::Op(")") => depth -= 1,
+                            _ => {}
+                        }
+                        self.pos += 1;
+                    }
+                }
+                self.expect_op(")")?;
+                Some(Box::new(w))
+            } else {
+                None
+            };
+            Ok(Expr::Function {
+                name,
+                args,
+                star,
+                distinct,
+                over,
+            })
         }
     }
 
     /// `::regclass` / `::regtype` / `::regnamespace`: name-to-OID casts, as functions.
     fn reg_cast(&mut self) -> Option<&'static str> {
-        let off = if matches!(self.peek(), Some(Token::Word { .. })) && self.is_op_at(1, ".") { 2 } else { 0 };
+        let off = if matches!(self.peek(), Some(Token::Word { .. })) && self.is_op_at(1, ".") {
+            2
+        } else {
+            0
+        };
         let f = match self.peek_at(off).and_then(Token::keyword).as_deref() {
             Some("regclass") => "regclass",
             Some("regtype") => "regtype",
@@ -2469,7 +3047,11 @@ impl Parser {
     }
 
     fn case_expr(&mut self) -> SqlResult<Expr> {
-        let operand = if self.is_kw("when") { None } else { Some(Box::new(self.expr()?)) };
+        let operand = if self.is_kw("when") {
+            None
+        } else {
+            Some(Box::new(self.expr()?))
+        };
         let mut whens = Vec::new();
         while self.eat_kw("when") {
             let cond = self.expr()?;
@@ -2480,14 +3062,28 @@ impl Parser {
         if whens.is_empty() {
             return Err(self.unexpected("WHEN"));
         }
-        let else_ = if self.eat_kw("else") { Some(Box::new(self.expr()?)) } else { None };
+        let else_ = if self.eat_kw("else") {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
         self.expect_kw("end")?;
-        Ok(Expr::Case { operand, whens, else_ })
+        Ok(Expr::Case {
+            operand,
+            whens,
+            else_,
+        })
     }
 }
 
 fn func(name: &str, args: Vec<Expr>) -> Expr {
-    Expr::Function { name: name.to_owned(), args, star: false, distinct: false, over: false }
+    Expr::Function {
+        name: name.to_owned(),
+        args,
+        star: false,
+        distinct: false,
+        over: None,
+    }
 }
 
 fn clamp_u8(n: u32) -> u8 {
@@ -2497,7 +3093,16 @@ fn clamp_u8(n: u32) -> u8 {
 fn is_interval_unit(u: &str) -> bool {
     matches!(
         u.trim_end_matches('s'),
-        "microsecond" | "millisecond" | "second" | "minute" | "hour" | "day" | "week" | "month" | "quarter" | "year"
+        "microsecond"
+            | "millisecond"
+            | "second"
+            | "minute"
+            | "hour"
+            | "day"
+            | "week"
+            | "month"
+            | "quarter"
+            | "year"
     )
 }
 
@@ -2505,11 +3110,53 @@ fn is_interval_unit(u: &str) -> bool {
 fn type_word(t: &str) -> bool {
     matches!(
         t,
-        "bool" | "boolean" | "bit" | "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "int2" | "int4"
-            | "int8" | "serial" | "bigserial" | "smallserial" | "decimal" | "numeric" | "real" | "float" | "double"
-            | "float4" | "float8" | "text" | "varchar" | "char" | "character" | "nvarchar" | "nchar" | "bytea" | "blob"
-            | "binary" | "varbinary" | "timestamp" | "timestamptz" | "datetime" | "date" | "time" | "uuid" | "json"
-            | "jsonb" | "enum" | "longtext" | "mediumtext" | "tinytext" | "money" | "year" | "interval"
+        "bool"
+            | "boolean"
+            | "bit"
+            | "tinyint"
+            | "smallint"
+            | "mediumint"
+            | "int"
+            | "integer"
+            | "bigint"
+            | "int2"
+            | "int4"
+            | "int8"
+            | "serial"
+            | "bigserial"
+            | "smallserial"
+            | "decimal"
+            | "numeric"
+            | "real"
+            | "float"
+            | "double"
+            | "float4"
+            | "float8"
+            | "text"
+            | "varchar"
+            | "char"
+            | "character"
+            | "nvarchar"
+            | "nchar"
+            | "bytea"
+            | "blob"
+            | "binary"
+            | "varbinary"
+            | "timestamp"
+            | "timestamptz"
+            | "datetime"
+            | "date"
+            | "time"
+            | "uuid"
+            | "json"
+            | "jsonb"
+            | "enum"
+            | "longtext"
+            | "mediumtext"
+            | "tinytext"
+            | "money"
+            | "year"
+            | "interval"
     )
 }
 
@@ -2586,31 +3233,90 @@ mod tests {
 
     #[test]
     fn precedence_and_folding() {
-        let Statement::Query(q) = one("SELECT A + b * 2 = 7 OR NOT c AND d FROM T", Dialect::Postgres) else { panic!() };
+        let Statement::Query(q) = one(
+            "SELECT A + b * 2 = 7 OR NOT c AND d FROM T",
+            Dialect::Postgres,
+        ) else {
+            panic!()
+        };
         let SetExpr::Select(s) = q.body else { panic!() };
-        let SelectItem::Expr { expr, .. } = &s.items[0] else { panic!() };
+        let SelectItem::Expr { expr, .. } = &s.items[0] else {
+            panic!()
+        };
         // OR at the top, AND below it, = below AND, + below =, * below +.
-        let Expr::Binary { op: BinaryOp::Or, left, right } = expr else { panic!("{expr:?}") };
-        assert!(matches!(**right, Expr::Binary { op: BinaryOp::And, .. }));
-        let Expr::Binary { op: BinaryOp::Eq, left: sum, .. } = &**left else { panic!() };
-        let Expr::Binary { op: BinaryOp::Add, left: a, right: prod } = &**sum else { panic!() };
+        let Expr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } = expr
+        else {
+            panic!("{expr:?}")
+        };
+        assert!(matches!(
+            **right,
+            Expr::Binary {
+                op: BinaryOp::And,
+                ..
+            }
+        ));
+        let Expr::Binary {
+            op: BinaryOp::Eq,
+            left: sum,
+            ..
+        } = &**left
+        else {
+            panic!()
+        };
+        let Expr::Binary {
+            op: BinaryOp::Add,
+            left: a,
+            right: prod,
+        } = &**sum
+        else {
+            panic!()
+        };
         assert_eq!(**a, Expr::Column(vec!["a".into()]));
-        assert!(matches!(**prod, Expr::Binary { op: BinaryOp::Mul, .. }));
+        assert!(matches!(
+            **prod,
+            Expr::Binary {
+                op: BinaryOp::Mul,
+                ..
+            }
+        ));
         assert!(matches!(&s.from[0], TableRef::Named { name, .. } if name == "t"));
         // MySQL keeps identifier case.
-        let Statement::Query(q) = one("SELECT A FROM T", Dialect::MySql) else { panic!() };
+        let Statement::Query(q) = one("SELECT A FROM T", Dialect::MySql) else {
+            panic!()
+        };
         let SetExpr::Select(s) = q.body else { panic!() };
         assert!(matches!(&s.from[0], TableRef::Named { name, .. } if name == "T"));
     }
 
     #[test]
     fn multiple_statements_and_errors() {
-        let (stmts, n) = parse("BEGIN; UPDATE t SET a = $2 WHERE id = $1; COMMIT;", Dialect::Postgres).unwrap();
+        let (stmts, n) = parse(
+            "BEGIN; UPDATE t SET a = $2 WHERE id = $1; COMMIT;",
+            Dialect::Postgres,
+        )
+        .unwrap();
         assert_eq!((stmts.len(), n), (3, 2));
         assert!(parse_one("SELECT FROM WHERE", Dialect::Postgres).is_err());
-        assert_eq!(parse_one("SELEC 1", Dialect::Postgres).unwrap_err().code, "0A000");
-        assert_eq!(parse_one("SELECT a FROM t WHERE", Dialect::Postgres).unwrap_err().code, "42601");
-        assert_eq!(parse_one("SELECT sum(a) OVER () FROM t", Dialect::Postgres).unwrap_err().code, "0A000");
+        assert_eq!(
+            parse_one("SELEC 1", Dialect::Postgres).unwrap_err().code,
+            "0A000"
+        );
+        assert_eq!(
+            parse_one("SELECT a FROM t WHERE", Dialect::Postgres)
+                .unwrap_err()
+                .code,
+            "42601"
+        );
+        assert_eq!(
+            parse_one("SELECT sum(a) OVER w FROM t", Dialect::Postgres)
+                .unwrap_err()
+                .code,
+            "0A000"
+        );
         assert_eq!(one("", Dialect::Postgres), Statement::Empty);
     }
 }

@@ -38,7 +38,10 @@ impl Token {
     /// The lower-cased text of an unquoted word.
     pub fn keyword(&self) -> Option<String> {
         match self {
-            Token::Word { text, quoted: false } => Some(text.to_ascii_lowercase()),
+            Token::Word {
+                text,
+                quoted: false,
+            } => Some(text.to_ascii_lowercase()),
             _ => None,
         }
     }
@@ -46,8 +49,9 @@ impl Token {
 
 /// Every operator, longest first (matching is greedy).
 const OPS: &[&str] = &[
-    "->>", "#>>", "<=>", "!=", "<>", "<=", ">=", "||", "::", "<<", ">>", "->", "#>", "@>", "<@", "&&", "!~*", "~*", "!~",
-    "(", ")", ",", ";", ".", "*", "+", "-", "/", "%", "=", "<", ">", "^", "~", "&", "|", "[", "]", "!", "{", "}", ":",
+    "->>", "#>>", "<=>", "!=", "<>", "<=", ">=", "||", "::", "<<", ">>", "->", "#>", "@>", "<@",
+    "&&", "!~*", "~*", "!~", "(", ")", ",", ";", ".", "*", "+", "-", "/", "%", "=", "<", ">", "^",
+    "~", "&", "|", "[", "]", "!", "{", "}", ":",
 ];
 
 /// Named placeholders map to positions in order of first appearance.
@@ -100,12 +104,23 @@ pub fn tokenize(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Token>, Params)> 
             continue;
         }
         // Prefixed strings: E'..' (escapes), N'..' (national), X'..' (hex), B'..' (bits).
-        if matches!(c, b'e' | b'E' | b'n' | b'N' | b'x' | b'X' | b'b' | b'B') && b.get(i + 1) == Some(&b'\'') {
-            let (s, next) = read_quoted(sql, i + 1, b'\'', matches!(c, b'e' | b'E') || dialect == Dialect::MySql)?;
+        if matches!(c, b'e' | b'E' | b'n' | b'N' | b'x' | b'X' | b'b' | b'B')
+            && b.get(i + 1) == Some(&b'\'')
+        {
+            let (s, next) = read_quoted(
+                sql,
+                i + 1,
+                b'\'',
+                matches!(c, b'e' | b'E') || dialect == Dialect::MySql,
+            )?;
             i = next;
             match c {
-                b'x' | b'X' => out.push(Token::Blob(parse_hex(&s).ok_or_else(|| err("invalid hexadecimal literal"))?)),
-                b'b' | b'B' => out.push(Token::Blob(parse_bits(&s).ok_or_else(|| err("invalid bit literal"))?)),
+                b'x' | b'X' => out.push(Token::Blob(
+                    parse_hex(&s).ok_or_else(|| err("invalid hexadecimal literal"))?,
+                )),
+                b'b' | b'B' => out.push(Token::Blob(
+                    parse_bits(&s).ok_or_else(|| err("invalid bit literal"))?,
+                )),
                 _ => out.push(Token::Str(s)),
             }
             continue;
@@ -120,19 +135,36 @@ pub fn tokenize(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Token>, Params)> 
         if c == b'"' {
             let (s, next) = read_quoted(sql, i, b'"', dialect == Dialect::MySql)?;
             // MySQL treats "..." as a string (ANSI_QUOTES off); everyone else as an identifier.
-            out.push(if dialect == Dialect::MySql { Token::Str(s) } else { Token::Word { text: s, quoted: true } });
+            out.push(if dialect == Dialect::MySql {
+                Token::Str(s)
+            } else {
+                Token::Word {
+                    text: s,
+                    quoted: true,
+                }
+            });
             i = next;
             continue;
         }
         if c == b'`' {
             let (s, next) = read_quoted(sql, i, b'`', false)?;
-            out.push(Token::Word { text: s, quoted: true });
+            out.push(Token::Word {
+                text: s,
+                quoted: true,
+            });
             i = next;
             continue;
         }
         if c == b'[' && matches!(dialect, Dialect::MsSql | Dialect::Sqlite) {
-            let end = sql[i + 1..].find(']').ok_or_else(|| err("unterminated [identifier]"))? + i + 1;
-            out.push(Token::Word { text: sql[i + 1..end].to_owned(), quoted: true });
+            let end = sql[i + 1..]
+                .find(']')
+                .ok_or_else(|| err("unterminated [identifier]"))?
+                + i
+                + 1;
+            out.push(Token::Word {
+                text: sql[i + 1..end].to_owned(),
+                quoted: true,
+            });
             i = end + 1;
             continue;
         }
@@ -155,9 +187,14 @@ pub fn tokenize(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Token>, Params)> 
             let tag_end = sql[i + 1..].find('$').map(|p| p + i + 1);
             if let Some(te) = tag_end {
                 let tag = &sql[i..=te];
-                if tag[1..tag.len() - 1].chars().all(|ch| ch.is_alphanumeric() || ch == '_') {
+                if tag[1..tag.len() - 1]
+                    .chars()
+                    .all(|ch| ch.is_alphanumeric() || ch == '_')
+                {
                     let body_start = te + 1;
-                    let close = sql[body_start..].find(tag).ok_or_else(|| err("unterminated dollar-quoted string"))?;
+                    let close = sql[body_start..]
+                        .find(tag)
+                        .ok_or_else(|| err("unterminated dollar-quoted string"))?;
                     out.push(Token::Str(sql[body_start..body_start + close].to_owned()));
                     i = body_start + close + tag.len();
                     continue;
@@ -177,7 +214,9 @@ pub fn tokenize(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Token>, Params)> 
             let system = b.get(i + 1) == Some(&b'@');
             let start = if system { i + 2 } else { i + 1 };
             let mut j = start;
-            while j < b.len() && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'_' | b'.' | b'$')) {
+            while j < b.len()
+                && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'_' | b'.' | b'$'))
+            {
                 j += 1;
             }
             if j > start {
@@ -191,7 +230,11 @@ pub fn tokenize(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Token>, Params)> 
                 continue;
             }
         }
-        if c == b':' && dialect != Dialect::Postgres && b.get(i + 1).is_some_and(|x| x.is_ascii_alphabetic() || *x == b'_') {
+        if c == b':'
+            && dialect != Dialect::Postgres
+            && b.get(i + 1)
+                .is_some_and(|x| x.is_ascii_alphabetic() || *x == b'_')
+        {
             let start = i + 1;
             let mut j = start;
             while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
@@ -203,13 +246,18 @@ pub fn tokenize(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Token>, Params)> 
         }
         // Numbers: 12, 1.5, .5, 1e10, 0x1F.
         if c.is_ascii_digit() || (c == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit)) {
-            if c == b'0' && matches!(b.get(i + 1), Some(b'x' | b'X')) && b.get(i + 2).is_some_and(u8::is_ascii_hexdigit) {
+            if c == b'0'
+                && matches!(b.get(i + 1), Some(b'x' | b'X'))
+                && b.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
+            {
                 let start = i + 2;
                 i = start;
                 while i < b.len() && b[i].is_ascii_hexdigit() {
                     i += 1;
                 }
-                out.push(Token::Blob(parse_hex(&sql[start..i]).ok_or_else(|| err("invalid hexadecimal literal"))?));
+                out.push(Token::Blob(
+                    parse_hex(&sql[start..i]).ok_or_else(|| err("invalid hexadecimal literal"))?,
+                ));
                 continue;
             }
             let start = i;
@@ -240,10 +288,15 @@ pub fn tokenize(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Token>, Params)> 
         // Words.
         if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
             let start = i;
-            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' || b[i] >= 0x80) {
+            while i < b.len()
+                && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' || b[i] >= 0x80)
+            {
                 i += 1;
             }
-            out.push(Token::Word { text: sql[start..i].to_owned(), quoted: false });
+            out.push(Token::Word {
+                text: sql[start..i].to_owned(),
+                quoted: false,
+            });
             continue;
         }
         // Operators.
@@ -252,7 +305,12 @@ pub fn tokenize(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Token>, Params)> 
                 out.push(Token::Op(op));
                 i += op.len();
             }
-            None => return Err(SqlError::syntax(format!("unexpected character {:?}", sql[i..].chars().next().unwrap_or(' ')))),
+            None => {
+                return Err(SqlError::syntax(format!(
+                    "unexpected character {:?}",
+                    sql[i..].chars().next().unwrap_or(' ')
+                )))
+            }
         }
     }
     Ok((out, params))
@@ -282,7 +340,8 @@ fn read_quoted(sql: &str, start: usize, quote: u8, backslash: bool) -> SqlResult
                 i += 2;
                 continue;
             }
-            let s = String::from_utf8(out).map_err(|_| SqlError::syntax("invalid UTF-8 in literal".into()))?;
+            let s = String::from_utf8(out)
+                .map_err(|_| SqlError::syntax("invalid UTF-8 in literal".into()))?;
             return Ok((s, i + 1));
         }
         if backslash && c == b'\\' && i + 1 < b.len() {
@@ -297,8 +356,13 @@ fn read_quoted(sql: &str, start: usize, quote: u8, backslash: bool) -> SqlResult
                 b'0' => out.push(0),
                 b'Z' => out.push(26),
                 b'x' if quote == b'\'' => {
-                    let hex: String = sql[i..].chars().take(2).take_while(char::is_ascii_hexdigit).collect();
-                    let v = u8::from_str_radix(&hex, 16).map_err(|_| SqlError::syntax("bad \\x escape".into()))?;
+                    let hex: String = sql[i..]
+                        .chars()
+                        .take(2)
+                        .take_while(char::is_ascii_hexdigit)
+                        .collect();
+                    let v = u8::from_str_radix(&hex, 16)
+                        .map_err(|_| SqlError::syntax("bad \\x escape".into()))?;
                     out.push(v);
                     i += hex.len();
                 }
@@ -317,12 +381,21 @@ fn read_quoted(sql: &str, start: usize, quote: u8, backslash: bool) -> SqlResult
         out.push(c);
         i += 1;
     }
-    Err(SqlError::syntax("unterminated quoted string or identifier".into()))
+    Err(SqlError::syntax(
+        "unterminated quoted string or identifier".into(),
+    ))
 }
 
 fn parse_hex(s: &str) -> Option<Vec<u8>> {
-    let s = if s.len() % 2 == 1 { format!("0{s}") } else { s.to_owned() };
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
+    let s = if s.len() % 2 == 1 {
+        format!("0{s}")
+    } else {
+        s.to_owned()
+    };
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 fn parse_bits(s: &str) -> Option<Vec<u8>> {
@@ -330,7 +403,10 @@ fn parse_bits(s: &str) -> Option<Vec<u8>> {
         return None;
     }
     let padded = format!("{}{s}", "0".repeat((8 - s.len() % 8) % 8));
-    (0..padded.len()).step_by(8).map(|i| u8::from_str_radix(&padded[i..i + 8], 2).ok()).collect()
+    (0..padded.len())
+        .step_by(8)
+        .map(|i| u8::from_str_radix(&padded[i..i + 8], 2).ok())
+        .collect()
 }
 
 #[cfg(test)]
@@ -343,42 +419,94 @@ mod tests {
 
     #[test]
     fn dialect_quoting_and_literals() {
-        let w = |t: &str, q| Token::Word { text: t.into(), quoted: q };
-        assert_eq!(toks("SELECT \"A b\" FROM t", Dialect::Postgres), vec![w("SELECT", false), w("A b", true), w("FROM", false), w("t", false)]);
-        assert_eq!(toks("select `x`, \"s\"", Dialect::MySql), vec![w("select", false), w("x", true), Token::Op(","), Token::Str("s".into())]);
+        let w = |t: &str, q| Token::Word {
+            text: t.into(),
+            quoted: q,
+        };
+        assert_eq!(
+            toks("SELECT \"A b\" FROM t", Dialect::Postgres),
+            vec![
+                w("SELECT", false),
+                w("A b", true),
+                w("FROM", false),
+                w("t", false)
+            ]
+        );
+        assert_eq!(
+            toks("select `x`, \"s\"", Dialect::MySql),
+            vec![
+                w("select", false),
+                w("x", true),
+                Token::Op(","),
+                Token::Str("s".into())
+            ]
+        );
         assert_eq!(toks("[my col]", Dialect::MsSql), vec![w("my col", true)]);
-        assert_eq!(toks("'it''s' E'a\\nb' $q$x'y$q$ $$z$$", Dialect::Postgres), vec![
-            Token::Str("it's".into()),
-            Token::Str("a\nb".into()),
-            Token::Str("x'y".into()),
-            Token::Str("z".into())
-        ]);
-        assert_eq!(toks("'a\\'b'", Dialect::MySql), vec![Token::Str("a'b".into())]);
-        assert_eq!(toks("'a\\'", Dialect::Postgres), vec![Token::Str("a\\".into())]);
-        assert_eq!(toks("X'0aFF' 0x10", Dialect::MySql), vec![Token::Blob(vec![10, 255]), Token::Blob(vec![16])]);
-        assert_eq!(toks("1 1.50 .5 2e3 1.5E-2", Dialect::Postgres), vec![
-            Token::Number("1".into()),
-            Token::Number("1.50".into()),
-            Token::Number(".5".into()),
-            Token::Number("2e3".into()),
-            Token::Number("1.5E-2".into())
-        ]);
+        assert_eq!(
+            toks("'it''s' E'a\\nb' $q$x'y$q$ $$z$$", Dialect::Postgres),
+            vec![
+                Token::Str("it's".into()),
+                Token::Str("a\nb".into()),
+                Token::Str("x'y".into()),
+                Token::Str("z".into())
+            ]
+        );
+        assert_eq!(
+            toks("'a\\'b'", Dialect::MySql),
+            vec![Token::Str("a'b".into())]
+        );
+        assert_eq!(
+            toks("'a\\'", Dialect::Postgres),
+            vec![Token::Str("a\\".into())]
+        );
+        assert_eq!(
+            toks("X'0aFF' 0x10", Dialect::MySql),
+            vec![Token::Blob(vec![10, 255]), Token::Blob(vec![16])]
+        );
+        assert_eq!(
+            toks("1 1.50 .5 2e3 1.5E-2", Dialect::Postgres),
+            vec![
+                Token::Number("1".into()),
+                Token::Number("1.50".into()),
+                Token::Number(".5".into()),
+                Token::Number("2e3".into()),
+                Token::Number("1.5E-2".into())
+            ]
+        );
     }
 
     #[test]
     fn comments_operators_and_placeholders() {
-        assert_eq!(toks("a -- c\n/* x /* y */ */ b # c", Dialect::MySql).len(), 2);
-        assert_eq!(toks("a::text >= b || c <> d", Dialect::Postgres)[1], Token::Op("::"));
+        assert_eq!(
+            toks("a -- c\n/* x /* y */ */ b # c", Dialect::MySql).len(),
+            2
+        );
+        assert_eq!(
+            toks("a::text >= b || c <> d", Dialect::Postgres)[1],
+            Token::Op("::")
+        );
         let (t, p) = tokenize("$2 = $1", Dialect::Postgres).unwrap();
         assert_eq!((t[0].clone(), p.count), (Token::Param(1), 2));
         let (t, p) = tokenize("? ? ?", Dialect::MySql).unwrap();
         assert_eq!((t[2].clone(), p.count), (Token::Param(2), 3));
         let (t, p) = tokenize("@b = @a and @b", Dialect::MsSql).unwrap();
-        assert_eq!((t[0].clone(), t[2].clone(), t[4].clone(), p.count), (Token::Param(0), Token::Param(1), Token::Param(0), 2));
-        assert_eq!(toks("@@version @x", Dialect::MySql), vec![
-            Token::Variable { name: "version".into(), system: true },
-            Token::Variable { name: "x".into(), system: false }
-        ]);
+        assert_eq!(
+            (t[0].clone(), t[2].clone(), t[4].clone(), p.count),
+            (Token::Param(0), Token::Param(1), Token::Param(0), 2)
+        );
+        assert_eq!(
+            toks("@@version @x", Dialect::MySql),
+            vec![
+                Token::Variable {
+                    name: "version".into(),
+                    system: true
+                },
+                Token::Variable {
+                    name: "x".into(),
+                    system: false
+                }
+            ]
+        );
         assert!(tokenize("'open", Dialect::Postgres).is_err());
         assert!(tokenize("/* open", Dialect::Postgres).is_err());
     }

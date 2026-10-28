@@ -32,7 +32,9 @@ pub fn serve(engine: Arc<Engine>, listener: TcpListener, auth: Arc<Auth>) {
         thread::spawn(move || {
             let _ = stream.set_nodelay(true);
             if let Err(e) = Conn::run(engine, stream, &auth) {
-                if e.kind() != io::ErrorKind::UnexpectedEof && e.kind() != io::ErrorKind::ConnectionReset {
+                if e.kind() != io::ErrorKind::UnexpectedEof
+                    && e.kind() != io::ErrorKind::ConnectionReset
+                {
                     eprintln!("storine-sql: postgres connection ended: {e}");
                 }
             }
@@ -83,8 +85,12 @@ struct Body<'a> {
 
 impl<'a> Body<'a> {
     fn cstr(&mut self) -> io::Result<String> {
-        let end = self.b[self.pos..].iter().position(|c| *c == 0).ok_or_else(|| bad_input("missing NUL"))?;
-        let s = String::from_utf8(self.b[self.pos..self.pos + end].to_vec()).map_err(|_| bad_input("bad UTF-8"))?;
+        let end = self.b[self.pos..]
+            .iter()
+            .position(|c| *c == 0)
+            .ok_or_else(|| bad_input("missing NUL"))?;
+        let s = String::from_utf8(self.b[self.pos..self.pos + end].to_vec())
+            .map_err(|_| bad_input("bad UTF-8"))?;
         self.pos += end + 1;
         Ok(s)
     }
@@ -172,7 +178,10 @@ impl Conn {
                 80_877_102 => return Ok(()), // cancel request: not supported, just close
                 196_608 => {
                     let mut p = HashMap::new();
-                    let mut b = Body { b: &body[4..], pos: 0 };
+                    let mut b = Body {
+                        b: &body[4..],
+                        pos: 0,
+                    };
                     loop {
                         let k = b.cstr()?;
                         if k.is_empty() {
@@ -184,19 +193,34 @@ impl Conn {
                     break p;
                 }
                 _ => {
-                    send_raw(&mut w, Msg::new(b'E').u8(b'S').cstr("FATAL").u8(b'C').cstr("0A000").u8(b'M').cstr("unsupported protocol version").u8(0))?;
+                    send_raw(
+                        &mut w,
+                        Msg::new(b'E')
+                            .u8(b'S')
+                            .cstr("FATAL")
+                            .u8(b'C')
+                            .cstr("0A000")
+                            .u8(b'M')
+                            .cstr("unsupported protocol version")
+                            .u8(0),
+                    )?;
                     w.flush()?;
                     return Ok(());
                 }
             }
         };
-        let user = params.get("user").cloned().unwrap_or_else(|| "storine".into());
+        let user = params
+            .get("user")
+            .cloned()
+            .unwrap_or_else(|| "storine".into());
         let database = params.get("database").cloned();
         if !auth.users.is_empty() {
             match scram(&mut r, &mut w, auth.users.get(&user).map(String::as_str)) {
                 Ok(true) => {}
                 Ok(false) => {
-                    let e = SqlError::auth(format!("password authentication failed for user \"{user}\""));
+                    let e = SqlError::auth(format!(
+                        "password authentication failed for user \"{user}\""
+                    ));
                     send_raw(&mut w, error_msg(&e, "FATAL"))?;
                     w.flush()?;
                     return Ok(());
@@ -220,12 +244,25 @@ impl Conn {
             ("IntervalStyle", "postgres".into()),
             ("is_superuser", "on".into()),
             ("session_authorization", user.clone()),
-            ("application_name", params.get("application_name").cloned().unwrap_or_default()),
+            (
+                "application_name",
+                params.get("application_name").cloned().unwrap_or_default(),
+            ),
         ] {
             send_raw(&mut w, Msg::new(b'S').cstr(k).cstr(&v))?;
         }
-        send_raw(&mut w, Msg::new(b'K').i32(session.id as i32).i32(0x5354_4f52))?;
-        let mut c = Conn { r, w, session, prepared: HashMap::new(), portals: HashMap::new(), skipping: false };
+        send_raw(
+            &mut w,
+            Msg::new(b'K').i32(session.id as i32).i32(0x5354_4f52),
+        )?;
+        let mut c = Conn {
+            r,
+            w,
+            session,
+            prepared: HashMap::new(),
+            portals: HashMap::new(),
+            skipping: false,
+        };
         c.ready()?;
         c.loop_messages()
     }
@@ -286,7 +323,10 @@ impl Conn {
                 b'p' => Ok(()), // stray password message
                 b'd' | b'c' | b'f' => Err(SqlError::unsupported("COPY")),
                 b'F' => Err(SqlError::unsupported("the function-call protocol")),
-                other => Err(SqlError::new("08P01", format!("unknown message type '{}'", other as char))),
+                other => Err(SqlError::new(
+                    "08P01",
+                    format!("unknown message type '{}'", other as char),
+                )),
             };
             match r {
                 Ok(()) => {}
@@ -304,7 +344,8 @@ impl Conn {
     }
 
     fn simple_query(&mut self, body: &[u8]) -> SqlResult<()> {
-        let sql = std::str::from_utf8(body.strip_suffix(&[0]).unwrap_or(body)).map_err(|_| SqlError::new("22021", "invalid UTF-8"))?;
+        let sql = std::str::from_utf8(body.strip_suffix(&[0]).unwrap_or(body))
+            .map_err(|_| SqlError::new("22021", "invalid UTF-8"))?;
         if crate::log_enabled() {
             eprintln!("[pg {}] {sql}", self.session.id);
         }
@@ -351,7 +392,11 @@ impl Conn {
         let stmt = match stmts.len() {
             0 => Statement::Empty,
             1 => stmts.into_iter().next().unwrap_or(Statement::Empty),
-            _ => return Err(SqlError::syntax("cannot insert multiple commands into a prepared statement".into())),
+            _ => {
+                return Err(SqlError::syntax(
+                    "cannot insert multiple commands into a prepared statement".into(),
+                ))
+            }
         };
         let mut inferred = infer_param_types(&self.session.engine, &stmt, count.max(types.len()));
         for (i, t) in types.iter().enumerate() {
@@ -359,7 +404,13 @@ impl Conn {
                 inferred[i] = *t;
             }
         }
-        self.prepared.insert(name, Prepared { stmt, param_types: inferred });
+        self.prepared.insert(
+            name,
+            Prepared {
+                stmt,
+                param_types: inferred,
+            },
+        );
         self.send(Msg::new(b'1')).map_err(io_err)
     }
 
@@ -373,7 +424,12 @@ impl Conn {
             formats.push(b.i16().map_err(io_sql)?);
         }
         let np = b.i16().map_err(io_sql)?.max(0) as usize;
-        let prep = self.prepared.get(&name).ok_or_else(|| SqlError::new("26000", format!("prepared statement \"{name}\" does not exist")))?;
+        let prep = self.prepared.get(&name).ok_or_else(|| {
+            SqlError::new(
+                "26000",
+                format!("prepared statement \"{name}\" does not exist"),
+            )
+        })?;
         let mut params = Vec::with_capacity(np);
         for i in 0..np {
             let len = b.i32().map_err(io_sql)?;
@@ -388,7 +444,11 @@ impl Conn {
                 _ => formats.get(i).copied().unwrap_or(0),
             };
             let oid = prep.param_types.get(i).copied().unwrap_or(0);
-            params.push(if fmt == 1 { decode_binary(oid, raw)? } else { decode_text(oid, raw)? });
+            params.push(if fmt == 1 {
+                decode_binary(oid, raw)?
+            } else {
+                decode_text(oid, raw)?
+            });
         }
         let nr = b.i16().map_err(io_sql)?.max(0) as usize;
         let mut result_formats = Vec::with_capacity(nr);
@@ -396,7 +456,15 @@ impl Conn {
             result_formats.push(b.i16().map_err(io_sql)?);
         }
         let stmt = prep.stmt.clone();
-        self.portals.insert(portal, Portal { stmt, params, result_formats, result: None });
+        self.portals.insert(
+            portal,
+            Portal {
+                stmt,
+                params,
+                result_formats,
+                result: None,
+            },
+        );
         self.send(Msg::new(b'2')).map_err(io_err)
     }
 
@@ -405,7 +473,12 @@ impl Conn {
         let kind = b.u8().map_err(io_sql)?;
         let name = b.cstr().map_err(io_sql)?;
         if kind == b'S' {
-            let prep = self.prepared.get(&name).ok_or_else(|| SqlError::new("26000", format!("prepared statement \"{name}\" does not exist")))?;
+            let prep = self.prepared.get(&name).ok_or_else(|| {
+                SqlError::new(
+                    "26000",
+                    format!("prepared statement \"{name}\" does not exist"),
+                )
+            })?;
             let mut m = Msg::new(b't').i16(prep.param_types.len() as i16);
             for t in &prep.param_types {
                 m = m.i32(*t as i32);
@@ -419,7 +492,10 @@ impl Conn {
             }
             return Ok(());
         }
-        let portal = self.portals.get_mut(&name).ok_or_else(|| SqlError::new("34000", format!("portal \"{name}\" does not exist")))?;
+        let portal = self
+            .portals
+            .get_mut(&name)
+            .ok_or_else(|| SqlError::new("34000", format!("portal \"{name}\" does not exist")))?;
         // Describing a portal runs it (its parameters are bound); Execute then streams the rows.
         if portal.result.is_none() {
             let (stmt, params) = (portal.stmt.clone(), portal.params.clone());
@@ -428,7 +504,10 @@ impl Conn {
                 p.result = Some((o, 0));
             }
         }
-        let portal = self.portals.get(&name).ok_or_else(|| SqlError::internal("portal vanished"))?;
+        let portal = self
+            .portals
+            .get(&name)
+            .ok_or_else(|| SqlError::internal("portal vanished"))?;
         let msg = match &portal.result {
             Some((Outcome::Rows(rs), _)) => row_description(&rs.columns, &portal.result_formats),
             _ => Msg::new(b'n'),
@@ -440,7 +519,10 @@ impl Conn {
         let mut b = Body { b: body, pos: 0 };
         let name = b.cstr().map_err(io_sql)?;
         let max_rows = b.i32().map_err(io_sql)?.max(0) as usize;
-        let portal = self.portals.get_mut(&name).ok_or_else(|| SqlError::new("34000", format!("portal \"{name}\" does not exist")))?;
+        let portal = self
+            .portals
+            .get_mut(&name)
+            .ok_or_else(|| SqlError::new("34000", format!("portal \"{name}\" does not exist")))?;
         if portal.result.is_none() {
             let (stmt, params) = (portal.stmt.clone(), portal.params.clone());
             let o = self.session.execute(&stmt, &params)?;
@@ -448,11 +530,19 @@ impl Conn {
                 p.result = Some((o, 0));
             }
         }
-        let Some(portal) = self.portals.get_mut(&name) else { return Err(SqlError::internal("portal vanished")) };
+        let Some(portal) = self.portals.get_mut(&name) else {
+            return Err(SqlError::internal("portal vanished"));
+        };
         let formats = portal.result_formats.clone();
-        let Some((outcome, sent)) = portal.result.take() else { return Ok(()) };
+        let Some((outcome, sent)) = portal.result.take() else {
+            return Ok(());
+        };
         if let Outcome::Rows(rs) = &outcome {
-            let end = if max_rows == 0 { rs.rows.len() } else { (sent + max_rows).min(rs.rows.len()) };
+            let end = if max_rows == 0 {
+                rs.rows.len()
+            } else {
+                (sent + max_rows).min(rs.rows.len())
+            };
             for row in &rs.rows[sent..end] {
                 let m = data_row(&rs.columns, row, &formats);
                 send_raw(&mut self.w, m).map_err(io_err)?;
@@ -464,9 +554,11 @@ impl Conn {
                 }
                 return Ok(());
             }
-            self.send(Msg::new(b'C').cstr(&format!("SELECT {}", rs.rows.len()))).map_err(io_err)?;
+            self.send(Msg::new(b'C').cstr(&format!("SELECT {}", rs.rows.len())))
+                .map_err(io_err)?;
         } else {
-            self.send_outcome(&outcome, &formats, false, 0).map_err(io_err)?;
+            self.send_outcome(&outcome, &formats, false, 0)
+                .map_err(io_err)?;
         }
         // The unnamed portal is single-use; named ones may be executed again.
         if !name.is_empty() {
@@ -490,7 +582,13 @@ impl Conn {
     }
 
     /// Sends a statement's result (`describe`: with its RowDescription first).
-    fn send_outcome(&mut self, o: &Outcome, formats: &[i16], describe: bool, _skip: usize) -> io::Result<()> {
+    fn send_outcome(
+        &mut self,
+        o: &Outcome,
+        formats: &[i16],
+        describe: bool,
+        _skip: usize,
+    ) -> io::Result<()> {
         match o {
             Outcome::Rows(rs) => {
                 if describe {
@@ -525,7 +623,16 @@ fn send_raw(w: &mut impl Write, m: Msg) -> io::Result<()> {
 }
 
 fn error_msg(e: &SqlError, severity: &str) -> Msg {
-    Msg::new(b'E').u8(b'S').cstr(severity).u8(b'V').cstr(severity).u8(b'C').cstr(e.code).u8(b'M').cstr(&e.message).u8(0)
+    Msg::new(b'E')
+        .u8(b'S')
+        .cstr(severity)
+        .u8(b'V')
+        .cstr(severity)
+        .u8(b'C')
+        .cstr(e.code)
+        .u8(b'M')
+        .cstr(&e.message)
+        .u8(0)
 }
 
 /// SCRAM-SHA-256 (RFC 5802 / 7677) exchange; `Ok(false)`: wrong password or unknown user.
@@ -556,7 +663,11 @@ fn scram(r: &mut impl Read, w: &mut impl Write, password: Option<&str>) -> io::R
     let gs2_flag = parts.next().unwrap_or("");
     let _authzid = parts.next();
     let bare = parts.next().unwrap_or("").to_owned();
-    let cnonce = bare.split(',').find_map(|kv| kv.strip_prefix("r=")).unwrap_or("").to_owned();
+    let cnonce = bare
+        .split(',')
+        .find_map(|kv| kv.strip_prefix("r="))
+        .unwrap_or("")
+        .to_owned();
     let salt = hash::random_bytes(16);
     let snonce = hash::base64_encode(&hash::random_bytes(18));
     let nonce = format!("{cnonce}{snonce}");
@@ -570,10 +681,18 @@ fn scram(r: &mut impl Read, w: &mut impl Write, password: Option<&str>) -> io::R
         Some(x) => x,
         None => return Ok(false),
     };
-    let channel = client_final.split(',').find_map(|kv| kv.strip_prefix("c=")).unwrap_or("");
+    let channel = client_final
+        .split(',')
+        .find_map(|kv| kv.strip_prefix("c="))
+        .unwrap_or("");
     let expected_channel = hash::base64_encode(format!("{gs2_flag},,").as_bytes());
-    let got_nonce = client_final.split(',').find_map(|kv| kv.strip_prefix("r=")).unwrap_or("");
-    let Some(password) = password else { return Ok(false) };
+    let got_nonce = client_final
+        .split(',')
+        .find_map(|kv| kv.strip_prefix("r="))
+        .unwrap_or("");
+    let Some(password) = password else {
+        return Ok(false);
+    };
     if got_nonce != nonce || channel != expected_channel {
         return Ok(false);
     }
@@ -582,17 +701,28 @@ fn scram(r: &mut impl Read, w: &mut impl Write, password: Option<&str>) -> io::R
     let stored_key = hash::sha256(&client_key);
     let auth_message = format!("{bare},{server_first},{without_proof}");
     let client_sig = hash::hmac_sha256(&stored_key, auth_message.as_bytes());
-    let Some(proof) = hash::base64_decode(proof_b64) else { return Ok(false) };
+    let Some(proof) = hash::base64_decode(proof_b64) else {
+        return Ok(false);
+    };
     if proof.len() != 32 {
         return Ok(false);
     }
-    let recovered: Vec<u8> = proof.iter().zip(client_sig.iter()).map(|(a, b)| a ^ b).collect();
+    let recovered: Vec<u8> = proof
+        .iter()
+        .zip(client_sig.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
     if !hash::ct_eq(&hash::sha256(&recovered), &stored_key) {
         return Ok(false);
     }
     let server_key = hash::hmac_sha256(&salted, b"Server Key");
     let server_sig = hash::hmac_sha256(&server_key, auth_message.as_bytes());
-    send_raw(w, Msg::new(b'R').i32(12).bytes(format!("v={}", hash::base64_encode(&server_sig)).as_bytes()))?;
+    send_raw(
+        w,
+        Msg::new(b'R')
+            .i32(12)
+            .bytes(format!("v={}", hash::base64_encode(&server_sig)).as_bytes()),
+    )?;
     Ok(true)
 }
 
@@ -601,7 +731,11 @@ fn type_len(ty: &DataType) -> i16 {
         DataType::Bool => 1,
         DataType::SmallInt => 2,
         DataType::Int | DataType::Real | DataType::Date => 4,
-        DataType::BigInt | DataType::Double | DataType::Timestamp | DataType::TimestampTz | DataType::Time => 8,
+        DataType::BigInt
+        | DataType::Double
+        | DataType::Timestamp
+        | DataType::TimestampTz
+        | DataType::Time => 8,
         DataType::Uuid | DataType::Interval => 16,
         _ => -1,
     }
@@ -618,7 +752,10 @@ fn format_for(formats: &[i16], i: usize) -> i16 {
 fn row_description(cols: &[OutCol], formats: &[i16]) -> Msg {
     let mut m = Msg::new(b'T').i16(cols.len() as i16);
     for (i, c) in cols.iter().enumerate() {
-        let table = c.table.as_deref().map_or(0, |t| system::table_oid(t) as i32);
+        let table = c
+            .table
+            .as_deref()
+            .map_or(0, |t| system::table_oid(t) as i32);
         m = m
             .cstr(&c.name)
             .i32(table)
@@ -639,7 +776,11 @@ fn data_row(cols: &[OutCol], row: &[Datum], formats: &[i16]) -> Msg {
             continue;
         }
         let ty = cols.get(i).map_or(DataType::Text, |c| c.ty.clone());
-        let bytes = if format_for(formats, i) == 1 { encode_binary(d, &ty) } else { encode_text(d, &ty).into_bytes() };
+        let bytes = if format_for(formats, i) == 1 {
+            encode_binary(d, &ty)
+        } else {
+            encode_text(d, &ty).into_bytes()
+        };
         m = m.i32(bytes.len() as i32).bytes(&bytes);
     }
     m
@@ -652,7 +793,16 @@ pub fn encode_text(d: &Datum, ty: &DataType) -> String {
         (Datum::Bool(b), _) => if *b { "t" } else { "f" }.into(),
         (Datum::Int(i), DataType::Bool) => if *i != 0 { "t" } else { "f" }.into(),
         (Datum::Array(items), DataType::Array(inner)) if **inner == DataType::TimestampTz => {
-            let parts: Vec<String> = items.iter().map(|x| if x.is_null() { "NULL".into() } else { format!("\"{}\"", encode_text(x, inner)) }).collect();
+            let parts: Vec<String> = items
+                .iter()
+                .map(|x| {
+                    if x.is_null() {
+                        "NULL".into()
+                    } else {
+                        format!("\"{}\"", encode_text(x, inner))
+                    }
+                })
+                .collect();
             format!("{{{}}}", parts.join(","))
         }
         (other, _) => other.as_text(),
@@ -670,14 +820,18 @@ fn encode_binary(d: &Datum, ty: &DataType) -> Vec<u8> {
         (DataType::SmallInt, _) => (d.as_i64().unwrap_or(0) as i16).to_be_bytes().to_vec(),
         (DataType::Int, _) => (d.as_i64().unwrap_or(0) as i32).to_be_bytes().to_vec(),
         (DataType::BigInt, _) => d.as_i64().unwrap_or(0).to_be_bytes().to_vec(),
-        (DataType::Real, _) => (datum::to_f64(&d).unwrap_or(0.0) as f32).to_be_bytes().to_vec(),
+        (DataType::Real, _) => (datum::to_f64(&d).unwrap_or(0.0) as f32)
+            .to_be_bytes()
+            .to_vec(),
         (DataType::Double, _) => datum::to_f64(&d).unwrap_or(0.0).to_be_bytes().to_vec(),
         (DataType::Numeric(_), Datum::Numeric(x)) => numeric_binary(*x),
         (DataType::Numeric(_), _) => numeric_binary(datum::to_decimal(&d).unwrap_or_default()),
         (DataType::Bytes, Datum::Bytes(b)) => b.clone(),
         (DataType::Uuid, Datum::Uuid(u)) => u.to_vec(),
         (DataType::Date, Datum::Date(days)) => (days - PG_EPOCH_DAYS).to_be_bytes().to_vec(),
-        (DataType::Timestamp | DataType::TimestampTz, Datum::Timestamp(ns)) => (ns.div_euclid(1000) - PG_EPOCH_US).to_be_bytes().to_vec(),
+        (DataType::Timestamp | DataType::TimestampTz, Datum::Timestamp(ns)) => {
+            (ns.div_euclid(1000) - PG_EPOCH_US).to_be_bytes().to_vec()
+        }
         (DataType::Time, Datum::Time(ns)) => (ns / 1000).to_be_bytes().to_vec(),
         (DataType::Interval, Datum::Interval { months, days, ns }) => {
             let mut v = (ns / 1000).to_be_bytes().to_vec();
@@ -713,9 +867,15 @@ fn numeric_binary(x: Decimal) -> Vec<u8> {
     let neg = x.is_negative();
     let digits = x.mantissa().unsigned_abs().to_string();
     let (int_part, frac_part) = if digits.len() > scale {
-        (digits[..digits.len() - scale].to_owned(), digits[digits.len() - scale..].to_owned())
+        (
+            digits[..digits.len() - scale].to_owned(),
+            digits[digits.len() - scale..].to_owned(),
+        )
     } else {
-        ("0".to_owned(), format!("{}{digits}", "0".repeat(scale - digits.len())))
+        (
+            "0".to_owned(),
+            format!("{}{digits}", "0".repeat(scale - digits.len())),
+        )
     };
     // Group the integer part from the right, the fraction from the left, in 4-digit groups.
     let ipad = (4 - int_part.len() % 4) % 4;
@@ -724,7 +884,12 @@ fn numeric_binary(x: Decimal) -> Vec<u8> {
     let fp = format!("{frac_part}{}", "0".repeat(fpad));
     let mut groups: Vec<i16> = Vec::new();
     for c in ip.as_bytes().chunks(4).chain(fp.as_bytes().chunks(4)) {
-        groups.push(std::str::from_utf8(c).ok().and_then(|s| s.parse().ok()).unwrap_or(0));
+        groups.push(
+            std::str::from_utf8(c)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+        );
     }
     let mut weight = (ip.len() / 4) as i16 - 1;
     // Strip leading and trailing zero groups.
@@ -776,10 +941,16 @@ fn numeric_from_binary(raw: &[u8]) -> SqlResult<Datum> {
     } else if (int_groups as usize) >= n {
         format!("{s}{}", "0000".repeat(int_groups as usize - n))
     } else {
-        format!("{}.{}", &s[..4 * int_groups as usize], &s[4 * int_groups as usize..])
+        format!(
+            "{}.{}",
+            &s[..4 * int_groups as usize],
+            &s[4 * int_groups as usize..]
+        )
     };
     let mut d = datum::parse_dec(&text).map_err(|_| bad())?;
-    d = d.rescale(dscale.min(38) as u8, storage_types::RoundingMode::HalfUp).map_err(|_| bad())?;
+    d = d
+        .rescale(dscale.min(38) as u8, storage_types::RoundingMode::HalfUp)
+        .map_err(|_| bad())?;
     if sign == 0x4000 {
         d = d.checked_neg().map_err(|_| bad())?;
     }
@@ -787,7 +958,8 @@ fn numeric_from_binary(raw: &[u8]) -> SqlResult<Datum> {
 }
 
 fn decode_text(oid: u32, raw: &[u8]) -> SqlResult<Datum> {
-    let s = String::from_utf8(raw.to_vec()).map_err(|_| SqlError::new("22021", "invalid UTF-8 in parameter"))?;
+    let s = String::from_utf8(raw.to_vec())
+        .map_err(|_| SqlError::new("22021", "invalid UTF-8 in parameter"))?;
     let ty = match oid {
         16 => DataType::Bool,
         20 | 21 | 23 => DataType::BigInt,
@@ -809,10 +981,16 @@ fn decode_binary(oid: u32, raw: &[u8]) -> SqlResult<Datum> {
     let be8 = |r: &[u8]| -> SqlResult<[u8; 8]> { r.try_into().map_err(|_| bad()) };
     Ok(match oid {
         16 => Datum::Bool(raw.first().copied().unwrap_or(0) != 0),
-        21 => Datum::Int(i64::from(i16::from_be_bytes(raw.try_into().map_err(|_| bad())?))),
-        23 => Datum::Int(i64::from(i32::from_be_bytes(raw.try_into().map_err(|_| bad())?))),
+        21 => Datum::Int(i64::from(i16::from_be_bytes(
+            raw.try_into().map_err(|_| bad())?,
+        ))),
+        23 => Datum::Int(i64::from(i32::from_be_bytes(
+            raw.try_into().map_err(|_| bad())?,
+        ))),
         20 => Datum::Int(i64::from_be_bytes(be8(raw)?)),
-        700 => Datum::Float(f64::from(f32::from_be_bytes(raw.try_into().map_err(|_| bad())?))),
+        700 => Datum::Float(f64::from(f32::from_be_bytes(
+            raw.try_into().map_err(|_| bad())?,
+        ))),
         701 => Datum::Float(f64::from_be_bytes(be8(raw)?)),
         1700 => numeric_from_binary(raw)?,
         17 => Datum::Bytes(raw.to_vec()),
@@ -820,7 +998,8 @@ fn decode_binary(oid: u32, raw: &[u8]) -> SqlResult<Datum> {
         1082 => Datum::Date(i32::from_be_bytes(raw.try_into().map_err(|_| bad())?) + PG_EPOCH_DAYS),
         1114 | 1184 => Datum::Timestamp((i64::from_be_bytes(be8(raw)?) + PG_EPOCH_US) * 1000),
         1083 => Datum::Time(i64::from_be_bytes(be8(raw)?) * 1000),
-        1000 | 1001 | 1003 | 1005 | 1007 | 1009 | 1014 | 1015 | 1016 | 1021 | 1022 | 1115 | 1182 | 1185 | 1231 | 2951 | 199 | 3807 => {
+        1000 | 1001 | 1003 | 1005 | 1007 | 1009 | 1014 | 1015 | 1016 | 1021 | 1022 | 1115
+        | 1182 | 1185 | 1231 | 2951 | 199 | 3807 => {
             // ndim, has-null flag, element type, (length, lower bound) per dimension, elements.
             let mut b = Body { b: raw, pos: 0 };
             let ndim = b.i32().map_err(|_| bad())?;
@@ -840,7 +1019,10 @@ fn decode_binary(oid: u32, raw: &[u8]) -> SqlResult<Datum> {
                 if len < 0 {
                     items.push(Datum::Null);
                 } else {
-                    items.push(decode_binary(elem, b.take(len as usize).map_err(|_| bad())?)?);
+                    items.push(decode_binary(
+                        elem,
+                        b.take(len as usize).map_err(|_| bad())?,
+                    )?);
                 }
             }
             Datum::Array(items)
@@ -861,14 +1043,21 @@ fn infer_param_types(engine: &Engine, stmt: &Statement, n: usize) -> Vec<u32> {
             }
         }
     };
-    let col_type = |tables: &[std::sync::Arc<crate::catalog::Table>], name: &str| -> Option<DataType> {
-        tables.iter().find_map(|t| t.column_index(name).map(|i| t.columns[i].ty.clone()))
-    };
+    let col_type =
+        |tables: &[std::sync::Arc<crate::catalog::Table>], name: &str| -> Option<DataType> {
+            tables
+                .iter()
+                .find_map(|t| t.column_index(name).map(|i| t.columns[i].ty.clone()))
+        };
     let mut tables = Vec::new();
-    let visit = |e: &Expr, tables: &[std::sync::Arc<crate::catalog::Table>], set: &mut dyn FnMut(usize, &DataType)| {
+    let visit = |e: &Expr,
+                 tables: &[std::sync::Arc<crate::catalog::Table>],
+                 set: &mut dyn FnMut(usize, &DataType)| {
         crate::exec::eval_walk(e, &mut |x| match x {
             Expr::Binary { left, right, .. } => {
-                if let (Expr::Column(p), Expr::Param(i)) | (Expr::Param(i), Expr::Column(p)) = (&**left, &**right) {
+                if let (Expr::Column(p), Expr::Param(i)) | (Expr::Param(i), Expr::Column(p)) =
+                    (&**left, &**right)
+                {
                     if let Some(t) = col_type(tables, &p[p.len() - 1]) {
                         set(*i, &t);
                     }
@@ -885,7 +1074,9 @@ fn infer_param_types(engine: &Engine, stmt: &Statement, n: usize) -> Vec<u32> {
                     }
                 }
             }
-            Expr::Between { expr, low, high, .. } => {
+            Expr::Between {
+                expr, low, high, ..
+            } => {
                 if let Expr::Column(p) = &**expr {
                     if let Some(t) = col_type(tables, &p[p.len() - 1]) {
                         for b in [low, high] {
@@ -913,7 +1104,14 @@ fn infer_param_types(engine: &Engine, stmt: &Statement, n: usize) -> Vec<u32> {
         Statement::Insert(ins) => {
             add_table(&ins.table, &mut tables);
             if let Some(t) = tables.first().cloned() {
-                let target: Vec<usize> = if ins.columns.is_empty() { (0..t.columns.len()).collect() } else { ins.columns.iter().filter_map(|c| t.column_index(c)).collect() };
+                let target: Vec<usize> = if ins.columns.is_empty() {
+                    (0..t.columns.len()).collect()
+                } else {
+                    ins.columns
+                        .iter()
+                        .filter_map(|c| t.column_index(c))
+                        .collect()
+                };
                 if let InsertSource::Values(rows) = &ins.source {
                     for r in rows {
                         for (k, e) in r.iter().enumerate() {
@@ -979,7 +1177,10 @@ fn infer_param_types(engine: &Engine, stmt: &Statement, n: usize) -> Vec<u32> {
         }
         _ => {}
     }
-    types.into_iter().map(|t| t.map_or(25, |t| system::type_oid(&t))).collect()
+    types
+        .into_iter()
+        .map(|t| t.map_or(25, |t| system::type_oid(&t)))
+        .collect()
 }
 
 fn collect_tables(t: &crate::ast::TableRef, f: &mut dyn FnMut(&str)) {
@@ -994,7 +1195,11 @@ fn collect_tables(t: &crate::ast::TableRef, f: &mut dyn FnMut(&str)) {
 }
 
 /// Result columns of a statement without running its writes.
-fn describe_columns(s: &mut Session, stmt: &Statement, nparams: usize) -> SqlResult<Option<Vec<OutCol>>> {
+fn describe_columns(
+    s: &mut Session,
+    stmt: &Statement,
+    nparams: usize,
+) -> SqlResult<Option<Vec<OutCol>>> {
     let nulls = vec![Datum::Null; nparams];
     match stmt {
         Statement::Query(q) => {
@@ -1009,9 +1214,15 @@ fn describe_columns(s: &mut Session, stmt: &Statement, nparams: usize) -> SqlRes
             Outcome::Rows(rs) => Ok(Some(rs.columns)),
             _ => Ok(None),
         },
-        Statement::Insert(i) if !i.returning.is_empty() => crate::exec::describe_returning(s, &i.table, &i.returning).map(Some),
-        Statement::Update(u) if !u.returning.is_empty() => crate::exec::describe_returning(s, &u.table, &u.returning).map(Some),
-        Statement::Delete(d) if !d.returning.is_empty() => crate::exec::describe_returning(s, &d.table, &d.returning).map(Some),
+        Statement::Insert(i) if !i.returning.is_empty() => {
+            crate::exec::describe_returning(s, &i.table, &i.returning).map(Some)
+        }
+        Statement::Update(u) if !u.returning.is_empty() => {
+            crate::exec::describe_returning(s, &u.table, &u.returning).map(Some)
+        }
+        Statement::Delete(d) if !d.returning.is_empty() => {
+            crate::exec::describe_returning(s, &d.table, &d.returning).map(Some)
+        }
         _ => Ok(None),
     }
 }
@@ -1022,7 +1233,18 @@ mod tests {
 
     #[test]
     fn numeric_binary_round_trips() {
-        for s in ["0", "1", "-1", "12345.678", "0.0001", "100.00", "-0.5", "99999999999999999999.99", "10000", "0.00"] {
+        for s in [
+            "0",
+            "1",
+            "-1",
+            "12345.678",
+            "0.0001",
+            "100.00",
+            "-0.5",
+            "99999999999999999999.99",
+            "10000",
+            "0.00",
+        ] {
             let d: Decimal = s.parse().unwrap();
             let back = numeric_from_binary(&numeric_binary(d)).unwrap();
             assert_eq!(back.as_text(), d.to_string(), "{s}");

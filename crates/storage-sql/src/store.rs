@@ -28,11 +28,19 @@ pub enum Op {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tag {
     /// A row of `table` (absent precondition failing: duplicate primary key).
-    Row { table: String },
+    Row {
+        table: String,
+    },
     /// A unique-constraint marker (absent precondition failing: duplicate value).
-    Unique { table: String, constraint: String },
+    Unique {
+        table: String,
+        constraint: String,
+    },
     /// A referenced parent row that must exist (foreign key).
-    Parent { table: String, constraint: String },
+    Parent {
+        table: String,
+        constraint: String,
+    },
     /// A row lock document.
     Lock,
     Internal,
@@ -51,9 +59,13 @@ pub struct Write {
 #[derive(Debug)]
 pub enum CommitError {
     /// Write `index`'s precondition failed (the document changed or exists / does not exist).
-    Condition { index: usize },
+    Condition {
+        index: usize,
+    },
     /// A patch targeted a missing document.
-    Missing { index: usize },
+    Missing {
+        index: usize,
+    },
     Other(SqlError),
 }
 
@@ -92,7 +104,13 @@ impl Store {
 
     /// Connects to `storine://...` (with the client's usual retries and failover).
     pub fn connect(url: &str, timeout: Duration) -> SqlResult<Store> {
-        let client = storine::connect_with(url, storine::Options { timeout, ..storine::Options::default() })?;
+        let client = storine::connect_with(
+            url,
+            storine::Options {
+                timeout,
+                ..storine::Options::default()
+            },
+        )?;
         Ok(Store { client })
     }
 
@@ -114,7 +132,12 @@ impl Store {
     }
 
     /// Visits matching documents in key order until `visit` returns false.
-    pub fn scan_while(&self, collection: &str, filter: Option<Filter>, mut visit: impl FnMut(Document) -> SqlResult<bool>) -> SqlResult<()> {
+    pub fn scan_while(
+        &self,
+        collection: &str,
+        filter: Option<Filter>,
+        mut visit: impl FnMut(Document) -> SqlResult<bool>,
+    ) -> SqlResult<()> {
         for d in self.client.collection(collection).scan(filter) {
             if !visit(d?)? {
                 break;
@@ -178,9 +201,15 @@ impl Store {
             Ok(())
         });
         r.map_err(|e| match e {
-            StoreError::Conflict { write_index: Some(i), .. } => CommitError::Condition { index: i as usize },
+            StoreError::Conflict {
+                write_index: Some(i),
+                ..
+            } => CommitError::Condition { index: i as usize },
             StoreError::Conflict { .. } => CommitError::Condition { index: usize::MAX },
-            StoreError::NotFound { write_index: Some(i), .. } => CommitError::Missing { index: i as usize },
+            StoreError::NotFound {
+                write_index: Some(i),
+                ..
+            } => CommitError::Missing { index: i as usize },
             StoreError::NotFound { .. } => CommitError::Missing { index: usize::MAX },
             StoreError::Invalid(m) => CommitError::Other(SqlError::new("22023", m)),
             other => CommitError::Other(other.into()),

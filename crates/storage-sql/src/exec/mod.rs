@@ -47,7 +47,11 @@ pub struct EngineConfig {
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        EngineConfig { database: "storine".into(), lock_timeout: Duration::from_secs(10), max_retries: 64 }
+        EngineConfig {
+            database: "storine".into(),
+            lock_timeout: Duration::from_secs(10),
+            max_retries: 64,
+        }
     }
 }
 
@@ -62,7 +66,12 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(store: Store, config: EngineConfig) -> Arc<Engine> {
-        Arc::new(Engine { store, catalog: Catalog::default(), config, next_session: AtomicU64::new(1) })
+        Arc::new(Engine {
+            store,
+            catalog: Catalog::default(),
+            config,
+            next_session: AtomicU64::new(1),
+        })
     }
 
     /// Re-reads every table schema when the cache is stale.
@@ -85,7 +94,9 @@ impl Engine {
             return Ok(t);
         }
         self.refresh_catalog(true)?;
-        self.catalog.get(name).ok_or_else(|| SqlError::undefined_table(name))
+        self.catalog
+            .get(name)
+            .ok_or_else(|| SqlError::undefined_table(name))
     }
 
     pub fn find_table(&self, name: &str) -> SqlResult<Option<Arc<Table>>> {
@@ -96,13 +107,21 @@ impl Engine {
         }
     }
 
-    pub fn new_session(self: &Arc<Self>, dialect: Dialect, user: &str, database: Option<&str>) -> Session {
+    pub fn new_session(
+        self: &Arc<Self>,
+        dialect: Dialect,
+        user: &str,
+        database: Option<&str>,
+    ) -> Session {
         let id = self.next_session.fetch_add(1, Ordering::Relaxed);
         Session {
             engine: Arc::clone(self),
             dialect,
             user: user.to_owned(),
-            database: database.filter(|d| !d.is_empty()).unwrap_or(&self.config.database).to_owned(),
+            database: database
+                .filter(|d| !d.is_empty())
+                .unwrap_or(&self.config.database)
+                .to_owned(),
             vars: default_vars(dialect),
             user_vars: HashMap::new(),
             txn: None,
@@ -124,7 +143,14 @@ fn default_vars(dialect: Dialect) -> HashMap<String, String> {
         ("datestyle", "ISO, MDY"),
         ("standard_conforming_strings", "on"),
         ("search_path", "\"$user\", public"),
-        ("transaction_isolation", if dialect == Dialect::MySql { "REPEATABLE-READ" } else { "read committed" }),
+        (
+            "transaction_isolation",
+            if dialect == Dialect::MySql {
+                "REPEATABLE-READ"
+            } else {
+                "read committed"
+            },
+        ),
         ("transaction_read_only", "off"),
         ("sql_mode", "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"),
         ("autocommit", "1"),
@@ -132,6 +158,21 @@ fn default_vars(dialect: Dialect) -> HashMap<String, String> {
         ("character_set_connection", "utf8mb4"),
         ("character_set_results", "utf8mb4"),
         ("collation_connection", "utf8mb4_0900_ai_ci"),
+        ("character_set_server", "utf8mb4"),
+        ("character_set_database", "utf8mb4"),
+        ("character_set_system", "utf8mb3"),
+        ("collation_server", "utf8mb4_0900_ai_ci"),
+        ("collation_database", "utf8mb4_0900_ai_ci"),
+        ("auto_increment_increment", "1"),
+        ("auto_increment_offset", "1"),
+        ("init_connect", ""),
+        ("license", "Apache-2.0"),
+        ("net_write_timeout", "60"),
+        ("performance_schema", "0"),
+        ("system_time_zone", "UTC"),
+        ("tx_isolation", "REPEATABLE-READ"),
+        ("query_cache_size", "0"),
+        ("query_cache_type", "OFF"),
         ("max_allowed_packet", "67108864"),
         ("lower_case_table_names", "0"),
         ("wait_timeout", "28800"),
@@ -170,12 +211,20 @@ pub enum Outcome {
     Rows(ResultSet),
     /// A command: its completion tag (`INSERT 0 3`, `UPDATE 2`, `BEGIN`), rows affected and the
     /// first auto-generated id (MySQL `LAST_INSERT_ID()`).
-    Command { tag: String, affected: u64, last_insert_id: Option<i64> },
+    Command {
+        tag: String,
+        affected: u64,
+        last_insert_id: Option<i64>,
+    },
 }
 
 impl Outcome {
     pub fn command(tag: impl Into<String>) -> Outcome {
-        Outcome::Command { tag: tag.into(), affected: 0, last_insert_id: None }
+        Outcome::Command {
+            tag: tag.into(),
+            affected: 0,
+            last_insert_id: None,
+        }
     }
 }
 
@@ -204,7 +253,11 @@ struct Entry {
 
 #[derive(Debug)]
 enum Undo {
-    Overlay { key: (String, String), prev: Option<Entry>, new_in_order: bool },
+    Overlay {
+        key: (String, String),
+        prev: Option<Entry>,
+        new_in_order: bool,
+    },
     Check,
 }
 
@@ -212,11 +265,16 @@ impl Txn {
     /// The buffered state of a document: `Some(None)` deleted, `Some(Some(doc))` written,
     /// `None` untouched.
     pub fn get(&self, collection: &str, key: &str) -> Option<Option<&Doc>> {
-        self.overlay.get(&(collection.to_owned(), key.to_owned())).map(|e| e.doc.as_ref())
+        self.overlay
+            .get(&(collection.to_owned(), key.to_owned()))
+            .map(|e| e.doc.as_ref())
     }
 
     /// Buffered documents of `collection` (key, doc or deletion).
-    pub fn entries<'a>(&'a self, collection: &'a str) -> impl Iterator<Item = (&'a str, Option<&'a Doc>)> + 'a {
+    pub fn entries<'a>(
+        &'a self,
+        collection: &'a str,
+    ) -> impl Iterator<Item = (&'a str, Option<&'a Doc>)> + 'a {
         self.order
             .iter()
             .filter(move |(c, _)| c == collection)
@@ -225,7 +283,14 @@ impl Txn {
 
     /// Buffers a write of `doc` (`None`: delete). `observed` is the version this transaction read
     /// (`None`: the document did not exist), used only the first time the key is touched.
-    pub fn write(&mut self, collection: &str, key: &str, observed: Option<u64>, doc: Option<Doc>, tag: Tag) {
+    pub fn write(
+        &mut self,
+        collection: &str,
+        key: &str,
+        observed: Option<u64>,
+        doc: Option<Doc>,
+        tag: Tag,
+    ) {
         let k = (collection.to_owned(), key.to_owned());
         let prev = self.overlay.get(&k).cloned();
         let new_in_order = prev.is_none();
@@ -237,7 +302,11 @@ impl Txn {
         if new_in_order {
             self.order.push(k.clone());
         }
-        self.journal.push(Undo::Overlay { key: k, prev, new_in_order });
+        self.journal.push(Undo::Overlay {
+            key: k,
+            prev,
+            new_in_order,
+        });
     }
 
     /// Adds a commit-time check (e.g. a foreign-key parent must still exist).
@@ -254,7 +323,11 @@ impl Txn {
     pub fn rollback_to(&mut self, mark: usize) {
         while self.journal.len() > mark {
             match self.journal.pop() {
-                Some(Undo::Overlay { key, prev, new_in_order }) => {
+                Some(Undo::Overlay {
+                    key,
+                    prev,
+                    new_in_order,
+                }) => {
                     match prev {
                         Some(e) => {
                             self.overlay.insert(key.clone(), e);
@@ -285,17 +358,28 @@ impl Txn {
     pub fn batch(&self) -> Vec<Write> {
         let mut out = Vec::with_capacity(self.order.len() + self.checks.len());
         for k in &self.order {
-            let Some(e) = self.overlay.get(k) else { continue };
+            let Some(e) = self.overlay.get(k) else {
+                continue;
+            };
             let op = match (&e.doc, e.base) {
                 (None, Pre::Absent) => continue, // created and deleted again
                 (Some(d), _) => Op::Put(d.clone()),
                 (None, _) => Op::Delete,
             };
-            out.push(Write { collection: k.0.clone(), key: k.1.clone(), op, pre: e.base, tag: e.tag.clone() });
+            out.push(Write {
+                collection: k.0.clone(),
+                key: k.1.clone(),
+                op,
+                pre: e.base,
+                tag: e.tag.clone(),
+            });
         }
         for c in &self.checks {
             // A check on a document this transaction also writes is covered by that write.
-            if !self.overlay.contains_key(&(c.collection.clone(), c.key.clone())) {
+            if !self
+                .overlay
+                .contains_key(&(c.collection.clone(), c.key.clone()))
+            {
                 out.push(c.clone());
             }
         }
@@ -321,13 +405,19 @@ pub struct Session {
 
 /// Nanoseconds since the epoch, now.
 pub fn now_ns() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 impl Session {
     /// MySQL `SET FOREIGN_KEY_CHECKS = 0` turns foreign-key enforcement off for the session.
     pub fn foreign_key_checks(&self) -> bool {
-        !self.vars.get("foreign_key_checks").is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("off"))
+        !self
+            .vars
+            .get("foreign_key_checks")
+            .is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("off"))
     }
 
     pub fn in_transaction(&self) -> bool {
@@ -351,7 +441,10 @@ impl Session {
                         return Ok(Outcome::command("BEGIN"));
                     }
                 }
-                self.txn = Some(Txn { explicit: true, ..Txn::default() });
+                self.txn = Some(Txn {
+                    explicit: true,
+                    ..Txn::default()
+                });
                 return Ok(Outcome::command("BEGIN"));
             }
             Statement::Commit => {
@@ -367,7 +460,10 @@ impl Session {
                 return Ok(Outcome::command("ROLLBACK"));
             }
             Statement::Savepoint(name) => {
-                let txn = self.txn.get_or_insert_with(|| Txn { explicit: true, ..Txn::default() });
+                let txn = self.txn.get_or_insert_with(|| Txn {
+                    explicit: true,
+                    ..Txn::default()
+                });
                 if txn.failed {
                     return Err(SqlError::in_failed_transaction());
                 }
@@ -380,18 +476,29 @@ impl Session {
                     let n = name.to_ascii_lowercase();
                     match txn.savepoints.iter().rposition(|(s, _)| *s == n) {
                         Some(p) => txn.savepoints.truncate(p),
-                        None => return Err(SqlError::new("3B001", format!("savepoint \"{name}\" does not exist"))),
+                        None => {
+                            return Err(SqlError::new(
+                                "3B001",
+                                format!("savepoint \"{name}\" does not exist"),
+                            ))
+                        }
                     }
                 }
                 return Ok(Outcome::command("RELEASE"));
             }
             Statement::RollbackToSavepoint(name) => {
                 let Some(txn) = self.txn.as_mut() else {
-                    return Err(SqlError::new("3B001", format!("savepoint \"{name}\" does not exist")));
+                    return Err(SqlError::new(
+                        "3B001",
+                        format!("savepoint \"{name}\" does not exist"),
+                    ));
                 };
                 let n = name.to_ascii_lowercase();
                 let Some(p) = txn.savepoints.iter().rposition(|(s, _)| *s == n) else {
-                    return Err(SqlError::new("3B001", format!("savepoint \"{name}\" does not exist")));
+                    return Err(SqlError::new(
+                        "3B001",
+                        format!("savepoint \"{name}\" does not exist"),
+                    ));
                 };
                 let mark = txn.savepoints[p].1;
                 txn.savepoints.truncate(p + 1);
@@ -405,8 +512,17 @@ impl Session {
             return Err(SqlError::in_failed_transaction());
         }
         // MySQL `autocommit = 0`: every statement runs in an open transaction until COMMIT.
-        if !self.in_transaction() && self.vars.get("autocommit").is_some_and(|v| v == "0" || v == "off") && !matches!(stmt, Statement::Set { .. }) {
-            self.txn = Some(Txn { explicit: true, ..Txn::default() });
+        if !self.in_transaction()
+            && self
+                .vars
+                .get("autocommit")
+                .is_some_and(|v| v == "0" || v == "off")
+            && !matches!(stmt, Statement::Set { .. })
+        {
+            self.txn = Some(Txn {
+                explicit: true,
+                ..Txn::default()
+            });
         }
         if self.in_transaction() {
             let mark = self.txn.as_ref().map_or(0, Txn::mark);
@@ -450,7 +566,10 @@ impl Session {
                     self.release_locks();
                     self.txn = None;
                     attempt += 1;
-                    if !retryable || attempt > self.engine.config.max_retries || !is_retry_safe(stmt) {
+                    if !retryable
+                        || attempt > self.engine.config.max_retries
+                        || !is_retry_safe(stmt)
+                    {
                         return Err(e);
                     }
                     std::thread::sleep(delay);
@@ -476,11 +595,19 @@ impl Session {
     }
 
     fn try_commit(&mut self) -> Result<(), (SqlError, bool)> {
-        let Some(txn) = self.txn.as_ref() else { return Ok(()) };
+        let Some(txn) = self.txn.as_ref() else {
+            return Ok(());
+        };
         let mut batch = txn.batch();
         // Row locks are released in the same atomic batch.
         for k in &txn.locks {
-            batch.push(Write { collection: crate::catalog::LOCKS.into(), key: k.clone(), op: Op::Delete, pre: Pre::None, tag: Tag::Lock });
+            batch.push(Write {
+                collection: crate::catalog::LOCKS.into(),
+                key: k.clone(),
+                op: Op::Delete,
+                pre: Pre::None,
+                tag: Tag::Lock,
+            });
         }
         match self.engine.store.commit(&batch) {
             Ok(_) => {
@@ -506,7 +633,13 @@ impl Session {
         let batch: Vec<Write> = txn
             .locks
             .drain(..)
-            .map(|k| Write { collection: crate::catalog::LOCKS.into(), key: k, op: Op::Delete, pre: Pre::None, tag: Tag::Lock })
+            .map(|k| Write {
+                collection: crate::catalog::LOCKS.into(),
+                key: k,
+                op: Op::Delete,
+                pre: Pre::None,
+                tag: Tag::Lock,
+            })
             .collect();
         // Best effort: an unreleased lock expires on its own.
         let _ = self.engine.store.commit(&batch);
@@ -536,10 +669,27 @@ impl Session {
             Statement::Delete(d) => dml::delete(self, d, params),
             Statement::CreateTable(c) => ddl::create_table(self, c, params),
             Statement::CreateIndex(c) => ddl::create_index(self, c),
-            Statement::DropTable { names, if_exists, cascade } => ddl::drop_tables(self, names, *if_exists, *cascade),
-            Statement::DropIndex { names, table, if_exists } => ddl::drop_indexes(self, names, table.as_deref(), *if_exists),
+            Statement::DropTable {
+                names,
+                if_exists,
+                cascade,
+            } => ddl::drop_tables(self, names, *if_exists, *cascade),
+            Statement::DropIndex {
+                names,
+                table,
+                if_exists,
+            } => ddl::drop_indexes(self, names, table.as_deref(), *if_exists),
             Statement::AlterTable { table, ops } => ddl::alter_table(self, table, ops),
             Statement::Truncate { tables } => ddl::truncate(self, tables),
+            Statement::CreateSequence {
+                name,
+                start,
+                increment,
+                if_not_exists,
+            } => dml::create_sequence(self, name, *start, *increment, *if_not_exists),
+            Statement::DropSequence { names, if_exists } => {
+                dml::drop_sequences(self, names, *if_exists)
+            }
             Statement::Set { name, value } => self.set_var(name, value.as_ref(), params),
             Statement::Show(s) => system::show(self, s),
             Statement::Use(db) => {
@@ -549,14 +699,25 @@ impl Session {
             Statement::Explain(inner) => {
                 let text = format!("Storine SQL plan: {}", explain_text(inner));
                 Ok(Outcome::Rows(ResultSet {
-                    columns: vec![OutCol { name: "QUERY PLAN".into(), ty: DataType::Text, table: None }],
+                    columns: vec![OutCol {
+                        name: "QUERY PLAN".into(),
+                        ty: DataType::Text,
+                        table: None,
+                    }],
                     rows: vec![vec![Datum::Text(text)]],
                 }))
             }
-            Statement::CreateSchema { .. } => Ok(Outcome::command(if self.dialect == Dialect::MySql { "CREATE DATABASE" } else { "CREATE SCHEMA" })),
+            Statement::CreateSchema { .. } => {
+                Ok(Outcome::command(if self.dialect == Dialect::MySql {
+                    "CREATE DATABASE"
+                } else {
+                    "CREATE SCHEMA"
+                }))
+            }
             Statement::DropSchema { .. } => Ok(Outcome::command("DROP SCHEMA")),
             Statement::Prepare { name, statement } => {
-                self.prepared.insert(name.to_ascii_lowercase(), ((**statement).clone(), 0));
+                self.prepared
+                    .insert(name.to_ascii_lowercase(), ((**statement).clone(), 0));
                 Ok(Outcome::command("PREPARE"))
             }
             Statement::Execute { name, args } => {
@@ -564,10 +725,17 @@ impl Session {
                     .prepared
                     .get(&name.to_ascii_lowercase())
                     .cloned()
-                    .ok_or_else(|| SqlError::new("26000", format!("prepared statement \"{name}\" does not exist")))?;
+                    .ok_or_else(|| {
+                        SqlError::new(
+                            "26000",
+                            format!("prepared statement \"{name}\" does not exist"),
+                        )
+                    })?;
                 let values = {
                     let ex = eval::Exec::new(self, params);
-                    args.iter().map(|a| ex.eval_const(a)).collect::<SqlResult<Vec<_>>>()?
+                    args.iter()
+                        .map(|a| ex.eval_const(a))
+                        .collect::<SqlResult<Vec<_>>>()?
                 };
                 self.run(&stmt, &values)
             }
@@ -587,11 +755,18 @@ impl Session {
             | Statement::Rollback
             | Statement::Savepoint(_)
             | Statement::ReleaseSavepoint(_)
-            | Statement::RollbackToSavepoint(_) => Err(SqlError::internal("transaction control in run()")),
+            | Statement::RollbackToSavepoint(_) => {
+                Err(SqlError::internal("transaction control in run()"))
+            }
         }
     }
 
-    fn set_var(&mut self, name: &str, value: Option<&Expr>, params: &[Datum]) -> SqlResult<Outcome> {
+    fn set_var(
+        &mut self,
+        name: &str,
+        value: Option<&Expr>,
+        params: &[Datum],
+    ) -> SqlResult<Outcome> {
         let v = match value {
             None => Datum::Null,
             Some(e) => eval::Exec::new(self, params).eval_const(e)?,
@@ -601,7 +776,10 @@ impl Session {
             return Ok(Outcome::command("SET"));
         }
         let text = match &v {
-            Datum::Null => default_vars(self.dialect).get(name).cloned().unwrap_or_default(),
+            Datum::Null => default_vars(self.dialect)
+                .get(name)
+                .cloned()
+                .unwrap_or_default(),
             other => other.to_text(self.dialect == Dialect::MySql),
         };
         let key = match name {
@@ -612,7 +790,10 @@ impl Session {
         if key == "autocommit" && matches!(text.as_str(), "0" | "off" | "false") {
             // MySQL autocommit=0: an implicit transaction stays open until COMMIT.
             if !self.in_transaction() {
-                self.txn = Some(Txn { explicit: true, ..Txn::default() });
+                self.txn = Some(Txn {
+                    explicit: true,
+                    ..Txn::default()
+                });
             }
         } else if key == "autocommit" && self.in_transaction() {
             self.commit()?;
@@ -624,19 +805,28 @@ impl Session {
 
 /// Whether re-running a statement after a lost write race is safe (it has no external effect).
 fn is_retry_safe(stmt: &Statement) -> bool {
-    !matches!(stmt, Statement::CreateTable(_) | Statement::DropTable { .. } | Statement::AlterTable { .. })
+    !matches!(
+        stmt,
+        Statement::CreateTable(_) | Statement::DropTable { .. } | Statement::AlterTable { .. }
+    )
 }
 
 fn explain_text(stmt: &Statement) -> String {
     match stmt {
         Statement::Query(_) => "scan with filter push-down, in-memory joins and sorting".into(),
         Statement::Insert(_) => "insert with primary-key and unique preconditions".into(),
-        Statement::Update(_) | Statement::Delete(_) => "read matching rows, write with version preconditions".into(),
+        Statement::Update(_) | Statement::Delete(_) => {
+            "read matching rows, write with version preconditions".into()
+        }
         _ => "utility statement".into(),
     }
 }
 
 /// Result columns of `RETURNING items` on `table` (for protocol-level Describe).
-pub fn describe_returning(s: &Session, table: &str, items: &[crate::ast::SelectItem]) -> SqlResult<Vec<OutCol>> {
+pub fn describe_returning(
+    s: &Session,
+    table: &str,
+    items: &[crate::ast::SelectItem],
+) -> SqlResult<Vec<OutCol>> {
     dml::describe_returning(s, table, items)
 }

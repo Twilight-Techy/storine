@@ -31,7 +31,9 @@ pub fn serve(engine: Arc<Engine>, listener: TcpListener, auth: Arc<Auth>) {
         thread::spawn(move || {
             let _ = stream.set_nodelay(true);
             if let Err(e) = Conn::run(engine, stream, &auth) {
-                if e.kind() != io::ErrorKind::UnexpectedEof && e.kind() != io::ErrorKind::ConnectionReset {
+                if e.kind() != io::ErrorKind::UnexpectedEof
+                    && e.kind() != io::ErrorKind::ConnectionReset
+                {
                     eprintln!("storine-sql: mysql connection ended: {e}");
                 }
             }
@@ -181,7 +183,10 @@ impl<'a> Rd<'a> {
     }
 
     fn cstr(&mut self) -> io::Result<&'a [u8]> {
-        let end = self.b[self.pos..].iter().position(|c| *c == 0).unwrap_or(self.left());
+        let end = self.b[self.pos..]
+            .iter()
+            .position(|c| *c == 0)
+            .unwrap_or(self.left());
         let s = &self.b[self.pos..self.pos + end];
         self.pos = (self.pos + end + 1).min(self.b.len());
         Ok(s)
@@ -211,7 +216,8 @@ impl Conn {
         loop {
             let mut hdr = [0u8; 4];
             self.r.read_exact(&mut hdr)?;
-            let len = usize::from(hdr[0]) | (usize::from(hdr[1]) << 8) | (usize::from(hdr[2]) << 16);
+            let len =
+                usize::from(hdr[0]) | (usize::from(hdr[1]) << 8) | (usize::from(hdr[2]) << 16);
             self.seq = hdr[3].wrapping_add(1);
             let start = out.len();
             if start + len > (1 << 30) {
@@ -255,7 +261,10 @@ impl Conn {
         let st = self.status() | if more { STATUS_MORE_RESULTS } else { 0 };
         p.extend_from_slice(&st.to_le_bytes());
         p.extend_from_slice(&0u16.to_le_bytes());
-        p.extend_from_slice(info.as_bytes());
+        // Servers write the info as a length-encoded string (Connector/J reads it so).
+        if !info.is_empty() {
+            lenenc_str(&mut p, info.as_bytes());
+        }
         self.write_packet(&p)
     }
 
@@ -300,9 +309,20 @@ impl Conn {
         let r = BufReader::new(stream.try_clone()?);
         let w = BufWriter::new(stream);
         let session = engine.new_session(Dialect::MySql, "", None);
-        let mut c = Conn { r, w, seq: 0, caps: 0, session, stmts: HashMap::new(), next_stmt: 1 };
+        let mut c = Conn {
+            r,
+            w,
+            seq: 0,
+            caps: 0,
+            session,
+            stmts: HashMap::new(),
+            next_stmt: 1,
+        };
         // Handshake.
-        let nonce: Vec<u8> = hash::random_bytes(20).into_iter().map(|b| (b % 94) + 33).collect();
+        let nonce: Vec<u8> = hash::random_bytes(20)
+            .into_iter()
+            .map(|b| (b % 94) + 33)
+            .collect();
         let mut p = vec![10u8];
         p.extend_from_slice(crate::MYSQL_VERSION.as_bytes());
         p.push(0);
@@ -326,13 +346,19 @@ impl Conn {
         let mut rd = Rd { b: &resp, pos: 0 };
         let caps = rd.u32()?;
         if caps & CLIENT_PROTOCOL_41 == 0 {
-            c.err(&SqlError::new("08004", "this server needs a MySQL 4.1+ client"))?;
+            c.err(&SqlError::new(
+                "08004",
+                "this server needs a MySQL 4.1+ client",
+            ))?;
             c.w.flush()?;
             return Ok(());
         }
         if caps & 0x800 != 0 && rd.left() <= 28 {
             // The client wants TLS (SSL request packet), which this server does not offer.
-            c.err(&SqlError::new("08004", "TLS is not supported by storine-sql; connect with ssl disabled"))?;
+            c.err(&SqlError::new(
+                "08004",
+                "TLS is not supported by storine-sql; connect with ssl disabled",
+            ))?;
             c.w.flush()?;
             return Ok(());
         }
@@ -349,8 +375,16 @@ impl Conn {
         } else {
             rd.cstr()?.to_vec()
         };
-        let database = if caps & CLIENT_CONNECT_WITH_DB != 0 && rd.left() > 0 { Some(String::from_utf8_lossy(rd.cstr()?).into_owned()) } else { None };
-        let plugin = if caps & CLIENT_PLUGIN_AUTH != 0 && rd.left() > 0 { String::from_utf8_lossy(rd.cstr()?).into_owned() } else { NATIVE.to_owned() };
+        let database = if caps & CLIENT_CONNECT_WITH_DB != 0 && rd.left() > 0 {
+            Some(String::from_utf8_lossy(rd.cstr()?).into_owned())
+        } else {
+            None
+        };
+        let plugin = if caps & CLIENT_PLUGIN_AUTH != 0 && rd.left() > 0 {
+            String::from_utf8_lossy(rd.cstr()?).into_owned()
+        } else {
+            NATIVE.to_owned()
+        };
         let mut token = token;
         if !auth.users.is_empty() && plugin != NATIVE {
             // Switch to mysql_native_password with the same nonce.
@@ -390,7 +424,9 @@ impl Conn {
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return Err(e),
             };
-            let Some((&cmd, body)) = pkt.split_first() else { continue };
+            let Some((&cmd, body)) = pkt.split_first() else {
+                continue;
+            };
             let r = match cmd {
                 0x01 => return Ok(()),
                 0x02 => {
@@ -409,7 +445,10 @@ impl Conn {
                     let id = rd.u32()?;
                     let p = rd.u16()? as usize;
                     if let Some(st) = self.stmts.get_mut(&id) {
-                        st.long_data.entry(p).or_default().extend_from_slice(&body[6..]);
+                        st.long_data
+                            .entry(p)
+                            .or_default()
+                            .extend_from_slice(&body[6..]);
                     }
                     continue;
                 }
@@ -434,7 +473,10 @@ impl Conn {
                     self.ok(0, 0, false, "")
                 }
                 0x11 => self.err(&SqlError::unsupported("COM_CHANGE_USER")),
-                other => self.err(&SqlError::new("08S01", format!("unsupported command 0x{other:02x}"))),
+                other => self.err(&SqlError::new(
+                    "08S01",
+                    format!("unsupported command 0x{other:02x}"),
+                )),
             };
             r?;
             self.w.flush()?;
@@ -466,8 +508,14 @@ impl Conn {
 
     fn affected(&self, o: &Outcome) -> (u64, u64, String) {
         match o {
-            Outcome::Command { tag, affected, last_insert_id } => {
-                let matched = tag.strip_prefix("UPDATE ").and_then(|n| n.parse::<u64>().ok());
+            Outcome::Command {
+                tag,
+                affected,
+                last_insert_id,
+            } => {
+                let matched = tag
+                    .strip_prefix("UPDATE ")
+                    .and_then(|n| n.parse::<u64>().ok());
                 let a = match matched {
                     Some(m) if self.caps & CLIENT_FOUND_ROWS != 0 => m,
                     _ => *affected,
@@ -537,7 +585,11 @@ impl Conn {
         self.write_packet(&p)?;
         if nparams > 0 {
             for i in 0..nparams {
-                let c = OutCol { name: "?".into(), ty: DataType::Text, table: None };
+                let c = OutCol {
+                    name: "?".into(),
+                    ty: DataType::Text,
+                    table: None,
+                };
                 let _ = i;
                 self.write_packet(&column_def(&c, ""))?;
             }
@@ -549,7 +601,16 @@ impl Conn {
             }
             self.mid_eof()?;
         }
-        self.stmts.insert(id, Prepared { stmt, nparams, columns, types: Vec::new(), long_data: HashMap::new() });
+        self.stmts.insert(
+            id,
+            Prepared {
+                stmt,
+                nparams,
+                columns,
+                types: Vec::new(),
+                long_data: HashMap::new(),
+            },
+        );
         Ok(())
     }
 
@@ -559,7 +620,10 @@ impl Conn {
         let _flags = rd.u8()?;
         let _iterations = rd.u32()?;
         let Some(st) = self.stmts.get_mut(&id) else {
-            return self.err(&SqlError::new("HY000", format!("unknown prepared statement handler ({id})")));
+            return self.err(&SqlError::new(
+                "HY000",
+                format!("unknown prepared statement handler ({id})"),
+            ));
         };
         let n = st.nparams;
         let mut params = Vec::with_capacity(n);
@@ -580,7 +644,10 @@ impl Conn {
                     continue;
                 }
                 if let Some(data) = st.long_data.remove(&i) {
-                    params.push(Datum::Text(String::from_utf8(data.clone()).unwrap_or_else(|_| String::from_utf8_lossy(&data).into_owned())));
+                    params
+                        .push(Datum::Text(String::from_utf8(data.clone()).unwrap_or_else(
+                            |_| String::from_utf8_lossy(&data).into_owned(),
+                        )));
                     continue;
                 }
                 let (t, unsigned) = st.types.get(i).copied().unwrap_or((T_VAR_STRING, false));
@@ -653,7 +720,9 @@ fn wire_type(ty: &DataType) -> (u8, u16, u32, u8, u16) {
         DataType::Date => (T_DATE, 128, 10, 0, BIN),
         DataType::Time => (T_TIME, 128, 17, 6, BIN),
         DataType::Json | DataType::Array(_) => (T_JSON, 16 | 128, 4_294_967_295, 0, BIN),
-        DataType::Varchar(n) | DataType::Char(n) => (T_VAR_STRING, 0, n.unwrap_or(255).saturating_mul(4), 0, UTF8),
+        DataType::Varchar(n) | DataType::Char(n) => {
+            (T_VAR_STRING, 0, n.unwrap_or(255).saturating_mul(4), 0, UTF8)
+        }
         _ => (T_BLOB, 16, 4_294_967_295, 0, UTF8),
     }
 }
@@ -662,7 +731,14 @@ fn column_def(c: &OutCol, db: &str) -> Vec<u8> {
     let (t, flags, len, decimals, charset) = wire_type(&c.ty);
     let mut p = Vec::new();
     lenenc_str(&mut p, b"def");
-    lenenc_str(&mut p, if c.table.is_some() { db.as_bytes() } else { b"" });
+    lenenc_str(
+        &mut p,
+        if c.table.is_some() {
+            db.as_bytes()
+        } else {
+            b""
+        },
+    );
     let table = c.table.as_deref().unwrap_or("");
     lenenc_str(&mut p, table.as_bytes());
     lenenc_str(&mut p, table.as_bytes());
@@ -683,7 +759,13 @@ fn text_value(d: &Datum, ty: &DataType) -> Vec<u8> {
     match (d, ty) {
         (Datum::Timestamp(ns), _) => mysql_datetime(*ns).into_bytes(),
         (Datum::Array(_), _) => datum::json_of(d).into_bytes(),
-        (Datum::Bool(b), _) => if *b { b"1".to_vec() } else { b"0".to_vec() },
+        (Datum::Bool(b), _) => {
+            if *b {
+                b"1".to_vec()
+            } else {
+                b"0".to_vec()
+            }
+        }
         (other, _) => other.to_wire_bytes(true),
     }
 }
@@ -714,7 +796,11 @@ fn binary_row(row: &[Datum], cols: &[OutCol]) -> Vec<u8> {
         }
         let (t, ..) = wire_type(&c.ty);
         match t {
-            T_TINY => p.push(d.as_i64().unwrap_or(i64::from(d.truthy().ok().flatten().unwrap_or(false))) as u8),
+            T_TINY => p.push(
+                d.as_i64()
+                    .unwrap_or(i64::from(d.truthy().ok().flatten().unwrap_or(false)))
+                    as u8,
+            ),
             T_SHORT => p.extend_from_slice(&(d.as_i64().unwrap_or(0) as i16).to_le_bytes()),
             T_LONG => p.extend_from_slice(&(d.as_i64().unwrap_or(0) as i32).to_le_bytes()),
             T_LONGLONG => p.extend_from_slice(&d.as_i64().unwrap_or(0).to_le_bytes()),
@@ -728,7 +814,11 @@ fn binary_row(row: &[Datum], cols: &[OutCol]) -> Vec<u8> {
                 let day = ns.div_euclid(86_400_000_000_000);
                 let rem = ns.rem_euclid(86_400_000_000_000);
                 let (y, m, dd) = datum::civil_from_days(day as i32);
-                let (h, mi, s) = (rem / 3_600_000_000_000, (rem / 60_000_000_000) % 60, (rem / 1_000_000_000) % 60);
+                let (h, mi, s) = (
+                    rem / 3_600_000_000_000,
+                    (rem / 60_000_000_000) % 60,
+                    (rem / 1_000_000_000) % 60,
+                );
                 let us = (rem % 1_000_000_000) / 1000;
                 if t == T_DATE {
                     p.push(4);
@@ -750,7 +840,11 @@ fn binary_row(row: &[Datum], cols: &[OutCol]) -> Vec<u8> {
                 p.push(12);
                 p.push(0);
                 p.extend_from_slice(&((secs / 86_400) as u32).to_le_bytes());
-                p.extend_from_slice(&[((secs / 3600) % 24) as u8, ((secs / 60) % 60) as u8, (secs % 60) as u8]);
+                p.extend_from_slice(&[
+                    ((secs / 3600) % 24) as u8,
+                    ((secs / 60) % 60) as u8,
+                    (secs % 60) as u8,
+                ]);
                 p.extend_from_slice(&(((ns % 1_000_000_000) / 1000) as u32).to_le_bytes());
             }
             _ => lenenc_str(&mut p, &text_value(d, &c.ty)),
@@ -764,15 +858,27 @@ fn read_binary_param(rd: &mut Rd<'_>, t: u8, unsigned: bool) -> io::Result<Datum
         T_NULL => Datum::Null,
         T_TINY => {
             let v = rd.u8()?;
-            Datum::Int(if unsigned { i64::from(v) } else { i64::from(v as i8) })
+            Datum::Int(if unsigned {
+                i64::from(v)
+            } else {
+                i64::from(v as i8)
+            })
         }
         T_SHORT | T_YEAR => {
             let v = rd.u16()?;
-            Datum::Int(if unsigned { i64::from(v) } else { i64::from(v as i16) })
+            Datum::Int(if unsigned {
+                i64::from(v)
+            } else {
+                i64::from(v as i16)
+            })
         }
         T_LONG | T_INT24 => {
             let v = rd.u32()?;
-            Datum::Int(if unsigned { i64::from(v) } else { i64::from(v as i32) })
+            Datum::Int(if unsigned {
+                i64::from(v)
+            } else {
+                i64::from(v as i32)
+            })
         }
         T_LONGLONG => {
             let v = rd.u64()?;
@@ -798,7 +904,8 @@ fn read_binary_param(rd: &mut Rd<'_>, t: u8, unsigned: bool) -> io::Result<Datum
             let days = datum::days_from_civil(y, u32::from(g(2)).max(1), u32::from(g(3)).max(1));
             let mut ns = i64::from(days) * 86_400_000_000_000;
             if n >= 7 {
-                ns += (i64::from(g(4)) * 3600 + i64::from(g(5)) * 60 + i64::from(g(6))) * 1_000_000_000;
+                ns += (i64::from(g(4)) * 3600 + i64::from(g(5)) * 60 + i64::from(g(6)))
+                    * 1_000_000_000;
             }
             if n >= 11 {
                 ns += i64::from(u32::from_le_bytes([g(7), g(8), g(9), g(10)])) * 1000;
@@ -817,16 +924,21 @@ fn read_binary_param(rd: &mut Rd<'_>, t: u8, unsigned: bool) -> io::Result<Datum
                 return Ok(Datum::Time(0));
             }
             let days = i64::from(u32::from_le_bytes([g(1), g(2), g(3), g(4)]));
-            let mut ns = ((days * 24 + i64::from(g(5))) * 3600 + i64::from(g(6)) * 60 + i64::from(g(7))) * 1_000_000_000;
+            let mut ns =
+                ((days * 24 + i64::from(g(5))) * 3600 + i64::from(g(6)) * 60 + i64::from(g(7)))
+                    * 1_000_000_000;
             if n >= 12 {
                 ns += i64::from(u32::from_le_bytes([g(8), g(9), g(10), g(11)])) * 1000;
             }
             Datum::Time(if g(0) == 1 { -ns } else { ns })
         }
-        T_DECIMAL | T_JSON | T_VARCHAR | T_BIT | T_BLOB | T_VAR_STRING | T_STRING | 0xf7 | 0xf8 | 0xf9 | 0xfa | 0xfb => {
+        T_DECIMAL | T_JSON | T_VARCHAR | T_BIT | T_BLOB | T_VAR_STRING | T_STRING | 0xf7 | 0xf8
+        | 0xf9 | 0xfa | 0xfb => {
             let bytes = rd.lenenc_bytes()?;
             match String::from_utf8(bytes.to_vec()) {
-                Ok(s) if t == T_DECIMAL => datum::parse_dec(&s).map(Datum::Numeric).unwrap_or(Datum::Text(s)),
+                Ok(s) if t == T_DECIMAL => datum::parse_dec(&s)
+                    .map(Datum::Numeric)
+                    .unwrap_or(Datum::Text(s)),
                 Ok(s) => Datum::Text(s),
                 Err(_) => Datum::Bytes(bytes.to_vec()),
             }
@@ -866,7 +978,11 @@ mod tests {
         let h2 = hash::sha1(&h1);
         let mut buf = nonce.to_vec();
         buf.extend_from_slice(&h2);
-        let token: Vec<u8> = h1.iter().zip(hash::sha1(&buf).iter()).map(|(a, b)| a ^ b).collect();
+        let token: Vec<u8> = h1
+            .iter()
+            .zip(hash::sha1(&buf).iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
         assert!(native_check("secret", nonce, &token));
         assert!(!native_check("wrong", nonce, &token));
         assert!(native_check("", nonce, &[]));

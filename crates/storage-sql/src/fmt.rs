@@ -12,7 +12,8 @@ fn quote_str(s: &str) -> String {
 /// An identifier, double-quoted when it is not a plain lower-case word.
 pub fn quote_ident(s: &str) -> String {
     let plain = !s.is_empty()
-        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         && !s.starts_with(|c: char| c.is_ascii_digit());
     if plain {
         s.to_owned()
@@ -48,10 +49,22 @@ fn op_str(op: &BinaryOp) -> &'static str {
         BinaryOp::ShiftRight => ">>",
         BinaryOp::JsonGet => "->",
         BinaryOp::JsonGetText => "->>",
-        BinaryOp::Regex { case_insensitive: false, negated: false } => "~",
-        BinaryOp::Regex { case_insensitive: true, negated: false } => "~*",
-        BinaryOp::Regex { case_insensitive: false, negated: true } => "!~",
-        BinaryOp::Regex { case_insensitive: true, negated: true } => "!~*",
+        BinaryOp::Regex {
+            case_insensitive: false,
+            negated: false,
+        } => "~",
+        BinaryOp::Regex {
+            case_insensitive: true,
+            negated: false,
+        } => "~*",
+        BinaryOp::Regex {
+            case_insensitive: false,
+            negated: true,
+        } => "!~",
+        BinaryOp::Regex {
+            case_insensitive: true,
+            negated: true,
+        } => "!~*",
         BinaryOp::Contains => "@>",
         BinaryOp::ContainedBy => "<@",
         BinaryOp::Overlap => "&&",
@@ -78,15 +91,29 @@ impl Display for Expr {
             Expr::Blob(b) => write!(f, "'\\x{}'::bytea", crate::hash::hex(b)),
             Expr::Param(i) => write!(f, "${}", i + 1),
             Expr::Default => f.write_str("DEFAULT"),
-            Expr::Column(parts) => f.write_str(&parts.iter().map(|p| quote_ident(p)).collect::<Vec<_>>().join(".")),
-            Expr::Variable { name, system } => write!(f, "{}{name}", if *system { "@@" } else { "@" }),
+            Expr::Column(parts) => f.write_str(
+                &parts
+                    .iter()
+                    .map(|p| quote_ident(p))
+                    .collect::<Vec<_>>()
+                    .join("."),
+            ),
+            Expr::Variable { name, system } => {
+                write!(f, "{}{name}", if *system { "@@" } else { "@" })
+            }
             Expr::Unary { op, expr } => match op {
                 UnaryOp::Neg => write!(f, "(-{expr})"),
                 UnaryOp::Not => write!(f, "(NOT {expr})"),
                 UnaryOp::BitNot => write!(f, "(~{expr})"),
             },
             Expr::Binary { op, left, right } => write!(f, "({left} {} {right})", op_str(op)),
-            Expr::Function { name, args, star, distinct, .. } => {
+            Expr::Function {
+                name,
+                args,
+                star,
+                distinct,
+                ..
+            } => {
                 write!(f, "{name}(")?;
                 if *star {
                     f.write_str("*")?;
@@ -98,7 +125,11 @@ impl Display for Expr {
                 }
                 f.write_str(")")
             }
-            Expr::Case { operand, whens, else_ } => {
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
                 f.write_str("CASE")?;
                 if let Some(o) = operand {
                     write!(f, " {o}")?;
@@ -112,28 +143,84 @@ impl Display for Expr {
                 f.write_str(" END")
             }
             Expr::Cast { expr, ty } => write!(f, "CAST({expr} AS {})", type_sql(ty)),
-            Expr::IsNull { expr, negated } => write!(f, "({expr} IS {}NULL)", if *negated { "NOT " } else { "" }),
-            Expr::IsBool { expr, value, negated } => {
-                write!(f, "({expr} IS {}{})", if *negated { "NOT " } else { "" }, if *value { "TRUE" } else { "FALSE" })
+            Expr::IsNull { expr, negated } => {
+                write!(f, "({expr} IS {}NULL)", if *negated { "NOT " } else { "" })
             }
-            Expr::IsDistinctFrom { left, right, negated } => {
-                write!(f, "({left} IS {}DISTINCT FROM {right})", if *negated { "NOT " } else { "" })
+            Expr::IsBool {
+                expr,
+                value,
+                negated,
+            } => {
+                write!(
+                    f,
+                    "({expr} IS {}{})",
+                    if *negated { "NOT " } else { "" },
+                    if *value { "TRUE" } else { "FALSE" }
+                )
             }
-            Expr::Between { expr, low, high, negated } => {
-                write!(f, "({expr} {}BETWEEN {low} AND {high})", if *negated { "NOT " } else { "" })
+            Expr::IsDistinctFrom {
+                left,
+                right,
+                negated,
+            } => {
+                write!(
+                    f,
+                    "({left} IS {}DISTINCT FROM {right})",
+                    if *negated { "NOT " } else { "" }
+                )
             }
-            Expr::InList { expr, list: items, negated } => {
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
+                write!(
+                    f,
+                    "({expr} {}BETWEEN {low} AND {high})",
+                    if *negated { "NOT " } else { "" }
+                )
+            }
+            Expr::InList {
+                expr,
+                list: items,
+                negated,
+            } => {
                 write!(f, "({expr} {}IN (", if *negated { "NOT " } else { "" })?;
                 list(f, items)?;
                 f.write_str("))")
             }
-            Expr::InSubquery { expr, negated, .. } => write!(f, "({expr} {}IN (subquery))", if *negated { "NOT " } else { "" }),
-            Expr::AnyAll { left, op, right, all } => {
-                write!(f, "({left} {} {}({right}))", op_str(op), if *all { "ALL" } else { "ANY" })
+            Expr::InSubquery { expr, negated, .. } => write!(
+                f,
+                "({expr} {}IN (subquery))",
+                if *negated { "NOT " } else { "" }
+            ),
+            Expr::AnyAll {
+                left,
+                op,
+                right,
+                all,
+            } => {
+                write!(
+                    f,
+                    "({left} {} {}({right}))",
+                    op_str(op),
+                    if *all { "ALL" } else { "ANY" }
+                )
             }
-            Expr::Exists { negated, .. } => write!(f, "({}EXISTS (subquery))", if *negated { "NOT " } else { "" }),
+            Expr::Exists { negated, .. } => write!(
+                f,
+                "({}EXISTS (subquery))",
+                if *negated { "NOT " } else { "" }
+            ),
             Expr::Subquery(_) => f.write_str("(subquery)"),
-            Expr::Like { expr, pattern, negated, case_insensitive, .. } => write!(
+            Expr::Like {
+                expr,
+                pattern,
+                negated,
+                case_insensitive,
+                ..
+            } => write!(
                 f,
                 "({expr} {}{} {pattern})",
                 if *negated { "NOT " } else { "" },

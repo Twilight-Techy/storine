@@ -38,7 +38,10 @@ fn run() -> Result<(), String> {
     let mut users = HashMap::new();
     let mut config = EngineConfig::default();
     while let Some(a) = args.next() {
-        let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value\n{USAGE}"));
+        let mut value = |name: &str| {
+            args.next()
+                .ok_or_else(|| format!("{name} needs a value\n{USAGE}"))
+        };
         match a.as_str() {
             "--data" => data = Some(PathBuf::from(value("--data")?)),
             "--storine" => url = Some(value("--storine")?),
@@ -78,19 +81,35 @@ fn run() -> Result<(), String> {
         }
         _ => return Err(format!("give exactly one of --data and --storine\n{USAGE}")),
     };
-    engine.refresh_catalog(true).map_err(|e| format!("cannot reach the database: {e}"))?;
+    engine
+        .refresh_catalog(true)
+        .map_err(|e| format!("cannot reach the database: {e}"))?;
     let mut threads = Vec::new();
     if let Some(addr) = pg {
         let l = TcpListener::bind(&addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
         eprintln!("storine-sql: PostgreSQL protocol on {addr}");
-        let (e, auth) = (Arc::clone(&engine), Arc::new(storage_sql::pg::Auth { users: users.clone() }));
-        threads.push(std::thread::spawn(move || storage_sql::pg::serve(e, l, auth)));
+        let (e, auth) = (
+            Arc::clone(&engine),
+            Arc::new(storage_sql::pg::Auth {
+                users: users.clone(),
+            }),
+        );
+        threads.push(std::thread::spawn(move || {
+            storage_sql::pg::serve(e, l, auth)
+        }));
     }
     if let Some(addr) = mysql {
         let l = TcpListener::bind(&addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
         eprintln!("storine-sql: MySQL protocol on {addr}");
-        let (e, auth) = (Arc::clone(&engine), Arc::new(storage_sql::mysql::Auth { users: users.clone() }));
-        threads.push(std::thread::spawn(move || storage_sql::mysql::serve(e, l, auth)));
+        let (e, auth) = (
+            Arc::clone(&engine),
+            Arc::new(storage_sql::mysql::Auth {
+                users: users.clone(),
+            }),
+        );
+        threads.push(std::thread::spawn(move || {
+            storage_sql::mysql::serve(e, l, auth)
+        }));
     }
     if threads.is_empty() {
         return Err("nothing to serve (--no-pg and --no-mysql)".into());

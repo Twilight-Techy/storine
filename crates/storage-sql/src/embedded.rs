@@ -21,10 +21,17 @@ pub struct Embedded {
 
 /// Opens (or creates) the database in `dir` and starts a loopback document server for it.
 pub fn start(dir: &Path, config: EngineConfig) -> SqlResult<Embedded> {
-    let store = Arc::new(DocumentStore::open(dir, StoreConfig::default()).map_err(|e| SqlError::internal(e.to_string()))?);
-    let server = StorageServer::start_documents("127.0.0.1:0", store, 4096, SecurityConfig::default(), None)
-        .map_err(|e| SqlError::internal(e.to_string()))?;
+    let store = Arc::new(
+        DocumentStore::open(dir, StoreConfig::default())
+            .map_err(|e| SqlError::internal(e.to_string()))?,
+    );
+    let server =
+        StorageServer::start_documents("127.0.0.1:0", store, 4096, SecurityConfig::default(), None)
+            .map_err(|e| SqlError::internal(e.to_string()))?;
     let url = format!("storine://{}", server.local_addr());
     let store = Store::connect(&url, Duration::from_secs(10))?;
-    Ok(Embedded { server, engine: Engine::new(store, config) })
+    Ok(Embedded {
+        server,
+        engine: Engine::new(store, config),
+    })
 }

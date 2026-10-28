@@ -14,7 +14,10 @@ pub type SqlResult<T> = Result<T, SqlError>;
 
 impl SqlError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
-        SqlError { code, message: message.into() }
+        SqlError {
+            code,
+            message: message.into(),
+        }
     }
 
     pub fn syntax(message: String) -> Self {
@@ -63,7 +66,12 @@ impl SqlError {
     }
 
     pub fn unique(table: &str, constraint: &str) -> Self {
-        SqlError::new("23505", format!("duplicate key value violates unique constraint \"{constraint}\" on \"{table}\""))
+        SqlError::new(
+            "23505",
+            format!(
+                "duplicate key value violates unique constraint \"{constraint}\" on \"{table}\""
+            ),
+        )
     }
 
     pub fn foreign_key(message: impl Into<String>) -> Self {
@@ -71,16 +79,25 @@ impl SqlError {
     }
 
     pub fn check(table: &str, constraint: &str) -> Self {
-        SqlError::new("23514", format!("new row for relation \"{table}\" violates check constraint \"{constraint}\""))
+        SqlError::new(
+            "23514",
+            format!("new row for relation \"{table}\" violates check constraint \"{constraint}\""),
+        )
     }
 
     /// A concurrent transaction changed data this one read or wrote: retry the transaction.
     pub fn serialization() -> Self {
-        SqlError::new("40001", "could not serialize access due to a concurrent update; retry the transaction")
+        SqlError::new(
+            "40001",
+            "could not serialize access due to a concurrent update; retry the transaction",
+        )
     }
 
     pub fn in_failed_transaction() -> Self {
-        SqlError::new("25P02", "current transaction is aborted, commands ignored until end of transaction block")
+        SqlError::new(
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+        )
     }
 
     pub fn lock_timeout(what: &str) -> Self {
@@ -140,7 +157,9 @@ impl From<storine::Error> for SqlError {
             storine::Error::NotFound { .. } => SqlError::serialization(),
             storine::Error::Invalid(m) => SqlError::new("22023", m),
             storine::Error::Unauthorized(m) => SqlError::new("42501", m),
-            storine::Error::Overloaded(m) | storine::Error::RateLimited(m) => SqlError::new("53300", m),
+            storine::Error::Overloaded(m) | storine::Error::RateLimited(m) => {
+                SqlError::new("53300", m)
+            }
             storine::Error::Unavailable(m) => SqlError::unavailable(m),
             storine::Error::Server(m) => SqlError::internal(m),
         }

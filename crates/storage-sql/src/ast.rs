@@ -8,10 +8,33 @@ pub enum Statement {
     Delete(Box<Delete>),
     CreateTable(Box<CreateTable>),
     CreateIndex(Box<CreateIndex>),
-    DropTable { names: Vec<String>, if_exists: bool, cascade: bool },
-    DropIndex { names: Vec<String>, table: Option<String>, if_exists: bool },
-    AlterTable { table: String, ops: Vec<AlterOp> },
-    Truncate { tables: Vec<String> },
+    DropTable {
+        names: Vec<String>,
+        if_exists: bool,
+        cascade: bool,
+    },
+    DropIndex {
+        names: Vec<String>,
+        table: Option<String>,
+        if_exists: bool,
+    },
+    AlterTable {
+        table: String,
+        ops: Vec<AlterOp>,
+    },
+    Truncate {
+        tables: Vec<String>,
+    },
+    CreateSequence {
+        name: String,
+        start: i64,
+        increment: i64,
+        if_not_exists: bool,
+    },
+    DropSequence {
+        names: Vec<String>,
+        if_exists: bool,
+    },
     /// `BEGIN` / `START TRANSACTION`.
     Begin,
     Commit,
@@ -20,16 +43,31 @@ pub enum Statement {
     ReleaseSavepoint(String),
     RollbackToSavepoint(String),
     /// `SET name = value` (session settings; value kept as text).
-    Set { name: String, value: Option<Expr> },
+    Set {
+        name: String,
+        value: Option<Expr>,
+    },
     Show(Show),
     /// `USE db` / `\c` style database switch (accepted; there is one database).
     Use(String),
     Explain(Box<Statement>),
-    CreateSchema { name: String, if_not_exists: bool },
-    DropSchema { name: String, if_exists: bool },
+    CreateSchema {
+        name: String,
+        if_not_exists: bool,
+    },
+    DropSchema {
+        name: String,
+        if_exists: bool,
+    },
     /// SQL-level `PREPARE name AS stmt` / `EXECUTE name(args)` / `DEALLOCATE name`.
-    Prepare { name: String, statement: Box<Statement> },
-    Execute { name: String, args: Vec<Expr> },
+    Prepare {
+        name: String,
+        statement: Box<Statement>,
+    },
+    Execute {
+        name: String,
+        args: Vec<Expr>,
+    },
     Deallocate(Option<String>),
     /// Statements accepted and ignored because they have no effect here (the tag is reported back).
     NoOp(&'static str),
@@ -82,7 +120,12 @@ pub enum LockMode {
 pub enum SetExpr {
     Select(Box<Select>),
     Values(Vec<Vec<Expr>>),
-    SetOp { op: SetOp, all: bool, left: Box<SetExpr>, right: Box<SetExpr> },
+    SetOp {
+        op: SetOp,
+        all: bool,
+        left: Box<SetExpr>,
+        right: Box<SetExpr>,
+    },
     Nested(Box<Query>),
 }
 
@@ -107,7 +150,10 @@ pub struct Select {
 pub enum SelectItem {
     /// `*` or `t.*`.
     Wildcard(Option<String>),
-    Expr { expr: Expr, alias: Option<String> },
+    Expr {
+        expr: Expr,
+        alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -118,10 +164,27 @@ pub struct TableAlias {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableRef {
-    Named { schema: Option<String>, name: String, alias: Option<TableAlias> },
-    Derived { query: Box<Query>, alias: Option<TableAlias>, lateral: bool },
-    Function { name: String, args: Vec<Expr>, alias: Option<TableAlias> },
-    Join { left: Box<TableRef>, right: Box<TableRef>, kind: JoinKind, constraint: JoinConstraint },
+    Named {
+        schema: Option<String>,
+        name: String,
+        alias: Option<TableAlias>,
+    },
+    Derived {
+        query: Box<Query>,
+        alias: Option<TableAlias>,
+        lateral: bool,
+    },
+    Function {
+        name: String,
+        args: Vec<Expr>,
+        alias: Option<TableAlias>,
+    },
+    Join {
+        left: Box<TableRef>,
+        right: Box<TableRef>,
+        kind: JoinKind,
+        constraint: JoinConstraint,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,7 +238,11 @@ pub enum OnConflict {
     DoNothing { target: Vec<String> },
     /// PostgreSQL / SQLite `ON CONFLICT (cols) DO UPDATE SET ... [WHERE ...]`; MySQL
     /// `ON DUPLICATE KEY UPDATE ...` (empty target: any unique key).
-    DoUpdate { target: Vec<String>, sets: Vec<(String, Expr)>, where_: Option<Expr> },
+    DoUpdate {
+        target: Vec<String>,
+        sets: Vec<(String, Expr)>,
+        where_: Option<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -243,23 +310,53 @@ pub enum RefAction {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TableConstraint {
-    PrimaryKey { name: Option<String>, columns: Vec<String> },
-    Unique { name: Option<String>, columns: Vec<String> },
-    ForeignKey { name: Option<String>, fk: ForeignKey },
-    Check { name: Option<String>, expr: Expr },
+    PrimaryKey {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    Unique {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    ForeignKey {
+        name: Option<String>,
+        fk: ForeignKey,
+    },
+    Check {
+        name: Option<String>,
+        expr: Expr,
+    },
     /// MySQL `KEY idx (cols)` / `INDEX idx (cols)` inside `CREATE TABLE`.
-    Index { name: Option<String>, columns: Vec<String> },
+    Index {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterOp {
-    AddColumn { column: ColumnDef, if_not_exists: bool },
-    DropColumn { name: String, if_exists: bool },
-    RenameColumn { from: String, to: String },
+    AddColumn {
+        column: ColumnDef,
+        if_not_exists: bool,
+    },
+    DropColumn {
+        name: String,
+        if_exists: bool,
+    },
+    RenameColumn {
+        from: String,
+        to: String,
+    },
     RenameTable(String),
-    AlterColumn { name: String, change: AlterColumn },
+    AlterColumn {
+        name: String,
+        change: AlterColumn,
+    },
     AddConstraint(TableConstraint),
-    DropConstraint { name: String, if_exists: bool },
+    DropConstraint {
+        name: String,
+        if_exists: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -309,6 +406,13 @@ pub enum DataType {
     Array(Box<DataType>),
 }
 
+/// `OVER (PARTITION BY ... ORDER BY ...)` of a window function.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Window {
+    pub partition_by: Vec<Expr>,
+    pub order_by: Vec<OrderBy>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     Neg,
@@ -348,7 +452,10 @@ pub enum BinaryOp {
     /// `->>` (JSON field as text).
     JsonGetText,
     /// `~`, `~*`, `!~`, `!~*`, `REGEXP`.
-    Regex { case_insensitive: bool, negated: bool },
+    Regex {
+        case_insensitive: bool,
+        negated: bool,
+    },
     /// `@>` (JSON / array contains).
     Contains,
     ContainedBy,
@@ -368,36 +475,107 @@ pub enum Expr {
     Default,
     /// `col`, `t.col` or `schema.t.col`.
     Column(Vec<String>),
-    Variable { name: String, system: bool },
-    Unary { op: UnaryOp, expr: Box<Expr> },
-    Binary { op: BinaryOp, left: Box<Expr>, right: Box<Expr> },
-    Function { name: String, args: Vec<Expr>, star: bool, distinct: bool, over: bool },
-    Case { operand: Option<Box<Expr>>, whens: Vec<(Expr, Expr)>, else_: Option<Box<Expr>> },
-    Cast { expr: Box<Expr>, ty: DataType },
-    IsNull { expr: Box<Expr>, negated: bool },
-    IsBool { expr: Box<Expr>, value: bool, negated: bool },
-    IsDistinctFrom { left: Box<Expr>, right: Box<Expr>, negated: bool },
-    Between { expr: Box<Expr>, low: Box<Expr>, high: Box<Expr>, negated: bool },
-    InList { expr: Box<Expr>, list: Vec<Expr>, negated: bool },
-    InSubquery { expr: Box<Expr>, query: Box<Query>, negated: bool },
+    Variable {
+        name: String,
+        system: bool,
+    },
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expr>,
+    },
+    Binary {
+        op: BinaryOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Function {
+        name: String,
+        args: Vec<Expr>,
+        star: bool,
+        distinct: bool,
+        over: Option<Box<Window>>,
+    },
+    Case {
+        operand: Option<Box<Expr>>,
+        whens: Vec<(Expr, Expr)>,
+        else_: Option<Box<Expr>>,
+    },
+    Cast {
+        expr: Box<Expr>,
+        ty: DataType,
+    },
+    IsNull {
+        expr: Box<Expr>,
+        negated: bool,
+    },
+    IsBool {
+        expr: Box<Expr>,
+        value: bool,
+        negated: bool,
+    },
+    IsDistinctFrom {
+        left: Box<Expr>,
+        right: Box<Expr>,
+        negated: bool,
+    },
+    Between {
+        expr: Box<Expr>,
+        low: Box<Expr>,
+        high: Box<Expr>,
+        negated: bool,
+    },
+    InList {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
+    InSubquery {
+        expr: Box<Expr>,
+        query: Box<Query>,
+        negated: bool,
+    },
     /// `x = ANY(array or subquery)` / `x > ALL(...)`.
-    AnyAll { left: Box<Expr>, op: BinaryOp, right: Box<Expr>, all: bool },
-    Exists { query: Box<Query>, negated: bool },
+    AnyAll {
+        left: Box<Expr>,
+        op: BinaryOp,
+        right: Box<Expr>,
+        all: bool,
+    },
+    Exists {
+        query: Box<Query>,
+        negated: bool,
+    },
     Subquery(Box<Query>),
-    Like { expr: Box<Expr>, pattern: Box<Expr>, negated: bool, case_insensitive: bool, escape: Option<Box<Expr>> },
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        negated: bool,
+        case_insensitive: bool,
+        escape: Option<Box<Expr>>,
+    },
     Tuple(Vec<Expr>),
     Array(Vec<Expr>),
     /// `expr[index]` (1-based, PostgreSQL arrays).
-    Index { expr: Box<Expr>, index: Box<Expr> },
+    Index {
+        expr: Box<Expr>,
+        index: Box<Expr>,
+    },
     /// `INTERVAL '1 day'`.
     Interval(String),
     /// `EXTRACT(field FROM expr)`.
-    Extract { field: String, expr: Box<Expr> },
+    Extract {
+        field: String,
+        expr: Box<Expr>,
+    },
 }
 
 impl Expr {
     pub fn binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
-        Expr::Binary { op, left: Box::new(left), right: Box::new(right) }
+        Expr::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        }
     }
 
     /// The column name when this is a bare or qualified column reference.

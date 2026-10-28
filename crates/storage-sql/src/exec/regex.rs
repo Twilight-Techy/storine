@@ -11,13 +11,21 @@ use crate::error::{SqlError, SqlResult};
 enum Node {
     Char(char),
     Any,
-    Class { items: Vec<ClassItem>, negated: bool },
+    Class {
+        items: Vec<ClassItem>,
+        negated: bool,
+    },
     Start,
     End,
     Group(Box<Node>),
     Alt(Vec<Node>),
     Concat(Vec<Node>),
-    Repeat { node: Box<Node>, min: usize, max: usize, greedy: bool },
+    Repeat {
+        node: Box<Node>,
+        min: usize,
+        max: usize,
+        greedy: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -44,7 +52,10 @@ impl Regex {
         if p.i != chars.len() {
             return Err(bad(pattern));
         }
-        Ok(Regex { root, ci: case_insensitive })
+        Ok(Regex {
+            root,
+            ci: case_insensitive,
+        })
     }
 
     pub fn is_match(&self, s: &str) -> bool {
@@ -112,7 +123,11 @@ impl P<'_> {
             self.i += 1;
             options.push(self.concat()?);
         }
-        Ok(if options.len() == 1 { options.pop().unwrap_or(Node::Concat(Vec::new())) } else { Node::Alt(options) })
+        Ok(if options.len() == 1 {
+            options.pop().unwrap_or(Node::Concat(Vec::new()))
+        } else {
+            Node::Alt(options)
+        })
     }
 
     fn concat(&mut self) -> SqlResult<Node> {
@@ -133,11 +148,21 @@ impl P<'_> {
             Some('+') => (1, usize::MAX),
             Some('?') => (0, 1),
             Some('{') => {
-                let close = self.c[self.i..].iter().position(|c| *c == '}').map(|p| p + self.i);
+                let close = self.c[self.i..]
+                    .iter()
+                    .position(|c| *c == '}')
+                    .map(|p| p + self.i);
                 let Some(close) = close else { return Ok(atom) };
                 let body: String = self.c[self.i + 1..close].iter().collect();
                 let (lo, hi) = match body.split_once(',') {
-                    Some((a, b)) => (a.trim().parse().map_err(|_| bad(&body))?, if b.trim().is_empty() { usize::MAX } else { b.trim().parse().map_err(|_| bad(&body))? }),
+                    Some((a, b)) => (
+                        a.trim().parse().map_err(|_| bad(&body))?,
+                        if b.trim().is_empty() {
+                            usize::MAX
+                        } else {
+                            b.trim().parse().map_err(|_| bad(&body))?
+                        },
+                    ),
                     None => {
                         let n = body.trim().parse().map_err(|_| bad(&body))?;
                         (n, n)
@@ -155,7 +180,12 @@ impl P<'_> {
         } else {
             true
         };
-        Ok(Node::Repeat { node: Box::new(atom), min, max, greedy })
+        Ok(Node::Repeat {
+            node: Box::new(atom),
+            min,
+            max,
+            greedy,
+        })
     }
 
     fn atom(&mut self) -> SqlResult<Node> {
@@ -181,12 +211,30 @@ impl P<'_> {
                 let e = self.peek().ok_or_else(|| bad("trailing backslash"))?;
                 self.i += 1;
                 match e {
-                    'd' => Node::Class { items: vec![ClassItem::Digit], negated: false },
-                    'D' => Node::Class { items: vec![ClassItem::Digit], negated: true },
-                    'w' => Node::Class { items: vec![ClassItem::Word], negated: false },
-                    'W' => Node::Class { items: vec![ClassItem::Word], negated: true },
-                    's' => Node::Class { items: vec![ClassItem::Space], negated: false },
-                    'S' => Node::Class { items: vec![ClassItem::Space], negated: true },
+                    'd' => Node::Class {
+                        items: vec![ClassItem::Digit],
+                        negated: false,
+                    },
+                    'D' => Node::Class {
+                        items: vec![ClassItem::Digit],
+                        negated: true,
+                    },
+                    'w' => Node::Class {
+                        items: vec![ClassItem::Word],
+                        negated: false,
+                    },
+                    'W' => Node::Class {
+                        items: vec![ClassItem::Word],
+                        negated: true,
+                    },
+                    's' => Node::Class {
+                        items: vec![ClassItem::Space],
+                        negated: false,
+                    },
+                    'S' => Node::Class {
+                        items: vec![ClassItem::Space],
+                        negated: true,
+                    },
                     'n' => Node::Char('\n'),
                     't' => Node::Char('\t'),
                     other => Node::Char(other),
@@ -213,7 +261,11 @@ impl P<'_> {
             }
             first = false;
             if c == '[' && self.peek() == Some(':') {
-                let close = self.c[self.i..].iter().collect::<String>().find(":]").ok_or_else(|| bad("bad class"))?;
+                let close = self.c[self.i..]
+                    .iter()
+                    .collect::<String>()
+                    .find(":]")
+                    .ok_or_else(|| bad("bad class"))?;
                 let name: String = self.c[self.i + 1..self.i + close].iter().collect();
                 self.i += close + 2;
                 items.push(match name.as_str() {
@@ -267,7 +319,11 @@ fn eq_ci(a: char, b: char, ci: bool) -> bool {
 fn class_has(items: &[ClassItem], c: char, ci: bool) -> bool {
     items.iter().any(|it| match it {
         ClassItem::Range(lo, hi) => {
-            (*lo <= c && c <= *hi) || (ci && c.to_lowercase().chain(c.to_uppercase()).any(|x| *lo <= x && x <= *hi))
+            (*lo <= c && c <= *hi)
+                || (ci
+                    && c.to_lowercase()
+                        .chain(c.to_uppercase())
+                        .any(|x| *lo <= x && x <= *hi))
         }
         ClassItem::Digit => c.is_ascii_digit(),
         ClassItem::Word => c.is_alphanumeric() || c == '_',
@@ -277,7 +333,14 @@ fn class_has(items: &[ClassItem], c: char, ci: bool) -> bool {
 
 /// Matches `node` at `pos`, calling `k` with every end position until it accepts. `steps`
 /// bounds the total work of one match attempt.
-fn m(node: &Node, t: &[char], pos: usize, ci: bool, steps: &Cell<usize>, k: &mut dyn FnMut(usize) -> bool) -> bool {
+fn m(
+    node: &Node,
+    t: &[char],
+    pos: usize,
+    ci: bool,
+    steps: &Cell<usize>,
+    k: &mut dyn FnMut(usize) -> bool,
+) -> bool {
     steps.set(steps.get() + 1);
     if steps.get() > STEP_LIMIT {
         return false;
@@ -285,20 +348,36 @@ fn m(node: &Node, t: &[char], pos: usize, ci: bool, steps: &Cell<usize>, k: &mut
     match node {
         Node::Char(c) => pos < t.len() && eq_ci(t[pos], *c, ci) && k(pos + 1),
         Node::Any => pos < t.len() && t[pos] != '\n' && k(pos + 1),
-        Node::Class { items, negated } => pos < t.len() && class_has(items, t[pos], ci) != *negated && k(pos + 1),
+        Node::Class { items, negated } => {
+            pos < t.len() && class_has(items, t[pos], ci) != *negated && k(pos + 1)
+        }
         Node::Start => pos == 0 && k(pos),
         Node::End => pos == t.len() && k(pos),
         Node::Group(inner) => m(inner, t, pos, ci, steps, k),
         Node::Alt(options) => options.iter().any(|o| m(o, t, pos, ci, steps, k)),
         Node::Concat(items) => seq(items, t, pos, ci, steps, k),
-        Node::Repeat { node, min, max, greedy } => rep(node, (*min, *max, *greedy), 0, t, pos, ci, steps, k),
+        Node::Repeat {
+            node,
+            min,
+            max,
+            greedy,
+        } => rep(node, (*min, *max, *greedy), 0, t, pos, ci, steps, k),
     }
 }
 
-fn seq(items: &[Node], t: &[char], pos: usize, ci: bool, steps: &Cell<usize>, k: &mut dyn FnMut(usize) -> bool) -> bool {
+fn seq(
+    items: &[Node],
+    t: &[char],
+    pos: usize,
+    ci: bool,
+    steps: &Cell<usize>,
+    k: &mut dyn FnMut(usize) -> bool,
+) -> bool {
     match items.split_first() {
         None => k(pos),
-        Some((first, rest)) => m(first, t, pos, ci, steps, &mut |p| seq(rest, t, p, ci, steps, k)),
+        Some((first, rest)) => m(first, t, pos, ci, steps, &mut |p| {
+            seq(rest, t, p, ci, steps, k)
+        }),
     }
 }
 
@@ -319,10 +398,15 @@ fn rep(
     }
     let spec = (min, max, greedy);
     if count < min {
-        return m(node, t, pos, ci, steps, &mut |p| rep(node, spec, count + 1, t, p, ci, steps, k));
+        return m(node, t, pos, ci, steps, &mut |p| {
+            rep(node, spec, count + 1, t, p, ci, steps, k)
+        });
     }
     let more = |k: &mut dyn FnMut(usize) -> bool| {
-        count < max && m(node, t, pos, ci, steps, &mut |p| p != pos && rep(node, spec, count + 1, t, p, ci, steps, k))
+        count < max
+            && m(node, t, pos, ci, steps, &mut |p| {
+                p != pos && rep(node, spec, count + 1, t, p, ci, steps, k)
+            })
     };
     // Greedy tries one more repetition first; lazy tries stopping first.
     #[allow(clippy::if_same_then_else)]
@@ -350,8 +434,18 @@ mod tests {
         assert!(r("cat|dog", "hotdog"));
         assert!(r("^(ab)+$", "ababab"));
         assert!(Regex::new("^HELLO$", true).unwrap().is_match("hello"));
-        assert_eq!(Regex::new("o", false).unwrap().replace("foo boo", "0", true), "f00 b00");
-        assert_eq!(Regex::new("o+", false).unwrap().replace("foo boo", "0", false), "f0 boo");
+        assert_eq!(
+            Regex::new("o", false)
+                .unwrap()
+                .replace("foo boo", "0", true),
+            "f00 b00"
+        );
+        assert_eq!(
+            Regex::new("o+", false)
+                .unwrap()
+                .replace("foo boo", "0", false),
+            "f0 boo"
+        );
         assert!(Regex::new("(", false).is_err());
         // Catastrophic patterns terminate.
         let evil = Regex::new("^(a+)+$", false).unwrap();

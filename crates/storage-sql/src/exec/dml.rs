@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 
 use storine::{Doc, Value};
 
-use crate::ast::{BinaryOp, DataType, Delete, Expr, Insert, InsertSource, OnConflict, Query, RefAction, SelectItem, SetExpr, TableRef, Update};
+use crate::ast::{
+    BinaryOp, DataType, Delete, Expr, Insert, InsertSource, OnConflict, Query, RefAction,
+    SelectItem, SetExpr, TableRef, Update,
+};
 use crate::catalog::{encode_key, Row, Table, LOCKS, SEQUENCES, UNIQUE};
 use crate::datum::{cast, Datum};
 use crate::error::{SqlError, SqlResult};
@@ -23,13 +26,34 @@ use crate::store::{CommitError, Op, Pre, Tag, Write};
 pub fn next_sequence(engine: &Engine, name: &str) -> SqlResult<i64> {
     let store = &engine.store;
     for attempt in 0..10_000u32 {
-        let (pre, n) = match store.get(SEQUENCES, name)? {
-            None => (Pre::Absent, 1),
-            Some(d) => (Pre::Version(d.version), d.fields.get("next").and_then(Value::as_i64).unwrap_or(1)),
+        let (pre, n, step) = match store.get(SEQUENCES, name)? {
+            None => (Pre::Absent, 1, 1),
+            Some(d) => (
+                Pre::Version(d.version),
+                d.fields.get("next").and_then(Value::as_i64).unwrap_or(1),
+                d.fields
+                    .get("increment")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(1),
+            ),
         };
         let mut doc = Doc::new();
-        doc.insert("next".into(), Value::Int(n + 1));
-        let w = Write { collection: SEQUENCES.into(), key: name.into(), op: Op::Put(doc), pre, tag: Tag::Internal };
+        doc.insert(
+            "next".into(),
+            Value::Int(n.checked_add(step).ok_or_else(|| {
+                SqlError::new("2200H", format!("sequence {name} reached its limit"))
+            })?),
+        );
+        if step != 1 {
+            doc.insert("increment".into(), Value::Int(step));
+        }
+        let w = Write {
+            collection: SEQUENCES.into(),
+            key: name.into(),
+            op: Op::Put(doc),
+            pre,
+            tag: Tag::Internal,
+        };
         match store.commit(std::slice::from_ref(&w)) {
             Ok(_) => return Ok(n),
             Err(CommitError::Condition { .. }) => backoff(attempt),
@@ -45,14 +69,23 @@ pub fn raise_sequence(engine: &Engine, name: &str, at_least: i64) -> SqlResult<(
     for attempt in 0..10_000u32 {
         let (pre, next) = match store.get(SEQUENCES, name)? {
             None => (Pre::Absent, 1),
-            Some(d) => (Pre::Version(d.version), d.fields.get("next").and_then(Value::as_i64).unwrap_or(1)),
+            Some(d) => (
+                Pre::Version(d.version),
+                d.fields.get("next").and_then(Value::as_i64).unwrap_or(1),
+            ),
         };
         if at_least < next {
             return Ok(());
         }
         let mut doc = Doc::new();
         doc.insert("next".into(), Value::Int(at_least.saturating_add(1)));
-        let w = Write { collection: SEQUENCES.into(), key: name.into(), op: Op::Put(doc), pre, tag: Tag::Internal };
+        let w = Write {
+            collection: SEQUENCES.into(),
+            key: name.into(),
+            op: Op::Put(doc),
+            pre,
+            tag: Tag::Internal,
+        };
         match store.commit(std::slice::from_ref(&w)) {
             Ok(_) => return Ok(()),
             Err(CommitError::Condition { .. }) => backoff(attempt),
@@ -86,7 +119,10 @@ fn read(s: &Session, collection: &str, key: &str) -> SqlResult<Option<(Option<u6
             return Ok(buffered.map(|d| (None, d.clone())));
         }
     }
-    Ok(s.engine.store.get(collection, key)?.map(|d| (Some(d.version), d.fields)))
+    Ok(s.engine
+        .store
+        .get(collection, key)?
+        .map(|d| (Some(d.version), d.fields)))
 }
 
 /// The version to base a write on: the observed version, or the one the overlay already has.
@@ -116,7 +152,12 @@ fn check_row(ex: &Exec<'_>, table: &Table, row: &Row) -> SqlResult<()> {
 }
 
 /// The parent document a foreign key of `row` must find: `(collection, key, constraint)`.
-fn fk_parent(s: &Session, table: &Table, fk: &crate::catalog::FkDef, row: &Row) -> SqlResult<Option<(String, String)>> {
+fn fk_parent(
+    s: &Session,
+    table: &Table,
+    fk: &crate::catalog::FkDef,
+    row: &Row,
+) -> SqlResult<Option<(String, String)>> {
     if fk.columns.iter().any(|i| row[*i].is_null()) {
         return Ok(None);
     }
@@ -124,12 +165,23 @@ fn fk_parent(s: &Session, table: &Table, fk: &crate::catalog::FkDef, row: &Row) 
     let ref_cols: Vec<usize> = if fk.ref_columns.is_empty() {
         parent.primary_key.clone()
     } else {
-        fk.ref_columns.iter().map(|c| parent.column(c)).collect::<SqlResult<_>>()?
+        fk.ref_columns
+            .iter()
+            .map(|c| parent.column(c))
+            .collect::<SqlResult<_>>()?
     };
     if ref_cols.len() != fk.columns.len() {
-        return Err(SqlError::foreign_key(format!("foreign key \"{}\" does not match the referenced key of \"{}\"", fk.name, parent.name)));
+        return Err(SqlError::foreign_key(format!(
+            "foreign key \"{}\" does not match the referenced key of \"{}\"",
+            fk.name, parent.name
+        )));
     }
-    let values: Vec<Datum> = fk.columns.iter().zip(&ref_cols).map(|(c, p)| cast(&row[*c], &parent.columns[*p].ty)).collect::<SqlResult<_>>()?;
+    let values: Vec<Datum> = fk
+        .columns
+        .iter()
+        .zip(&ref_cols)
+        .map(|(c, p)| cast(&row[*c], &parent.columns[*p].ty))
+        .collect::<SqlResult<_>>()?;
     if ref_cols == parent.primary_key {
         let parts: Vec<&Datum> = values.iter().collect();
         return Ok(Some((parent.collection.clone(), encode_key(&parts)?)));
@@ -139,13 +191,20 @@ fn fk_parent(s: &Session, table: &Table, fk: &crate::catalog::FkDef, row: &Row) 
         .uniques
         .iter()
         .find(|u| u.columns == ref_cols)
-        .ok_or_else(|| SqlError::foreign_key(format!("there is no unique constraint matching given keys for referenced table \"{}\"", parent.name)))?;
+        .ok_or_else(|| {
+            SqlError::foreign_key(format!(
+                "there is no unique constraint matching given keys for referenced table \"{}\"",
+                parent.name
+            ))
+        })?;
     let mut prow = vec![Datum::Null; parent.columns.len()];
     for (p, v) in ref_cols.iter().zip(values) {
         prow[*p] = v;
     }
     let _ = table;
-    Ok(parent.unique_marker(uk, &prow)?.map(|m| (UNIQUE.to_owned(), m)))
+    Ok(parent
+        .unique_marker(uk, &prow)?
+        .map(|m| (UNIQUE.to_owned(), m)))
 }
 
 fn marker_doc(row_key: &str) -> Doc {
@@ -180,29 +239,70 @@ fn apply_insert(s: &mut Session, table: &Table, key: &str, row: &Row) -> SqlResu
     }
     let doc = table.to_doc(row);
     let txn = s.txn_mut();
-    txn.write(&table.collection, key, None, Some(doc), Tag::Row { table: table.name.clone() });
+    txn.write(
+        &table.collection,
+        key,
+        None,
+        Some(doc),
+        Tag::Row {
+            table: table.name.clone(),
+        },
+    );
     for (m, name) in markers {
-        txn.write(UNIQUE, &m, None, Some(marker_doc(key)), Tag::Unique { table: table.name.clone(), constraint: name });
+        txn.write(
+            UNIQUE,
+            &m,
+            None,
+            Some(marker_doc(key)),
+            Tag::Unique {
+                table: table.name.clone(),
+                constraint: name,
+            },
+        );
     }
     for (coll, pkey, name) in parents {
-        txn.check(Write { collection: coll, key: pkey, op: Op::Check, pre: Pre::Exists, tag: Tag::Parent { table: table.name.clone(), constraint: name } });
+        txn.check(Write {
+            collection: coll,
+            key: pkey,
+            op: Op::Check,
+            pre: Pre::Exists,
+            tag: Tag::Parent {
+                table: table.name.clone(),
+                constraint: name,
+            },
+        });
     }
     Ok(())
 }
 
 /// Buffers a changed row (same key): marker moves and foreign-key checks for changed columns.
-fn apply_update(s: &mut Session, table: &Table, key: &str, version: Option<u64>, old: &Row, new: &Row) -> SqlResult<()> {
+fn apply_update(
+    s: &mut Session,
+    table: &Table,
+    key: &str,
+    version: Option<u64>,
+    old: &Row,
+    new: &Row,
+) -> SqlResult<()> {
     let new_key = table.row_key(new)?;
     if let Some(nk) = &new_key {
         if nk != key {
             // The primary key changed: the row moves to a new key.
-            if s.engine.catalog.referencing(&table.name).iter().any(|_| true) {
+            if s.engine
+                .catalog
+                .referencing(&table.name)
+                .iter()
+                .any(|_| true)
+            {
                 plan_and_apply_delete(s, table, key, version, old, true)?;
             } else {
                 apply_delete(s, table, key, version, old)?;
             }
             if read(s, &table.collection, nk)?.is_some() {
-                return Err(SqlError::unique(&table.name, &format!("{}_pkey", table.name)));
+                return Err(SqlError::unique(
+                    &table.name,
+                    &format!("{}_pkey", table.name),
+                ));
             }
             return apply_insert(s, table, nk, new);
         }
@@ -231,7 +331,11 @@ fn apply_update(s: &mut Session, table: &Table, key: &str, version: Option<u64>,
     }
     let mut parents = Vec::new();
     for fk in table.foreign_keys.iter().filter(|_| s.foreign_key_checks()) {
-        if fk.columns.iter().all(|c| crate::datum::group_eq(&old[*c], &new[*c])) {
+        if fk
+            .columns
+            .iter()
+            .all(|c| crate::datum::group_eq(&old[*c], &new[*c]))
+        {
             continue;
         }
         if let Some((coll, pkey)) = fk_parent(s, table, fk, new)? {
@@ -246,23 +350,64 @@ fn apply_update(s: &mut Session, table: &Table, key: &str, version: Option<u64>,
     }
     let doc = table.to_doc(new);
     let txn = s.txn_mut();
-    txn.write(&table.collection, key, observed(version), Some(doc), Tag::Row { table: table.name.clone() });
+    txn.write(
+        &table.collection,
+        key,
+        observed(version),
+        Some(doc),
+        Tag::Row {
+            table: table.name.clone(),
+        },
+    );
     for (old_m, new_m, name) in moves {
         if let Some((m, v)) = old_m {
-            txn.write(UNIQUE, &m, v, None, Tag::Unique { table: table.name.clone(), constraint: name.clone() });
+            txn.write(
+                UNIQUE,
+                &m,
+                v,
+                None,
+                Tag::Unique {
+                    table: table.name.clone(),
+                    constraint: name.clone(),
+                },
+            );
         }
         if let Some(m) = new_m {
-            txn.write(UNIQUE, &m, None, Some(marker_doc(key)), Tag::Unique { table: table.name.clone(), constraint: name });
+            txn.write(
+                UNIQUE,
+                &m,
+                None,
+                Some(marker_doc(key)),
+                Tag::Unique {
+                    table: table.name.clone(),
+                    constraint: name,
+                },
+            );
         }
     }
     for (coll, pkey, name) in parents {
-        txn.check(Write { collection: coll, key: pkey, op: Op::Check, pre: Pre::Exists, tag: Tag::Parent { table: table.name.clone(), constraint: name } });
+        txn.check(Write {
+            collection: coll,
+            key: pkey,
+            op: Op::Check,
+            pre: Pre::Exists,
+            tag: Tag::Parent {
+                table: table.name.clone(),
+                constraint: name,
+            },
+        });
     }
     Ok(())
 }
 
 /// Buffers a deleted row and its markers (no foreign-key work: see `plan_and_apply_delete`).
-fn apply_delete(s: &mut Session, table: &Table, key: &str, version: Option<u64>, old: &Row) -> SqlResult<()> {
+fn apply_delete(
+    s: &mut Session,
+    table: &Table,
+    key: &str,
+    version: Option<u64>,
+    old: &Row,
+) -> SqlResult<()> {
     let mut markers = Vec::new();
     for uk in &table.uniques {
         if let Some(m) = table.unique_marker(uk, old)? {
@@ -271,28 +416,76 @@ fn apply_delete(s: &mut Session, table: &Table, key: &str, version: Option<u64>,
         }
     }
     let txn = s.txn_mut();
-    txn.write(&table.collection, key, observed(version), None, Tag::Row { table: table.name.clone() });
+    txn.write(
+        &table.collection,
+        key,
+        observed(version),
+        None,
+        Tag::Row {
+            table: table.name.clone(),
+        },
+    );
     for (m, v, name) in markers {
-        txn.write(UNIQUE, &m, v, None, Tag::Unique { table: table.name.clone(), constraint: name });
+        txn.write(
+            UNIQUE,
+            &m,
+            v,
+            None,
+            Tag::Unique {
+                table: table.name.clone(),
+                constraint: name,
+            },
+        );
     }
     Ok(())
 }
 
 enum Action {
-    Delete { table: Arc<Table>, key: String, version: Option<u64>, row: Row },
-    Update { table: Arc<Table>, key: String, version: Option<u64>, old: Row, new: Row },
+    Delete {
+        table: Arc<Table>,
+        key: String,
+        version: Option<u64>,
+        row: Row,
+    },
+    Update {
+        table: Arc<Table>,
+        key: String,
+        version: Option<u64>,
+        old: Row,
+        new: Row,
+    },
 }
 
 /// Deletes a row and applies the referential actions of the foreign keys that point at it.
-fn plan_and_apply_delete(s: &mut Session, table: &Table, key: &str, version: Option<u64>, old: &Row, key_change: bool) -> SqlResult<()> {
+fn plan_and_apply_delete(
+    s: &mut Session,
+    table: &Table,
+    key: &str,
+    version: Option<u64>,
+    old: &Row,
+    key_change: bool,
+) -> SqlResult<()> {
     let mut plan = Vec::new();
     let mut seen = HashSet::new();
     let me = s.engine.table(&table.name)?;
-    plan_delete(s, &me, key, version, old, &mut plan, &mut seen, 0, key_change)?;
+    plan_delete(
+        s, &me, key, version, old, &mut plan, &mut seen, 0, key_change,
+    )?;
     for a in plan {
         match a {
-            Action::Delete { table, key, version, row } => apply_delete(s, &table, &key, version, &row)?,
-            Action::Update { table, key, version, old, new } => apply_update(s, &table, &key, version, &old, &new)?,
+            Action::Delete {
+                table,
+                key,
+                version,
+                row,
+            } => apply_delete(s, &table, &key, version, &row)?,
+            Action::Update {
+                table,
+                key,
+                version,
+                old,
+                new,
+            } => apply_update(s, &table, &key, version, &old, &new)?,
         }
     }
     Ok(())
@@ -311,17 +504,28 @@ fn plan_delete(
     key_change: bool,
 ) -> SqlResult<()> {
     if depth > 32 {
-        return Err(SqlError::new("54001", "foreign key cascades are nested too deeply"));
+        return Err(SqlError::new(
+            "54001",
+            "foreign key cascades are nested too deeply",
+        ));
     }
     if !seen.insert((table.collection.clone(), key.to_owned())) {
         return Ok(());
     }
-    plan.push(Action::Delete { table: Arc::clone(table), key: key.to_owned(), version, row: old.clone() });
+    plan.push(Action::Delete {
+        table: Arc::clone(table),
+        key: key.to_owned(),
+        version,
+        row: old.clone(),
+    });
     for (child, fk) in s.engine.catalog.referencing(&table.name) {
         let ref_cols: Vec<usize> = if fk.ref_columns.is_empty() {
             table.primary_key.clone()
         } else {
-            fk.ref_columns.iter().filter_map(|c| table.column_index(c)).collect()
+            fk.ref_columns
+                .iter()
+                .filter_map(|c| table.column_index(c))
+                .collect()
         };
         if ref_cols.len() != fk.columns.len() || ref_cols.iter().any(|i| old[*i].is_null()) {
             continue;
@@ -331,7 +535,13 @@ fn plan_delete(
             .columns
             .iter()
             .zip(&ref_cols)
-            .map(|(c, p)| Expr::binary(BinaryOp::Eq, Expr::Column(vec![child.name.clone(), child.columns[*c].name.clone()]), literal(&old[*p])))
+            .map(|(c, p)| {
+                Expr::binary(
+                    BinaryOp::Eq,
+                    Expr::Column(vec![child.name.clone(), child.columns[*c].name.clone()]),
+                    literal(&old[*p]),
+                )
+            })
             .reduce(|a, b| Expr::binary(BinaryOp::And, a, b));
         let Some(cond) = cond else { continue };
         let ex = Exec::new(s, &[]);
@@ -339,7 +549,9 @@ fn plan_delete(
         let cols = table_cols(&child);
         let mut kids = Vec::new();
         for tr in ex.scan_rows(&child, Some(&child.name), &conjs, Vec::new(), None)? {
-            if ex.eval_bool(&cond, &Env::new(&cols, &tr.row))? && !seen.contains(&(child.collection.clone(), tr.key.clone())) {
+            if ex.eval_bool(&cond, &Env::new(&cols, &tr.row))?
+                && !seen.contains(&(child.collection.clone(), tr.key.clone()))
+            {
                 kids.push(tr);
             }
         }
@@ -347,7 +559,11 @@ fn plan_delete(
         if kids.is_empty() {
             continue;
         }
-        let action = if key_change { fk.on_update } else { fk.on_delete };
+        let action = if key_change {
+            fk.on_update
+        } else {
+            fk.on_delete
+        };
         match action {
             RefAction::Cascade if !key_change => {
                 for k in kids {
@@ -411,8 +627,17 @@ pub fn lock_rows(s: &mut Session, table: &Table, keys: &[String], nowait: bool) 
         loop {
             let mut doc = Doc::new();
             doc.insert("owner".into(), Value::Text(owner.clone()));
-            doc.insert("expires".into(), Value::Timestamp(crate::exec::now_ns() + 120 * 1_000_000_000));
-            let w = Write { collection: LOCKS.into(), key: lock_key.clone(), op: Op::Put(doc), pre: Pre::Absent, tag: Tag::Lock };
+            doc.insert(
+                "expires".into(),
+                Value::Timestamp(crate::exec::now_ns() + 120 * 1_000_000_000),
+            );
+            let w = Write {
+                collection: LOCKS.into(),
+                key: lock_key.clone(),
+                op: Op::Put(doc),
+                pre: Pre::Absent,
+                tag: Tag::Lock,
+            };
             match s.engine.store.commit(std::slice::from_ref(&w)) {
                 Ok(_) => {
                     s.txn_mut().locks.push(lock_key.clone());
@@ -427,7 +652,13 @@ pub fn lock_rows(s: &mut Session, table: &Table, keys: &[String], nowait: bool) 
                             break;
                         }
                         if expired {
-                            let del = Write { collection: LOCKS.into(), key: lock_key.clone(), op: Op::Delete, pre: Pre::Version(d.version), tag: Tag::Lock };
+                            let del = Write {
+                                collection: LOCKS.into(),
+                                key: lock_key.clone(),
+                                op: Op::Delete,
+                                pre: Pre::Version(d.version),
+                                tag: Tag::Lock,
+                            };
                             let _ = s.engine.store.commit(std::slice::from_ref(&del));
                             continue;
                         }
@@ -435,7 +666,10 @@ pub fn lock_rows(s: &mut Session, table: &Table, keys: &[String], nowait: bool) 
                         continue;
                     }
                     if nowait || Instant::now() >= deadline {
-                        return Err(SqlError::lock_timeout(&format!("row in relation \"{}\"", table.name)));
+                        return Err(SqlError::lock_timeout(&format!(
+                            "row in relation \"{}\"",
+                            table.name
+                        )));
                     }
                     std::thread::sleep(delay);
                     delay = (delay * 2).min(Duration::from_millis(25));
@@ -450,20 +684,42 @@ pub fn lock_rows(s: &mut Session, table: &Table, keys: &[String], nowait: bool) 
 /// `SELECT ... FOR UPDATE` in a transaction: locks the rows of its single base table first, so
 /// the query then reads their latest values.
 pub fn lock_query_rows(s: &mut Session, q: &Query, params: &[Datum]) -> SqlResult<()> {
-    let SetExpr::Select(sel) = &q.body else { return Ok(()) };
-    let [TableRef::Named { schema: None, name, alias }] = sel.from.as_slice() else { return Ok(()) };
-    let nowait = matches!(q.lock, Some(crate::ast::LockMode::Update { nowait: true, .. }));
-    let Some(table) = s.engine.find_table(name)? else { return Ok(()) };
+    let SetExpr::Select(sel) = &q.body else {
+        return Ok(());
+    };
+    let [TableRef::Named {
+        schema: None,
+        name,
+        alias,
+    }] = sel.from.as_slice()
+    else {
+        return Ok(());
+    };
+    let nowait = matches!(
+        q.lock,
+        Some(crate::ast::LockMode::Update { nowait: true, .. })
+    );
+    let Some(table) = s.engine.find_table(name)? else {
+        return Ok(());
+    };
     let qual = alias.as_ref().map_or(name.clone(), |a| a.name.clone());
     let keys = {
         let ex = Exec::new(s, params);
-        target_rows(&ex, &table, &qual, sel.where_.as_ref())?.into_iter().map(|t| t.key).collect::<Vec<_>>()
+        target_rows(&ex, &table, &qual, sel.where_.as_ref())?
+            .into_iter()
+            .map(|t| t.key)
+            .collect::<Vec<_>>()
     };
     lock_rows(s, &table, &keys, nowait)
 }
 
 /// Rows of `table` matching `where_` (evaluated exactly).
-fn target_rows(ex: &Exec<'_>, table: &Table, qual: &str, where_: Option<&Expr>) -> SqlResult<Vec<TableRow>> {
+fn target_rows(
+    ex: &Exec<'_>,
+    table: &Table,
+    qual: &str,
+    where_: Option<&Expr>,
+) -> SqlResult<Vec<TableRow>> {
     let conjs: Vec<&Expr> = where_.map(conjuncts).unwrap_or_default();
     let mut cols = table_cols(table);
     for c in &mut cols {
@@ -492,21 +748,38 @@ fn returning_cols(table: &Table, qual: &str) -> Vec<ColMeta> {
     cols
 }
 
-fn project_returning(ex: &Exec<'_>, items: &[SelectItem], cols: &[ColMeta], rows: &[Row]) -> SqlResult<Rel> {
+fn project_returning(
+    ex: &Exec<'_>,
+    items: &[SelectItem],
+    cols: &[ColMeta],
+    rows: &[Row],
+) -> SqlResult<Rel> {
     let mut out_cols = Vec::new();
     let mut exprs = Vec::new();
     for it in items {
         match it {
             SelectItem::Wildcard(_) => {
                 for c in cols {
-                    out_cols.push(ColMeta { qual: None, ..c.clone() });
+                    out_cols.push(ColMeta {
+                        qual: None,
+                        ..c.clone()
+                    });
                     exprs.push(Expr::Column(vec![c.name.clone()]));
                 }
             }
             SelectItem::Expr { expr, alias } => {
                 let (ty, table) = ex.static_type(expr, cols);
-                let name = alias.clone().unwrap_or_else(|| expr.column_name().map_or_else(|| "?column?".to_owned(), str::to_owned));
-                out_cols.push(ColMeta { qual: None, name, ty, table, hidden: false });
+                let name = alias.clone().unwrap_or_else(|| {
+                    expr.column_name()
+                        .map_or_else(|| "?column?".to_owned(), str::to_owned)
+                });
+                out_cols.push(ColMeta {
+                    qual: None,
+                    name,
+                    ty,
+                    table,
+                    hidden: false,
+                });
                 exprs.push(expr.clone());
             }
         }
@@ -514,26 +787,46 @@ fn project_returning(ex: &Exec<'_>, items: &[SelectItem], cols: &[ColMeta], rows
     let mut out = Vec::new();
     for r in rows {
         let env = Env::new(cols, r);
-        out.push(exprs.iter().map(|e| ex.eval(e, &env)).collect::<SqlResult<Row>>()?);
+        out.push(
+            exprs
+                .iter()
+                .map(|e| ex.eval(e, &env))
+                .collect::<SqlResult<Row>>()?,
+        );
     }
-    Ok(Rel { cols: out_cols, rows: out })
+    Ok(Rel {
+        cols: out_cols,
+        rows: out,
+    })
 }
 
 /// Fills defaults, generated ids and casts for one inserted row.
-fn build_row(ex: &Exec<'_>, table: &Table, target: &[usize], values: Vec<Option<Datum>>, generated: &mut Option<i64>) -> SqlResult<Row> {
+fn build_row(
+    ex: &Exec<'_>,
+    table: &Table,
+    target: &[usize],
+    values: Vec<Option<Datum>>,
+    generated: &mut Option<i64>,
+) -> SqlResult<Row> {
     let n = table.columns.len();
     let mut row = vec![Datum::Null; n];
     let mut given = vec![false; n];
     for (ti, v) in target.iter().zip(values) {
         if let Some(v) = v {
-            row[*ti] = cast(&v, &table.columns[*ti].ty).map_err(|e| SqlError::new(e.code, format!("{} (column \"{}\")", e.message, table.columns[*ti].name)))?;
+            row[*ti] = cast(&v, &table.columns[*ti].ty).map_err(|e| {
+                SqlError::new(
+                    e.code,
+                    format!("{} (column \"{}\")", e.message, table.columns[*ti].name),
+                )
+            })?;
             given[*ti] = true;
         }
     }
     let mysql = ex.dialect() == Dialect::MySql;
     for (i, c) in table.columns.iter().enumerate() {
         if c.auto_increment {
-            let generate = !given[i] || (row[i].is_null() && mysql) || (mysql && row[i] == Datum::Int(0));
+            let generate =
+                !given[i] || (row[i].is_null() && mysql) || (mysql && row[i] == Datum::Int(0));
             if generate {
                 let id = next_sequence(&ex.s.engine, &auto_sequence(table, i))?;
                 row[i] = cast(&Datum::Int(id), &c.ty)?;
@@ -570,7 +863,10 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
         for c in &ins.columns {
             let i = table.column(c)?;
             if !seen.insert(i) {
-                return Err(SqlError::new("42701", format!("column \"{c}\" specified more than once")));
+                return Err(SqlError::new(
+                    "42701",
+                    format!("column \"{c}\" specified more than once"),
+                ));
             }
             v.push(i);
         }
@@ -594,16 +890,31 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
                             target.len()
                         )));
                     }
-                    out.push(r.iter().map(|e| if *e == Expr::Default { Ok(None) } else { ex.eval_const(e).map(Some) }).collect::<SqlResult<_>>()?);
+                    out.push(
+                        r.iter()
+                            .map(|e| {
+                                if *e == Expr::Default {
+                                    Ok(None)
+                                } else {
+                                    ex.eval_const(e).map(Some)
+                                }
+                            })
+                            .collect::<SqlResult<_>>()?,
+                    );
                 }
                 out
             }
             InsertSource::Query(q) => {
                 let rel = ex.query(q, None)?;
                 if !rel.rows.is_empty() && rel.cols.len() != target.len() {
-                    return Err(SqlError::syntax("INSERT has more target columns than expressions".into()));
+                    return Err(SqlError::syntax(
+                        "INSERT has more target columns than expressions".into(),
+                    ));
                 }
-                rel.rows.into_iter().map(|r| r.into_iter().map(Some).collect()).collect()
+                rel.rows
+                    .into_iter()
+                    .map(|r| r.into_iter().map(Some).collect())
+                    .collect()
             }
         };
         for vals in source {
@@ -623,13 +934,22 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
         // Find a conflicting row: same primary key or same value of a unique key.
         let mut conflict: Option<(String, Option<u64>, Row, String)> = None;
         if let Some((v, d)) = read(s, &table.collection, &key)? {
-            conflict = Some((key.clone(), v, table.from_doc(&d), format!("{}_pkey", table.name)));
+            conflict = Some((
+                key.clone(),
+                v,
+                table.from_doc(&d),
+                format!("{}_pkey", table.name),
+            ));
         }
         if conflict.is_none() {
             for uk in &table.uniques {
                 if let Some(m) = table.unique_marker(uk, &row)? {
                     if let Some((_, md)) = read(s, UNIQUE, &m)? {
-                        let rk = md.get("row").and_then(Value::as_str).unwrap_or_default().to_owned();
+                        let rk = md
+                            .get("row")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
                         if let Some((v, d)) = read(s, &table.collection, &rk)? {
                             conflict = Some((rk, v, table.from_doc(&d), uk.name.clone()));
                             break;
@@ -649,8 +969,14 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
                 returned.push(row);
             }
             Some((ckey, cver, existing, constraint)) => {
-                if statement_keys.contains(&ckey) && matches!(ins.on_conflict, Some(OnConflict::DoUpdate { .. })) && s.dialect != Dialect::MySql {
-                    return Err(SqlError::new("21000", "ON CONFLICT DO UPDATE command cannot affect row a second time"));
+                if statement_keys.contains(&ckey)
+                    && matches!(ins.on_conflict, Some(OnConflict::DoUpdate { .. }))
+                    && s.dialect != Dialect::MySql
+                {
+                    return Err(SqlError::new(
+                        "21000",
+                        "ON CONFLICT DO UPDATE command cannot affect row a second time",
+                    ));
                 }
                 match &ins.on_conflict {
                     Some(OnConflict::DoNothing { .. }) => {}
@@ -659,12 +985,20 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
                         let mut cols = returning_cols(&table, &table.name);
                         let mut env_row = existing.clone();
                         for c in table_cols(&table) {
-                            cols.push(ColMeta { qual: Some("excluded".into()), hidden: true, ..c.clone() });
+                            cols.push(ColMeta {
+                                qual: Some("excluded".into()),
+                                hidden: true,
+                                ..c.clone()
+                            });
                         }
                         env_row.extend(row.iter().cloned());
                         if let Some(a) = &ins.alias {
                             for c in table_cols(&table) {
-                                cols.push(ColMeta { qual: Some(a.clone()), hidden: true, ..c });
+                                cols.push(ColMeta {
+                                    qual: Some(a.clone()),
+                                    hidden: true,
+                                    ..c
+                                });
                             }
                             env_row.extend(row.iter().cloned());
                         }
@@ -695,7 +1029,15 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
                         let changed = new != existing;
                         apply_update(s, &table, &ckey, cver, &existing, &new)?;
                         // MySQL reports 2 for an updated row, 0 when nothing changed.
-                        affected += if s.dialect == Dialect::MySql { if changed { 2 } else { 0 } } else { 1 };
+                        affected += if s.dialect == Dialect::MySql {
+                            if changed {
+                                2
+                            } else {
+                                0
+                            }
+                        } else {
+                            1
+                        };
                         returned.push(new);
                     }
                     None if ins.replace => {
@@ -704,7 +1046,11 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
                         for uk in &table.uniques {
                             if let Some(m) = table.unique_marker(uk, &row)? {
                                 if let Some((_, md)) = read(s, UNIQUE, &m)? {
-                                    let rk = md.get("row").and_then(Value::as_str).unwrap_or_default().to_owned();
+                                    let rk = md
+                                        .get("row")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned();
                                     if let Some((v, d)) = read(s, &table.collection, &rk)? {
                                         let r = table.from_doc(&d);
                                         plan_and_apply_delete(s, &table, &rk, v, &r, false)?;
@@ -728,41 +1074,75 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
     }
     if !ins.returning.is_empty() {
         let ex = Exec::new(s, params);
-        let rel = project_returning(&ex, &ins.returning, &returning_cols(&table, &qual), &returned)?;
+        let rel = project_returning(
+            &ex,
+            &ins.returning,
+            &returning_cols(&table, &qual),
+            &returned,
+        )?;
         let rs = ex.result_set(rel)?;
         return Ok(Outcome::Rows(rs));
     }
-    Ok(Outcome::Command { tag: format!("INSERT 0 {affected}"), affected, last_insert_id: first_generated })
+    Ok(Outcome::Command {
+        tag: format!("INSERT 0 {affected}"),
+        affected,
+        last_insert_id: first_generated,
+    })
 }
 
 // ── UPDATE ──
 
 /// Autocommit `UPDATE t SET n = n + 1 WHERE pk = ...`: one server-side atomic patch, no read and
 /// no retry loop. Returns `None` when the statement does not have that shape.
-fn try_atomic_update(s: &mut Session, upd: &Update, table: &Table, params: &[Datum]) -> SqlResult<Option<Outcome>> {
-    if s.in_transaction() || !upd.from.is_empty() || !upd.returning.is_empty() || !upd.order_by.is_empty() || upd.limit.is_some() {
+fn try_atomic_update(
+    s: &mut Session,
+    upd: &Update,
+    table: &Table,
+    params: &[Datum],
+) -> SqlResult<Option<Outcome>> {
+    if s.in_transaction()
+        || !upd.from.is_empty()
+        || !upd.returning.is_empty()
+        || !upd.order_by.is_empty()
+        || upd.limit.is_some()
+    {
         return Ok(None);
     }
     if table.primary_key.is_empty() {
         return Ok(None);
     }
-    let Some(w) = &upd.where_ else { return Ok(None) };
+    let Some(w) = &upd.where_ else {
+        return Ok(None);
+    };
     let qual = upd.alias.as_deref().unwrap_or(&table.name);
     let ex = Exec::new(s, params);
     // WHERE must be exactly `pk1 = const AND pk2 = const ...`.
     let mut pk_vals: Vec<Option<Datum>> = vec![None; table.primary_key.len()];
     for c in conjuncts(w) {
-        let Expr::Binary { op: BinaryOp::Eq, left, right } = c else { return Ok(None) };
+        let Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } = c
+        else {
+            return Ok(None);
+        };
         let (col, val) = match (column_of(table, qual, left), column_of(table, qual, right)) {
             (Some(ci), None) => (ci, right),
             (None, Some(ci)) => (ci, left),
             _ => return Ok(None),
         };
-        let Some(slot) = table.primary_key.iter().position(|p| *p == col) else { return Ok(None) };
-        let Ok(v) = ex.eval_const(val) else { return Ok(None) };
+        let Some(slot) = table.primary_key.iter().position(|p| *p == col) else {
+            return Ok(None);
+        };
+        let Ok(v) = ex.eval_const(val) else {
+            return Ok(None);
+        };
         pk_vals[slot] = Some(cast(&v, &table.columns[col].ty)?);
     }
-    let Some(pk) = pk_vals.into_iter().collect::<Option<Vec<Datum>>>() else { return Ok(None) };
+    let Some(pk) = pk_vals.into_iter().collect::<Option<Vec<Datum>>>() else {
+        return Ok(None);
+    };
     let constrained: HashSet<usize> = table
         .primary_key
         .iter()
@@ -778,28 +1158,51 @@ fn try_atomic_update(s: &mut Session, upd: &Update, table: &Table, params: &[Dat
             return Ok(None);
         }
         let col = &table.columns[ci];
-        let numeric = matches!(col.ty, DataType::SmallInt | DataType::Int | DataType::BigInt | DataType::Numeric(_));
+        let numeric = matches!(
+            col.ty,
+            DataType::SmallInt | DataType::Int | DataType::BigInt | DataType::Numeric(_)
+        );
         match e {
-            Expr::Binary { op: op @ (BinaryOp::Add | BinaryOp::Sub), left, right } if numeric && column_of(table, qual, left) == Some(ci) => {
+            Expr::Binary {
+                op: op @ (BinaryOp::Add | BinaryOp::Sub),
+                left,
+                right,
+            } if numeric && column_of(table, qual, left) == Some(ci) => {
                 if column_refs_any(right) {
                     return Ok(None);
                 }
-                let Ok(amount) = ex.eval_const(right) else { return Ok(None) };
+                let Ok(amount) = ex.eval_const(right) else {
+                    return Ok(None);
+                };
                 let amount = match (&col.ty, amount) {
                     (_, Datum::Null) => return Ok(None),
                     (DataType::Numeric(spec), v) => {
-                        let Ok(Datum::Numeric(d)) = cast(&v, &DataType::Numeric(None)) else { return Ok(None) };
+                        let Ok(Datum::Numeric(d)) = cast(&v, &DataType::Numeric(None)) else {
+                            return Ok(None);
+                        };
                         if spec.is_some_and(|(_, sc)| d.scale() > sc) {
                             return Ok(None);
                         }
-                        Datum::Numeric(if *op == BinaryOp::Sub { d.checked_neg().map_err(|_| SqlError::numeric_out_of_range("out of range"))? } else { d })
+                        Datum::Numeric(if *op == BinaryOp::Sub {
+                            d.checked_neg()
+                                .map_err(|_| SqlError::numeric_out_of_range("out of range"))?
+                        } else {
+                            d
+                        })
                     }
                     (_, v) => {
                         let Ok(i) = v.as_i64() else { return Ok(None) };
-                        if matches!(v, Datum::Float(_) | Datum::Numeric(_)) && cast(&v, &DataType::BigInt).ok() != Some(Datum::Int(i)) {
+                        if matches!(v, Datum::Float(_) | Datum::Numeric(_))
+                            && cast(&v, &DataType::BigInt).ok() != Some(Datum::Int(i))
+                        {
                             return Ok(None);
                         }
-                        Datum::Int(if *op == BinaryOp::Sub { i.checked_neg().ok_or_else(|| SqlError::numeric_out_of_range("out of range"))? } else { i })
+                        Datum::Int(if *op == BinaryOp::Sub {
+                            i.checked_neg()
+                                .ok_or_else(|| SqlError::numeric_out_of_range("out of range"))?
+                        } else {
+                            i
+                        })
                     }
                 };
                 let mut op_ = storine::add(&col.field, crate::datum::to_value(&amount, &col.ty));
@@ -836,10 +1239,26 @@ fn try_atomic_update(s: &mut Session, upd: &Update, table: &Table, params: &[Dat
     drop(ex);
     let parts: Vec<&Datum> = pk.iter().collect();
     let key = encode_key(&parts)?;
-    let w = Write { collection: table.collection.clone(), key, op: Op::Patch(ops), pre: Pre::None, tag: Tag::Row { table: table.name.clone() } };
+    let w = Write {
+        collection: table.collection.clone(),
+        key,
+        op: Op::Patch(ops),
+        pre: Pre::None,
+        tag: Tag::Row {
+            table: table.name.clone(),
+        },
+    };
     match s.engine.store.commit(std::slice::from_ref(&w)) {
-        Ok(_) => Ok(Some(Outcome::Command { tag: "UPDATE 1".into(), affected: 1, last_insert_id: None })),
-        Err(CommitError::Missing { .. }) => Ok(Some(Outcome::Command { tag: "UPDATE 0".into(), affected: 0, last_insert_id: None })),
+        Ok(_) => Ok(Some(Outcome::Command {
+            tag: "UPDATE 1".into(),
+            affected: 1,
+            last_insert_id: None,
+        })),
+        Err(CommitError::Missing { .. }) => Ok(Some(Outcome::Command {
+            tag: "UPDATE 0".into(),
+            affected: 0,
+            last_insert_id: None,
+        })),
         // Bound violated or a stored value of another type: let the general path decide.
         Err(CommitError::Other(e)) if e.code == "22023" => Ok(None),
         Err(e) => Err(e.to_sql(std::slice::from_ref(&w))),
@@ -849,8 +1268,14 @@ fn try_atomic_update(s: &mut Session, upd: &Update, table: &Table, params: &[Dat
 /// Storage bounds that keep an integer / decimal column inside its declared range.
 fn type_bounds(ty: &DataType) -> (Option<Value>, Option<Value>) {
     match ty {
-        DataType::SmallInt => (Some(Value::Int(i64::from(i16::MIN))), Some(Value::Int(i64::from(i16::MAX)))),
-        DataType::Int => (Some(Value::Int(i64::from(i32::MIN))), Some(Value::Int(i64::from(i32::MAX)))),
+        DataType::SmallInt => (
+            Some(Value::Int(i64::from(i16::MIN))),
+            Some(Value::Int(i64::from(i16::MAX))),
+        ),
+        DataType::Int => (
+            Some(Value::Int(i64::from(i32::MIN))),
+            Some(Value::Int(i64::from(i32::MAX))),
+        ),
         DataType::Numeric(Some((p, s))) if *p > *s && *p <= 38 => {
             let digits = u32::from(*p);
             let m = 10i128.pow(digits.min(38)) - 1;
@@ -865,7 +1290,10 @@ fn type_bounds(ty: &DataType) -> (Option<Value>, Option<Value>) {
 
 fn column_of(table: &Table, qual: &str, e: &Expr) -> Option<usize> {
     let Expr::Column(p) = e else { return None };
-    if p.len() > 1 && !p[p.len() - 2].eq_ignore_ascii_case(qual) && !p[p.len() - 2].eq_ignore_ascii_case(&table.name) {
+    if p.len() > 1
+        && !p[p.len() - 2].eq_ignore_ascii_case(qual)
+        && !p[p.len() - 2].eq_ignore_ascii_case(&table.name)
+    {
         return None;
     }
     table.column_index(&p[p.len() - 1])
@@ -874,7 +1302,10 @@ fn column_of(table: &Table, qual: &str, e: &Expr) -> Option<usize> {
 fn column_refs_any(e: &Expr) -> bool {
     let mut found = false;
     crate::exec::eval::walk(e, &mut |x| {
-        if matches!(x, Expr::Column(_) | Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. }) {
+        if matches!(
+            x,
+            Expr::Column(_) | Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. }
+        ) {
             found = true;
         }
     });
@@ -885,7 +1316,13 @@ fn column_refs_any(e: &Expr) -> bool {
 /// Target rows with the joined FROM / USING row (empty without one).
 type Targets = (Vec<ColMeta>, Vec<(TableRow, Row)>);
 
-fn dml_targets(ex: &Exec<'_>, table: &Table, qual: &str, from: &[TableRef], where_: Option<&Expr>) -> SqlResult<Targets> {
+fn dml_targets(
+    ex: &Exec<'_>,
+    table: &Table,
+    qual: &str,
+    from: &[TableRef],
+    where_: Option<&Expr>,
+) -> SqlResult<Targets> {
     let mut cols = table_cols(table);
     for c in &mut cols {
         c.qual = Some(qual.to_owned());
@@ -916,14 +1353,23 @@ fn dml_targets(ex: &Exec<'_>, table: &Table, qual: &str, from: &[TableRef], wher
     Ok((all, out))
 }
 
-fn order_and_limit(ex: &Exec<'_>, cols: &[ColMeta], targets: &mut Vec<(TableRow, Row)>, order_by: &[crate::ast::OrderBy], limit: Option<&Expr>) -> SqlResult<()> {
+fn order_and_limit(
+    ex: &Exec<'_>,
+    cols: &[ColMeta],
+    targets: &mut Vec<(TableRow, Row)>,
+    order_by: &[crate::ast::OrderBy],
+    limit: Option<&Expr>,
+) -> SqlResult<()> {
     if !order_by.is_empty() {
         let mut keyed = Vec::new();
         for t in targets.drain(..) {
             let mut row = t.0.row.clone();
             row.extend(t.1.iter().cloned());
             let env = Env::new(cols, &row);
-            let k = order_by.iter().map(|o| ex.eval(&o.expr, &env)).collect::<SqlResult<Vec<_>>>()?;
+            let k = order_by
+                .iter()
+                .map(|o| ex.eval(&o.expr, &env))
+                .collect::<SqlResult<Vec<_>>>()?;
             keyed.push((k, t));
         }
         keyed.sort_by(|a, b| {
@@ -981,7 +1427,12 @@ pub fn update(s: &mut Session, upd: &Update, params: &[Datum]) -> SqlResult<Outc
                 } else {
                     ex.eval(e, &env)?
                 };
-                new[i] = cast(&v, &table.columns[i].ty).map_err(|e| SqlError::new(e.code, format!("{} (column \"{}\")", e.message, table.columns[i].name)))?;
+                new[i] = cast(&v, &table.columns[i].ty).map_err(|e| {
+                    SqlError::new(
+                        e.code,
+                        format!("{} (column \"{}\")", e.message, table.columns[i].name),
+                    )
+                })?;
             }
             check_row(&ex, &table, &new)?;
             changes.push((t, new));
@@ -1000,12 +1451,25 @@ pub fn update(s: &mut Session, upd: &Update, params: &[Datum]) -> SqlResult<Outc
     }
     if !upd.returning.is_empty() {
         let ex = Exec::new(s, params);
-        let rel = project_returning(&ex, &upd.returning, &returning_cols(&table, &qual), &returned)?;
+        let rel = project_returning(
+            &ex,
+            &upd.returning,
+            &returning_cols(&table, &qual),
+            &returned,
+        )?;
         return Ok(Outcome::Rows(ex.result_set(rel)?));
     }
     // MySQL reports changed rows (matched rows with CLIENT_FOUND_ROWS: see the tag).
-    let affected = if s.dialect == Dialect::MySql { changed } else { matched };
-    Ok(Outcome::Command { tag: format!("UPDATE {matched}"), affected, last_insert_id: None })
+    let affected = if s.dialect == Dialect::MySql {
+        changed
+    } else {
+        matched
+    };
+    Ok(Outcome::Command {
+        tag: format!("UPDATE {matched}"),
+        affected,
+        last_insert_id: None,
+    })
 }
 
 // ── DELETE ──
@@ -1027,7 +1491,8 @@ pub fn delete(s: &mut Session, del: &Delete, params: &[Datum]) -> SqlResult<Outc
         order_and_limit(&ex, &cols, &mut targets, &del.order_by, del.limit.as_ref())?;
         targets
     };
-    let referenced = s.foreign_key_checks() && !s.engine.catalog.referencing(&table.name).is_empty();
+    let referenced =
+        s.foreign_key_checks() && !s.engine.catalog.referencing(&table.name).is_empty();
     let mut returned = Vec::new();
     let n = targets.len() as u64;
     for (t, _) in targets {
@@ -1040,15 +1505,144 @@ pub fn delete(s: &mut Session, del: &Delete, params: &[Datum]) -> SqlResult<Outc
     }
     if !del.returning.is_empty() {
         let ex = Exec::new(s, params);
-        let rel = project_returning(&ex, &del.returning, &returning_cols(&table, &qual), &returned)?;
+        let rel = project_returning(
+            &ex,
+            &del.returning,
+            &returning_cols(&table, &qual),
+            &returned,
+        )?;
         return Ok(Outcome::Rows(ex.result_set(rel)?));
     }
-    Ok(Outcome::Command { tag: format!("DELETE {n}"), affected: n, last_insert_id: None })
+    Ok(Outcome::Command {
+        tag: format!("DELETE {n}"),
+        affected: n,
+        last_insert_id: None,
+    })
 }
 
-pub fn describe_returning(s: &Session, table: &str, items: &[SelectItem]) -> SqlResult<Vec<crate::exec::OutCol>> {
+pub fn describe_returning(
+    s: &Session,
+    table: &str,
+    items: &[SelectItem],
+) -> SqlResult<Vec<crate::exec::OutCol>> {
     let t = s.engine.table(table)?;
     let ex = Exec::new(s, &[]);
     let rel = project_returning(&ex, items, &returning_cols(&t, &t.name), &[])?;
     Ok(ex.result_set(rel)?.columns)
+}
+
+fn sequence_key(name: &str) -> String {
+    let bare = name.rsplit('.').next().unwrap_or(name).trim_matches('"');
+    format!("seq:{bare}")
+}
+
+/// The stored sequence behind `name`: a `CREATE SEQUENCE` one, or the implicit
+/// `<table>_<column>_seq` of a SERIAL / AUTO_INCREMENT column.
+fn resolve_sequence(engine: &Engine, name: &str) -> SqlResult<String> {
+    let key = sequence_key(name);
+    if engine.store.get(SEQUENCES, &key)?.is_some() {
+        return Ok(key);
+    }
+    let bare = &key["seq:".len()..];
+    if let Some(stem) = bare.strip_suffix("_seq") {
+        for (i, _) in stem.match_indices('_') {
+            if let Ok(t) = engine.table(&stem[..i]) {
+                if let Some(c) = t
+                    .columns
+                    .iter()
+                    .position(|c| c.auto_increment && c.name.eq_ignore_ascii_case(&stem[i + 1..]))
+                {
+                    return Ok(auto_sequence(&t, c));
+                }
+            }
+        }
+    }
+    Err(SqlError::new(
+        "42P01",
+        format!("relation \"{bare}\" does not exist"),
+    ))
+}
+
+pub fn create_sequence(
+    s: &mut Session,
+    name: &str,
+    start: i64,
+    increment: i64,
+    if_not_exists: bool,
+) -> SqlResult<Outcome> {
+    let mut doc = Doc::new();
+    doc.insert("next".into(), Value::Int(start));
+    doc.insert("increment".into(), Value::Int(increment));
+    let w = Write {
+        collection: SEQUENCES.into(),
+        key: sequence_key(name),
+        op: Op::Put(doc),
+        pre: Pre::Absent,
+        tag: Tag::Internal,
+    };
+    match s.engine.store.commit(std::slice::from_ref(&w)) {
+        Ok(_) => Ok(Outcome::command("CREATE SEQUENCE")),
+        Err(CommitError::Condition { .. }) if if_not_exists => {
+            Ok(Outcome::command("CREATE SEQUENCE"))
+        }
+        Err(CommitError::Condition { .. }) => Err(SqlError::new(
+            "42P07",
+            format!("relation \"{name}\" already exists"),
+        )),
+        Err(e) => Err(e.to_sql(std::slice::from_ref(&w))),
+    }
+}
+
+pub fn drop_sequences(s: &mut Session, names: &[String], if_exists: bool) -> SqlResult<Outcome> {
+    for n in names {
+        let key = sequence_key(n);
+        if s.engine.store.get(SEQUENCES, &key)?.is_none() {
+            if if_exists {
+                continue;
+            }
+            return Err(SqlError::undefined_table(n));
+        }
+        let w = Write {
+            collection: SEQUENCES.into(),
+            key,
+            op: Op::Delete,
+            pre: Pre::None,
+            tag: Tag::Internal,
+        };
+        s.engine
+            .store
+            .commit(std::slice::from_ref(&w))
+            .map_err(|e| e.to_sql(std::slice::from_ref(&w)))?;
+    }
+    Ok(Outcome::command("DROP SEQUENCE"))
+}
+
+/// `nextval('name')`.
+pub fn nextval(engine: &Engine, name: &str) -> SqlResult<i64> {
+    next_sequence(engine, &resolve_sequence(engine, name)?)
+}
+
+/// `setval('name', v)`: the next value becomes `v + increment`.
+pub fn setval(engine: &Engine, name: &str, v: i64) -> SqlResult<()> {
+    let key = resolve_sequence(engine, name)?;
+    let step = engine
+        .store
+        .get(SEQUENCES, &key)?
+        .and_then(|d| d.fields.get("increment").and_then(Value::as_i64))
+        .unwrap_or(1);
+    let mut doc = Doc::new();
+    doc.insert("next".into(), Value::Int(v.saturating_add(step)));
+    doc.insert("increment".into(), Value::Int(step));
+    let w = Write {
+        collection: SEQUENCES.into(),
+        key,
+        op: Op::Put(doc),
+        pre: Pre::None,
+        tag: Tag::Internal,
+    };
+    engine
+        .store
+        .commit(std::slice::from_ref(&w))
+        .map_err(|e| e.to_sql(std::slice::from_ref(&w)))?;
+    Ok(())
 }

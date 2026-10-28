@@ -130,11 +130,22 @@ pub fn table_oid(name: &str) -> i64 {
 }
 
 fn object_oid(kind: &str, table: &str, name: &str) -> i64 {
-    100_000_000 + i64::from(fnv(&format!("{kind}:{}:{}", table.to_ascii_lowercase(), name.to_ascii_lowercase())) % 1_000_000_000)
+    100_000_000
+        + i64::from(
+            fnv(&format!(
+                "{kind}:{}:{}",
+                table.to_ascii_lowercase(),
+                name.to_ascii_lowercase()
+            )) % 1_000_000_000,
+        )
 }
 
 fn table_by_oid(ex: &Exec<'_>, oid: i64) -> Option<std::sync::Arc<Table>> {
-    ex.s.engine.catalog.all().into_iter().find(|t| table_oid(&t.name) == oid)
+    ex.s.engine
+        .catalog
+        .all()
+        .into_iter()
+        .find(|t| table_oid(&t.name) == oid)
 }
 
 /// True for names that address a system catalog.
@@ -156,7 +167,13 @@ struct Builder {
 
 impl Builder {
     fn new(spec: &[(&str, DataType)]) -> Builder {
-        Builder { cols: spec.iter().map(|(n, t)| ColMeta::new(*n, Some(t.clone()))).collect(), rows: Vec::new() }
+        Builder {
+            cols: spec
+                .iter()
+                .map(|(n, t)| ColMeta::new(*n, Some(t.clone())))
+                .collect(),
+            rows: Vec::new(),
+        }
     }
 
     fn row(&mut self, r: Vec<Datum>) {
@@ -164,7 +181,10 @@ impl Builder {
     }
 
     fn done(self) -> Rel {
-        Rel { cols: self.cols, rows: self.rows }
+        Rel {
+            cols: self.cols,
+            rows: self.rows,
+        }
     }
 }
 
@@ -185,7 +205,11 @@ const N: Datum = Datum::Null;
 use DataType::{BigInt as I8, Bool as B, Int as I4, Name as NM, SmallInt as I2, Text as T};
 
 fn int2vector(cols: &[usize]) -> Datum {
-    t(cols.iter().map(|c| (c + 1).to_string()).collect::<Vec<_>>().join(" "))
+    t(cols
+        .iter()
+        .map(|c| (c + 1).to_string())
+        .collect::<Vec<_>>()
+        .join(" "))
 }
 
 fn int_array(cols: &[usize]) -> Datum {
@@ -203,17 +227,38 @@ pub fn table(ex: &Exec<'_>, schema: Option<&str>, name: &str) -> SqlResult<Optio
     let tables = ex.s.engine.catalog.all();
     let mysql = ex.dialect() == Dialect::MySql;
     let db = ex.s.database.clone();
-    let schema_name = if mysql { db.clone() } else { "public".to_owned() };
+    let schema_name = if mysql {
+        db.clone()
+    } else {
+        "public".to_owned()
+    };
     let rel = match (sch.as_deref(), n.as_str()) {
-        (None, "dual") => Rel { cols: Vec::new(), rows: vec![Vec::new()] },
+        (None, "dual") => Rel {
+            cols: Vec::new(),
+            rows: vec![Vec::new()],
+        },
         (None, "sqlite_master" | "sqlite_schema") => {
-            let mut bd = Builder::new(&[("type", T), ("name", T), ("tbl_name", T), ("rootpage", I8), ("sql", T)]);
+            let mut bd = Builder::new(&[
+                ("type", T),
+                ("name", T),
+                ("tbl_name", T),
+                ("rootpage", I8),
+                ("sql", T),
+            ]);
             for tb in &tables {
-                bd.row(vec![t("table"), t(&tb.name), t(&tb.name), i(0), t(create_table_sql(tb, Dialect::Sqlite))]);
+                bd.row(vec![
+                    t("table"),
+                    t(&tb.name),
+                    t(&tb.name),
+                    i(0),
+                    t(create_table_sql(tb, Dialect::Sqlite)),
+                ]);
             }
             bd.done()
         }
-        (Some("information_schema"), _) => information_schema(ex, &n, &tables, &schema_name, mysql)?,
+        (Some("information_schema"), _) => {
+            information_schema(ex, &n, &tables, &schema_name, mysql)?
+        }
         (Some("mysql" | "performance_schema" | "sys"), _) => Rel::default(),
         _ => pg_catalog(ex, &n, &tables)?,
     };
@@ -224,8 +269,17 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
     let user = ex.s.user.clone();
     Ok(match n {
         "pg_namespace" => {
-            let mut bd = Builder::new(&[("oid", I8), ("nspname", NM), ("nspowner", I8), ("nspacl", T)]);
-            for (oid, name) in [(NS_PG_CATALOG, "pg_catalog"), (NS_PUBLIC, "public"), (NS_INFORMATION_SCHEMA, "information_schema")] {
+            let mut bd = Builder::new(&[
+                ("oid", I8),
+                ("nspname", NM),
+                ("nspowner", I8),
+                ("nspacl", T),
+            ]);
+            for (oid, name) in [
+                (NS_PG_CATALOG, "pg_catalog"),
+                (NS_PUBLIC, "public"),
+                (NS_INFORMATION_SCHEMA, "information_schema"),
+            ] {
                 bd.row(vec![i(oid), t(name), i(10), N]);
             }
             bd.done()
@@ -265,18 +319,73 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
             ]);
             for tb in tables {
                 let oid = table_oid(&tb.name);
-                let has_index = !tb.primary_key.is_empty() || !tb.uniques.is_empty() || !tb.indexes.is_empty();
+                let has_index =
+                    !tb.primary_key.is_empty() || !tb.uniques.is_empty() || !tb.indexes.is_empty();
                 bd.row(vec![
-                    i(oid), t(&tb.name), i(NS_PUBLIC), i(oid + 1), i(0), i(10), i(2), i(oid), i(0), i(1), Datum::Float(-1.0), i(0), i(0),
-                    b(has_index), b(false), t("p"), t("r"), i(tb.columns.len() as i64), i(tb.checks.len() as i64), b(false), b(false),
-                    b(false), b(false), b(false), b(true), t("d"), b(false), N, N, N,
+                    i(oid),
+                    t(&tb.name),
+                    i(NS_PUBLIC),
+                    i(oid + 1),
+                    i(0),
+                    i(10),
+                    i(2),
+                    i(oid),
+                    i(0),
+                    i(1),
+                    Datum::Float(-1.0),
+                    i(0),
+                    i(0),
+                    b(has_index),
+                    b(false),
+                    t("p"),
+                    t("r"),
+                    i(tb.columns.len() as i64),
+                    i(tb.checks.len() as i64),
+                    b(false),
+                    b(false),
+                    b(false),
+                    b(false),
+                    b(false),
+                    b(true),
+                    t("d"),
+                    b(false),
+                    N,
+                    N,
+                    N,
                 ]);
                 for (idx_name, cols) in index_list(tb) {
                     let ioid = object_oid("i", &tb.name, &idx_name);
                     bd.row(vec![
-                        i(ioid), t(idx_name), i(NS_PUBLIC), i(0), i(0), i(10), i(403), i(ioid), i(0), i(1), Datum::Float(0.0), i(0), i(0),
-                        b(false), b(false), t("p"), t("i"), i(cols.len() as i64), i(0), b(false), b(false), b(false), b(false), b(false),
-                        b(true), t("n"), b(false), N, N, N,
+                        i(ioid),
+                        t(idx_name),
+                        i(NS_PUBLIC),
+                        i(0),
+                        i(0),
+                        i(10),
+                        i(403),
+                        i(ioid),
+                        i(0),
+                        i(1),
+                        Datum::Float(0.0),
+                        i(0),
+                        i(0),
+                        b(false),
+                        b(false),
+                        t("p"),
+                        t("i"),
+                        i(cols.len() as i64),
+                        i(0),
+                        b(false),
+                        b(false),
+                        b(false),
+                        b(false),
+                        b(false),
+                        b(true),
+                        t("n"),
+                        b(false),
+                        N,
+                        N,
+                        N,
                     ]);
                 }
             }
@@ -317,7 +426,11 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                         DataType::Bool => 1,
                         DataType::SmallInt => 2,
                         DataType::Int | DataType::Real | DataType::Date => 4,
-                        DataType::BigInt | DataType::Double | DataType::Timestamp | DataType::TimestampTz | DataType::Time => 8,
+                        DataType::BigInt
+                        | DataType::Double
+                        | DataType::Timestamp
+                        | DataType::TimestampTz
+                        | DataType::Time => 8,
                         DataType::Uuid | DataType::Interval => 16,
                         _ => -1,
                     };
@@ -342,7 +455,16 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                         b(false),
                         b(true),
                         i(0),
-                        i(if matches!(c.ty, DataType::Text | DataType::Varchar(_) | DataType::Char(_)) { 100 } else { 0 }),
+                        i(
+                            if matches!(
+                                c.ty,
+                                DataType::Text | DataType::Varchar(_) | DataType::Char(_)
+                            ) {
+                                100
+                            } else {
+                                0
+                            },
+                        ),
                         N,
                         N,
                         N,
@@ -428,9 +550,38 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
             for tb in tables {
                 let oid = table_oid(&tb.name);
                 let mut row = vec![
-                    i(oid + 1), t(&tb.name), i(NS_PUBLIC), i(10), i(-1), b(false), t("c"), t("C"), b(false), b(true), t(","), i(oid),
-                    t("-"), i(0), i(0), t("record_in"), t("record_out"), t("record_recv"), t("record_send"), t("-"), t("-"), t("-"),
-                    t("d"), t("x"), b(false), i(0), i(-1), i(0), i(0), N, N, N,
+                    i(oid + 1),
+                    t(&tb.name),
+                    i(NS_PUBLIC),
+                    i(10),
+                    i(-1),
+                    b(false),
+                    t("c"),
+                    t("C"),
+                    b(false),
+                    b(true),
+                    t(","),
+                    i(oid),
+                    t("-"),
+                    i(0),
+                    i(0),
+                    t("record_in"),
+                    t("record_out"),
+                    t("record_recv"),
+                    t("record_send"),
+                    t("-"),
+                    t("-"),
+                    t("-"),
+                    t("d"),
+                    t("x"),
+                    b(false),
+                    i(0),
+                    i(-1),
+                    i(0),
+                    i(0),
+                    N,
+                    N,
+                    N,
                 ];
                 row.truncate(32);
                 bd.row(row);
@@ -466,9 +617,27 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                     let primary = k == 0 && !tb.primary_key.is_empty();
                     let unique = primary || tb.uniques.iter().any(|u| u.name == name);
                     bd.row(vec![
-                        i(object_oid("i", &tb.name, &name)), i(table_oid(&tb.name)), i(cols.len() as i64), i(cols.len() as i64), b(unique),
-                        b(false), b(primary), b(false), b(true), b(false), b(true), b(false), b(true), b(true), b(false),
-                        int2vector(&cols), t("0"), t("0"), t("0"), N, N,
+                        i(object_oid("i", &tb.name, &name)),
+                        i(table_oid(&tb.name)),
+                        i(cols.len() as i64),
+                        i(cols.len() as i64),
+                        b(unique),
+                        b(false),
+                        b(primary),
+                        b(false),
+                        b(true),
+                        b(false),
+                        b(true),
+                        b(false),
+                        b(true),
+                        b(true),
+                        b(false),
+                        int2vector(&cols),
+                        t("0"),
+                        t("0"),
+                        t("0"),
+                        N,
+                        N,
                     ]);
                 }
             }
@@ -512,35 +681,112 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 if !tb.primary_key.is_empty() {
                     let name = format!("{}_pkey", tb.name);
                     bd.row(vec![
-                        i(object_oid("c", &tb.name, &name)), t(&name), i(NS_PUBLIC), t("p"), b(false), b(false), b(true), i(toid), i(0),
-                        i(object_oid("i", &tb.name, &name)), i(0), i(0), t(" "), t(" "), t(" "), b(true), i(0), b(true),
-                        int_array(&tb.primary_key), N, N,
+                        i(object_oid("c", &tb.name, &name)),
+                        t(&name),
+                        i(NS_PUBLIC),
+                        t("p"),
+                        b(false),
+                        b(false),
+                        b(true),
+                        i(toid),
+                        i(0),
+                        i(object_oid("i", &tb.name, &name)),
+                        i(0),
+                        i(0),
+                        t(" "),
+                        t(" "),
+                        t(" "),
+                        b(true),
+                        i(0),
+                        b(true),
+                        int_array(&tb.primary_key),
+                        N,
+                        N,
                     ]);
                 }
                 for u in &tb.uniques {
                     bd.row(vec![
-                        i(object_oid("c", &tb.name, &u.name)), t(&u.name), i(NS_PUBLIC), t("u"), b(false), b(false), b(true), i(toid), i(0),
-                        i(object_oid("i", &tb.name, &u.name)), i(0), i(0), t(" "), t(" "), t(" "), b(true), i(0), b(true),
-                        int_array(&u.columns), N, N,
+                        i(object_oid("c", &tb.name, &u.name)),
+                        t(&u.name),
+                        i(NS_PUBLIC),
+                        t("u"),
+                        b(false),
+                        b(false),
+                        b(true),
+                        i(toid),
+                        i(0),
+                        i(object_oid("i", &tb.name, &u.name)),
+                        i(0),
+                        i(0),
+                        t(" "),
+                        t(" "),
+                        t(" "),
+                        b(true),
+                        i(0),
+                        b(true),
+                        int_array(&u.columns),
+                        N,
+                        N,
                     ]);
                 }
                 for f in &tb.foreign_keys {
                     let parent = ex.s.engine.catalog.get(&f.ref_table);
                     let fcols: Vec<usize> = match &parent {
                         Some(p) if f.ref_columns.is_empty() => p.primary_key.clone(),
-                        Some(p) => f.ref_columns.iter().filter_map(|c| p.column_index(c)).collect(),
+                        Some(p) => f
+                            .ref_columns
+                            .iter()
+                            .filter_map(|c| p.column_index(c))
+                            .collect(),
                         None => Vec::new(),
                     };
                     bd.row(vec![
-                        i(object_oid("c", &tb.name, &f.name)), t(&f.name), i(NS_PUBLIC), t("f"), b(false), b(false), b(true), i(toid), i(0),
-                        i(0), i(0), i(table_oid(&f.ref_table)), act(f.on_update), act(f.on_delete), t("s"), b(true), i(0), b(true),
-                        int_array(&f.columns), int_array(&fcols), N,
+                        i(object_oid("c", &tb.name, &f.name)),
+                        t(&f.name),
+                        i(NS_PUBLIC),
+                        t("f"),
+                        b(false),
+                        b(false),
+                        b(true),
+                        i(toid),
+                        i(0),
+                        i(0),
+                        i(0),
+                        i(table_oid(&f.ref_table)),
+                        act(f.on_update),
+                        act(f.on_delete),
+                        t("s"),
+                        b(true),
+                        i(0),
+                        b(true),
+                        int_array(&f.columns),
+                        int_array(&fcols),
+                        N,
                     ]);
                 }
                 for c in &tb.checks {
                     bd.row(vec![
-                        i(object_oid("c", &tb.name, &c.name)), t(&c.name), i(NS_PUBLIC), t("c"), b(false), b(false), b(true), i(toid), i(0),
-                        i(0), i(0), i(0), t(" "), t(" "), t(" "), b(true), i(0), b(false), Datum::Array(Vec::new()), N, t(c.expr.to_string()),
+                        i(object_oid("c", &tb.name, &c.name)),
+                        t(&c.name),
+                        i(NS_PUBLIC),
+                        t("c"),
+                        b(false),
+                        b(false),
+                        b(true),
+                        i(toid),
+                        i(0),
+                        i(0),
+                        i(0),
+                        i(0),
+                        t(" "),
+                        t(" "),
+                        t(" "),
+                        b(true),
+                        i(0),
+                        b(false),
+                        Datum::Array(Vec::new()),
+                        N,
+                        t(c.expr.to_string()),
                     ]);
                 }
             }
@@ -552,29 +798,67 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 for (k, c) in tb.columns.iter().enumerate() {
                     let def = match (&c.default, c.auto_increment) {
                         (Some(d), _) => Some(d.to_string()),
-                        (None, true) => Some(format!("nextval('{}_{}_seq'::regclass)", tb.name, c.name)),
+                        (None, true) => {
+                            Some(format!("nextval('{}_{}_seq'::regclass)", tb.name, c.name))
+                        }
                         _ => None,
                     };
                     if let Some(d) = def {
-                        bd.row(vec![i(object_oid("d", &tb.name, &c.name)), i(table_oid(&tb.name)), i(k as i64 + 1), t(d)]);
+                        bd.row(vec![
+                            i(object_oid("d", &tb.name, &c.name)),
+                            i(table_oid(&tb.name)),
+                            i(k as i64 + 1),
+                            t(d),
+                        ]);
                     }
                 }
             }
             bd.done()
         }
         "pg_tables" => {
-            let mut bd = Builder::new(&[("schemaname", T), ("tablename", T), ("tableowner", T), ("tablespace", T), ("hasindexes", B), ("hasrules", B), ("hastriggers", B), ("rowsecurity", B)]);
+            let mut bd = Builder::new(&[
+                ("schemaname", T),
+                ("tablename", T),
+                ("tableowner", T),
+                ("tablespace", T),
+                ("hasindexes", B),
+                ("hasrules", B),
+                ("hastriggers", B),
+                ("rowsecurity", B),
+            ]);
             for tb in tables {
-                bd.row(vec![t("public"), t(&tb.name), t(&user), N, b(true), b(false), b(false), b(false)]);
+                bd.row(vec![
+                    t("public"),
+                    t(&tb.name),
+                    t(&user),
+                    N,
+                    b(true),
+                    b(false),
+                    b(false),
+                    b(false),
+                ]);
             }
             bd.done()
         }
         "pg_indexes" => {
-            let mut bd = Builder::new(&[("schemaname", T), ("tablename", T), ("indexname", T), ("tablespace", T), ("indexdef", T)]);
+            let mut bd = Builder::new(&[
+                ("schemaname", T),
+                ("tablename", T),
+                ("indexname", T),
+                ("tablespace", T),
+                ("indexdef", T),
+            ]);
             for tb in tables {
                 for (name, cols) in index_list(tb) {
-                    let unique = name.ends_with("_pkey") || tb.uniques.iter().any(|u| u.name == name);
-                    bd.row(vec![t("public"), t(&tb.name), t(&name), N, t(index_sql(tb, &name, &cols, unique))]);
+                    let unique =
+                        name.ends_with("_pkey") || tb.uniques.iter().any(|u| u.name == name);
+                    bd.row(vec![
+                        t("public"),
+                        t(&tb.name),
+                        t(&name),
+                        N,
+                        t(index_sql(tb, &name, &cols, unique)),
+                    ]);
                 }
             }
             bd.done()
@@ -596,7 +880,22 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 ("datctype", T),
                 ("datacl", T),
             ]);
-            bd.row(vec![i(16_384), t(&ex.s.database), i(10), i(6), t("c"), b(false), b(true), i(-1), i(0), i(1), i(1663), t("C"), t("C"), N]);
+            bd.row(vec![
+                i(16_384),
+                t(&ex.s.database),
+                i(10),
+                i(6),
+                t("c"),
+                b(false),
+                b(true),
+                i(-1),
+                i(0),
+                i(1),
+                i(1663),
+                t("C"),
+                t("C"),
+                N,
+            ]);
             bd.done()
         }
         "pg_roles" | "pg_user" | "pg_authid" | "pg_shadow" => {
@@ -618,50 +917,207 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 ("rolconfig", T),
                 ("usesysid", I8),
             ]);
-            bd.row(vec![i(10), t(&user), t(&user), b(true), b(true), b(true), b(true), b(true), b(true), b(true), b(false), i(-1), N, b(false), N, i(10)]);
+            bd.row(vec![
+                i(10),
+                t(&user),
+                t(&user),
+                b(true),
+                b(true),
+                b(true),
+                b(true),
+                b(true),
+                b(true),
+                b(true),
+                b(false),
+                i(-1),
+                N,
+                b(false),
+                N,
+                i(10),
+            ]);
             bd.done()
         }
         "pg_settings" => {
-            let mut bd = Builder::new(&[("name", T), ("setting", T), ("unit", T), ("category", T), ("short_desc", T), ("context", T), ("vartype", T), ("source", T), ("boot_val", T), ("reset_val", T)]);
+            let mut bd = Builder::new(&[
+                ("name", T),
+                ("setting", T),
+                ("unit", T),
+                ("category", T),
+                ("short_desc", T),
+                ("context", T),
+                ("vartype", T),
+                ("source", T),
+                ("boot_val", T),
+                ("reset_val", T),
+            ]);
             let mut vars: Vec<(&String, &String)> = ex.s.vars.iter().collect();
             vars.sort();
             for (k, v) in vars {
-                bd.row(vec![t(k), t(v), N, t("Storine"), t(""), t("user"), t("string"), t("session"), t(v), t(v)]);
+                bd.row(vec![
+                    t(k),
+                    t(v),
+                    N,
+                    t("Storine"),
+                    t(""),
+                    t("user"),
+                    t("string"),
+                    t("session"),
+                    t(v),
+                    t(v),
+                ]);
             }
-            bd.row(vec![t("server_version"), t(crate::PG_VERSION), N, t("Storine"), t(""), t("internal"), t("string"), t("default"), t(crate::PG_VERSION), t(crate::PG_VERSION)]);
-            bd.row(vec![t("server_version_num"), t(crate::PG_VERSION_NUM), N, t("Storine"), t(""), t("internal"), t("integer"), t("default"), t(crate::PG_VERSION_NUM), t(crate::PG_VERSION_NUM)]);
+            bd.row(vec![
+                t("server_version"),
+                t(crate::PG_VERSION),
+                N,
+                t("Storine"),
+                t(""),
+                t("internal"),
+                t("string"),
+                t("default"),
+                t(crate::PG_VERSION),
+                t(crate::PG_VERSION),
+            ]);
+            bd.row(vec![
+                t("server_version_num"),
+                t(crate::PG_VERSION_NUM),
+                N,
+                t("Storine"),
+                t(""),
+                t("internal"),
+                t("integer"),
+                t("default"),
+                t(crate::PG_VERSION_NUM),
+                t(crate::PG_VERSION_NUM),
+            ]);
             bd.done()
         }
         "pg_am" => {
-            let mut bd = Builder::new(&[("oid", I8), ("amname", T), ("amhandler", T), ("amtype", T)]);
+            let mut bd =
+                Builder::new(&[("oid", I8), ("amname", T), ("amhandler", T), ("amtype", T)]);
             bd.row(vec![i(2), t("heap"), t("heap_tableam_handler"), t("t")]);
             bd.row(vec![i(403), t("btree"), t("bthandler"), t("i")]);
             bd.done()
         }
-        "pg_description" => Builder::new(&[("objoid", I8), ("classoid", I8), ("objsubid", I4), ("description", T)]).done(),
-        "pg_proc" => Builder::new(&[("oid", I8), ("proname", T), ("pronamespace", I8), ("prorettype", I8), ("proargtypes", T), ("prokind", T)]).done(),
-        "pg_enum" => Builder::new(&[("oid", I8), ("enumtypid", I8), ("enumsortorder", DataType::Real), ("enumlabel", T)]).done(),
-        "pg_extension" => Builder::new(&[("oid", I8), ("extname", T), ("extowner", I8), ("extnamespace", I8), ("extrelocatable", B), ("extversion", T)]).done(),
-        "pg_inherits" => Builder::new(&[("inhrelid", I8), ("inhparent", I8), ("inhseqno", I4), ("inhdetachpending", B)]).done(),
-        "pg_trigger" => Builder::new(&[("oid", I8), ("tgrelid", I8), ("tgname", T), ("tgenabled", T), ("tgisinternal", B)]).done(),
-        "pg_views" | "pg_matviews" => Builder::new(&[("schemaname", T), ("viewname", T), ("viewowner", T), ("definition", T)]).done(),
-        "pg_sequence" | "pg_sequences" => Builder::new(&[("seqrelid", I8), ("schemaname", T), ("sequencename", T), ("last_value", I8)]).done(),
+        "pg_description" => Builder::new(&[
+            ("objoid", I8),
+            ("classoid", I8),
+            ("objsubid", I4),
+            ("description", T),
+        ])
+        .done(),
+        "pg_proc" => Builder::new(&[
+            ("oid", I8),
+            ("proname", T),
+            ("pronamespace", I8),
+            ("prorettype", I8),
+            ("proargtypes", T),
+            ("prokind", T),
+        ])
+        .done(),
+        "pg_enum" => Builder::new(&[
+            ("oid", I8),
+            ("enumtypid", I8),
+            ("enumsortorder", DataType::Real),
+            ("enumlabel", T),
+        ])
+        .done(),
+        "pg_extension" => Builder::new(&[
+            ("oid", I8),
+            ("extname", T),
+            ("extowner", I8),
+            ("extnamespace", I8),
+            ("extrelocatable", B),
+            ("extversion", T),
+        ])
+        .done(),
+        "pg_inherits" => Builder::new(&[
+            ("inhrelid", I8),
+            ("inhparent", I8),
+            ("inhseqno", I4),
+            ("inhdetachpending", B),
+        ])
+        .done(),
+        "pg_trigger" => Builder::new(&[
+            ("oid", I8),
+            ("tgrelid", I8),
+            ("tgname", T),
+            ("tgenabled", T),
+            ("tgisinternal", B),
+        ])
+        .done(),
+        "pg_views" | "pg_matviews" => Builder::new(&[
+            ("schemaname", T),
+            ("viewname", T),
+            ("viewowner", T),
+            ("definition", T),
+        ])
+        .done(),
+        "pg_sequence" | "pg_sequences" => Builder::new(&[
+            ("seqrelid", I8),
+            ("schemaname", T),
+            ("sequencename", T),
+            ("last_value", I8),
+        ])
+        .done(),
         "pg_collation" => {
-            let mut bd = Builder::new(&[("oid", I8), ("collname", T), ("collnamespace", I8), ("collprovider", T), ("collencoding", I4)]);
+            let mut bd = Builder::new(&[
+                ("oid", I8),
+                ("collname", T),
+                ("collnamespace", I8),
+                ("collprovider", T),
+                ("collencoding", I4),
+            ]);
             bd.row(vec![i(100), t("default"), i(NS_PG_CATALOG), t("d"), i(-1)]);
             bd.row(vec![i(950), t("C"), i(NS_PG_CATALOG), t("c"), i(-1)]);
             bd.done()
         }
         "pg_stat_activity" => {
-            let mut bd = Builder::new(&[("datid", I8), ("datname", T), ("pid", I8), ("usename", T), ("application_name", T), ("state", T), ("query", T)]);
-            bd.row(vec![i(16_384), t(&ex.s.database), i(ex.s.id as i64), t(&user), t(ex.s.vars.get("application_name").cloned().unwrap_or_default()), t("active"), t("")]);
+            let mut bd = Builder::new(&[
+                ("datid", I8),
+                ("datname", T),
+                ("pid", I8),
+                ("usename", T),
+                ("application_name", T),
+                ("state", T),
+                ("query", T),
+            ]);
+            bd.row(vec![
+                i(16_384),
+                t(&ex.s.database),
+                i(ex.s.id as i64),
+                t(&user),
+                t(ex.s
+                    .vars
+                    .get("application_name")
+                    .cloned()
+                    .unwrap_or_default()),
+                t("active"),
+                t(""),
+            ]);
             bd.done()
         }
-        "pg_locks" | "pg_stat_user_tables" | "pg_statio_user_tables" | "pg_stat_database" | "pg_publication" | "pg_rewrite" | "pg_policy"
-        | "pg_foreign_table" | "pg_partitioned_table" | "pg_depend" | "pg_shdescription" | "pg_event_trigger" | "pg_cast" | "pg_operator"
-        | "pg_range" | "pg_tablespace" | "pg_seclabel" | "pg_statistic_ext" | "pg_opclass" | "pg_language" | "pg_aggregate" => {
-            Builder::new(&[("oid", I8)]).done()
-        }
+        "pg_locks"
+        | "pg_stat_user_tables"
+        | "pg_statio_user_tables"
+        | "pg_stat_database"
+        | "pg_publication"
+        | "pg_rewrite"
+        | "pg_policy"
+        | "pg_foreign_table"
+        | "pg_partitioned_table"
+        | "pg_depend"
+        | "pg_shdescription"
+        | "pg_event_trigger"
+        | "pg_cast"
+        | "pg_operator"
+        | "pg_range"
+        | "pg_tablespace"
+        | "pg_seclabel"
+        | "pg_statistic_ext"
+        | "pg_opclass"
+        | "pg_language"
+        | "pg_aggregate" => Builder::new(&[("oid", I8)]).done(),
         // Other catalogs (publications, policies, statistics...) describe features this
         // gateway does not have: they are empty.
         _ => Builder::new(&[("oid", I8)]).done(),
@@ -689,7 +1145,10 @@ fn index_sql(tb: &Table, name: &str, cols: &[usize], unique: bool) -> String {
         if unique { "UNIQUE " } else { "" },
         crate::fmt::quote_ident(name),
         crate::fmt::quote_ident(&tb.name),
-        cols.iter().map(|c| crate::fmt::quote_ident(&tb.columns[*c].name)).collect::<Vec<_>>().join(", ")
+        cols.iter()
+            .map(|c| crate::fmt::quote_ident(&tb.columns[*c].name))
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
@@ -715,7 +1174,16 @@ pub fn mysql_type(ty: &DataType) -> (String, String) {
         DataType::Interval => ("varchar".into(), "varchar(64)".into()),
         DataType::Uuid => ("char".into(), "char(36)".into()),
         DataType::Json => ("json".into(), "json".into()),
-        DataType::Enum(v) => ("enum".into(), format!("enum({})", v.iter().map(|x| format!("'{x}'")).collect::<Vec<_>>().join(","))),
+        DataType::Enum(v) => (
+            "enum".into(),
+            format!(
+                "enum({})",
+                v.iter()
+                    .map(|x| format!("'{x}'"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        ),
         DataType::Array(_) => ("json".into(), "json".into()),
     }
 }
@@ -731,20 +1199,57 @@ fn pg_data_type(ty: &DataType) -> String {
     }
 }
 
-fn information_schema(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>], schema: &str, mysql: bool) -> SqlResult<Rel> {
+fn information_schema(
+    ex: &Exec<'_>,
+    n: &str,
+    tables: &[std::sync::Arc<Table>],
+    schema: &str,
+    mysql: bool,
+) -> SqlResult<Rel> {
     let db = ex.s.database.clone();
     // MySQL's information_schema uses upper-case column names; lookups are case-insensitive.
-    let cased = |name: &str| if mysql { name.to_ascii_uppercase() } else { name.to_owned() };
+    let cased = |name: &str| {
+        if mysql {
+            name.to_ascii_uppercase()
+        } else {
+            name.to_owned()
+        }
+    };
     let mk = |spec: &[(&str, DataType)]| -> Builder {
-        let owned: Vec<(String, DataType)> = spec.iter().map(|(n, t)| (cased(n), t.clone())).collect();
-        Builder { cols: owned.into_iter().map(|(n, t)| ColMeta::new(n, Some(t))).collect(), rows: Vec::new() }
+        let owned: Vec<(String, DataType)> =
+            spec.iter().map(|(n, t)| (cased(n), t.clone())).collect();
+        Builder {
+            cols: owned
+                .into_iter()
+                .map(|(n, t)| ColMeta::new(n, Some(t)))
+                .collect(),
+            rows: Vec::new(),
+        }
     };
     Ok(match n {
         "schemata" => {
-            let mut bd = mk(&[("catalog_name", T), ("schema_name", T), ("schema_owner", T), ("default_character_set_name", T), ("default_collation_name", T)]);
+            let mut bd = mk(&[
+                ("catalog_name", T),
+                ("schema_name", T),
+                ("schema_owner", T),
+                ("default_character_set_name", T),
+                ("default_collation_name", T),
+            ]);
             if mysql {
-                bd.row(vec![t("def"), t(&db), N, t("utf8mb4"), t("utf8mb4_0900_ai_ci")]);
-                bd.row(vec![t("def"), t("information_schema"), N, t("utf8mb3"), t("utf8mb3_general_ci")]);
+                bd.row(vec![
+                    t("def"),
+                    t(&db),
+                    N,
+                    t("utf8mb4"),
+                    t("utf8mb4_0900_ai_ci"),
+                ]);
+                bd.row(vec![
+                    t("def"),
+                    t("information_schema"),
+                    N,
+                    t("utf8mb3"),
+                    t("utf8mb3_general_ci"),
+                ]);
             } else {
                 for s in ["public", "pg_catalog", "information_schema"] {
                     bd.row(vec![t(&db), t(s), t(&ex.s.user), N, N]);
@@ -820,8 +1325,12 @@ fn information_schema(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>], 
                 for (k, c) in tb.columns.iter().enumerate() {
                     let (my_dt, my_ct) = mysql_type(&c.ty);
                     let (char_len, num_prec, num_scale) = match &c.ty {
-                        DataType::Varchar(Some(n)) | DataType::Char(Some(n)) => (Some(i64::from(*n)), None, None),
-                        DataType::Numeric(Some((p, s))) => (None, Some(i64::from(*p)), Some(i64::from(*s))),
+                        DataType::Varchar(Some(n)) | DataType::Char(Some(n)) => {
+                            (Some(i64::from(*n)), None, None)
+                        }
+                        DataType::Numeric(Some((p, s))) => {
+                            (None, Some(i64::from(*p)), Some(i64::from(*s)))
+                        }
                         DataType::SmallInt => (None, Some(16), Some(0)),
                         DataType::Int => (None, Some(32), Some(0)),
                         DataType::BigInt => (None, Some(64), Some(0)),
@@ -833,17 +1342,31 @@ fn information_schema(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>], 
                         "PRI"
                     } else if tb.uniques.iter().any(|u| u.columns.first() == Some(&k)) {
                         "UNI"
-                    } else if tb.indexes.iter().any(|x| x.columns.first() == Some(&k)) || tb.foreign_keys.iter().any(|f| f.columns.first() == Some(&k)) {
+                    } else if tb.indexes.iter().any(|x| x.columns.first() == Some(&k))
+                        || tb
+                            .foreign_keys
+                            .iter()
+                            .any(|f| f.columns.first() == Some(&k))
+                    {
                         "MUL"
                     } else {
                         ""
                     };
                     let default = match (&c.default, c.auto_increment) {
-                        (Some(d), _) => Some(if mysql { mysql_default(d) } else { d.to_string() }),
-                        (None, true) if !mysql => Some(format!("nextval('{}_{}_seq'::regclass)", tb.name, c.name)),
+                        (Some(d), _) => Some(if mysql {
+                            mysql_default(d)
+                        } else {
+                            d.to_string()
+                        }),
+                        (None, true) if !mysql => {
+                            Some(format!("nextval('{}_{}_seq'::regclass)", tb.name, c.name))
+                        }
                         _ => None,
                     };
-                    let udt = PG_TYPES.iter().find(|p| p.0 == type_oid(&c.ty)).map_or("text", |p| p.1);
+                    let udt = PG_TYPES
+                        .iter()
+                        .find(|p| p.0 == type_oid(&c.ty))
+                        .map_or("text", |p| p.1);
                     bd.row(vec![
                         t(if mysql { "def" } else { &db }),
                         t(schema),
@@ -856,21 +1379,60 @@ fn information_schema(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>], 
                         char_len.map_or(N, i),
                         char_len.map_or(N, |n| i(n * 4)),
                         num_prec.map_or(N, i),
-                        num_prec.map_or(N, |_| i(if matches!(c.ty, DataType::Numeric(_)) { 10 } else { 2 })),
+                        num_prec.map_or(N, |_| {
+                            i(if matches!(c.ty, DataType::Numeric(_)) {
+                                10
+                            } else {
+                                2
+                            })
+                        }),
                         num_scale.map_or(N, i),
-                        if matches!(c.ty, DataType::Timestamp | DataType::TimestampTz | DataType::Time) { i(6) } else { N },
-                        if matches!(c.ty, DataType::Text | DataType::Varchar(_) | DataType::Char(_)) { t("utf8mb4") } else { N },
-                        if matches!(c.ty, DataType::Text | DataType::Varchar(_) | DataType::Char(_)) { t("utf8mb4_0900_ai_ci") } else { N },
+                        if matches!(
+                            c.ty,
+                            DataType::Timestamp | DataType::TimestampTz | DataType::Time
+                        ) {
+                            i(6)
+                        } else {
+                            N
+                        },
+                        if matches!(
+                            c.ty,
+                            DataType::Text | DataType::Varchar(_) | DataType::Char(_)
+                        ) {
+                            t("utf8mb4")
+                        } else {
+                            N
+                        },
+                        if matches!(
+                            c.ty,
+                            DataType::Text | DataType::Varchar(_) | DataType::Char(_)
+                        ) {
+                            t("utf8mb4_0900_ai_ci")
+                        } else {
+                            N
+                        },
                         t(my_ct),
                         t(key),
-                        t(if c.auto_increment { "auto_increment" } else { "" }),
+                        t(if c.auto_increment {
+                            "auto_increment"
+                        } else {
+                            ""
+                        }),
                         t("select,insert,update,references"),
                         t(""),
                         t(&db),
                         t("pg_catalog"),
                         t(udt),
-                        t(if c.auto_increment && !mysql { "YES" } else { "NO" }),
-                        if c.auto_increment && !mysql { t("BY DEFAULT") } else { N },
+                        t(if c.auto_increment && !mysql {
+                            "YES"
+                        } else {
+                            "NO"
+                        }),
+                        if c.auto_increment && !mysql {
+                            t("BY DEFAULT")
+                        } else {
+                            N
+                        },
                         t("NEVER"),
                         N,
                         t("YES"),
@@ -895,10 +1457,25 @@ fn information_schema(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>], 
             ]);
             for tb in tables {
                 let mut push = |name: &str, kind: &str| {
-                    bd.row(vec![t(&db), t(schema), t(name), t(&db), t(schema), t(&tb.name), t(kind), t("NO"), t("NO"), t("YES")]);
+                    bd.row(vec![
+                        t(&db),
+                        t(schema),
+                        t(name),
+                        t(&db),
+                        t(schema),
+                        t(&tb.name),
+                        t(kind),
+                        t("NO"),
+                        t("NO"),
+                        t("YES"),
+                    ]);
                 };
                 if !tb.primary_key.is_empty() {
-                    let pk = if mysql { "PRIMARY".to_owned() } else { format!("{}_pkey", tb.name) };
+                    let pk = if mysql {
+                        "PRIMARY".to_owned()
+                    } else {
+                        format!("{}_pkey", tb.name)
+                    };
                     push(&pk, "PRIMARY KEY");
                 }
                 for u in &tb.uniques {
@@ -952,14 +1529,31 @@ fn information_schema(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>], 
                     }
                 };
                 if !tb.primary_key.is_empty() {
-                    push(&if mysql { "PRIMARY".to_owned() } else { format!("{}_pkey", tb.name) }, &tb.primary_key, None);
+                    push(
+                        &if mysql {
+                            "PRIMARY".to_owned()
+                        } else {
+                            format!("{}_pkey", tb.name)
+                        },
+                        &tb.primary_key,
+                        None,
+                    );
                 }
                 for u in &tb.uniques {
                     push(&u.name, &u.columns, None);
                 }
                 for f in &tb.foreign_keys {
                     let ref_cols = if f.ref_columns.is_empty() {
-                        ex.s.engine.catalog.get(&f.ref_table).map(|p| p.primary_key.iter().map(|i| p.columns[*i].name.clone()).collect()).unwrap_or_default()
+                        ex.s.engine
+                            .catalog
+                            .get(&f.ref_table)
+                            .map(|p| {
+                                p.primary_key
+                                    .iter()
+                                    .map(|i| p.columns[*i].name.clone())
+                                    .collect()
+                            })
+                            .unwrap_or_default()
                     } else {
                         f.ref_columns.clone()
                     };
@@ -990,7 +1584,11 @@ fn information_schema(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>], 
                         t(&f.name),
                         t(&db),
                         t(schema),
-                        t(if mysql { "PRIMARY".to_owned() } else { format!("{}_pkey", f.ref_table) }),
+                        t(if mysql {
+                            "PRIMARY".to_owned()
+                        } else {
+                            format!("{}_pkey", f.ref_table)
+                        }),
                         t(if mysql { "NONE" } else { "SIMPLE" }),
                         t(action_name(f.on_update)),
                         t(action_name(f.on_delete)),
@@ -1002,23 +1600,62 @@ fn information_schema(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>], 
             bd.done()
         }
         "constraint_column_usage" => {
-            let mut bd = mk(&[("table_catalog", T), ("table_schema", T), ("table_name", T), ("column_name", T), ("constraint_catalog", T), ("constraint_schema", T), ("constraint_name", T)]);
+            let mut bd = mk(&[
+                ("table_catalog", T),
+                ("table_schema", T),
+                ("table_name", T),
+                ("column_name", T),
+                ("constraint_catalog", T),
+                ("constraint_schema", T),
+                ("constraint_name", T),
+            ]);
             for tb in tables {
                 if !tb.primary_key.is_empty() {
                     for c in &tb.primary_key {
-                        bd.row(vec![t(&db), t(schema), t(&tb.name), t(&tb.columns[*c].name), t(&db), t(schema), t(format!("{}_pkey", tb.name))]);
+                        bd.row(vec![
+                            t(&db),
+                            t(schema),
+                            t(&tb.name),
+                            t(&tb.columns[*c].name),
+                            t(&db),
+                            t(schema),
+                            t(format!("{}_pkey", tb.name)),
+                        ]);
                     }
                 }
                 for u in &tb.uniques {
                     for c in &u.columns {
-                        bd.row(vec![t(&db), t(schema), t(&tb.name), t(&tb.columns[*c].name), t(&db), t(schema), t(&u.name)]);
+                        bd.row(vec![
+                            t(&db),
+                            t(schema),
+                            t(&tb.name),
+                            t(&tb.columns[*c].name),
+                            t(&db),
+                            t(schema),
+                            t(&u.name),
+                        ]);
                     }
                 }
                 for f in &tb.foreign_keys {
                     if let Some(p) = ex.s.engine.catalog.get(&f.ref_table) {
-                        let cols: Vec<String> = if f.ref_columns.is_empty() { p.primary_key.iter().map(|i| p.columns[*i].name.clone()).collect() } else { f.ref_columns.clone() };
+                        let cols: Vec<String> = if f.ref_columns.is_empty() {
+                            p.primary_key
+                                .iter()
+                                .map(|i| p.columns[*i].name.clone())
+                                .collect()
+                        } else {
+                            f.ref_columns.clone()
+                        };
                         for c in cols {
-                            bd.row(vec![t(&db), t(schema), t(&p.name), t(c), t(&db), t(schema), t(&f.name)]);
+                            bd.row(vec![
+                                t(&db),
+                                t(schema),
+                                t(&p.name),
+                                t(c),
+                                t(&db),
+                                t(schema),
+                                t(&f.name),
+                            ]);
                         }
                     }
                 }
@@ -1026,7 +1663,12 @@ fn information_schema(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>], 
             bd.done()
         }
         "check_constraints" => {
-            let mut bd = mk(&[("constraint_catalog", T), ("constraint_schema", T), ("constraint_name", T), ("check_clause", T)]);
+            let mut bd = mk(&[
+                ("constraint_catalog", T),
+                ("constraint_schema", T),
+                ("constraint_name", T),
+                ("check_clause", T),
+            ]);
             for tb in tables {
                 for c in &tb.checks {
                     bd.row(vec![t(&db), t(schema), t(&c.name), t(c.expr.to_string())]);
@@ -1057,8 +1699,13 @@ fn information_schema(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>], 
             ]);
             for tb in tables {
                 for (name, cols) in index_list(tb) {
-                    let unique = name.ends_with("_pkey") || tb.uniques.iter().any(|u| u.name == name);
-                    let shown = if name.ends_with("_pkey") && mysql { "PRIMARY".to_owned() } else { name.clone() };
+                    let unique =
+                        name.ends_with("_pkey") || tb.uniques.iter().any(|u| u.name == name);
+                    let shown = if name.ends_with("_pkey") && mysql {
+                        "PRIMARY".to_owned()
+                    } else {
+                        name.clone()
+                    };
                     for (k, c) in cols.iter().enumerate() {
                         bd.row(vec![
                             t("def"),
@@ -1086,27 +1733,83 @@ fn information_schema(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>], 
             bd.done()
         }
         "character_sets" => {
-            let mut bd = mk(&[("character_set_name", T), ("default_collate_name", T), ("description", T), ("maxlen", I8)]);
-            bd.row(vec![t("utf8mb4"), t("utf8mb4_0900_ai_ci"), t("UTF-8 Unicode"), i(4)]);
+            let mut bd = mk(&[
+                ("character_set_name", T),
+                ("default_collate_name", T),
+                ("description", T),
+                ("maxlen", I8),
+            ]);
+            bd.row(vec![
+                t("utf8mb4"),
+                t("utf8mb4_0900_ai_ci"),
+                t("UTF-8 Unicode"),
+                i(4),
+            ]);
             bd.done()
         }
         "collations" => {
-            let mut bd = mk(&[("collation_name", T), ("character_set_name", T), ("id", I8), ("is_default", T), ("is_compiled", T), ("sortlen", I8)]);
-            bd.row(vec![t("utf8mb4_0900_ai_ci"), t("utf8mb4"), i(255), t("Yes"), t("Yes"), i(0)]);
-            bd.row(vec![t("utf8mb4_bin"), t("utf8mb4"), i(46), t(""), t("Yes"), i(1)]);
+            let mut bd = mk(&[
+                ("collation_name", T),
+                ("character_set_name", T),
+                ("id", I8),
+                ("is_default", T),
+                ("is_compiled", T),
+                ("sortlen", I8),
+            ]);
+            bd.row(vec![
+                t("utf8mb4_0900_ai_ci"),
+                t("utf8mb4"),
+                i(255),
+                t("Yes"),
+                t("Yes"),
+                i(0),
+            ]);
+            bd.row(vec![
+                t("utf8mb4_bin"),
+                t("utf8mb4"),
+                i(46),
+                t(""),
+                t("Yes"),
+                i(1),
+            ]);
+            bd.done()
+        }
+        "keywords" => {
+            let mut bd = mk(&[("word", T), ("reserved", I8)]);
+            for w in crate::exec::func::RESERVED_WORDS {
+                bd.row(vec![t(*w), i(1)]);
+            }
             bd.done()
         }
         "engines" => {
-            let mut bd = mk(&[("engine", T), ("support", T), ("comment", T), ("transactions", T), ("xa", T), ("savepoints", T)]);
-            bd.row(vec![t("InnoDB"), t("DEFAULT"), t("Storine"), t("YES"), t("NO"), t("YES")]);
+            let mut bd = mk(&[
+                ("engine", T),
+                ("support", T),
+                ("comment", T),
+                ("transactions", T),
+                ("xa", T),
+                ("savepoints", T),
+            ]);
+            bd.row(vec![
+                t("InnoDB"),
+                t("DEFAULT"),
+                t("Storine"),
+                t("YES"),
+                t("NO"),
+                t("YES"),
+            ]);
             bd.done()
         }
-        "views" | "routines" | "triggers" | "sequences" | "parameters" | "events" | "partitions" | "table_privileges" | "column_privileges"
-        | "user_privileges" | "schema_privileges" | "processlist" | "innodb_trx" | "role_table_grants" | "domains" | "element_types"
-        | "attributes" | "user_defined_types" | "column_statistics" | "plugins" => {
-            mk(&[("table_schema", T), ("table_name", T)]).done()
+        "views" | "routines" | "triggers" | "sequences" | "parameters" | "events"
+        | "partitions" | "table_privileges" | "column_privileges" | "user_privileges"
+        | "schema_privileges" | "processlist" | "innodb_trx" | "role_table_grants" | "domains"
+        | "element_types" | "attributes" | "user_defined_types" | "column_statistics"
+        | "plugins" => mk(&[("table_schema", T), ("table_name", T)]).done(),
+        other => {
+            return Err(SqlError::undefined_table(&format!(
+                "information_schema.{other}"
+            )))
         }
-        other => return Err(SqlError::undefined_table(&format!("information_schema.{other}"))),
     })
 }
 
@@ -1125,7 +1828,9 @@ fn mysql_default(e: &crate::ast::Expr) -> String {
 // ── functions used by catalog queries ──
 
 pub fn format_type(oid: &Datum, typmod: Option<&Datum>) -> Datum {
-    let Ok(o) = oid.as_i64() else { return Datum::Null };
+    let Ok(o) = oid.as_i64() else {
+        return Datum::Null;
+    };
     let m = typmod.and_then(|t| t.as_i64().ok()).unwrap_or(-1);
     let base = match o {
         16 => "boolean".to_owned(),
@@ -1138,8 +1843,20 @@ pub fn format_type(oid: &Datum, typmod: Option<&Datum>) -> Datum {
         3802 => "jsonb".into(),
         700 => "real".into(),
         701 => "double precision".into(),
-        1042 => if m > 4 { format!("character({})", m - 4) } else { "character".into() },
-        1043 => if m > 4 { format!("character varying({})", m - 4) } else { "character varying".into() },
+        1042 => {
+            if m > 4 {
+                format!("character({})", m - 4)
+            } else {
+                "character".into()
+            }
+        }
+        1043 => {
+            if m > 4 {
+                format!("character varying({})", m - 4)
+            } else {
+                "character varying".into()
+            }
+        }
         1082 => "date".into(),
         1083 => "time without time zone".into(),
         1114 => "timestamp without time zone".into(),
@@ -1155,7 +1872,10 @@ pub fn format_type(oid: &Datum, typmod: Option<&Datum>) -> Datum {
         }
         2950 => "uuid".into(),
         _ => match PG_TYPES.iter().find(|p| i64::from(p.0) == o) {
-            Some(p) if p.1.starts_with('_') => format!("{}[]", format_type(&Datum::Int(i64::from(p.5)), None).as_text()),
+            Some(p) if p.1.starts_with('_') => format!(
+                "{}[]",
+                format_type(&Datum::Int(i64::from(p.5)), None).as_text()
+            ),
             Some(p) => p.1.to_owned(),
             None => "unknown".into(),
         },
@@ -1172,12 +1892,22 @@ pub fn pg_get_expr(_ex: &Exec<'_>, expr: &Datum, _rel: Option<&Datum>) -> SqlRes
 }
 
 pub fn constraint_def(ex: &Exec<'_>, oid: &Datum) -> SqlResult<Datum> {
-    let Ok(o) = oid.as_i64() else { return Ok(Datum::Null) };
+    let Ok(o) = oid.as_i64() else {
+        return Ok(Datum::Null);
+    };
     for tb in ex.s.engine.catalog.all() {
-        let names = |cols: &[usize]| cols.iter().map(|c| crate::fmt::quote_ident(&tb.columns[*c].name)).collect::<Vec<_>>().join(", ");
+        let names = |cols: &[usize]| {
+            cols.iter()
+                .map(|c| crate::fmt::quote_ident(&tb.columns[*c].name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let pk = format!("{}_pkey", tb.name);
         if !tb.primary_key.is_empty() && object_oid("c", &tb.name, &pk) == o {
-            return Ok(Datum::Text(format!("PRIMARY KEY ({})", names(&tb.primary_key))));
+            return Ok(Datum::Text(format!(
+                "PRIMARY KEY ({})",
+                names(&tb.primary_key)
+            )));
         }
         for u in &tb.uniques {
             if object_oid("c", &tb.name, &u.name) == o {
@@ -1186,8 +1916,16 @@ pub fn constraint_def(ex: &Exec<'_>, oid: &Datum) -> SqlResult<Datum> {
         }
         for f in &tb.foreign_keys {
             if object_oid("c", &tb.name, &f.name) == o {
-                let refs = if f.ref_columns.is_empty() { String::new() } else { format!("({})", f.ref_columns.join(", ")) };
-                let mut s = format!("FOREIGN KEY ({}) REFERENCES {}{refs}", names(&f.columns), crate::fmt::quote_ident(&f.ref_table));
+                let refs = if f.ref_columns.is_empty() {
+                    String::new()
+                } else {
+                    format!("({})", f.ref_columns.join(", "))
+                };
+                let mut s = format!(
+                    "FOREIGN KEY ({}) REFERENCES {}{refs}",
+                    names(&f.columns),
+                    crate::fmt::quote_ident(&f.ref_table)
+                );
                 if f.on_delete != crate::ast::RefAction::NoAction {
                     s.push_str(&format!(" ON DELETE {}", action_name(f.on_delete)));
                 }
@@ -1204,7 +1942,9 @@ pub fn constraint_def(ex: &Exec<'_>, oid: &Datum) -> SqlResult<Datum> {
 }
 
 pub fn index_def(ex: &Exec<'_>, oid: &Datum) -> SqlResult<Datum> {
-    let Ok(o) = oid.as_i64() else { return Ok(Datum::Null) };
+    let Ok(o) = oid.as_i64() else {
+        return Ok(Datum::Null);
+    };
     for tb in ex.s.engine.catalog.all() {
         for (name, cols) in index_list(&tb) {
             if object_oid("i", &tb.name, &name) == o {
@@ -1219,31 +1959,58 @@ pub fn index_def(ex: &Exec<'_>, oid: &Datum) -> SqlResult<Datum> {
 
 /// `CREATE TABLE` text of a table (`SHOW CREATE TABLE`, `sqlite_master.sql`).
 pub fn create_table_sql(tb: &Table, dialect: Dialect) -> String {
-    let q = |s: &str| if dialect == Dialect::MySql { format!("`{s}`") } else { crate::fmt::quote_ident(s) };
+    let q = |s: &str| {
+        if dialect == Dialect::MySql {
+            format!("`{s}`")
+        } else {
+            crate::fmt::quote_ident(s)
+        }
+    };
     let mut lines = Vec::new();
     for c in &tb.columns {
-        let ty = if dialect == Dialect::MySql { mysql_type(&c.ty).1 } else { type_sql(&c.ty) };
+        let ty = if dialect == Dialect::MySql {
+            mysql_type(&c.ty).1
+        } else {
+            type_sql(&c.ty)
+        };
         let mut l = format!("  {} {ty}", q(&c.name));
         if c.not_null {
             l.push_str(" NOT NULL");
         }
         if c.auto_increment {
-            l.push_str(if dialect == Dialect::MySql { " AUTO_INCREMENT" } else { " GENERATED BY DEFAULT AS IDENTITY" });
+            l.push_str(if dialect == Dialect::MySql {
+                " AUTO_INCREMENT"
+            } else {
+                " GENERATED BY DEFAULT AS IDENTITY"
+            });
         }
         if let Some(d) = &c.default {
             l.push_str(&format!(" DEFAULT {d}"));
         }
         lines.push(l);
     }
-    let names = |cols: &[usize]| cols.iter().map(|c| q(&tb.columns[*c].name)).collect::<Vec<_>>().join(", ");
+    let names = |cols: &[usize]| {
+        cols.iter()
+            .map(|c| q(&tb.columns[*c].name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     if !tb.primary_key.is_empty() {
         lines.push(format!("  PRIMARY KEY ({})", names(&tb.primary_key)));
     }
     for u in &tb.uniques {
         if dialect == Dialect::MySql {
-            lines.push(format!("  UNIQUE KEY {} ({})", q(&u.name), names(&u.columns)));
+            lines.push(format!(
+                "  UNIQUE KEY {} ({})",
+                q(&u.name),
+                names(&u.columns)
+            ));
         } else {
-            lines.push(format!("  CONSTRAINT {} UNIQUE ({})", q(&u.name), names(&u.columns)));
+            lines.push(format!(
+                "  CONSTRAINT {} UNIQUE ({})",
+                q(&u.name),
+                names(&u.columns)
+            ));
         }
     }
     for x in &tb.indexes {
@@ -1257,8 +2024,23 @@ pub fn create_table_sql(tb: &Table, dialect: Dialect) -> String {
             q(&f.name),
             names(&f.columns),
             q(&f.ref_table),
-            if f.ref_columns.is_empty() { String::new() } else { format!(" ({})", f.ref_columns.iter().map(|c| q(c)).collect::<Vec<_>>().join(", ")) },
-            if f.on_delete == crate::ast::RefAction::NoAction { String::new() } else { format!(" ON DELETE {}", action_name(f.on_delete)) }
+            if f.ref_columns.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " ({})",
+                    f.ref_columns
+                        .iter()
+                        .map(|c| q(c))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
+            if f.on_delete == crate::ast::RefAction::NoAction {
+                String::new()
+            } else {
+                format!(" ON DELETE {}", action_name(f.on_delete))
+            }
         ));
     }
     for c in &tb.checks {
@@ -1273,13 +2055,21 @@ pub fn create_table_sql(tb: &Table, dialect: Dialect) -> String {
 
 fn text_rs(cols: &[&str], rows: Vec<Vec<Datum>>) -> Outcome {
     Outcome::Rows(ResultSet {
-        columns: cols.iter().map(|c| OutCol { name: (*c).to_owned(), ty: DataType::Text, table: None }).collect(),
+        columns: cols
+            .iter()
+            .map(|c| OutCol {
+                name: (*c).to_owned(),
+                ty: DataType::Text,
+                table: None,
+            })
+            .collect(),
         rows,
     })
 }
 
 fn like_filter(like: &Option<String>, s: &str) -> bool {
-    like.as_ref().is_none_or(|p| crate::exec::eval::like(&s.to_lowercase(), &p.to_lowercase(), Some('\\')))
+    like.as_ref()
+        .is_none_or(|p| crate::exec::eval::like(&s.to_lowercase(), &p.to_lowercase(), Some('\\')))
 }
 
 /// `SHOW ...` (MySQL commands and PostgreSQL's `SHOW setting`).
@@ -1293,11 +2083,20 @@ pub fn show(s: &mut Session, what: &Show) -> SqlResult<Outcome> {
                 "server_version" => crate::PG_VERSION.to_owned(),
                 "server_version_num" => crate::PG_VERSION_NUM.to_owned(),
                 "all" => {
-                    let mut rows: Vec<Vec<Datum>> = s.vars.iter().map(|(k, v)| vec![t(k), t(v), t("")]).collect();
+                    let mut rows: Vec<Vec<Datum>> = s
+                        .vars
+                        .iter()
+                        .map(|(k, v)| vec![t(k), t(v), t("")])
+                        .collect();
                     rows.sort_by_key(|r| r[0].as_text());
                     return Ok(text_rs(&["name", "setting", "description"], rows));
                 }
-                other => s.vars.get(other).cloned().ok_or_else(|| SqlError::new("42704", format!("unrecognized configuration parameter \"{other}\"")))?,
+                other => s.vars.get(other).cloned().ok_or_else(|| {
+                    SqlError::new(
+                        "42704",
+                        format!("unrecognized configuration parameter \"{other}\""),
+                    )
+                })?,
             };
             text_rs(&[name.as_str()], vec![vec![t(v)]])
         }
@@ -1306,7 +2105,13 @@ pub fn show(s: &mut Session, what: &Show) -> SqlResult<Outcome> {
             let rows: Vec<Vec<Datum>> = tables
                 .iter()
                 .filter(|tb| like_filter(like, &tb.name))
-                .map(|tb| if *full { vec![t(&tb.name), t("BASE TABLE")] } else { vec![t(&tb.name)] })
+                .map(|tb| {
+                    if *full {
+                        vec![t(&tb.name), t("BASE TABLE")]
+                    } else {
+                        vec![t(&tb.name)]
+                    }
+                })
                 .collect();
             if *full {
                 text_rs(&[&col, "Table_type"], rows)
@@ -1336,10 +2141,24 @@ pub fn show(s: &mut Session, what: &Show) -> SqlResult<Outcome> {
                         t(if c.not_null { "NO" } else { "YES" }),
                         t(key),
                         c.default.as_ref().map_or(N, |d| t(mysql_default(d))),
-                        t(if c.auto_increment { "auto_increment" } else { "" }),
+                        t(if c.auto_increment {
+                            "auto_increment"
+                        } else {
+                            ""
+                        }),
                     ];
                     if *full {
-                        r.insert(2, if matches!(c.ty, DataType::Text | DataType::Varchar(_) | DataType::Char(_)) { t("utf8mb4_0900_ai_ci") } else { N });
+                        r.insert(
+                            2,
+                            if matches!(
+                                c.ty,
+                                DataType::Text | DataType::Varchar(_) | DataType::Char(_)
+                            ) {
+                                t("utf8mb4_0900_ai_ci")
+                            } else {
+                                N
+                            },
+                        );
                         r.push(t("select,insert,update,references"));
                         r.push(t(""));
                     }
@@ -1347,7 +2166,20 @@ pub fn show(s: &mut Session, what: &Show) -> SqlResult<Outcome> {
                 })
                 .collect();
             if *full {
-                text_rs(&["Field", "Type", "Collation", "Null", "Key", "Default", "Extra", "Privileges", "Comment"], rows)
+                text_rs(
+                    &[
+                        "Field",
+                        "Type",
+                        "Collation",
+                        "Null",
+                        "Key",
+                        "Default",
+                        "Extra",
+                        "Privileges",
+                        "Comment",
+                    ],
+                    rows,
+                )
             } else {
                 text_rs(&["Field", "Type", "Null", "Key", "Default", "Extra"], rows)
             }
@@ -1357,7 +2189,11 @@ pub fn show(s: &mut Session, what: &Show) -> SqlResult<Outcome> {
             let mut rows = Vec::new();
             for (name, cols) in index_list(&tb) {
                 let unique = name.ends_with("_pkey") || tb.uniques.iter().any(|u| u.name == name);
-                let shown = if name.ends_with("_pkey") { "PRIMARY".to_owned() } else { name.clone() };
+                let shown = if name.ends_with("_pkey") {
+                    "PRIMARY".to_owned()
+                } else {
+                    name.clone()
+                };
                 for (k, c) in cols.iter().enumerate() {
                     rows.push(vec![
                         t(&tb.name),
@@ -1379,18 +2215,49 @@ pub fn show(s: &mut Session, what: &Show) -> SqlResult<Outcome> {
                 }
             }
             text_rs(
-                &["Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name", "Collation", "Cardinality", "Sub_part", "Packed", "Null", "Index_type", "Comment", "Index_comment", "Visible", "Expression"],
+                &[
+                    "Table",
+                    "Non_unique",
+                    "Key_name",
+                    "Seq_in_index",
+                    "Column_name",
+                    "Collation",
+                    "Cardinality",
+                    "Sub_part",
+                    "Packed",
+                    "Null",
+                    "Index_type",
+                    "Comment",
+                    "Index_comment",
+                    "Visible",
+                    "Expression",
+                ],
                 rows,
             )
         }
-        Show::Databases => text_rs(&["Database"], vec![vec![t("information_schema")], vec![t(&db)]]),
+        Show::Databases => text_rs(
+            &["Database"],
+            vec![vec![t("information_schema")], vec![t(&db)]],
+        ),
         Show::CreateTable(name) => {
             let tb = s.engine.table(name)?;
-            text_rs(&["Table", "Create Table"], vec![vec![t(&tb.name), t(create_table_sql(&tb, s.dialect))]])
+            text_rs(
+                &["Table", "Create Table"],
+                vec![vec![t(&tb.name), t(create_table_sql(&tb, s.dialect))]],
+            )
         }
         Show::Variables { like, .. } => {
-            let mut rows: Vec<Vec<Datum>> = s.vars.iter().filter(|(k, _)| like_filter(like, k)).map(|(k, v)| vec![t(k), t(v)]).collect();
-            for (k, v) in [("version", crate::MYSQL_VERSION), ("version_comment", "Storine"), ("have_ssl", "DISABLED")] {
+            let mut rows: Vec<Vec<Datum>> = s
+                .vars
+                .iter()
+                .filter(|(k, _)| like_filter(like, k))
+                .map(|(k, v)| vec![t(k), t(v)])
+                .collect();
+            for (k, v) in [
+                ("version", crate::MYSQL_VERSION),
+                ("version_comment", "Storine"),
+                ("have_ssl", "DISABLED"),
+            ] {
                 if like_filter(like, k) {
                     rows.push(vec![t(k), t(v)]);
                 }
@@ -1398,26 +2265,124 @@ pub fn show(s: &mut Session, what: &Show) -> SqlResult<Outcome> {
             rows.sort_by_key(|r| r[0].as_text());
             text_rs(&["Variable_name", "Value"], rows)
         }
-        Show::Status => text_rs(&["Variable_name", "Value"], vec![vec![t("Uptime"), t("1")], vec![t("Threads_connected"), t("1")]]),
+        Show::Status => text_rs(
+            &["Variable_name", "Value"],
+            vec![
+                vec![t("Uptime"), t("1")],
+                vec![t("Threads_connected"), t("1")],
+            ],
+        ),
         Show::Warnings | Show::Errors => text_rs(&["Level", "Code", "Message"], Vec::new()),
         Show::Collation => text_rs(
-            &["Collation", "Charset", "Id", "Default", "Compiled", "Sortlen", "Pad_attribute"],
-            vec![vec![t("utf8mb4_0900_ai_ci"), t("utf8mb4"), i(255), t("Yes"), t("Yes"), i(0), t("NO PAD")]],
+            &[
+                "Collation",
+                "Charset",
+                "Id",
+                "Default",
+                "Compiled",
+                "Sortlen",
+                "Pad_attribute",
+            ],
+            vec![vec![
+                t("utf8mb4_0900_ai_ci"),
+                t("utf8mb4"),
+                i(255),
+                t("Yes"),
+                t("Yes"),
+                i(0),
+                t("NO PAD"),
+            ]],
         ),
-        Show::CharacterSet => text_rs(&["Charset", "Description", "Default collation", "Maxlen"], vec![vec![t("utf8mb4"), t("UTF-8 Unicode"), t("utf8mb4_0900_ai_ci"), i(4)]]),
-        Show::Engines => text_rs(&["Engine", "Support", "Comment", "Transactions", "XA", "Savepoints"], vec![vec![t("InnoDB"), t("DEFAULT"), t("Storine"), t("YES"), t("NO"), t("YES")]]),
+        Show::CharacterSet => text_rs(
+            &["Charset", "Description", "Default collation", "Maxlen"],
+            vec![vec![
+                t("utf8mb4"),
+                t("UTF-8 Unicode"),
+                t("utf8mb4_0900_ai_ci"),
+                i(4),
+            ]],
+        ),
+        Show::Engines => text_rs(
+            &[
+                "Engine",
+                "Support",
+                "Comment",
+                "Transactions",
+                "XA",
+                "Savepoints",
+            ],
+            vec![vec![
+                t("InnoDB"),
+                t("DEFAULT"),
+                t("Storine"),
+                t("YES"),
+                t("NO"),
+                t("YES"),
+            ]],
+        ),
         Show::ProcessList => text_rs(
-            &["Id", "User", "Host", "db", "Command", "Time", "State", "Info"],
-            vec![vec![i(s.id as i64), t(&s.user), t("localhost"), t(&db), t("Query"), i(0), t(""), t("SHOW PROCESSLIST")]],
+            &[
+                "Id", "User", "Host", "db", "Command", "Time", "State", "Info",
+            ],
+            vec![vec![
+                i(s.id as i64),
+                t(&s.user),
+                t("localhost"),
+                t(&db),
+                t("Query"),
+                i(0),
+                t(""),
+                t("SHOW PROCESSLIST"),
+            ]],
         ),
         Show::TableStatus { like } => {
             let rows = tables
                 .iter()
                 .filter(|tb| like_filter(like, &tb.name))
-                .map(|tb| vec![t(&tb.name), t("InnoDB"), i(10), t("Dynamic"), N, N, N, N, N, N, N, N, N, N, t("utf8mb4_0900_ai_ci"), N, t(""), t("")])
+                .map(|tb| {
+                    vec![
+                        t(&tb.name),
+                        t("InnoDB"),
+                        i(10),
+                        t("Dynamic"),
+                        N,
+                        N,
+                        N,
+                        N,
+                        N,
+                        N,
+                        N,
+                        N,
+                        N,
+                        N,
+                        t("utf8mb4_0900_ai_ci"),
+                        N,
+                        t(""),
+                        t(""),
+                    ]
+                })
                 .collect();
             text_rs(
-                &["Name", "Engine", "Version", "Row_format", "Rows", "Avg_row_length", "Data_length", "Max_data_length", "Index_length", "Data_free", "Auto_increment", "Create_time", "Update_time", "Check_time", "Collation", "Checksum", "Create_options", "Comment"],
+                &[
+                    "Name",
+                    "Engine",
+                    "Version",
+                    "Row_format",
+                    "Rows",
+                    "Avg_row_length",
+                    "Data_length",
+                    "Max_data_length",
+                    "Index_length",
+                    "Data_free",
+                    "Auto_increment",
+                    "Create_time",
+                    "Update_time",
+                    "Check_time",
+                    "Collation",
+                    "Checksum",
+                    "Create_options",
+                    "Comment",
+                ],
                 rows,
             )
         }

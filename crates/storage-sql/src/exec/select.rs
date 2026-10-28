@@ -7,7 +7,10 @@ use std::rc::Rc;
 
 use storine::Filter;
 
-use crate::ast::{BinaryOp, DataType, Expr, JoinConstraint, JoinKind, OrderBy, Query, Select, SelectItem, SetExpr, SetOp, TableAlias, TableRef};
+use crate::ast::{
+    BinaryOp, DataType, Expr, JoinConstraint, JoinKind, OrderBy, Query, Select, SelectItem,
+    SetExpr, SetOp, TableAlias, TableRef,
+};
 use crate::catalog::{Row, Table};
 use crate::datum::{self, cast, compare, hash_key, Datum};
 use crate::error::{SqlError, SqlResult};
@@ -30,7 +33,13 @@ pub struct ColMeta {
 
 impl ColMeta {
     pub fn new(name: impl Into<String>, ty: Option<DataType>) -> ColMeta {
-        ColMeta { qual: None, name: name.into(), ty, table: None, hidden: false }
+        ColMeta {
+            qual: None,
+            name: name.into(),
+            ty,
+            table: None,
+            hidden: false,
+        }
     }
 }
 
@@ -43,14 +52,22 @@ pub struct Rel {
 
 impl Rel {
     fn requalify(mut self, alias: &Option<TableAlias>, default: Option<&str>) -> SqlResult<Rel> {
-        let qual = alias.as_ref().map(|a| a.name.clone()).or_else(|| default.map(str::to_owned));
+        let qual = alias
+            .as_ref()
+            .map(|a| a.name.clone())
+            .or_else(|| default.map(str::to_owned));
         for c in &mut self.cols {
             c.qual = qual.clone();
         }
         if let Some(a) = alias {
             if !a.columns.is_empty() {
                 if a.columns.len() > self.cols.len() {
-                    return Err(SqlError::syntax(format!("table \"{}\" has {} columns available but {} columns specified", a.name, self.cols.len(), a.columns.len())));
+                    return Err(SqlError::syntax(format!(
+                        "table \"{}\" has {} columns available but {} columns specified",
+                        a.name,
+                        self.cols.len(),
+                        a.columns.len()
+                    )));
                 }
                 for (c, n) in self.cols.iter_mut().zip(&a.columns) {
                     c.name = n.clone();
@@ -73,7 +90,11 @@ pub struct TableRow {
 /// Splits `e` into its top-level AND conjuncts.
 pub fn conjuncts(e: &Expr) -> Vec<&Expr> {
     match e {
-        Expr::Binary { op: BinaryOp::And, left, right } => {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
             let mut v = conjuncts(left);
             v.extend(conjuncts(right));
             v
@@ -96,7 +117,10 @@ fn column_refs(e: &Expr) -> Vec<Vec<String>> {
 fn has_subquery(e: &Expr) -> bool {
     let mut found = false;
     walk(e, &mut |x| {
-        if matches!(x, Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. }) {
+        if matches!(
+            x,
+            Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. }
+        ) {
             found = true;
         }
         if let Expr::AnyAll { right, .. } = x {
@@ -116,7 +140,13 @@ impl Exec<'_> {
             self.ctes.borrow_mut().push(HashMap::new());
             for cte in &q.ctes {
                 let rel = self.query(&cte.query, outer)?;
-                let rel = rel.requalify(&Some(TableAlias { name: cte.name.clone(), columns: cte.columns.clone() }), None)?;
+                let rel = rel.requalify(
+                    &Some(TableAlias {
+                        name: cte.name.clone(),
+                        columns: cte.columns.clone(),
+                    }),
+                    None,
+                )?;
                 let rc = Rc::new(rel);
                 scope.insert(cte.name.to_ascii_lowercase(), Rc::clone(&rc));
                 if let Some(top) = self.ctes.borrow_mut().last_mut() {
@@ -137,14 +167,18 @@ impl Exec<'_> {
             None => None,
             Some(e) => match self.eval_const(e)? {
                 Datum::Null => None,
-                v => Some(usize::try_from(v.as_i64()?).map_err(|_| SqlError::new("2201W", "LIMIT must not be negative"))?),
+                v => Some(
+                    usize::try_from(v.as_i64()?)
+                        .map_err(|_| SqlError::new("2201W", "LIMIT must not be negative"))?,
+                ),
             },
         };
         let off = match &q.offset {
             None => 0,
             Some(e) => match self.eval_const(e)? {
                 Datum::Null => 0,
-                v => usize::try_from(v.as_i64()?).map_err(|_| SqlError::new("2201X", "OFFSET must not be negative"))?,
+                v => usize::try_from(v.as_i64()?)
+                    .map_err(|_| SqlError::new("2201X", "OFFSET must not be negative"))?,
             },
         };
         Ok((lim, off))
@@ -161,8 +195,16 @@ impl Exec<'_> {
                 .rows
                 .iter()
                 .map(|r| {
-                    let env = Env { cols: &rel.cols, row: r, outer, aggs: None };
-                    q.order_by.iter().map(|o| self.output_order_key(o, &rel.cols, r, &env)).collect::<SqlResult<Vec<_>>>()
+                    let env = Env {
+                        cols: &rel.cols,
+                        row: r,
+                        outer,
+                        aggs: None,
+                    };
+                    q.order_by
+                        .iter()
+                        .map(|o| self.output_order_key(o, &rel.cols, r, &env))
+                        .collect::<SqlResult<Vec<_>>>()
                 })
                 .collect::<SqlResult<_>>()?;
             let mut idx: Vec<usize> = (0..rel.rows.len()).collect();
@@ -176,13 +218,31 @@ impl Exec<'_> {
 
     /// An ORDER BY key of a set operation / VALUES result: an ordinal, an output name or an
     /// expression over the output columns.
-    fn output_order_key(&self, o: &OrderBy, cols: &[ColMeta], row: &[Datum], env: &Env<'_>) -> SqlResult<Datum> {
+    fn output_order_key(
+        &self,
+        o: &OrderBy,
+        cols: &[ColMeta],
+        row: &[Datum],
+        env: &Env<'_>,
+    ) -> SqlResult<Datum> {
         if let Expr::Number(n) = &o.expr {
-            let i: usize = n.parse().map_err(|_| SqlError::syntax(format!("bad ORDER BY position {n}")))?;
-            return row.get(i.wrapping_sub(1)).cloned().ok_or_else(|| SqlError::syntax(format!("ORDER BY position {i} is not in select list")));
+            let i: usize = n
+                .parse()
+                .map_err(|_| SqlError::syntax(format!("bad ORDER BY position {n}")))?;
+            return row.get(i.wrapping_sub(1)).cloned().ok_or_else(|| {
+                SqlError::syntax(format!("ORDER BY position {i} is not in select list"))
+            });
         }
         if let Expr::Column(p) = &o.expr {
-            if let Some(i) = find_column(cols, if p.len() > 1 { Some(&p[p.len() - 2]) } else { None }, &p[p.len() - 1])? {
+            if let Some(i) = find_column(
+                cols,
+                if p.len() > 1 {
+                    Some(&p[p.len() - 2])
+                } else {
+                    None
+                },
+                &p[p.len() - 1],
+            )? {
                 return Ok(row[i].clone());
             }
         }
@@ -193,7 +253,9 @@ impl Exec<'_> {
         let mysql = self.dialect() == Dialect::MySql;
         for (o, (x, y)) in order.iter().zip(a.iter().zip(b)) {
             // PostgreSQL: NULLs sort as larger than any value; MySQL: as smaller.
-            let nulls_first = o.nulls_first.unwrap_or(if mysql { !o.desc } else { o.desc });
+            let nulls_first = o
+                .nulls_first
+                .unwrap_or(if mysql { !o.desc } else { o.desc });
             let ord = match (x.is_null(), y.is_null()) {
                 (true, true) => Ordering::Equal,
                 (true, false) => {
@@ -234,21 +296,35 @@ impl Exec<'_> {
                 let env = outer.copied().unwrap_or(Env::EMPTY);
                 let mut out = Rel::default();
                 for (i, r) in rows.iter().enumerate() {
-                    let vals = r.iter().map(|x| self.eval(x, &env)).collect::<SqlResult<Vec<_>>>()?;
+                    let vals = r
+                        .iter()
+                        .map(|x| self.eval(x, &env))
+                        .collect::<SqlResult<Vec<_>>>()?;
                     if i == 0 {
-                        out.cols = (1..=vals.len()).map(|n| ColMeta::new(format!("column{n}"), None)).collect();
+                        out.cols = (1..=vals.len())
+                            .map(|n| ColMeta::new(format!("column{n}"), None))
+                            .collect();
                     } else if vals.len() != out.cols.len() {
-                        return Err(SqlError::syntax("VALUES lists must all be the same length".into()));
+                        return Err(SqlError::syntax(
+                            "VALUES lists must all be the same length".into(),
+                        ));
                     }
                     out.rows.push(vals);
                 }
                 Ok(out)
             }
-            SetExpr::SetOp { op, all, left, right } => {
+            SetExpr::SetOp {
+                op,
+                all,
+                left,
+                right,
+            } => {
                 let l = self.set_expr(left, outer)?;
                 let r = self.set_expr(right, outer)?;
                 if !l.cols.is_empty() && !r.cols.is_empty() && l.cols.len() != r.cols.len() {
-                    return Err(SqlError::syntax("each UNION query must have the same number of columns".into()));
+                    return Err(SqlError::syntax(
+                        "each UNION query must have the same number of columns".into(),
+                    ));
                 }
                 let key = |row: &Row| row.iter().map(hash_key).collect::<Vec<_>>().join("\u{1}");
                 let mut cols = l.cols.clone();
@@ -322,11 +398,20 @@ impl Exec<'_> {
 
     fn cte(&self, name: &str) -> Option<Rc<Rel>> {
         let lower = name.to_ascii_lowercase();
-        self.ctes.borrow().iter().rev().find_map(|scope| scope.get(&lower).cloned())
+        self.ctes
+            .borrow()
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(&lower).cloned())
     }
 
     /// Evaluates the FROM list; `pushable` are WHERE conjuncts that may narrow table scans.
-    pub fn eval_from(&self, from: &[TableRef], pushable: &[&Expr], outer: Option<&Env<'_>>) -> SqlResult<Rel> {
+    pub fn eval_from(
+        &self,
+        from: &[TableRef],
+        pushable: &[&Expr],
+        outer: Option<&Env<'_>>,
+    ) -> SqlResult<Rel> {
         let mut acc: Option<Rel> = None;
         for item in from {
             let rel = self.eval_from_entry(item, pushable, outer, acc.as_ref())?;
@@ -335,12 +420,25 @@ impl Exec<'_> {
                 Some(l) => self.join(l, rel, JoinKind::Cross, &JoinConstraint::None, outer)?,
             });
         }
-        Ok(acc.unwrap_or(Rel { cols: Vec::new(), rows: vec![Vec::new()] }))
+        Ok(acc.unwrap_or(Rel {
+            cols: Vec::new(),
+            rows: vec![Vec::new()],
+        }))
     }
 
-    fn eval_from_entry(&self, item: &TableRef, pushable: &[&Expr], outer: Option<&Env<'_>>, lateral_left: Option<&Rel>) -> SqlResult<Rel> {
+    fn eval_from_entry(
+        &self,
+        item: &TableRef,
+        pushable: &[&Expr],
+        outer: Option<&Env<'_>>,
+        lateral_left: Option<&Rel>,
+    ) -> SqlResult<Rel> {
         match item {
-            TableRef::Named { schema, name, alias } => {
+            TableRef::Named {
+                schema,
+                name,
+                alias,
+            } => {
                 if schema.is_none() {
                     if let Some(rel) = self.cte(name) {
                         return (*rel).clone().requalify(alias, Some(name));
@@ -352,10 +450,17 @@ impl Exec<'_> {
                 let table = self.s.engine.table(name)?;
                 let qual = alias.as_ref().map_or(name.as_str(), |a| a.name.as_str());
                 let rows = self.scan_rows(&table, Some(qual), pushable, Vec::new(), outer)?;
-                let rel = Rel { cols: table_cols(&table), rows: rows.into_iter().map(|r| r.row).collect() };
+                let rel = Rel {
+                    cols: table_cols(&table),
+                    rows: rows.into_iter().map(|r| r.row).collect(),
+                };
                 rel.requalify(alias, Some(&table.name))
             }
-            TableRef::Derived { query, alias, lateral } => {
+            TableRef::Derived {
+                query,
+                alias,
+                lateral,
+            } => {
                 let rel = if *lateral {
                     // LATERAL: evaluated per left row is not supported beyond uncorrelated use.
                     let _ = lateral_left;
@@ -367,24 +472,55 @@ impl Exec<'_> {
             }
             TableRef::Function { name, args, alias } => {
                 let env = outer.copied().unwrap_or(Env::EMPTY);
-                let vals = args.iter().map(|a| self.eval(a, &env)).collect::<SqlResult<Vec<_>>>()?;
+                let vals = args
+                    .iter()
+                    .map(|a| self.eval(a, &env))
+                    .collect::<SqlResult<Vec<_>>>()?;
                 func::table_function(self, name, &vals)?.requalify(alias, Some(name))
             }
-            TableRef::Join { left, right, kind, constraint } => {
+            TableRef::Join {
+                left,
+                right,
+                kind,
+                constraint,
+            } => {
                 // WHERE conjuncts may narrow the preserved side(s) only.
-                let lp: &[&Expr] = if matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left) { pushable } else { &[] };
-                let rp: &[&Expr] = if matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Right) { pushable } else { &[] };
+                let lp: &[&Expr] =
+                    if matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Left) {
+                        pushable
+                    } else {
+                        &[]
+                    };
+                let rp: &[&Expr] =
+                    if matches!(kind, JoinKind::Inner | JoinKind::Cross | JoinKind::Right) {
+                        pushable
+                    } else {
+                        &[]
+                    };
                 let l = self.eval_from_entry(left, lp, outer, lateral_left)?;
                 // Lookup join: fetch only the right rows whose join key appears on the left.
                 let r = match (&**right, constraint) {
-                    (TableRef::Named { schema: None, name, alias }, JoinConstraint::On(on))
-                        if self.cte(name).is_none() && !system::is_system(None, name) && l.rows.len() <= 2000 && matches!(kind, JoinKind::Inner | JoinKind::Left) =>
+                    (
+                        TableRef::Named {
+                            schema: None,
+                            name,
+                            alias,
+                        },
+                        JoinConstraint::On(on),
+                    ) if self.cte(name).is_none()
+                        && !system::is_system(None, name)
+                        && l.rows.len() <= 2000
+                        && matches!(kind, JoinKind::Inner | JoinKind::Left) =>
                     {
                         let table = self.s.engine.table(name)?;
                         let qual = alias.as_ref().map_or(name.as_str(), |a| a.name.as_str());
                         let extra = self.lookup_filters(&table, qual, on, &l, outer)?;
                         let rows = self.scan_rows(&table, Some(qual), rp, extra, outer)?;
-                        Rel { cols: table_cols(&table), rows: rows.into_iter().map(|r| r.row).collect() }.requalify(alias, Some(&table.name))?
+                        Rel {
+                            cols: table_cols(&table),
+                            rows: rows.into_iter().map(|r| r.row).collect(),
+                        }
+                        .requalify(alias, Some(&table.name))?
                     }
                     _ => self.eval_from_entry(right, rp, outer, Some(&l))?,
                 };
@@ -394,35 +530,81 @@ impl Exec<'_> {
     }
 
     /// For `ON right.col = <left expr>`: an IN filter on `right.col` with the left side's values.
-    fn lookup_filters(&self, table: &Table, qual: &str, on: &Expr, left: &Rel, outer: Option<&Env<'_>>) -> SqlResult<Vec<Filter>> {
+    fn lookup_filters(
+        &self,
+        table: &Table,
+        qual: &str,
+        on: &Expr,
+        left: &Rel,
+        outer: Option<&Env<'_>>,
+    ) -> SqlResult<Vec<Filter>> {
         let mut out = Vec::new();
         for c in conjuncts(on) {
-            let Expr::Binary { op: BinaryOp::Eq, left: a, right: b } = c else { continue };
+            let Expr::Binary {
+                op: BinaryOp::Eq,
+                left: a,
+                right: b,
+            } = c
+            else {
+                continue;
+            };
             for (mine, other) in [(a, b), (b, a)] {
                 let Expr::Column(p) = &**mine else { continue };
-                let q = if p.len() > 1 { Some(p[p.len() - 2].as_str()) } else { None };
-                if q.is_some_and(|q| !q.eq_ignore_ascii_case(qual)) || (q.is_none() && find_column(&left.cols, None, &p[p.len() - 1]).ok().flatten().is_some()) {
+                let q = if p.len() > 1 {
+                    Some(p[p.len() - 2].as_str())
+                } else {
+                    None
+                };
+                if q.is_some_and(|q| !q.eq_ignore_ascii_case(qual))
+                    || (q.is_none()
+                        && find_column(&left.cols, None, &p[p.len() - 1])
+                            .ok()
+                            .flatten()
+                            .is_some())
+                {
                     continue;
                 }
-                let Some(ci) = table.column_index(&p[p.len() - 1]) else { continue };
+                let Some(ci) = table.column_index(&p[p.len() - 1]) else {
+                    continue;
+                };
                 // The other side must be computable from the left row alone.
                 let refs = column_refs(other);
                 if refs.is_empty() || has_subquery(other) {
                     continue;
                 }
-                if !refs.iter().all(|r| find_column(&left.cols, if r.len() > 1 { Some(&r[r.len() - 2]) } else { None }, &r[r.len() - 1]).ok().flatten().is_some()) {
+                if !refs.iter().all(|r| {
+                    find_column(
+                        &left.cols,
+                        if r.len() > 1 {
+                            Some(&r[r.len() - 2])
+                        } else {
+                            None
+                        },
+                        &r[r.len() - 1],
+                    )
+                    .ok()
+                    .flatten()
+                    .is_some()
+                }) {
                     continue;
                 }
                 let col = &table.columns[ci];
                 let mut seen = HashSet::new();
                 let mut values = Vec::new();
                 for row in &left.rows {
-                    let env = Env { cols: &left.cols, row, outer, aggs: None };
+                    let env = Env {
+                        cols: &left.cols,
+                        row,
+                        outer,
+                        aggs: None,
+                    };
                     let v = self.eval(other, &env)?;
                     if v.is_null() {
                         continue;
                     }
-                    let Ok(cv) = cast(&v, &col.ty) else { return Ok(Vec::new()) };
+                    let Ok(cv) = cast(&v, &col.ty) else {
+                        return Ok(Vec::new());
+                    };
                     if seen.insert(hash_key(&cv)) {
                         values.push(datum::to_value(&cv, &col.ty));
                     }
@@ -436,7 +618,14 @@ impl Exec<'_> {
         Ok(out)
     }
 
-    fn join(&self, l: Rel, r: Rel, kind: JoinKind, constraint: &JoinConstraint, outer: Option<&Env<'_>>) -> SqlResult<Rel> {
+    fn join(
+        &self,
+        l: Rel,
+        r: Rel,
+        kind: JoinKind,
+        constraint: &JoinConstraint,
+        outer: Option<&Env<'_>>,
+    ) -> SqlResult<Rel> {
         let mut cols = l.cols.clone();
         let mut rcols = r.cols.clone();
         // USING / NATURAL: equality on shared names; the right copies are hidden.
@@ -445,7 +634,12 @@ impl Exec<'_> {
             JoinConstraint::Natural => l
                 .cols
                 .iter()
-                .filter(|c| !c.hidden && r.cols.iter().any(|rc| !rc.hidden && rc.name.eq_ignore_ascii_case(&c.name)))
+                .filter(|c| {
+                    !c.hidden
+                        && r.cols
+                            .iter()
+                            .any(|rc| !rc.hidden && rc.name.eq_ignore_ascii_case(&c.name))
+                })
                 .map(|c| c.name.clone())
                 .collect(),
             _ => Vec::new(),
@@ -469,7 +663,12 @@ impl Exec<'_> {
         let mut residual: Vec<&Expr> = Vec::new();
         if let Some(on) = on {
             for c in conjuncts(on) {
-                if let Expr::Binary { op: BinaryOp::Eq, left: a, right: b } = c {
+                if let Expr::Binary {
+                    op: BinaryOp::Eq,
+                    left: a,
+                    right: b,
+                } = c
+                {
                     let side = |e: &Expr| -> Option<bool> {
                         let refs = column_refs(e);
                         if refs.is_empty() || has_subquery(e) {
@@ -501,7 +700,12 @@ impl Exec<'_> {
             }
         }
         let lkey = |row: &Row| -> SqlResult<Option<String>> {
-            let env = Env { cols: &l.cols, row, outer, aggs: None };
+            let env = Env {
+                cols: &l.cols,
+                row,
+                outer,
+                aggs: None,
+            };
             let mut k = String::new();
             for (li, _) in &eq_pairs {
                 if row[*li].is_null() {
@@ -521,7 +725,12 @@ impl Exec<'_> {
             Ok(Some(k))
         };
         let rkey = |row: &Row| -> SqlResult<Option<String>> {
-            let env = Env { cols: &r.cols, row, outer, aggs: None };
+            let env = Env {
+                cols: &r.cols,
+                row,
+                outer,
+                aggs: None,
+            };
             let mut k = String::new();
             for (_, ri) in &eq_pairs {
                 if row[*ri].is_null() {
@@ -566,7 +775,12 @@ impl Exec<'_> {
             for &ri in candidates {
                 let mut row = lrow.clone();
                 row.extend(r.rows[ri].iter().cloned());
-                let env = Env { cols: &cols, row: &row, outer, aggs: None };
+                let env = Env {
+                    cols: &cols,
+                    row: &row,
+                    outer,
+                    aggs: None,
+                };
                 let mut ok = true;
                 for c in &residual {
                     if !self.eval_bool(c, &env)? {
@@ -606,7 +820,14 @@ impl Exec<'_> {
 
     /// Rows of `table` that may satisfy `conjuncts` (filters pushed down where exact enough;
     /// callers re-check everything), merged with this transaction's own writes.
-    pub fn scan_rows(&self, table: &Table, qual: Option<&str>, conjs: &[&Expr], mut extra: Vec<Filter>, outer: Option<&Env<'_>>) -> SqlResult<Vec<TableRow>> {
+    pub fn scan_rows(
+        &self,
+        table: &Table,
+        qual: Option<&str>,
+        conjs: &[&Expr],
+        mut extra: Vec<Filter>,
+        outer: Option<&Env<'_>>,
+    ) -> SqlResult<Vec<TableRow>> {
         let store = &self.s.engine.store;
         let txn = self.s.txn.as_ref();
         // Primary-key point lookups.
@@ -618,11 +839,19 @@ impl Exec<'_> {
                     continue;
                 }
                 match txn.and_then(|t| t.get(&table.collection, &k)) {
-                    Some(Some(doc)) => out.push(TableRow { key: k, version: None, row: table.from_doc(doc) }),
+                    Some(Some(doc)) => out.push(TableRow {
+                        key: k,
+                        version: None,
+                        row: table.from_doc(doc),
+                    }),
                     Some(None) => {}
                     None => {
                         if let Some(d) = store.get(&table.collection, &k)? {
-                            out.push(TableRow { key: d.key, version: Some(d.version), row: table.from_doc(&d.fields) });
+                            out.push(TableRow {
+                                key: d.key,
+                                version: Some(d.version),
+                                row: table.from_doc(&d.fields),
+                            });
                         }
                     }
                 }
@@ -640,30 +869,50 @@ impl Exec<'_> {
             _ => Some(storine::and(extra)),
         };
         let mut out = Vec::new();
-        let overlay: HashMap<&str, Option<&storine::Doc>> = txn.map(|t| t.entries(&table.collection).collect()).unwrap_or_default();
+        let overlay: HashMap<&str, Option<&storine::Doc>> = txn
+            .map(|t| t.entries(&table.collection).collect())
+            .unwrap_or_default();
         for d in store.scan(&table.collection, filter)? {
             if overlay.contains_key(d.key.as_str()) {
                 continue;
             }
-            out.push(TableRow { row: table.from_doc(&d.fields), key: d.key, version: Some(d.version) });
+            out.push(TableRow {
+                row: table.from_doc(&d.fields),
+                key: d.key,
+                version: Some(d.version),
+            });
         }
         for (k, doc) in overlay {
             if let Some(doc) = doc {
-                out.push(TableRow { key: k.to_owned(), version: None, row: table.from_doc(doc) });
+                out.push(TableRow {
+                    key: k.to_owned(),
+                    version: None,
+                    row: table.from_doc(doc),
+                });
             }
         }
         Ok(out)
     }
 
     /// Keys when the conjuncts pin the whole primary key to constants (`id = 5`, `id IN (1, 2)`).
-    fn pk_lookup(&self, table: &Table, qual: Option<&str>, conjs: &[&Expr], outer: Option<&Env<'_>>) -> SqlResult<Option<Vec<String>>> {
+    fn pk_lookup(
+        &self,
+        table: &Table,
+        qual: Option<&str>,
+        conjs: &[&Expr],
+        outer: Option<&Env<'_>>,
+    ) -> SqlResult<Option<Vec<String>>> {
         if table.primary_key.is_empty() {
             return Ok(None);
         }
         let mut choices: Vec<Option<Vec<Datum>>> = vec![None; table.primary_key.len()];
         for c in conjs {
             let (col, values) = match c {
-                Expr::Binary { op: BinaryOp::Eq, left, right } => {
+                Expr::Binary {
+                    op: BinaryOp::Eq,
+                    left,
+                    right,
+                } => {
                     if let Some(ci) = self.own_column(table, qual, left) {
                         match self.constant(right, outer) {
                             Some(v) => (ci, vec![v]),
@@ -678,8 +927,14 @@ impl Exec<'_> {
                         continue;
                     }
                 }
-                Expr::InList { expr, list, negated: false } => {
-                    let Some(ci) = self.own_column(table, qual, expr) else { continue };
+                Expr::InList {
+                    expr,
+                    list,
+                    negated: false,
+                } => {
+                    let Some(ci) = self.own_column(table, qual, expr) else {
+                        continue;
+                    };
                     let mut vals = Vec::new();
                     for x in list {
                         match self.constant(x, outer) {
@@ -744,7 +999,8 @@ impl Exec<'_> {
         let Expr::Column(p) = e else { return None };
         if p.len() > 1 {
             let q = &p[p.len() - 2];
-            let ok = qual.is_some_and(|x| x.eq_ignore_ascii_case(q)) || q.eq_ignore_ascii_case(&table.name);
+            let ok = qual.is_some_and(|x| x.eq_ignore_ascii_case(q))
+                || q.eq_ignore_ascii_case(&table.name);
             if !ok {
                 return None;
             }
@@ -766,7 +1022,13 @@ impl Exec<'_> {
     }
 
     /// A storage filter equivalent to (or wider than) conjunct `c` for this table.
-    fn to_filter(&self, table: &Table, qual: Option<&str>, c: &Expr, outer: Option<&Env<'_>>) -> Option<Filter> {
+    fn to_filter(
+        &self,
+        table: &Table,
+        qual: Option<&str>,
+        c: &Expr,
+        outer: Option<&Env<'_>>,
+    ) -> Option<Filter> {
         let typed = |ci: usize, v: Datum| -> Option<storine::Value> {
             let col = &table.columns[ci];
             if !pushable_type(&col.ty) || v.is_null() {
@@ -775,7 +1037,12 @@ impl Exec<'_> {
             cast(&v, &col.ty).ok().map(|t| datum::to_value(&t, &col.ty))
         };
         match c {
-            Expr::Binary { op, left, right } if matches!(op, BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) => {
+            Expr::Binary { op, left, right }
+                if matches!(
+                    op,
+                    BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+                ) =>
+            {
                 let (ci, v, flipped) = if let Some(ci) = self.own_column(table, qual, left) {
                     (ci, self.constant(right, outer)?, false)
                 } else {
@@ -792,13 +1059,22 @@ impl Exec<'_> {
                     _ => storine::ge(field, val),
                 })
             }
-            Expr::Between { expr, low, high, negated: false } => {
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated: false,
+            } => {
                 let ci = self.own_column(table, qual, expr)?;
                 let lo = typed(ci, self.constant(low, outer)?)?;
                 let hi = typed(ci, self.constant(high, outer)?)?;
                 Some(storine::between(&table.columns[ci].field, lo, hi))
             }
-            Expr::InList { expr, list, negated: false } => {
+            Expr::InList {
+                expr,
+                list,
+                negated: false,
+            } => {
                 let ci = self.own_column(table, qual, expr)?;
                 let mut vals = Vec::new();
                 for x in list {
@@ -810,17 +1086,32 @@ impl Exec<'_> {
                 }
                 Some(storine::is_in(&table.columns[ci].field, vals))
             }
-            Expr::IsNull { expr, negated: true } => {
+            Expr::IsNull {
+                expr,
+                negated: true,
+            } => {
                 let ci = self.own_column(table, qual, expr)?;
                 Some(storine::exists(&table.columns[ci].field))
             }
-            Expr::Like { expr, pattern, negated: false, case_insensitive: false, escape: None } => {
+            Expr::Like {
+                expr,
+                pattern,
+                negated: false,
+                case_insensitive: false,
+                escape: None,
+            } => {
                 let ci = self.own_column(table, qual, expr)?;
-                if !matches!(table.columns[ci].ty, DataType::Text | DataType::Varchar(_) | DataType::Char(_)) {
+                if !matches!(
+                    table.columns[ci].ty,
+                    DataType::Text | DataType::Varchar(_) | DataType::Char(_)
+                ) {
                     return None;
                 }
                 let p = self.constant(pattern, outer)?.as_text();
-                let lit: String = p.chars().take_while(|ch| !matches!(ch, '%' | '_' | '\\')).collect();
+                let lit: String = p
+                    .chars()
+                    .take_while(|ch| !matches!(ch, '%' | '_' | '\\'))
+                    .collect();
                 if lit.is_empty() {
                     return None;
                 }
@@ -832,16 +1123,35 @@ impl Exec<'_> {
 
     // ── SELECT ──
 
-    pub fn select(&self, sel: &Select, outer: Option<&Env<'_>>, order_by: &[OrderBy], limit: Option<usize>, offset: usize) -> SqlResult<Rel> {
+    pub fn select(
+        &self,
+        sel: &Select,
+        outer: Option<&Env<'_>>,
+        order_by: &[OrderBy],
+        limit: Option<usize>,
+        offset: usize,
+    ) -> SqlResult<Rel> {
         let where_conjs: Vec<&Expr> = sel.where_.as_ref().map(conjuncts).unwrap_or_default();
-        let pushable: Vec<&Expr> = where_conjs.iter().copied().filter(|c| !has_subquery(c) && !has_aggregate(c)).collect();
+        let pushable: Vec<&Expr> = where_conjs
+            .iter()
+            .copied()
+            .filter(|c| !has_subquery(c) && !has_aggregate(c))
+            .collect();
         let src = self.eval_from(&sel.from, &pushable, outer)?;
         // WHERE.
         let mut rows = Vec::with_capacity(src.rows.len());
         for row in src.rows {
             let ok = match &sel.where_ {
                 None => true,
-                Some(w) => self.eval_bool(w, &Env { cols: &src.cols, row: &row, outer, aggs: None })?,
+                Some(w) => self.eval_bool(
+                    w,
+                    &Env {
+                        cols: &src.cols,
+                        row: &row,
+                        outer,
+                        aggs: None,
+                    },
+                )?,
             };
             if ok {
                 rows.push(row);
@@ -859,7 +1169,11 @@ impl Exec<'_> {
                             continue;
                         }
                         if let Some(q) = q {
-                            if !c.qual.as_deref().is_some_and(|cq| cq.eq_ignore_ascii_case(q)) {
+                            if !c
+                                .qual
+                                .as_deref()
+                                .is_some_and(|cq| cq.eq_ignore_ascii_case(q))
+                            {
                                 continue;
                             }
                         }
@@ -873,7 +1187,10 @@ impl Exec<'_> {
                     }
                     if !any {
                         if let Some(q) = q {
-                            return Err(SqlError::new("42P01", format!("missing FROM-clause entry for table \"{q}\"")));
+                            return Err(SqlError::new(
+                                "42P01",
+                                format!("missing FROM-clause entry for table \"{q}\""),
+                            ));
                         }
                     }
                 }
@@ -891,7 +1208,13 @@ impl Exec<'_> {
             .iter()
             .map(|(e, name, _)| {
                 let (ty, table) = self.static_type(e, &cols);
-                ColMeta { qual: None, name: name.clone(), ty, table, hidden: false }
+                ColMeta {
+                    qual: None,
+                    name: name.clone(),
+                    ty,
+                    table,
+                    hidden: false,
+                }
             })
             .collect();
         // Each output row with its ORDER BY keys.
@@ -901,17 +1224,27 @@ impl Exec<'_> {
                 .iter()
                 .map(|o| {
                     if let Expr::Number(n) = &o.expr {
-                        let i: usize = n.parse().map_err(|_| SqlError::syntax(format!("bad ORDER BY position {n}")))?;
-                        return out.get(i.wrapping_sub(1)).cloned().ok_or_else(|| SqlError::syntax(format!("ORDER BY position {i} is not in select list")));
+                        let i: usize = n
+                            .parse()
+                            .map_err(|_| SqlError::syntax(format!("bad ORDER BY position {n}")))?;
+                        return out.get(i.wrapping_sub(1)).cloned().ok_or_else(|| {
+                            SqlError::syntax(format!("ORDER BY position {i} is not in select list"))
+                        });
                     }
                     // A bare name matching an output alias sorts by that output column.
                     if let Expr::Column(p) = &o.expr {
                         if p.len() == 1 {
-                            if let Some(i) = items.iter().position(|(_, n, a)| a.is_some() && n.eq_ignore_ascii_case(&p[0])) {
+                            if let Some(i) = items
+                                .iter()
+                                .position(|(_, n, a)| a.is_some() && n.eq_ignore_ascii_case(&p[0]))
+                            {
                                 return Ok(out[i].clone());
                             }
                             if find_column(env.cols, None, &p[0])?.is_none() {
-                                if let Some(i) = items.iter().position(|(_, n, _)| n.eq_ignore_ascii_case(&p[0])) {
+                                if let Some(i) = items
+                                    .iter()
+                                    .position(|(_, n, _)| n.eq_ignore_ascii_case(&p[0]))
+                                {
                                     return Ok(out[i].clone());
                                 }
                             }
@@ -921,13 +1254,25 @@ impl Exec<'_> {
                 })
                 .collect()
         };
+        // Rows to project, each with the aggregate (and window) values it sees.
+        type Work = (Row, Vec<(Expr, Datum)>);
+        let mut work: Vec<Work> = Vec::new();
         if aggregated {
-            // Collect every aggregate call.
+            // Collect every aggregate call (window functions are computed separately).
             let mut agg_exprs: Vec<Expr> = Vec::new();
             let mut collect = |e: &Expr| {
                 walk(e, &mut |x| {
-                    if let Expr::Function { name, args, .. } = x {
-                        if is_aggregate(name) && !(matches!(name.as_str(), "min" | "max") && args.len() > 1) && !agg_exprs.contains(x) {
+                    if let Expr::Function {
+                        name,
+                        args,
+                        over: None,
+                        ..
+                    } = x
+                    {
+                        if is_aggregate(name)
+                            && !(matches!(name.as_str(), "min" | "max") && args.len() > 1)
+                            && !agg_exprs.contains(x)
+                        {
                             agg_exprs.push(x.clone());
                         }
                     }
@@ -947,9 +1292,19 @@ impl Exec<'_> {
                 .group_by
                 .iter()
                 .map(|g| match g {
-                    Expr::Number(n) => n.parse::<usize>().ok().and_then(|i| items.get(i.wrapping_sub(1))).map_or_else(|| g.clone(), |(e, _, _)| e.clone()),
-                    Expr::Column(p) if p.len() == 1 && find_column(&cols, None, &p[0]).ok().flatten().is_none() => {
-                        items.iter().find(|(_, n, _)| n.eq_ignore_ascii_case(&p[0])).map_or_else(|| g.clone(), |(e, _, _)| e.clone())
+                    Expr::Number(n) => n
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| items.get(i.wrapping_sub(1)))
+                        .map_or_else(|| g.clone(), |(e, _, _)| e.clone()),
+                    Expr::Column(p)
+                        if p.len() == 1
+                            && find_column(&cols, None, &p[0]).ok().flatten().is_none() =>
+                    {
+                        items
+                            .iter()
+                            .find(|(_, n, _)| n.eq_ignore_ascii_case(&p[0]))
+                            .map_or_else(|| g.clone(), |(e, _, _)| e.clone())
                     }
                     other => other.clone(),
                 })
@@ -957,7 +1312,12 @@ impl Exec<'_> {
             let mut groups: Vec<Vec<usize>> = Vec::new();
             let mut by_key: HashMap<String, usize> = HashMap::new();
             for (i, row) in rows.iter().enumerate() {
-                let env = Env { cols: &cols, row, outer, aggs: None };
+                let env = Env {
+                    cols: &cols,
+                    row,
+                    outer,
+                    aggs: None,
+                };
                 let mut k = String::new();
                 for g in &group_exprs {
                     k.push_str(&hash_key(&self.eval(g, &env)?));
@@ -980,27 +1340,57 @@ impl Exec<'_> {
                     aggs.push((a.clone(), v));
                 }
                 let rep = g.first().map_or(&null_row, |i| &rows[*i]);
-                let env = Env { cols: &cols, row: rep, outer, aggs: Some(&aggs) };
+                let env = Env {
+                    cols: &cols,
+                    row: rep,
+                    outer,
+                    aggs: Some(&aggs),
+                };
                 if let Some(h) = &sel.having {
                     if !self.eval_bool(h, &env)? {
                         continue;
                     }
                 }
-                let out = items.iter().map(|(e, _, _)| self.eval(e, &env)).collect::<SqlResult<Row>>()?;
-                let keys = order_key(self, &env, &out)?;
-                produced.push((out, keys));
+                work.push((rep.clone(), aggs));
             }
         } else {
-            for row in &rows {
-                let env = Env { cols: &cols, row, outer, aggs: None };
-                let out = items.iter().map(|(e, _, _)| self.eval(e, &env)).collect::<SqlResult<Row>>()?;
-                let keys = order_key(self, &env, &out)?;
-                produced.push((out, keys));
-            }
+            work = rows.into_iter().map(|r| (r, Vec::new())).collect();
+        }
+        // Window functions over the rows (or groups) that survived WHERE / HAVING.
+        let mut wins: Vec<Expr> = Vec::new();
+        for e in items
+            .iter()
+            .map(|(e, _, _)| e)
+            .chain(order_by.iter().map(|o| &o.expr))
+        {
+            walk(e, &mut |x| {
+                if matches!(x, Expr::Function { over: Some(_), .. }) && !wins.contains(x) {
+                    wins.push(x.clone());
+                }
+            });
+        }
+        for w in &wins {
+            self.window(w, &mut work, &cols, outer)?;
+        }
+        for (row, aggs) in &work {
+            let env = Env {
+                cols: &cols,
+                row,
+                outer,
+                aggs: Some(aggs),
+            };
+            let out = items
+                .iter()
+                .map(|(e, _, _)| self.eval(e, &env))
+                .collect::<SqlResult<Row>>()?;
+            let keys = order_key(self, &env, &out)?;
+            produced.push((out, keys));
         }
         if sel.distinct {
             let mut seen = HashSet::new();
-            produced.retain(|(r, _)| seen.insert(r.iter().map(hash_key).collect::<Vec<_>>().join("\u{1}")));
+            produced.retain(|(r, _)| {
+                seen.insert(r.iter().map(hash_key).collect::<Vec<_>>().join("\u{1}"))
+            });
         }
         if !order_by.is_empty() {
             produced.sort_by(|a, b| self.order_cmp(order_by, &a.1, &b.1));
@@ -1010,20 +1400,231 @@ impl Exec<'_> {
         // Untyped columns take the type of their first non-null value.
         for (i, c) in out_cols.iter_mut().enumerate() {
             if c.ty.is_none() {
-                c.ty = out_rows.iter().map(|r| &r[i]).find(|d| !d.is_null()).map(Datum::natural_type);
+                c.ty = out_rows
+                    .iter()
+                    .map(|r| &r[i])
+                    .find(|d| !d.is_null())
+                    .map(Datum::natural_type);
             }
         }
-        Ok(Rel { cols: out_cols, rows: out_rows })
+        Ok(Rel {
+            cols: out_cols,
+            rows: out_rows,
+        })
+    }
+
+    /// Computes window function `w` for every row of `work` (appended to the row's values).
+    fn window(
+        &self,
+        w: &Expr,
+        work: &mut [(Row, Vec<(Expr, Datum)>)],
+        cols: &[ColMeta],
+        outer: Option<&Env<'_>>,
+    ) -> SqlResult<()> {
+        let Expr::Function {
+            name,
+            args,
+            star,
+            distinct,
+            over: Some(spec),
+        } = w
+        else {
+            return Ok(());
+        };
+        // Partitions in order of first appearance.
+        let mut parts: Vec<Vec<usize>> = Vec::new();
+        let mut by_key: HashMap<String, usize> = HashMap::new();
+        let mut keys: Vec<Vec<Datum>> = Vec::with_capacity(work.len());
+        for (i, (row, aggs)) in work.iter().enumerate() {
+            let env = Env {
+                cols,
+                row,
+                outer,
+                aggs: Some(aggs),
+            };
+            let mut k = String::new();
+            for p in &spec.partition_by {
+                k.push_str(&hash_key(&self.eval(p, &env)?));
+                k.push('\u{1}');
+            }
+            let pi = *by_key.entry(k).or_insert_with(|| {
+                parts.push(Vec::new());
+                parts.len() - 1
+            });
+            parts[pi].push(i);
+            keys.push(
+                spec.order_by
+                    .iter()
+                    .map(|o| self.eval(&o.expr, &env))
+                    .collect::<SqlResult<Vec<_>>>()?,
+            );
+        }
+        let mut values: Vec<Datum> = vec![Datum::Null; work.len()];
+        let arg = |this: &Self, i: usize, k: usize| -> SqlResult<Datum> {
+            match args.get(k) {
+                Some(a) => this.eval(
+                    a,
+                    &Env {
+                        cols,
+                        row: &work[i].0,
+                        outer,
+                        aggs: Some(&work[i].1),
+                    },
+                ),
+                None => Ok(Datum::Null),
+            }
+        };
+        for part in &mut parts {
+            part.sort_by(|a, b| self.order_cmp(&spec.order_by, &keys[*a], &keys[*b]));
+            let n = part.len();
+            // Peer groups: rows with equal ORDER BY keys.
+            let mut peer_end = vec![0usize; n];
+            let mut peer_start = vec![0usize; n];
+            let mut start = 0;
+            for pos in 0..n {
+                if pos > 0
+                    && self.order_cmp(&spec.order_by, &keys[part[pos]], &keys[part[pos - 1]])
+                        != Ordering::Equal
+                {
+                    start = pos;
+                }
+                peer_start[pos] = start;
+            }
+            let mut end = n;
+            for pos in (0..n).rev() {
+                if pos + 1 < n
+                    && self.order_cmp(&spec.order_by, &keys[part[pos]], &keys[part[pos + 1]])
+                        != Ordering::Equal
+                {
+                    end = pos + 1;
+                }
+                peer_end[pos] = end;
+            }
+            let mut dense = 0i64;
+            for pos in 0..n {
+                let i = part[pos];
+                if peer_start[pos] == pos {
+                    dense += 1;
+                }
+                values[i] = match name.as_str() {
+                    "row_number" => Datum::Int(pos as i64 + 1),
+                    "rank" => Datum::Int(peer_start[pos] as i64 + 1),
+                    "dense_rank" => Datum::Int(dense),
+                    "percent_rank" => Datum::Float(if n > 1 {
+                        peer_start[pos] as f64 / (n - 1) as f64
+                    } else {
+                        0.0
+                    }),
+                    "cume_dist" => Datum::Float(peer_end[pos] as f64 / n as f64),
+                    "ntile" => {
+                        let buckets = arg(self, i, 0)?.as_i64()?.max(1) as usize;
+                        Datum::Int((pos * buckets / n) as i64 + 1)
+                    }
+                    "lag" | "lead" => {
+                        let off = if args.len() > 1 {
+                            arg(self, i, 1)?.as_i64()?
+                        } else {
+                            1
+                        };
+                        let target = if name == "lag" {
+                            pos as i64 - off
+                        } else {
+                            pos as i64 + off
+                        };
+                        if target >= 0 && (target as usize) < n {
+                            arg(self, part[target as usize], 0)?
+                        } else {
+                            arg(self, i, 2)?
+                        }
+                    }
+                    "first_value" => arg(self, part[0], 0)?,
+                    "last_value" => {
+                        let last = if spec.order_by.is_empty() {
+                            n - 1
+                        } else {
+                            peer_end[pos] - 1
+                        };
+                        arg(self, part[last], 0)?
+                    }
+                    "nth_value" => {
+                        let k = arg(self, i, 1)?.as_i64()?.max(1) as usize;
+                        let last = if spec.order_by.is_empty() {
+                            n
+                        } else {
+                            peer_end[pos]
+                        };
+                        if k <= last {
+                            arg(self, part[k - 1], 0)?
+                        } else {
+                            Datum::Null
+                        }
+                    }
+                    agg if is_aggregate(agg) => {
+                        // Default frame: the whole partition, or up to the current peers with ORDER BY.
+                        let last = if spec.order_by.is_empty() {
+                            n
+                        } else {
+                            peer_end[pos]
+                        };
+                        if pos > 0
+                            && peer_end[pos] == peer_end[pos - 1]
+                            && !spec.order_by.is_empty()
+                            || (pos > 0 && spec.order_by.is_empty())
+                        {
+                            values[part[pos - 1]].clone()
+                        } else {
+                            let plain = Expr::Function {
+                                name: name.clone(),
+                                args: args.clone(),
+                                star: *star,
+                                distinct: *distinct,
+                                over: None,
+                            };
+                            let rows: Vec<&Row> =
+                                part[..last].iter().map(|j| &work[*j].0).collect();
+                            self.aggregate(&plain, rows.into_iter(), cols, outer)?
+                        }
+                    }
+                    other => {
+                        return Err(SqlError::unsupported(format!("window function {other}()")))
+                    }
+                };
+            }
+        }
+        for (i, v) in values.into_iter().enumerate() {
+            work[i].1.push((w.clone(), v));
+        }
+        Ok(())
     }
 
     /// Computes one aggregate over a group's rows.
-    fn aggregate<'r>(&self, e: &Expr, rows: impl Iterator<Item = &'r Row>, cols: &[ColMeta], outer: Option<&Env<'_>>) -> SqlResult<Datum> {
-        let Expr::Function { name, args, star, distinct, .. } = e else { return Err(SqlError::internal("not an aggregate")) };
+    fn aggregate<'r>(
+        &self,
+        e: &Expr,
+        rows: impl Iterator<Item = &'r Row>,
+        cols: &[ColMeta],
+        outer: Option<&Env<'_>>,
+    ) -> SqlResult<Datum> {
+        let Expr::Function {
+            name,
+            args,
+            star,
+            distinct,
+            ..
+        } = e
+        else {
+            return Err(SqlError::internal("not an aggregate"));
+        };
         let mut values: Vec<Datum> = Vec::new();
         let mut separator = None;
         let mut count = 0i64;
         for row in rows {
-            let env = Env { cols, row, outer, aggs: None };
+            let env = Env {
+                cols,
+                row,
+                outer,
+                aggs: None,
+            };
             if *star {
                 count += 1;
                 continue;
@@ -1032,7 +1633,10 @@ impl Exec<'_> {
                 Some(a) => self.eval(a, &env)?,
                 None => Datum::Null,
             };
-            if separator.is_none() && matches!(name.as_str(), "string_agg" | "group_concat" | "listagg") && args.len() > 1 {
+            if separator.is_none()
+                && matches!(name.as_str(), "string_agg" | "group_concat" | "listagg")
+                && args.len() > 1
+            {
                 separator = Some(self.eval(&args[args.len() - 1], &env)?.as_text());
             }
             if !v.is_null() || matches!(name.as_str(), "array_agg" | "json_agg" | "jsonb_agg") {
@@ -1051,11 +1655,18 @@ impl Exec<'_> {
         let mysql = self.dialect() == Dialect::MySql;
         match e {
             Expr::Column(p) => p.last().cloned().unwrap_or_default(),
-            _ if mysql => e.to_string().trim_matches(|c| c == '(' || c == ')').to_owned(),
+            _ if mysql => e
+                .to_string()
+                .trim_matches(|c| c == '(' || c == ')')
+                .to_owned(),
             Expr::Function { name, .. } => name.clone(),
             Expr::Cast { expr, ty } => match &**expr {
                 Expr::Column(p) => p.last().cloned().unwrap_or_default(),
-                _ => datum::type_sql(ty).split(['(', ' ']).next().unwrap_or("?column?").to_owned(),
+                _ => datum::type_sql(ty)
+                    .split(['(', ' '])
+                    .next()
+                    .unwrap_or("?column?")
+                    .to_owned(),
             },
             Expr::Case { .. } => "case".into(),
             Expr::Exists { .. } => "exists".into(),
@@ -1067,7 +1678,9 @@ impl Exec<'_> {
                 },
                 _ => "?column?".into(),
             },
-            Expr::Variable { name, system } => format!("{}{name}", if *system { "@@" } else { "@" }),
+            Expr::Variable { name, system } => {
+                format!("{}{name}", if *system { "@@" } else { "@" })
+            }
             _ => "?column?".into(),
         }
     }
@@ -1076,20 +1689,48 @@ impl Exec<'_> {
     pub fn static_type(&self, e: &Expr, cols: &[ColMeta]) -> (Option<DataType>, Option<String>) {
         match e {
             Expr::Column(p) => {
-                let q = if p.len() > 1 { Some(p[p.len() - 2].as_str()) } else { None };
+                let q = if p.len() > 1 {
+                    Some(p[p.len() - 2].as_str())
+                } else {
+                    None
+                };
                 match find_column(cols, q, &p[p.len() - 1]) {
                     Ok(Some(i)) => (cols[i].ty.clone(), cols[i].table.clone()),
                     _ => (None, None),
                 }
             }
             Expr::Cast { ty, .. } => (Some(ty.clone()), None),
-            Expr::Bool(_) | Expr::IsNull { .. } | Expr::IsBool { .. } | Expr::Exists { .. } | Expr::InList { .. } | Expr::InSubquery { .. } | Expr::Like { .. } | Expr::Between { .. } => {
-                (Some(if self.dialect() == Dialect::MySql { DataType::BigInt } else { DataType::Bool }), None)
-            }
+            Expr::Bool(_)
+            | Expr::IsNull { .. }
+            | Expr::IsBool { .. }
+            | Expr::Exists { .. }
+            | Expr::InList { .. }
+            | Expr::InSubquery { .. }
+            | Expr::Like { .. }
+            | Expr::Between { .. } => (
+                Some(if self.dialect() == Dialect::MySql {
+                    DataType::BigInt
+                } else {
+                    DataType::Bool
+                }),
+                None,
+            ),
             Expr::Binary { op, left, right } => match op {
-                BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::And | BinaryOp::Or => {
-                    (Some(if self.dialect() == Dialect::MySql { DataType::BigInt } else { DataType::Bool }), None)
-                }
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq
+                | BinaryOp::And
+                | BinaryOp::Or => (
+                    Some(if self.dialect() == Dialect::MySql {
+                        DataType::BigInt
+                    } else {
+                        DataType::Bool
+                    }),
+                    None,
+                ),
                 BinaryOp::Concat => (Some(DataType::Text), None),
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
                     let (a, _) = self.static_type(left, cols);
@@ -1098,7 +1739,9 @@ impl Exec<'_> {
                 }
                 _ => (None, None),
             },
-            Expr::Function { name, args, star, .. } => (func::return_type(self, name, args, *star, cols), None),
+            Expr::Function {
+                name, args, star, ..
+            } => (func::return_type(self, name, args, *star, cols), None),
             Expr::Str(_) => (Some(DataType::Text), None),
             _ => (None, None),
         }
@@ -1131,7 +1774,11 @@ fn numeric_result(a: Option<DataType>, b: Option<DataType>) -> Option<DataType> 
 }
 
 fn resolves(cols: &[ColMeta], p: &[String]) -> bool {
-    let q = if p.len() > 1 { Some(p[p.len() - 2].as_str()) } else { None };
+    let q = if p.len() > 1 {
+        Some(p[p.len() - 2].as_str())
+    } else {
+        None
+    };
     matches!(find_column(cols, q, &p[p.len() - 1]), Ok(Some(_)))
 }
 
@@ -1139,7 +1786,13 @@ fn resolves(cols: &[ColMeta], p: &[String]) -> bool {
 pub fn table_cols(t: &Table) -> Vec<ColMeta> {
     t.columns
         .iter()
-        .map(|c| ColMeta { qual: Some(t.name.clone()), name: c.name.clone(), ty: Some(c.ty.clone()), table: Some(t.name.clone()), hidden: false })
+        .map(|c| ColMeta {
+            qual: Some(t.name.clone()),
+            name: c.name.clone(),
+            ty: Some(c.ty.clone()),
+            table: Some(t.name.clone()),
+            hidden: false,
+        })
         .collect()
 }
 
