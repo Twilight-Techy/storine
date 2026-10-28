@@ -109,6 +109,12 @@ storine-sql --data /var/lib/storine-sql --mssql 0.0.0.0:1433 \
 
 - Clients ask for the service principal `MSSQLSvc/<host>:<port>`, so the host name in the
   connection string must be one the keytab has a key for (a keytab may hold several).
+- **go-mssqldb** (up to at least v1.8.2) looks the SPN's host up and drops the last character
+  of the answer, expecting the trailing dot DNS answers carry. Names resolved from
+  `/etc/hosts` (such as `localhost`) have none, so `MSSQLSvc/localhost:1433` becomes
+  `MSSQLSvc/localhos:1433` and the KDC reports `KDC_ERR_S_PRINCIPAL_UNKNOWN`. Connect by a
+  DNS name, or set `ServerSPN` to a name served by DNS (or one that does not resolve at all,
+  which go-mssqldb then leaves unchanged).
 - Accepted: AP-REQs wrapped in SPNEGO or plain GSS-API Kerberos tokens, with the AES encryption
   types (aes256/aes128-cts-hmac-sha1-96, aes256-cts-hmac-sha384-192,
   aes128-cts-hmac-sha256-128). RC4 and DES are refused, as is NTLM.
