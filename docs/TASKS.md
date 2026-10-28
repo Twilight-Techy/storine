@@ -694,12 +694,10 @@ This document defines the strict chronological execution order for building the 
     - Benchmark row `with_ref (Cold primary tier)`: `4.2 µs` p50, `0.00` allocs/op (it was `44 µs` before the slot-offset page index). All other allocation gates unchanged.
     - `111` tests passing, `0` clippy warnings (native and portable).
 
-- [ ] **TASK-090: `epoll` Reactor on Linux (`RULE-CPU-03`, `F-NET-01`)** — *implemented; open until its tests have run on Linux*
+- [x] **TASK-090: `epoll` Reactor on Linux (`RULE-CPU-03`, `F-NET-01`)** — *closed 2026-10-28 after the Linux test run*
   - **`EpollPoller`** (`storage-mmap`, Linux only): persistent, level-triggered registration with caller tokens; `add` / `modify` / `delete` / `wait` over raw `epoll_*` syscalls (no external crates; `epoll_event` packed on x86-64 per the kernel ABI).
-  - **Reactor** (`reactor_worker_loop_epoll`): each socket is registered once (token = fd, with a token → index map that survives `swap_remove`). Write interest changes only when a connection's output state changes. A wake-up drives only the ready sockets plus connections awaiting an admin job: `O(active)` instead of `O(connections)` per wake-up. The timeout and waker policy are identical to the `poll` reactor. `STORINE_REACTOR=poll` falls back to `poll`.
-  - **Also found by the first Linux build**: three `ptr_as_ptr` clippy warnings in the Unix-only mmap code (`raw.rs`) that Windows builds never compile. Fixed.
-  - **Verification so far**: `cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu`: `0` warnings (type-checked and linted, not linked: no Linux linker on this Windows machine). Windows behavior unchanged (server tests pass; the `poll` path is untouched).
-  - **To close**: on Linux (or WSL), run `cargo test --workspace`. That runs `test_epoll_reports_only_ready_sockets_and_tracks_interest` and every server test through the epoll reactor. Then compare the TCP benchmark with `STORINE_REACTOR=poll`.
+  - **Reactor** (`reactor_worker_loop_epoll`, now generic over `ReadyPoller`): each socket is registered once; write interest changes only when a connection's output state changes; a wake-up drives only the ready sockets plus connections awaiting a job: `O(active)` instead of `O(connections)`. `STORINE_REACTOR=poll` falls back to `poll`.
+  - **Linux verification**: `cargo test --workspace` green (including `test_epoll_reports_only_ready_sockets_and_tracks_interest` and every server test through the epoll reactor). New `reactor-scale` benchmark (one active connection next to `N` idle ones): epoll stays at ~34k ops/s (`p50 ≈ 27 µs`) from 0 to 8,000 idle connections, while `poll` falls to 9.8k ops/s at 4,000 and 4.4k ops/s (`p50 217 µs`) at 8,000 idle connections. With a single connection the two are within noise (A/B/A/B: 32.8k / 37.2k / 31.6k / 36.4k ops/s), as expected for a 2-descriptor poll set.
 
 - [x] **TASK-091: Release Binary Size Budget (`RULE-MEM-03`)** — *resolved 2026-10-27: budget raised to `< 1 MiB` by the user*
   - Measured (Windows x86-64, fat LTO, stripped): `storage-server` `829 KiB` / `storage-cli` `760 KiB` at `opt-level = 3`; `647` / `613 KiB` at `"s"`; `591.5` / `572 KiB` at `"z"`. No compiler setting alone meets the budget.
@@ -758,3 +756,11 @@ This document defines the strict chronological execution order for building the 
   - Binary: `--node-id N --peers 1=host:port,...` and `STORAGE_CLUSTER_TOKEN`.
   - **Exit Criteria**: `test_three_node_tcp_cluster_writes_redirects_and_failover` (8 consecutive runs green), `test_index_build_stays_exact_under_concurrent_writes`; 3-process smoke test of the release binary elects one leader.
   - **Documented limit**: static membership (no joint-consensus reconfiguration yet).
+
+## Stage 24: Windows Readiness Reactor — AFD Poll over IOCP (`TASK-102`)
+
+- [ ] **TASK-102: `epoll`-Equivalent Reactor on Windows (`F-NET-01`, `RULE-CPU-03`, `RULE-SAFE-01`)** — *implemented; open until its tests have run on Windows*
+  - **`AfdPoller`** (`storage-mmap`, Windows only): the `wepoll` / `mio` technique. One `\Device\Afd` handle (opened with `NtCreateFile`) is associated with an I/O completion port; every socket's base provider handle (`SIO_BSP_HANDLE_POLL`, then `SIO_BASE_HANDLE`) gets an `IOCTL_AFD_POLL` request; `GetQueuedCompletionStatusEx` returns only completed (ready) sockets: `O(ready)` wake-ups like `epoll`, without `WSAPoll`'s `O(registered)` scans and known bugs. Requests are re-armed before each wait (level-triggered); interest changes and deletions cancel the in-flight request (`NtCancelIoFileEx`); buffers of cancelled requests are kept (`zombies`) until their completion is dequeued, so the kernel never writes into freed memory; completions are matched to sockets in `O(1)` by allocation address.
+  - **Reactor**: the same `ReadyPoller` loop as Linux; `STORINE_REACTOR=poll` falls back to `WSAPoll`.
+  - **Verification so far**: `cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc`: `0` warnings (type-checked and linted against the Windows standard library, including `deny(clippy::undocumented_unsafe_blocks)`; not executed: no Windows machine here). Linux behavior unchanged.
+  - **To close**: on Windows, run `cargo test --workspace` (runs `test_afd_poll_reports_only_ready_sockets_and_tracks_interest` and every server test through the AFD reactor) and `cargo run --release -p storage-benches --bin reactor-scale` with and without `STORINE_REACTOR=poll`.

@@ -739,6 +739,13 @@ fn reactor_worker_loop<T: ZeroCopyRecord + Indexable>(
             return reactor_worker_loop_epoll(shard, shared, shutdown, active_connections, ep);
         }
     }
+    // Windows: AFD poll over an I/O completion port (the epoll equivalent, `TASK-102`).
+    #[cfg(windows)]
+    if std::env::var("STORINE_REACTOR").map_or(true, |v| v != "poll") {
+        if let Ok(ep) = storage_mmap::AfdPoller::new(1024) {
+            return reactor_worker_loop_epoll(shard, shared, shutdown, active_connections, ep);
+        }
+    }
     let mut conns: Vec<NonBlockingConn> = Vec::with_capacity(64);
     let mut poller = SocketPoller::with_capacity(64);
     let mut idle_polls: u32 = 0;
@@ -832,19 +839,19 @@ fn reactor_worker_loop<T: ZeroCopyRecord + Indexable>(
     }
 }
 
-/// Linux reactor (`TASK-090`): sockets are registered once with `epoll` (token = fd) and each
-/// wake-up drives only the ready connections plus those awaiting an admin job, so its cost is
-/// `O(active)` rather than `O(connections)`. Same timeout policy as the `poll` reactor; set
-/// `STORINE_REACTOR=poll` to use that one instead.
-#[cfg(target_os = "linux")]
-fn reactor_worker_loop_epoll<T: ZeroCopyRecord + Indexable>(
+/// Readiness reactor (`TASK-090` Linux `epoll`, `TASK-102` Windows AFD poll): sockets are
+/// registered once (token = descriptor / socket handle) and each wake-up drives only the ready
+/// connections plus those awaiting a job, so its cost is `O(active)` rather than
+/// `O(connections)`. Same timeout policy as the `poll` reactor; set `STORINE_REACTOR=poll` to use
+/// that one instead.
+#[cfg(any(target_os = "linux", windows))]
+fn reactor_worker_loop_epoll<T: ZeroCopyRecord + Indexable, P: storage_mmap::ReadyPoller>(
     shard: Arc<ReactorShard>,
     shared: Arc<ServerShared<T>>,
     shutdown: Arc<AtomicBool>,
     active_connections: Arc<AtomicUsize>,
-    mut ep: storage_mmap::EpollPoller,
+    mut ep: P,
 ) {
-    use std::os::unix::io::AsRawFd;
     const WAKER_TOKEN: u64 = u64::MAX;
 
     let mut conns: Vec<NonBlockingConn> = Vec::with_capacity(64);
@@ -871,7 +878,7 @@ fn reactor_worker_loop_epoll<T: ZeroCopyRecord + Indexable>(
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
             for stream in inc.drain(..) {
-                let token = stream.as_raw_fd() as u64;
+                let token = storage_mmap::socket_token(&stream);
                 let conn = NonBlockingConn::new(stream, &shared.security);
                 if ep.add(&conn.stream, token, false).is_err() {
                     // Not watchable: close it rather than leave it unserved.
@@ -933,7 +940,7 @@ fn reactor_worker_loop_epoll<T: ZeroCopyRecord + Indexable>(
                     slots.remove(&token);
                     conns.swap_remove(idx);
                     if let Some(moved) = conns.get(idx) {
-                        let moved_token = moved.stream.as_raw_fd() as u64;
+                        let moved_token = storage_mmap::socket_token(&moved.stream);
                         if let Some(slot) = slots.get_mut(&moved_token) {
                             slot.0 = idx;
                         }

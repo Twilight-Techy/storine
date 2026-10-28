@@ -27,3 +27,7 @@ storage-server = { path = "../crates/storage-server" }
 
 [lints]
 workspace = true
+
+[[bin]]
+name = "reactor-scale"
+path = "src/bin/reactor_scale.rs"

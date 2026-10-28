@@ -13,7 +13,11 @@ pub mod pool;
 pub mod raw;
 
 pub use arena::{ArenaLocation, ArenaManager, ArenaSegment, DEFAULT_SEGMENT_CAPACITY};
-pub use net_poll::SocketPoller;
+pub use net_poll::{socket_token, SocketPoller};
+#[cfg(any(target_os = "linux", windows))]
+pub use net_poll::ReadyPoller;
+#[cfg(windows)]
+pub use net_poll::AfdPoller;
 #[cfg(target_os = "linux")]
 pub use net_poll::EpollPoller;
 pub use path::{PathResolver, StackRelPath};
