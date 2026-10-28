@@ -21,8 +21,8 @@ Official clients of the Storine document API. Every SDK:
 | Java 17+ | [`java/`](java) | `java.math.BigDecimal` | `mvn test` |
 | C# / .NET 8+ | [`csharp/`](csharp) | `decimal` (or `BigDecimal` beyond 28 digits) | `dotnet test` |
 | Rust 1.70+ | [`rust/`](rust) | `storine::Decimal` | `cargo test` |
-| PHP | *planned* (`TASK-110`) | | |
-| Ruby | *planned* (`TASK-111`) | | |
+| PHP 8.1+ | [`php/`](php) | `Storine\Decimal` (exact, keeps its scale) | `php tests/harness.php` |
+| Ruby 3.2+ | [`ruby/`](ruby) | `Storine::Decimal` (exact, keeps its scale; converts to `BigDecimal`) | `ruby -Ilib test/test_vectors.rb && ruby -Ilib test/test_e2e.rb` |
 
 The end-to-end tests use `target/release/storage-server` (build it with `cargo build --release -p storage-server`)
 or the binary named by `$STORINE_SERVER`; without it they are skipped.

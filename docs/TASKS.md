@@ -765,7 +765,7 @@ This document defines the strict chronological execution order for building the 
   - **Verification so far**: `cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc`: `0` warnings (type-checked and linted against the Windows standard library, including `deny(clippy::undocumented_unsafe_blocks)`; not executed: no Windows machine here). Linux behavior unchanged.
   - **To close**: on Windows, run `cargo test --workspace` (runs `test_afd_poll_reports_only_ready_sockets_and_tracks_interest` and every server test through the AFD reactor) and `cargo run --release -p storage-benches --bin reactor-scale` with and without `STORINE_REACTOR=poll`.
 
-## Stage 25: Client SDKs — Protocol Specification, Conformance Vectors & Six Languages (`TASK-103` – `TASK-111`)
+## Stage 25: Client SDKs — Protocol Specification, Conformance Vectors & Eight Languages (`TASK-103` – `TASK-111`)
 
 *(Follow-Up Prompt 2: "build sdks for popular backend languages … with simplicity and user intuitiveness/clarity included as rules"; Follow-Up Prompt 3: PHP and Ruby as TODO.)*
 
@@ -779,8 +779,8 @@ This document defines the strict chronological execution order for building the 
 - [x] **TASK-108: C# / .NET SDK** (`sdks/csharp`) — async-first with `CancellationToken`, `decimal` money, nanosecond `Timestamp`, `& | !` filters, `IAsyncEnumerable` scans.
 - [x] **TASK-109: Rust SDK** (`sdks/rust`) — standalone crate (not a workspace member), `forbid(unsafe_code)`, `doc!` / `list!` macros, `& | !` filters.
   - **Exit Criteria (103 – 109)**: every SDK passes every request / response / value vector byte for byte, rejects every truncation of a hostile value, and passes the same end-to-end suite against the release server: CRUD with every value type, 800 concurrent `+0.01` deposits summing exactly, overdraft refused atomically, atomic transfers, version-conditioned writes, indexed vs. unindexed queries, pagination over 120 documents, TTL expiry, invalid names rejected, and a 3-node cluster whose leader is killed mid-run with every deposit applied exactly once.
-- [ ] **TASK-110: PHP SDK** — *TODO (Follow-Up Prompt 3)*.
-- [ ] **TASK-111: Ruby SDK** — *TODO (Follow-Up Prompt 3)*.
+- [x] **TASK-110: PHP SDK** (`sdks/php`, Follow-Up Prompt 4) — PHP 8.1+, no extensions; `Storine\Decimal` (exact, keeps its scale; PHP has no decimal type and 64-bit ints, so 128-bit values go through a pure-PHP `BigInt`), `Filter::and(...)` / `FieldOp::add(...)->min(...)` factories like Java, `...IfVersion` variants, generator scans, Composer PSR-4 or a plain autoloader; dependency-free test harness (vectors + end to end with forked workers and the 3-node failover).
+- [x] **TASK-111: Ruby SDK** (`sdks/ruby`, Follow-Up Prompt 4) — Ruby 3.2+, standard library only; `Storine::Decimal` (exact, keeps its scale, converts to `BigDecimal`, which drops trailing zeros), nanosecond `Time`, keyword bounds `Storine.add(path, amount, min: 0)`, `& | ~` filters, block transactions, Enumerator scans; minitest vectors + end to end (threads, 3-node failover).
 
 
 ## Stage 26: SQL Gateway — PostgreSQL, MySQL & SQL Server Wire Compatibility (`TASK-112` – `TASK-118`)

@@ -1,0 +1,69 @@
+# Storine for Ruby
+
+Standard library only, Ruby 3.2+.
+
+```ruby
+require "storine"
+
+D = Storine.method(:Decimal)
+
+db = Storine.connect("storine://127.0.0.1:7878")        # or "storine://token@h1:7878,h2:7878,h3:7878"
+accounts = db.collection("accounts")
+
+accounts.insert("alice", { "owner" => "Alice", "balance" => D.("100.00") })
+accounts.insert("bob", { "owner" => "Bob", "balance" => D.("0.00") })
+
+# Atomic, exact, server-side: no lost updates, no overdraft.
+accounts.update("alice", Storine.add("balance", D.("-25.00"), min: 0))
+
+# Several writes, all or nothing.
+db.transaction do |tx|
+  tx.update("accounts", "alice", Storine.add("balance", D.("-10.00"), min: 0))
+  tx.update("accounts", "bob", Storine.add("balance", D.("10.00")))
+end
+
+doc = accounts.get("alice")              # Document: a Hash with #key and #version
+puts doc["balance"], doc.version         # 65.00 ...
+
+accounts.create_index("owner")
+rich = accounts.find(Storine.gt("balance", D.("50")), order_by: "-balance", limit: 10)
+puts accounts.count(Storine.eq("owner", "Bob"))
+accounts.scan { |d| ... }                # every document, any collection size (Enumerator without a block)
+```
+
+## API
+
+| Call | Does |
+| --- | --- |
+| `Storine.connect(url, token: nil, timeout: 5.0, follower_reads: false)` | Connection pool to a server or cluster (thread-safe). |
+| `db.collection(name)` / `db[name]` | A collection handle. |
+| `c.get(key)` | `Document` or `nil`. |
+| `c.put(key, fields, ttl: nil)` | Create or replace; returns the version. `ttl:` in seconds. |
+| `c.insert(key, fields)` | Create only (`ConflictError` if it exists). |
+| `c.replace(key, fields, if_version: nil)` | Replace an existing document (optionally only at a version). |
+| `c.update(key, *changes, if_version: nil)` | Atomic server-side changes: `Storine.set`, `unset`, `add(path, amount, min:, max:)`, `append`, or a `{ field => value }` Hash. |
+| `c.delete(key, if_version: nil)` | `true` if it existed. |
+| `c.find(where, order_by:, limit:, offset:)` / `c.first(...)` / `c.count(where)` / `c.scan(where)` | Queries. `where` is a filter (`Storine.eq`, `ne`, `lt`, `le`, `gt`, `ge`, `between`, `in`, `prefix`, `contains`, `exists`, `missing`, `key_prefix`, `and`, `or`, `not`; or combine with `&`, `\|`, `~`) or `{ field => value }`. `order_by: "-price"` sorts descending. |
+| `c.create_index(field)` / `c.drop_index(field)` / `c.info` / `c.drop` | Indexes (up to 4 per collection) and collection management. |
+| `db.transaction { \|tx\| ... }` | Buffered writes committed atomically when the block returns (or `tx.commit`); `tx.require(...)` adds a version check. |
+
+**Values**: `nil`, `true` / `false`, `Integer` (64- or 128-bit), `Float`, `Storine::Decimal` (exact, up to 38
+digits, keeps its scale — use it for money; `BigDecimal` is accepted too and `#to_d` converts back), `String`
+(UTF-8 text; binary strings such as `"\x00".b` are bytes), `Time` (UTC, nanosecond precision),
+`Storine::Uuid`, `Storine::Id`, `Storine::UInt64`, arrays and hashes (String or Symbol keys; read back as
+Strings).
+
+**Reliability built in**: every write carries a request id that the client reuses on its own retries, so
+timeouts, reconnects and cluster leader changes never apply a write twice. Clients follow cluster redirects
+automatically; reads come from the leader unless `follower_reads: true`.
+
+**Errors** (`Storine::Error` subclasses): `NotFoundError`, `ConflictError` (`#write_index`,
+`#current_version`), `InvalidError` (bad value, bound violated — don't retry), `UnauthorizedError`,
+`OverloadedError` / `RateLimitedError` (retry later), `UnavailableError`, `ServerError`.
+
+## Tests
+
+```bash
+ruby -Ilib test/test_vectors.rb                 # protocol conformance (no server needed)
+cargo build --release -p storage-server && ruby -Ilib test/test_e2e.rb
+```

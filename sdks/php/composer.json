@@ -1,0 +1,15 @@
+{
+    "name": "storine/storine",
+    "description": "Client for the Storine document database: exact decimals, atomic server-side updates, at-most-once retries and cluster failover.",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.1"
+    },
+    "autoload": {
+        "psr-4": { "Storine\\": "src/" }
+    },
+    "scripts": {
+        "test": "php tests/harness.php"
+    }
+}

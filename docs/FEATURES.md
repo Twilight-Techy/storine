@@ -176,7 +176,7 @@
 | Feature ID | Feature Name | Description | Target Tier |
 | :--- | :--- | :--- | :--- |
 | **F-SDK-01** | **Protocol Specification & Golden Vectors** | `protocol/PROTOCOL.md` plus byte-exact request/response vectors every SDK must reproduce. | v1.1 |
-| **F-SDK-02** | **Official SDKs** | Python, TypeScript, Go, Java, C# and Rust (`sdks/<language>/`): the same API in each language, no runtime dependencies, exact decimals, at-most-once retries, leader discovery and failover. PHP and Ruby planned (`TASK-110`, `TASK-111`). | v1.1 |
+| **F-SDK-02** | **Official SDKs** | Python, TypeScript, Go, Java, C#, Rust, PHP and Ruby (`sdks/<language>/`): the same API in each language, no runtime dependencies, exact decimals, at-most-once retries, leader discovery and failover. | v1.1 |
 
 ### 6.12 SQL Gateway (`F-SQL-*`, Stage 26)
 
