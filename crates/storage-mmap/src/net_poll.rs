@@ -489,6 +489,8 @@ struct AfdOp {
     iosb: afd::IoStatusBlock,
     info: afd::AfdPollInfo,
     token: u64,
+    /// The registered socket (`socket_token`).
+    socket: u64,
     base: afd::HANDLE,
     want_write: bool,
     pending: bool,
@@ -505,6 +507,12 @@ pub struct AfdPoller {
     by_addr: std::collections::HashMap<usize, u64>,
     /// Unregistered ops whose request is still in flight (freed when its completion arrives).
     zombies: std::collections::HashMap<usize, Box<AfdOp>>,
+    /// Socket -> token, so `delete` finds a socket whatever token it was added with (as
+    /// `epoll` deletes by descriptor).
+    by_socket: std::collections::HashMap<u64, u64>,
+    /// Sockets whose request completed and must be re-armed before the next wait: only these
+    /// are touched, so a wait costs `O(ready)`, not `O(registered)`.
+    rearm: Vec<u64>,
     entries: Vec<afd::OverlappedEntry>,
     ready: Vec<u64>,
 }
@@ -591,6 +599,8 @@ impl AfdPoller {
             ops: std::collections::HashMap::new(),
             by_addr: std::collections::HashMap::new(),
             zombies: std::collections::HashMap::new(),
+            by_socket: std::collections::HashMap::new(),
+            rearm: Vec::new(),
             entries: vec![
                 afd::OverlappedEntry {
                     completion_key: 0,
@@ -723,6 +733,7 @@ impl ReadyPoller for AfdPoller {
             iosb: afd::IoStatusBlock::default(),
             info: afd::AfdPollInfo::default(),
             token,
+            socket: socket_token(stream),
             base,
             want_write,
             pending: false,
@@ -733,6 +744,7 @@ impl ReadyPoller for AfdPoller {
         if let Some(mut old) = self.ops.insert(token, op) {
             // Token reused before the old socket was deleted: retire the old request.
             self.by_addr.remove(&op_addr(&old));
+            self.by_socket.remove(&old.socket);
             old.deleted = true;
             Self::cancel(self.afd, &mut old);
             if old.pending {
@@ -740,6 +752,7 @@ impl ReadyPoller for AfdPoller {
             }
         }
         self.by_addr.insert(addr, token);
+        self.by_socket.insert(socket_token(stream), token);
         Ok(())
     }
 
@@ -758,8 +771,14 @@ impl ReadyPoller for AfdPoller {
     }
 
     fn delete(&mut self, stream: &TcpStream) -> std::io::Result<()> {
-        let token = socket_token(stream);
+        let socket = socket_token(stream);
+        let Some(token) = self.by_socket.remove(&socket) else {
+            return Ok(()); // not registered
+        };
         let afd_handle = self.afd;
+        if self.ops.get(&token).is_some_and(|op| op.socket != socket) {
+            return Ok(()); // the token now belongs to another socket
+        }
         if let Some(mut op) = self.ops.remove(&token) {
             self.by_addr.remove(&op_addr(&op));
             op.deleted = true;
@@ -774,9 +793,11 @@ impl ReadyPoller for AfdPoller {
     fn wait(&mut self, timeout_ms: i32) -> &[u64] {
         self.ready.clear();
         let afd_handle = self.afd;
-        for op in self.ops.values_mut() {
-            // A socket that cannot be polled any more (closed under us) simply stays silent.
-            let _ = Self::arm(afd_handle, op);
+        for token in core::mem::take(&mut self.rearm) {
+            if let Some(op) = self.ops.get_mut(&token) {
+                // A socket that cannot be polled any more (closed under us) simply stays silent.
+                let _ = Self::arm(afd_handle, op);
+            }
         }
         let mut removed = 0u32;
         let millis = if timeout_ms < 0 { afd::INFINITE } else { timeout_ms as u32 };
@@ -807,6 +828,7 @@ impl ReadyPoller for AfdPoller {
                 continue;
             };
             op.pending = false;
+            self.rearm.push(op.token);
             let status = op.iosb.status as i32;
             if status == afd::STATUS_CANCELLED {
                 continue; // interest change: re-armed before the next wait

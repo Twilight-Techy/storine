@@ -548,3 +548,13 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - Under machine load, `test_index_build_stays_exact_under_concurrent_writes` failed in 36 of 160 runs: an indexed query missed a document that a full scan found.
   - **Cause**: a writer read the collection's index ids, then the build published the index as *building*, then the writer committed with the stale ids. The rebuild pass then skipped that document on its version conflict, assuming the newer version already carried the index; it did not. A field patch could slip through the same way, since a patch keeps the index ids already stored on the document.
   - **Fix**: every document write now checks, in its own atomic commit, that the collection's `$meta` version is still the one its index ids came from. On a mismatch it is rebuilt with fresh ids (bounded retries). The rebuild pass re-reads and rewrites a document that changed under it instead of skipping it. Under the same load the failure rate is now 0 of 160.
+
+### Stage 24 (progress): the Windows reactor under Wine (`TASK-102`, still open) — 2026-10-28
+
+- **What could be done without Windows**: the workspace was cross-compiled for `x86_64-pc-windows-gnu` (MinGW) and every test binary ran under Wine 9.0. Before this, the Windows code had only been type-checked and linted.
+- **Results**: all 30 test binaries pass on the AFD reactor. That includes the AFD poll test, the clustered servers over TCP, and membership changes.
+- **Bugs found and fixed**:
+  - `AfdPoller::delete` ignored sockets registered under a token other than their handle value. The server always used the handle, so production was unaffected, but the poller now deletes by socket as `epoll` does.
+  - Re-arming walked every registered socket on each wait. Only completed requests are re-armed now.
+- **Benchmark**: `reactor-scale` under Wine, AFD versus `WSAPoll` at 8,000 idle connections: 160 versus 25 ops/s. Wine's AFD emulation is itself `O(registered)` in `wineserver`, so this shows the reactor works, not how it scales on Windows.
+- **Why it stays open**: Wine is a reimplementation of the Windows API, not Windows. `TASK-102` closes after the same commands run on a Windows machine.
