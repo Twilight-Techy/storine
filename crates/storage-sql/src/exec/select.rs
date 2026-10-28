@@ -1094,6 +1094,85 @@ impl Exec<'_> {
 
     // ── table scans ──
 
+    /// The vector hint for `sel` when it is a plain single-table query ordered by
+    /// `vector_column <=> constant` with a LIMIT, and the column has an hnsw / ivfflat index.
+    fn vector_hint_for(
+        &self,
+        sel: &Select,
+        order_by: &[OrderBy],
+        limit: Option<usize>,
+        offset: usize,
+    ) -> SqlResult<Option<super::eval::VectorHint>> {
+        let (Some(limit), [ob]) = (limit, order_by) else { return Ok(None) };
+        let [TableRef::Named { name, .. }] = sel.from.as_slice() else { return Ok(None) };
+        if ob.desc
+            || sel.distinct
+            || !sel.distinct_on.is_empty()
+            || !sel.group_by.is_empty()
+            || sel.having.is_some()
+            || self.s.dialect != Dialect::Postgres
+        {
+            return Ok(None);
+        }
+        let items: Vec<(&Expr, Option<&String>)> = sel
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                SelectItem::Expr { expr, alias } => Some((expr, alias.as_ref())),
+                SelectItem::Wildcard(_) => None,
+            })
+            .collect();
+        if items
+            .iter()
+            .any(|(e, _)| has_aggregate(e) || matches!(e, Expr::Function { over: Some(_), .. }))
+        {
+            return Ok(None);
+        }
+        // ORDER BY may name a select-list alias (`ORDER BY distance`) or position (`ORDER BY 2`).
+        let mut key = &ob.expr;
+        if let Expr::Column(p) = key {
+            if p.len() == 1 {
+                if let Some((e, _)) = items.iter().find(|(_, a)| a.is_some_and(|a| a.eq_ignore_ascii_case(&p[0]))) {
+                    key = e;
+                }
+            }
+        }
+        if let Expr::Number(n) = key {
+            if let Some((e, _)) = n.parse::<usize>().ok().and_then(|i| i.checked_sub(1)).and_then(|i| items.get(i)) {
+                key = e;
+            }
+        }
+        let Expr::Binary { op: BinaryOp::VecCosine, left, right } = key else { return Ok(None) };
+        let (col, probe) = match (&**left, &**right) {
+            (Expr::Column(p), other) | (other, Expr::Column(p)) => (p, other),
+            _ => return Ok(None),
+        };
+        let Some(table) = self.s.engine.find_table(name)? else { return Ok(None) };
+        let Some(ci) = table
+            .columns
+            .iter()
+            .position(|c| p_last(col).is_some_and(|n| c.name.eq_ignore_ascii_case(n)))
+        else {
+            return Ok(None);
+        };
+        let DataType::Vector(Some(dims)) = table.columns[ci].ty else { return Ok(None) };
+        if !table.indexes.iter().any(|i| i.is_vector() && i.columns == [ci]) {
+            return Ok(None);
+        }
+        let Ok(probe) = self.eval_const(probe) else { return Ok(None) };
+        let Ok(vector) = crate::vector::coerce(&probe, Some(dims)) else { return Ok(None) };
+        let k = limit.saturating_add(offset);
+        if k == 0 || k > storage_core_max_k() {
+            return Ok(None);
+        }
+        Ok(Some(super::eval::VectorHint {
+            collection: table.collection.clone(),
+            field: table.columns[ci].field.clone(),
+            vector,
+            k,
+        }))
+    }
+
     /// Rows of `table` that may satisfy `conjuncts` (filters pushed down where exact enough;
     /// callers re-check everything), merged with this transaction's own writes.
     pub fn scan_rows(
@@ -1166,7 +1245,29 @@ impl Exec<'_> {
         let overlay: HashMap<&str, Option<&storine::Doc>> = txn
             .map(|t| t.entries(&table.collection).collect())
             .unwrap_or_default();
-        for d in store.scan(&table.collection, filter)? {
+        let hint = {
+            let mut h = self.vector_hint.borrow_mut();
+            if h.as_ref().is_some_and(|h| h.collection == table.collection) { h.take() } else { None }
+        };
+        let docs = match hint {
+            // Candidates from the vector index: twice the rows asked for, so a WHERE clause the
+            // storage filter could not express rarely leaves the result short (`select` falls
+            // back to a full scan when it does).
+            Some(h) if !store.vector_indexes(&table.collection)?.iter().any(|(f, _)| *f == h.field) => {
+                store.scan(&table.collection, filter)?
+            }
+            Some(h) => {
+                self.vector_hint_used.set(true);
+                let k = (h.k * 2).max(h.k + 16).min(storage_core_max_k());
+                let mut docs = store.nearest(&table.collection, &h.field, &h.vector, k as u32, filter)?;
+                for d in &mut docs {
+                    d.fields.remove("$score");
+                }
+                docs
+            }
+            None => store.scan(&table.collection, filter)?,
+        };
+        for d in docs {
             if overlay.contains_key(d.key.as_str()) {
                 continue;
             }
@@ -1432,27 +1533,43 @@ impl Exec<'_> {
             .copied()
             .filter(|c| !has_subquery(c) && !has_aggregate(c))
             .collect();
-        let src = self.eval_from(&sel.from, &pushable, outer)?;
-        // WHERE.
-        let mut rows = Vec::with_capacity(src.rows.len());
-        for row in src.rows {
-            let ok = match &sel.where_ {
-                None => true,
-                Some(w) => self.eval_bool(
-                    w,
-                    &Env {
-                        cols: &src.cols,
-                        row: &row,
-                        outer,
-                        aggs: None,
-                    },
-                )?,
-            };
-            if ok {
-                rows.push(row);
+        // pgvector: `ORDER BY col <=> vector LIMIT k` over an hnsw / ivfflat index reads only
+        // the index's nearest candidates (exact distances are still computed and sorted below).
+        let hint = self.vector_hint_for(sel, order_by, limit, offset)?;
+        let wanted = hint.as_ref().map_or(0, |h| h.k);
+        *self.vector_hint.borrow_mut() = hint;
+        self.vector_hint_used.set(false);
+        let filtered = |src: Rel| -> SqlResult<(Vec<ColMeta>, Vec<Row>)> {
+            // WHERE.
+            let mut rows = Vec::with_capacity(src.rows.len());
+            for row in src.rows {
+                let ok = match &sel.where_ {
+                    None => true,
+                    Some(w) => self.eval_bool(
+                        w,
+                        &Env {
+                            cols: &src.cols,
+                            row: &row,
+                            outer,
+                            aggs: None,
+                        },
+                    )?,
+                };
+                if ok {
+                    rows.push(row);
+                }
             }
+            Ok((src.cols, rows))
+        };
+        let src = self.eval_from(&sel.from, &pushable, outer);
+        *self.vector_hint.borrow_mut() = None;
+        let used = self.vector_hint_used.replace(false);
+        let (mut cols, mut rows) = filtered(src?)?;
+        if used && rows.len() < wanted {
+            // The WHERE clause rejected too many candidates: scan the whole table instead.
+            (cols, rows) = filtered(self.eval_from(&sel.from, &pushable, outer)?)?;
         }
-        let cols = src.cols;
+        let cols = cols;
         // Expand the select list.
         let mut items: Vec<(Expr, String, Option<String>)> = Vec::new(); // expr, name, explicit alias
         for it in &sel.items {
@@ -2118,9 +2235,15 @@ impl Exec<'_> {
                     None,
                 ),
                 BinaryOp::Concat => (Some(DataType::Text), None),
+                BinaryOp::VecL2 | BinaryOp::VecCosine | BinaryOp::VecNegInner | BinaryOp::VecL1 => {
+                    (Some(DataType::Double), None)
+                }
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
                     let (a, _) = self.static_type(left, cols);
                     let (b, _) = self.static_type(right, cols);
+                    if matches!(a, Some(DataType::Vector(_))) || matches!(b, Some(DataType::Vector(_))) {
+                        return (Some(DataType::Vector(None)), None);
+                    }
                     (numeric_result(a, b), None)
                 }
                 _ => (None, None),
@@ -2295,4 +2418,13 @@ fn apply_limit(rows: &mut Vec<Row>, limit: Option<usize>, offset: usize) {
     if let Some(l) = limit {
         rows.truncate(l);
     }
+}
+
+/// Largest `k` the document store serves for one nearest-neighbour query.
+fn storage_core_max_k() -> usize {
+    10_000
+}
+
+fn p_last(p: &[String]) -> Option<&str> {
+    p.last().map(String::as_str)
 }

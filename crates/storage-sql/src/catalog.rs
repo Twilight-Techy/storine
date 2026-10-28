@@ -101,6 +101,15 @@ pub struct KeyDef {
 pub struct IndexDef {
     pub name: String,
     pub columns: Vec<usize>,
+    /// `USING` method (`hnsw` / `ivfflat` make a vector index), when not the default.
+    pub method: Option<String>,
+}
+
+impl IndexDef {
+    /// A pgvector index (`USING hnsw` / `USING ivfflat`).
+    pub fn is_vector(&self) -> bool {
+        matches!(self.method.as_deref(), Some("hnsw" | "ivfflat"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -297,10 +306,15 @@ impl Table {
             "uniques".into(),
             keys(self.uniques.iter().map(|k| (&k.name, &k.columns)).collect()),
         );
-        d.insert(
-            "indexes".into(),
-            keys(self.indexes.iter().map(|k| (&k.name, &k.columns)).collect()),
-        );
+        let mut indexes = keys(self.indexes.iter().map(|k| (&k.name, &k.columns)).collect());
+        if let Value::List(items) = &mut indexes {
+            for (item, def) in items.iter_mut().zip(&self.indexes) {
+                if let (Value::Map(m), Some(method)) = (item, &def.method) {
+                    m.insert("method".into(), Value::Text(method.clone()));
+                }
+            }
+        }
+        d.insert("indexes".into(), indexes);
         d.insert(
             "foreign_keys".into(),
             Value::List(
@@ -434,6 +448,10 @@ impl Table {
             t.indexes.push(IndexDef {
                 name: text(m, "name")?,
                 columns,
+                method: match m.get("method") {
+                    Some(Value::Text(x)) => Some(x.clone()),
+                    _ => None,
+                },
             });
         }
         for f in list(doc, "foreign_keys") {
@@ -689,6 +707,7 @@ mod tests {
             indexes: vec![IndexDef {
                 name: "ix_balance".into(),
                 columns: vec![1],
+                method: None,
             }],
             foreign_keys: vec![FkDef {
                 name: "fk".into(),

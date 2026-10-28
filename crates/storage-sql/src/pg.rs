@@ -1356,6 +1356,7 @@ fn encode_binary(d: &Datum, ty: &DataType) -> Vec<u8> {
         (DataType::Numeric(_), Datum::Numeric(x)) => numeric_binary(*x),
         (DataType::Numeric(_), _) => numeric_binary(datum::to_decimal(&d).unwrap_or_default()),
         (DataType::Bytes, Datum::Bytes(b)) => b.clone(),
+        (DataType::Vector(_), Datum::Vector(v)) => crate::vector::encode_binary(v),
         (DataType::Uuid, Datum::Uuid(u)) => u.to_vec(),
         (DataType::Date, Datum::Date(days)) => (days - PG_EPOCH_DAYS).to_be_bytes().to_vec(),
         (DataType::Timestamp | DataType::TimestampTz, Datum::Timestamp(ns)) => {
@@ -1506,6 +1507,7 @@ fn decode_text(oid: u32, raw: &[u8]) -> SqlResult<Datum> {
         2950 => DataType::Uuid,
         17 => DataType::Bytes,
         114 | 3802 => return Ok(Datum::Json(s)),
+        crate::vector::VECTOR_OID => return crate::vector::parse(&s).map(Datum::Vector),
         _ => return Ok(Datum::Text(s)),
     };
     datum::cast(&Datum::Text(s), &ty)
@@ -1515,6 +1517,7 @@ fn decode_binary(oid: u32, raw: &[u8]) -> SqlResult<Datum> {
     let bad = || SqlError::new("22P03", format!("invalid binary parameter for type {oid}"));
     let be8 = |r: &[u8]| -> SqlResult<[u8; 8]> { r.try_into().map_err(|_| bad()) };
     Ok(match oid {
+        crate::vector::VECTOR_OID => Datum::Vector(crate::vector::decode_binary(raw)?),
         16 => Datum::Bool(raw.first().copied().unwrap_or(0) != 0),
         21 => Datum::Int(i64::from(i16::from_be_bytes(
             raw.try_into().map_err(|_| bad())?,

@@ -491,6 +491,10 @@ pub struct CreateIndex {
     pub columns: Vec<String>,
     pub unique: bool,
     pub if_not_exists: bool,
+    /// `USING method` (`btree`, `hnsw`, `ivfflat`, ...), lowercase.
+    pub method: Option<String>,
+    /// Operator class of each column (`vector_cosine_ops`, ...), lowercase.
+    pub opclasses: Vec<Option<String>>,
 }
 
 /// SQL column types (every spelling of each dialect maps onto one of these).
@@ -523,6 +527,8 @@ pub enum DataType {
     PgChar,
     /// MySQL `ENUM('a', 'b')`.
     Enum(Vec<String>),
+    /// pgvector `vector(n)` (`None`: any dimension).
+    Vector(Option<u32>),
     Array(Box<DataType>),
 }
 
@@ -581,6 +587,12 @@ pub enum BinaryOp {
     ContainedBy,
     /// `&&` (array overlap).
     Overlap,
+    /// pgvector `<->` (L2 distance), `<=>` (cosine distance), `<#>` (negative inner product),
+    /// `<+>` (L1 distance).
+    VecL2,
+    VecCosine,
+    VecNegInner,
+    VecL1,
 }
 
 #[derive(Debug, Clone, PartialEq)]

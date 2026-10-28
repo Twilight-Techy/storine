@@ -41,6 +41,8 @@ pub enum Datum {
     Uuid([u8; 16]),
     Json(String),
     Array(Vec<Datum>),
+    /// pgvector `vector`.
+    Vector(Vec<f32>),
 }
 
 impl Datum {
@@ -84,6 +86,7 @@ impl Datum {
             Datum::Uuid(_) => "uuid",
             Datum::Json(_) => "json",
             Datum::Array(_) => "array",
+            Datum::Vector(_) => "vector",
         }
     }
 
@@ -102,6 +105,7 @@ impl Datum {
             Datum::Interval { .. } => DataType::Interval,
             Datum::Uuid(_) => DataType::Uuid,
             Datum::Json(_) => DataType::Json,
+            Datum::Vector(_) => DataType::Vector(None),
             Datum::Array(a) => DataType::Array(Box::new(
                 a.iter()
                     .find(|d| !d.is_null())
@@ -176,6 +180,7 @@ impl Datum {
             Datum::Time(ns) => format_time(*ns),
             Datum::Interval { months, days, ns } => format_interval(*months, *days, *ns),
             Datum::Uuid(u) => format_uuid(u),
+            Datum::Vector(v) => crate::vector::format(v),
             Datum::Array(items) => {
                 let mut s = String::from("{");
                 for (i, d) in items.iter().enumerate() {
@@ -246,6 +251,7 @@ fn rank(d: &Datum) -> u8 {
         Datum::Interval { .. } => 6,
         Datum::Uuid(_) => 7,
         Datum::Array(_) => 8,
+        Datum::Vector(_) => 9,
     }
 }
 
@@ -276,6 +282,18 @@ pub fn sql_cmp(a: &Datum, b: &Datum) -> Option<Ordering> {
             }
             x.len().cmp(&y.len())
         }
+        // pgvector orders vectors element by element, then by length.
+        (Vector(x), Vector(y)) => {
+            for (p, q) in x.iter().zip(y) {
+                match p.partial_cmp(q)? {
+                    Ordering::Equal => {}
+                    o => return Some(o),
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        (Vector(_), Text(s)) => return sql_cmp(a, &Vector(crate::vector::parse(s).ok()?)),
+        (Text(s), Vector(_)) => return sql_cmp(&Vector(crate::vector::parse(s).ok()?), b),
         // A text literal compared with a typed value is read as that type ('5' = 5, '2024-01-01' < ts).
         (Text(s), other) => return sql_cmp(&coerce_text(s, other)?, other),
         (other, Text(s)) => return sql_cmp(other, &coerce_text(s, other)?),
@@ -575,6 +593,7 @@ pub fn cast(d: &Datum, ty: &DataType) -> SqlResult<Datum> {
         ))
     };
     Ok(match ty {
+        DataType::Vector(n) => Vector(crate::vector::coerce(d, *n)?),
         DataType::Bool => match d {
             Bool(b) => Bool(*b),
             Int(i) => Bool(*i != 0),
@@ -793,6 +812,8 @@ pub fn type_sql(ty: &DataType) -> String {
         DataType::Uuid => "uuid".into(),
         DataType::Json => "json".into(),
         DataType::Jsonb => "jsonb".into(),
+        DataType::Vector(None) => "vector".into(),
+        DataType::Vector(Some(n)) => format!("vector({n})"),
         DataType::Enum(v) => format!(
             "enum({})",
             v.iter()
@@ -825,6 +846,8 @@ pub fn to_value(d: &Datum, ty: &DataType) -> storine::Value {
         Datum::Time(ns) => V::Text(format_time(*ns)),
         Datum::Interval { .. } => V::Text(d.as_text()),
         Datum::Uuid(u) => V::Uuid(*u),
+        // A list of numbers: what the document store's vector indexes read.
+        Datum::Vector(v) => V::List(v.iter().map(|x| V::Float(f64::from(*x))).collect()),
         Datum::Array(items) => {
             let inner = match ty {
                 DataType::Array(t) => (**t).clone(),
@@ -867,6 +890,7 @@ pub fn from_value(v: &storine::Value, ty: Option<&DataType>) -> Datum {
     match ty {
         None => natural,
         Some(DataType::Array(_)) => natural,
+        Some(DataType::Vector(n)) => crate::vector::coerce(&natural, *n).map(Datum::Vector).unwrap_or(natural),
         Some(DataType::Json | DataType::Jsonb) => match natural {
             Datum::Text(s) => Datum::Json(s),
             other => other,
@@ -929,6 +953,7 @@ pub fn json_of(d: &Datum) -> String {
             "[{}]",
             items.iter().map(json_of).collect::<Vec<_>>().join(",")
         ),
+        Datum::Vector(v) => crate::vector::format(v),
         other => json_string(&other.as_text()),
     }
 }

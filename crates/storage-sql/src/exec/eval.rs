@@ -32,6 +32,19 @@ pub struct Exec<'a> {
     /// by node address) and the current view nesting depth.
     pub(crate) views: RefCell<HashMap<String, Rc<ViewDef>>>,
     pub(crate) view_depth: std::cell::Cell<u32>,
+    /// A nearest-neighbour scan the next table scan of this table may use (set by `select`
+    /// for `ORDER BY col <=> vector LIMIT k`, consumed by `scan_rows`).
+    pub(crate) vector_hint: RefCell<Option<VectorHint>>,
+    pub(crate) vector_hint_used: std::cell::Cell<bool>,
+}
+
+/// Candidates for `ORDER BY field <=> vector LIMIT k` from the storage vector index.
+#[derive(Debug, Clone)]
+pub(crate) struct VectorHint {
+    pub collection: String,
+    pub field: String,
+    pub vector: Vec<f32>,
+    pub k: usize,
 }
 
 /// The row an expression is evaluated against, with its enclosing rows (correlated subqueries).
@@ -185,6 +198,8 @@ impl<'a> Exec<'a> {
             correlated: RefCell::new(Default::default()),
             views: RefCell::new(HashMap::new()),
             view_depth: std::cell::Cell::new(0),
+            vector_hint: RefCell::new(None),
+            vector_hint_used: std::cell::Cell::new(false),
         }
     }
 
@@ -670,6 +685,19 @@ impl<'a> Exec<'a> {
                 (Some(x), Some(y)) => Datum::Bool(x != y),
                 _ => Datum::Null,
             },
+            Add | Sub | Mul if matches!((&a, &b), (Datum::Vector(_), _) | (_, Datum::Vector(_))) => {
+                if a.is_null() || b.is_null() {
+                    Datum::Null
+                } else {
+                    let (x, y) = (crate::vector::coerce(&a, None)?, crate::vector::coerce(&b, None)?);
+                    let c = match op {
+                        Add => '+',
+                        Sub => '-',
+                        _ => '*',
+                    };
+                    Datum::Vector(crate::vector::elementwise(c, &x, &y)?)
+                }
+            }
             // T-SQL: `+` on two strings concatenates.
             Add if self.dialect() == Dialect::MsSql
                 && matches!((&a, &b), (Datum::Text(_), Datum::Text(_))) =>
@@ -750,6 +778,20 @@ impl<'a> Exec<'a> {
                         ShiftLeft => x.checked_shl(y as u32).unwrap_or(0),
                         _ => x.checked_shr(y as u32).unwrap_or(0),
                     })
+                }
+            }
+            VecL2 | VecCosine | VecNegInner | VecL1 => {
+                if a.is_null() || b.is_null() {
+                    Datum::Null
+                } else {
+                    let metric = match op {
+                        VecL2 => crate::vector::Metric::L2,
+                        VecCosine => crate::vector::Metric::Cosine,
+                        VecNegInner => crate::vector::Metric::NegInner,
+                        _ => crate::vector::Metric::L1,
+                    };
+                    let (x, y) = (crate::vector::coerce(&a, None)?, crate::vector::coerce(&b, None)?);
+                    Datum::Float(crate::vector::distance(metric, &x, &y)?)
                 }
             }
             JsonGet | JsonGetText => match a {

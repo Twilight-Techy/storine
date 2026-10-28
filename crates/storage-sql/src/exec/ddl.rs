@@ -23,7 +23,7 @@ use crate::lexer::Dialect;
 use crate::store::{CommitError, Op, Pre, Tag, Write};
 
 /// Most single-field storage indexes a collection can have.
-const MAX_STORAGE_INDEXES: usize = 4;
+const MAX_STORAGE_INDEXES: usize = 16;
 
 fn column_from_def(ex: &Exec<'_>, d: &ColumnDef) -> SqlResult<Column> {
     if let Some(def) = &d.default {
@@ -134,6 +134,7 @@ fn add_constraint(t: &mut Table, c: &TableConstraint, s: &Session) -> SqlResult<
             t.indexes.push(IndexDef {
                 name,
                 columns: cols,
+                method: None,
             });
         }
     }
@@ -146,6 +147,7 @@ fn wanted_storage_indexes(t: &Table) -> Vec<String> {
     let firsts = t
         .indexes
         .iter()
+        .filter(|i| !i.is_vector())
         .map(|i| i.columns.first())
         .chain(t.uniques.iter().map(|u| u.columns.first()))
         .chain(t.foreign_keys.iter().map(|f| f.columns.first()));
@@ -163,7 +165,40 @@ fn wanted_storage_indexes(t: &Table) -> Vec<String> {
     out
 }
 
+/// Storage vector indexes a table needs: `(field, dims)` of every `hnsw` / `ivfflat` index on a
+/// `vector(n)` column (a `vector` without a dimension cannot be indexed, as in pgvector).
+fn wanted_vector_indexes(t: &Table) -> Vec<(String, u32)> {
+    let mut out: Vec<(String, u32)> = Vec::new();
+    for i in t.indexes.iter().filter(|i| i.is_vector()) {
+        let Some(&c) = i.columns.first() else { continue };
+        if let DataType::Vector(Some(n)) = t.columns[c].ty {
+            let f = t.columns[c].field.clone();
+            if !out.iter().any(|(x, _)| *x == f) {
+                out.push((f, n));
+            }
+        }
+    }
+    out
+}
+
+fn sync_vector_indexes(s: &Session, t: &Table) -> SqlResult<()> {
+    let want = wanted_vector_indexes(t);
+    let have = s.engine.store.vector_indexes(&t.collection).unwrap_or_default();
+    for (f, dims) in &have {
+        if !want.iter().any(|(w, d)| w == f && d == dims) {
+            let _ = s.engine.store.drop_vector_index(&t.collection, f);
+        }
+    }
+    for (f, dims) in want {
+        if !have.iter().any(|(h, d)| *h == f && *d == dims) {
+            s.engine.store.create_vector_index(&t.collection, &f, dims)?;
+        }
+    }
+    Ok(())
+}
+
 fn sync_storage_indexes(s: &Session, t: &Table) -> SqlResult<()> {
+    sync_vector_indexes(s, t)?;
     let want = wanted_storage_indexes(t);
     let have: Vec<String> = s
         .engine
@@ -475,10 +510,18 @@ pub fn create_index(s: &mut Session, ci: &CreateIndex) -> SqlResult<Outcome> {
             t.uniques.push(uk);
         }
     } else {
-        t.indexes.push(IndexDef {
-            name,
-            columns: cols,
-        });
+        let method = ci.method.clone().filter(|m| m != "btree");
+        let def = IndexDef { name, columns: cols, method };
+        if def.is_vector() {
+            // pgvector: one vector column, of a fixed dimension for the storage index.
+            if def.columns.len() != 1 || !matches!(t.columns[def.columns[0]].ty, DataType::Vector(_)) {
+                return Err(SqlError::new(
+                    "42809",
+                    "an hnsw / ivfflat index covers exactly one vector column",
+                ));
+            }
+        }
+        t.indexes.push(def);
     }
     save_schema(s, &t, Pre::Version(version))?;
     sync_storage_indexes(s, &t)?;

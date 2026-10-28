@@ -164,9 +164,10 @@
 | **F-CONC-10** | **Conditional Atomic Commits** | Any mix of puts, deletes, patches and checks with `absent` / `exists` / `version` preconditions committed atomically (`StorageEngine::commit`, `OP_TXN`, `OP_DOC_WRITE`). Versions are monotonic across delete + re-create (no ABA). | v1.1 |
 | **F-CONC-11** | **Idempotent Requests** | A client request id makes a retried write apply at most once (crash-safe marker committed in the same transaction; 24 h window). | v1.1 |
 | **F-DOC-01** | **Schema-Flexible Document Collections** | Named collections of keyed documents with typed fields in one engine; cross-collection transactions. | v1.1 |
-| **F-DOC-02** | **Document Secondary Indexes** | Up to 4 per collection; equality, range and `IN` predicates use them; results always exact. | v1.1 |
+| **F-DOC-02** | **Document Secondary Indexes** | Up to 16 per collection; equality, range and `IN` predicates use them; results always exact. | v1.1 |
 | **F-DOC-03** | **Document Queries** | Filters (comparison, between, in, prefix, contains, exists / missing, key prefix, and / or / not), ordering, offset / limit, cursors. | v1.1 |
 | **F-DOC-04** | **Document Wire Protocol** | `OP_DOC_*` opcodes with the SVE value encoding (`protocol/PROTOCOL.md`), used by every SDK and the SQL adapter. | v1.1 |
+| **F-DOC-05** | **Document Vector Search** | Named HNSW vector indexes on embedding fields (up to 4 per collection, 4,096 dimensions); `nearest` queries combined with any filter, exact re-ranking, `$score`; in every SDK. | v1.2 |
 | **F-DIST-05** | **Networked Raft Runtime & Clustered Serving** | Election timers, pre-vote, per-peer replication, leader lease; servers route writes through consensus, redirect from followers (`NotLeader` + leader address) and serve opt-in follower reads (`--node-id`, `--peers`). | v1.1 |
 | **F-NET-04** | **Session Options & Cluster Info** | `OP_SET_OPTIONS` (follower reads) and `OP_CLUSTER_INFO` (leader discovery for SDKs). | v1.1 |
 | **F-NET-03** | **Rich Status Codes** | `NotLeader`, `Invalid`, `CommitUnknown`, conflict details (write index + current version). | v1.1 |
@@ -188,6 +189,7 @@
 | **F-SQL-04** | **Money-Safe Transactions** | Versioned writes (no lost updates), REPEATABLE READ / SERIALIZABLE read validation, row locks, constraints enforced by atomic preconditions (race-free foreign keys), exact decimals on every wire format. | v1.2 |
 | **F-SQL-05** | **Zero-Dependency TLS** | TLS 1.3 and 1.2 (ChaCha20-Poly1305, x25519, Ed25519) on all three endpoints, including every SQL Server encryption mode and TDS 8 strict. | v1.2 |
 | **F-SQL-07** | **Platform-Neutral SQL Server Logins** | SQL Server authentication plus OpenID Connect access tokens from any issuer (JWKS, RS256/384/512, EdDSA) and Kerberos from any realm (keytab), without tying deployments to a cloud or to Windows. | v1.2 |
+| **F-SQL-08** | **pgvector Compatibility** | `vector(n)`, `<->` / `<=>` / `<#>` / `<+>`, pgvector's functions and wire formats, `CREATE INDEX ... USING hnsw / ivfflat` backed by the store's vector indexes; works with the pgvector adapters for psycopg, psycopg2 and SQLAlchemy. | v1.2 |
 | **F-SQL-06** | **Real-Client Compatibility Matrix** | `tests/clients/run_all.sh`: 14 suites over Python, Node, Go, Java, .NET, PHP and Ruby drivers and ORMs. | v1.2 |
 
 ---

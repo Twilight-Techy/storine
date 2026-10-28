@@ -190,6 +190,47 @@ impl Store {
             .drop_index(field)?)
     }
 
+    /// The `k` documents most similar (cosine) to `vector` in `field`, among those matching
+    /// `filter`, best first (`TASK-122`).
+    pub fn nearest(
+        &self,
+        collection: &str,
+        field: &str,
+        vector: &[f32],
+        k: u32,
+        filter: Option<Filter>,
+    ) -> SqlResult<Vec<Document>> {
+        Ok(self
+            .client
+            .collection(&self.c(collection))
+            .nearest(field, vector, k, filter)?)
+    }
+
+    pub fn create_vector_index(&self, collection: &str, field: &str, dims: u32) -> SqlResult<()> {
+        Ok(self
+            .client
+            .collection(&self.c(collection))
+            .create_vector_index(field, dims)?)
+    }
+
+    pub fn drop_vector_index(&self, collection: &str, field: &str) -> SqlResult<()> {
+        Ok(self
+            .client
+            .collection(&self.c(collection))
+            .drop_vector_index(field)?)
+    }
+
+    /// `(field, dims)` of a collection's vector indexes that are ready.
+    pub fn vector_indexes(&self, collection: &str) -> SqlResult<Vec<(String, u32)>> {
+        Ok(self
+            .client
+            .collection(&self.c(collection))
+            .vector_indexes()?
+            .into_iter()
+            .map(|v| (v.field, v.dims))
+            .collect())
+    }
+
     /// Storage indexes of a collection (ready and building).
     pub fn indexed_fields(&self, collection: &str) -> SqlResult<Vec<String>> {
         let info = self.client.collection(&self.c(collection)).info()?;

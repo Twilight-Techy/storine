@@ -161,7 +161,7 @@ updates, transfers between rows in transactions, and stale-version rejection all
 - **Types**: `smallint`/`int`/`bigint`, `numeric(p,s)` / `decimal(p,s)` (exact, never binary
   floating point), `real`/`double`, `boolean`, `text`/`varchar(n)`/`char(n)`, `bytea`/`blob`,
   `date`, `time(p)`, `timestamp(p)` / `datetime(p)` / `timestamptz` (precision kept and
-  rounded like PostgreSQL), `interval`, `uuid`, `json`/`jsonb`, arrays, MySQL `enum`.
+  rounded like PostgreSQL), `interval`, `uuid`, `json`/`jsonb`, arrays, MySQL `enum`, pgvector `vector(n)` (see below).
 - **Queries**: joins (inner, left, right, full, cross, `USING`, `NATURAL`, comma joins planned
   as hash joins), subqueries (scalar, `IN`, `EXISTS`, `ANY`/`ALL`, derived tables, correlated
   `LATERAL`), CTEs (including `WITH RECURSIVE`), `UNION`/`INTERSECT`/`EXCEPT`, `GROUP
@@ -201,6 +201,35 @@ updates, transfers between rows in transactions, and stale-version rejection all
   `ROW_COUNT()`, `FOUND_ROWS()`, server status flags; TDS SQL batches, RPC (`sp_executesql`,
 `sp_prepare` / `sp_execute` / `sp_prepexec` / `sp_unprepare`) with typed parameters including
 `NVARCHAR(MAX)` / `VARBINARY(MAX)`, transaction-manager requests, multiple result sets.
+
+## Vector search (pgvector)
+
+The PostgreSQL endpoint accepts pgvector's SQL, so code written for PostgreSQL + pgvector runs
+unchanged (`CREATE EXTENSION vector` is accepted and does nothing):
+
+```sql
+CREATE TABLE items (id bigserial PRIMARY KEY, body text, embedding vector(384));
+CREATE INDEX ON items USING hnsw (embedding vector_cosine_ops);
+SELECT id, body, embedding <=> $1 AS distance
+FROM items WHERE body <> '' ORDER BY distance LIMIT 10;
+```
+
+- **Type**: `vector(n)` (up to 16,000 dimensions; text `[1,2,3]` and pgvector's binary format),
+  casts from text and numeric arrays. Dimension mismatches fail with SQLSTATE `22000`, as in
+  pgvector.
+- **Operators and functions**: `<->` (L2), `<=>` (cosine), `<#>` (negative inner product), `<+>`
+  (L1); `l2_distance`, `cosine_distance`, `inner_product`, `l1_distance`, `vector_dims`,
+  `vector_norm`, `l2_normalize`, `subvector`; element-wise `+ - *`; `sum` and `avg`.
+- **Indexes**: `USING hnsw` or `USING ivfflat` on one `vector(n)` column creates a vector index in
+  the store (up to 4 per table, 4,096 dimensions; index parameters and `SET hnsw.ef_search` are
+  accepted and ignored). A query of the form `ORDER BY col <=> constant LIMIT k` on one table,
+  ascending, without `GROUP BY` / `DISTINCT`, reads only the nearest candidates (re-ranked
+  exactly); when `WHERE` leaves fewer than `k` of them, it rescans the whole table, so filtering
+  never shortens the result. Every other query, and `<->` / `<#>` / `<+>` ordering, computes
+  distances row by row (exact, no index).
+- **Clients**: the `pgvector` adapters for psycopg 3, psycopg2 and SQLAlchemy are tested
+  (`tests/clients/test_python.py`). On the MySQL and SQL Server endpoints, store embeddings in
+  JSON columns or use the document API's `nearest` queries.
 
 ## Transactions and money safety
 
@@ -258,7 +287,8 @@ what Django's and Rails' test databases and Prisma's shadow databases rely on.
   from server-side files is not available; stream through `STDIN` / `STDOUT`.
 - **Views** are read-only and evaluated when queried (no `INSERT` into a view, no materialized
   views).
-- **Not supported**: stored procedures, functions and triggers, PostgreSQL extensions,
+- **Not supported**: stored procedures, functions and triggers, PostgreSQL extensions other
+  than pgvector's SQL,
   `NOTIFY` (`LISTEN` is accepted but no notification is ever delivered). Unsupported
   statements fail with SQLSTATE `0A000` and a message naming the feature; nothing else is
   silently ignored except session settings that do not apply (e.g. `SET search_path`, `SET

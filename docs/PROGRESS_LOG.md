@@ -558,3 +558,13 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - Re-arming walked every registered socket on each wait. Only completed requests are re-armed now.
 - **Benchmark**: `reactor-scale` under Wine, AFD versus `WSAPoll` at 8,000 idle connections: 160 versus 25 ops/s. Wine's AFD emulation is itself `O(registered)` in `wineserver`, so this shows the reactor works, not how it scales on Windows.
 - **Why it stays open**: Wine is a reimplementation of the Windows API, not Windows. `TASK-102` closes after the same commands run on a Windows machine.
+
+### Stage 27: Vector search for documents and SQL (`TASK-122`) — 2026-10-28
+
+- **Why**: the engine had HNSW and a SIMD cosine scorer, but only for the single built-in embedding of the typed API. Documents, the SDKs and SQL had no way to store embeddings and ask for the nearest ones, so "unstructured data" (text, images, audio as embeddings) needed a second database.
+- **Engine and documents**: any number of named vector indexes per collection, each over one list-of-numbers field. Queries combine `nearest` with ordinary filters. Small candidate sets are scanned exactly; large ones go through HNSW with oversampling and are re-ranked exactly, and if filters leave fewer than `k` hits the query falls back to an exact scan, so a filter never silently shrinks the answer.
+- **SQL**: pgvector's surface (type, operators, functions, formats, `USING hnsw` indexes), so applications written for PostgreSQL + pgvector run unchanged. The planner uses the vector index only for the shape it can answer exactly (`ORDER BY col <=> constant LIMIT k`, ascending, one table, no grouping) and otherwise evaluates distances row by row.
+- **Measured**: 5,000 × 16-dimensional vectors, `ORDER BY <=> LIMIT 10`: 27 ms full scan, 4 ms with the HNSW index, recall 1.0.
+- **Also**: the secondary-index limit per collection (and per SQL table) went from 4 to 16.
+- **Verification**: engine, replica and SDK suites; the pgvector section of the Python client suite against numpy; the full client matrix (14 suites) green.
+

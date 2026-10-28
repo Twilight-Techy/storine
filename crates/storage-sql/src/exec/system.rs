@@ -17,6 +17,8 @@ pub const NS_INFORMATION_SCHEMA: i64 = 13_183;
 /// PostgreSQL type OIDs.
 pub fn type_oid(ty: &DataType) -> u32 {
     match ty {
+        DataType::Vector(_) => crate::vector::VECTOR_OID,
+        DataType::Array(inner) if matches!(**inner, DataType::Vector(_)) => crate::vector::VECTOR_ARRAY_OID,
         DataType::Bool => 16,
         DataType::Bytes => 17,
         DataType::BigInt => 20,
@@ -117,7 +119,19 @@ const PG_TYPES: &[(u32, &str, i32, &str, u32, u32)] = &[
     (2951, "_uuid", -1, "A", 0, 2950),
     (199, "_json", -1, "A", 0, 114),
     (3807, "_jsonb", -1, "A", 0, 3802),
+    (1560, "bit", -1, "V", 1561, 0),
+    (1561, "_bit", -1, "A", 0, 1560),
+    // pgvector (its OIDs are assigned by CREATE EXTENSION; clients look them up by name).
+    (crate::vector::VECTOR_OID, "vector", -1, "U", crate::vector::VECTOR_ARRAY_OID, 0),
+    (crate::vector::VECTOR_ARRAY_OID, "_vector", -1, "A", 0, crate::vector::VECTOR_OID),
 ];
+
+/// OID of a catalog type by its `pg_type.typname` (`_vector`, `int4`, ...).
+pub fn type_oid_by_name(name: &str) -> Option<u32> {
+    let name = name.trim().trim_matches('"').to_ascii_lowercase();
+    let name = name.strip_prefix("pg_catalog.").or_else(|| name.strip_prefix("public.")).unwrap_or(&name);
+    PG_TYPES.iter().find(|t| t.1 == name).map(|t| t.0)
+}
 
 fn fnv(s: &str) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
@@ -1432,7 +1446,7 @@ pub fn mysql_type(ty: &DataType) -> (String, String) {
                     .join(",")
             ),
         ),
-        DataType::Array(_) => ("json".into(), "json".into()),
+        DataType::Array(_) | DataType::Vector(_) => ("json".into(), "json".into()),
     }
 }
 

@@ -281,6 +281,86 @@ def run_all():
             await eng.dispose()
         asyncio.run(main())
 
+    try:
+        import numpy as np
+        import pgvector  # noqa: F401
+    except ImportError:
+        np = None
+    if np is not None:
+        @section("pgvector: psycopg 3 / psycopg2 adapters, operators, HNSW index, SQLAlchemy Vector")
+        def _():
+            from pgvector.psycopg import register_vector
+            from pgvector.psycopg2 import register_vector as register_vector2
+            with psycopg.connect(f"host=127.0.0.1 port={PG_PORT} user=app dbname=shop", autocommit=True) as c:
+                c.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                register_vector(c)
+                c.execute("DROP TABLE IF EXISTS pv_items")
+                c.execute("CREATE TABLE pv_items (id int PRIMARY KEY, cat int, embedding vector(8))")
+                rng = np.random.default_rng(7)
+                data = rng.standard_normal((3000, 8)).astype(np.float32)
+                with c.cursor() as cur:
+                    with cur.copy("COPY pv_items (id, cat, embedding) FROM STDIN") as cp:
+                        for i, v in enumerate(data):
+                            cp.write_row((i, i % 3, v))
+                q = rng.standard_normal(8).astype(np.float32)
+                ids = lambda sql, *a: [r[0] for r in c.execute(sql, a).fetchall()]
+                exact = ids("SELECT id FROM pv_items ORDER BY embedding <=> %s LIMIT 10", q)
+                # Distances agree with numpy (cosine, L2, inner product, L1).
+                row = c.execute("SELECT embedding <=> %s, embedding <-> %s, embedding <#> %s, embedding <+> %s, embedding "
+                                "FROM pv_items WHERE id = %s", (q, q, q, q, exact[0])).fetchone()
+                v = row[4].to_numpy()
+                cos = 1 - float(np.dot(v, q)) / float(np.linalg.norm(v) * np.linalg.norm(q))
+                assert abs(row[0] - cos) < 1e-6 and abs(row[1] - float(np.linalg.norm(v - q))) < 1e-5, row
+                assert abs(row[2] + float(np.dot(v, q))) < 1e-5 and abs(row[3] - float(np.abs(v - q).sum())) < 1e-5
+                # The HNSW index serves ORDER BY ... LIMIT (approximate, like pgvector).
+                c.execute("CREATE INDEX pv_items_emb ON pv_items USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)")
+                c.execute("SET hnsw.ef_search = 40")
+                approx = ids("SELECT id FROM pv_items ORDER BY embedding <=> %s LIMIT 10", q)
+                assert len(set(approx) & set(exact)) >= 8, (approx, exact)
+                cat = ids("SELECT id, embedding <=> %s AS distance FROM pv_items WHERE cat = 1 ORDER BY distance LIMIT 5", q)
+                assert len(cat) == 5 and all(i % 3 == 1 for i in cat), cat
+                assert sorted(ids("SELECT id FROM pv_items WHERE id < 3 ORDER BY embedding <=> %s LIMIT 10", q)) == [0, 1, 2]
+                with c.cursor(binary=True) as cur:
+                    cur.execute("SELECT embedding FROM pv_items WHERE id = 0")
+                    assert np.allclose(cur.fetchone()[0].to_numpy(), data[0])
+                assert c.execute("SELECT vector_dims(embedding), round(vector_norm('[3,4]')::numeric, 1) FROM pv_items LIMIT 1").fetchone() == (8, D("5.0"))
+                try:
+                    c.execute("INSERT INTO pv_items VALUES (99999, 0, '[1,2]')")
+                    raise AssertionError("wrong dimensions accepted")
+                except psycopg.errors.DataError:
+                    pass
+            c2 = psycopg2.connect(host="127.0.0.1", port=PG_PORT, user="app", dbname="shop")
+            register_vector2(c2)
+            cur = c2.cursor()
+            cur.execute("SELECT id, embedding FROM pv_items ORDER BY embedding <-> %s LIMIT 1", (data[42],))
+            rid, emb = cur.fetchone()
+            emb = emb.to_numpy() if hasattr(emb, "to_numpy") else emb  # pgvector >= 0.4 returns Vector
+            assert rid == 42 and np.allclose(emb, data[42])
+            c2.close()
+            from pgvector.sqlalchemy import Vector
+            from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+
+            class Base(DeclarativeBase):
+                pass
+
+            class Item(Base):
+                __tablename__ = "pv_orm_items"
+                id: Mapped[int] = mapped_column(primary_key=True)
+                embedding = mapped_column(Vector(3))
+
+            eng = sa.create_engine(f"postgresql+psycopg://app:x@127.0.0.1:{PG_PORT}/shop")
+            Base.metadata.drop_all(eng)
+            Base.metadata.create_all(eng)
+            with Session(eng) as s:
+                s.add_all([Item(id=1, embedding=[1, 0, 0]), Item(id=2, embedding=[0, 1, 0]), Item(id=3, embedding=[0.9, 0.1, 0])])
+                s.commit()
+                near = s.scalars(sa.select(Item).order_by(Item.embedding.cosine_distance([1, 0.05, 0])).limit(2)).all()
+                assert [i.id for i in near] == [1, 3], [i.id for i in near]
+                far = s.scalars(sa.select(Item).order_by(Item.embedding.l2_distance([0, 1, 0])).limit(1)).one()
+                assert far.id == 2 and list(far.embedding) == [0, 1, 0]
+            Base.metadata.drop_all(eng)
+            eng.dispose()
+
     if MY_PORT:
         import pymysql
 

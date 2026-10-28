@@ -469,6 +469,44 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             }
             Datum::Text(out)
         }
+        // ── pgvector ──
+        "l2_distance" | "cosine_distance" | "inner_product" | "l1_distance" => {
+            let b = args.get(1).cloned().unwrap_or(Datum::Null);
+            if a0.is_null() || b.is_null() {
+                Datum::Null
+            } else {
+                use crate::vector::{coerce, distance, Metric};
+                let (x, y) = (coerce(&a0, None)?, coerce(&b, None)?);
+                Datum::Float(match name {
+                    "l2_distance" => distance(Metric::L2, &x, &y)?,
+                    "cosine_distance" => distance(Metric::Cosine, &x, &y)?,
+                    "l1_distance" => distance(Metric::L1, &x, &y)?,
+                    _ => -distance(Metric::NegInner, &x, &y)?,
+                })
+            }
+        }
+        "vector_dims" | "vector_norm" | "l2_normalize" | "subvector" if !a0.is_null() => {
+            let v = crate::vector::coerce(&a0, None)?;
+            match name {
+                "vector_dims" => Datum::Int(v.len() as i64),
+                "vector_norm" => Datum::Float(crate::vector::norm(&v)),
+                "l2_normalize" => {
+                    let n = crate::vector::norm(&v);
+                    Datum::Vector(if n == 0.0 { v } else { v.iter().map(|x| (f64::from(*x) / n) as f32).collect() })
+                }
+                _ => {
+                    // subvector(v, start (1-based), count)
+                    let start = args.get(1).map(Datum::as_i64).transpose()?.unwrap_or(1).max(1) as usize;
+                    let count = args.get(2).map(Datum::as_i64).transpose()?.unwrap_or(0).max(0) as usize;
+                    let part: Vec<f32> = v.iter().skip(start - 1).take(count).copied().collect();
+                    if part.is_empty() {
+                        return Err(SqlError::invalid_text("vector must have at least 1 dimension"));
+                    }
+                    Datum::Vector(part)
+                }
+            }
+        }
+        "vector_dims" | "vector_norm" | "l2_normalize" | "subvector" => Datum::Null,
         // ── numbers ──
         "abs" => match &a0 {
             Datum::Null => Datum::Null,
@@ -886,6 +924,9 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
         "regtype" | "to_regtype" => match &a0 {
             Datum::Null => Datum::Null,
             Datum::Int(i) => Datum::Int(*i),
+            d if crate::exec::system::type_oid_by_name(&text(d)).is_some() => {
+                Datum::Int(i64::from(crate::exec::system::type_oid_by_name(&text(d)).unwrap_or(25)))
+            }
             d => match crate::parser::parse_data_type(&text(d)) {
                 Ok(t) => Datum::Int(i64::from(crate::exec::system::type_oid(&t))),
                 Err(_) if name == "to_regtype" => Datum::Null,
@@ -1335,6 +1376,26 @@ pub fn finish_aggregate(
 ) -> SqlResult<Datum> {
     Ok(match name {
         "count" | "count_big" => Datum::Int(if star { count } else { values.len() as i64 }),
+        // pgvector: element-wise sum and mean of vectors.
+        "sum" | "avg" if values.first().is_some_and(|v| matches!(v, Datum::Vector(_))) => {
+            let mut acc: Vec<f64> = Vec::new();
+            for v in &values {
+                let x = crate::vector::coerce(v, None)?;
+                if acc.is_empty() {
+                    acc = vec![0.0; x.len()];
+                } else if acc.len() != x.len() {
+                    return Err(SqlError::new(
+                        "22000",
+                        format!("expected {} dimensions, not {}", acc.len(), x.len()),
+                    ));
+                }
+                for (a, b) in acc.iter_mut().zip(&x) {
+                    *a += f64::from(*b);
+                }
+            }
+            let n = if name == "avg" { values.len() as f64 } else { 1.0 };
+            Datum::Vector(acc.iter().map(|a| (a / n) as f32).collect())
+        }
         "sum" => {
             if values.is_empty() {
                 return Ok(Datum::Null);
@@ -2111,6 +2172,7 @@ pub fn return_type(
     }
     Some(match name {
         "count" | "count_big" => DataType::BigInt,
+        "sum" | "avg" if matches!(arg_ty(0), Some(DataType::Vector(_))) => DataType::Vector(None),
         "sum" => match arg_ty(0) {
             Some(DataType::Real | DataType::Double) => DataType::Double,
             _ => DataType::Numeric(None),
@@ -2172,7 +2234,9 @@ pub fn return_type(
         | "instr" | "locate" | "ascii" | "pg_backend_pid" | "connection_id" | "last_insert_id"
         | "lastval" | "nextval" | "currval" | "setval" | "row_count" | "found_rows" | "year"
         | "month" | "day" | "hour" | "minute" | "second" | "unix_timestamp" | "datediff"
-        | "sign" | "array_length" | "cardinality" => DataType::BigInt,
+        | "sign" | "array_length" | "cardinality" | "vector_dims" => DataType::BigInt,
+        "l2_distance" | "cosine_distance" | "inner_product" | "l1_distance" | "vector_norm" => DataType::Double,
+        "l2_normalize" | "subvector" => DataType::Vector(None),
         "now"
         | "current_timestamp"
         | "transaction_timestamp"

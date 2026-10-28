@@ -21,6 +21,7 @@ pub mod rsa;
 pub mod store;
 pub mod tds;
 pub mod tls;
+pub mod vector;
 
 pub use error::{SqlError, SqlResult};
 pub use lexer::Dialect;

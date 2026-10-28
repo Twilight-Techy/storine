@@ -1095,10 +1095,13 @@ impl Parser {
             self.expect_kw("on")?;
             let _ = self.eat_kw("only");
             let table = self.table_name()?;
-            if self.eat_kw("using") {
-                self.ident()?;
-            }
+            let method = if self.eat_kw("using") {
+                Some(self.ident()?.to_ascii_lowercase())
+            } else {
+                None
+            };
             let mut columns = Vec::new();
+            let mut opclasses = Vec::new();
             self.expect_op("(")?;
             loop {
                 // Expression indexes (lower(email)) index the column they wrap.
@@ -1125,7 +1128,9 @@ impl Parser {
                     && !self.is_kw("desc")
                     && !self.is_kw("nulls")
                 {
-                    self.ident()?;
+                    opclasses.push(Some(self.ident()?.to_ascii_lowercase()));
+                } else {
+                    opclasses.push(None);
                 }
                 let _ = self.eat_kw("asc") || self.eat_kw("desc");
                 if self.eat_kw("nulls") {
@@ -1143,6 +1148,8 @@ impl Parser {
                 columns,
                 unique,
                 if_not_exists,
+                method,
+                opclasses,
             })));
         }
         if self.is_kw("schema") || self.is_kw("database") {
@@ -1702,6 +1709,10 @@ impl Parser {
             "uuid" | "uniqueidentifier" => DataType::Uuid,
             "json" => DataType::Json,
             "jsonb" => DataType::Jsonb,
+            "vector" if self.dialect == Dialect::Postgres => {
+                let n = paren_numbers(self)?;
+                DataType::Vector(n.first().copied())
+            }
             "enum" => {
                 self.expect_op("(")?;
                 let mut values = Vec::new();
@@ -3229,7 +3240,7 @@ impl Parser {
                 Some(Token::Op("<=")) => BinaryOp::LtEq,
                 Some(Token::Op(">")) => BinaryOp::Gt,
                 Some(Token::Op(">=")) => BinaryOp::GtEq,
-                Some(Token::Op("<=>")) => BinaryOp::NullSafeEq,
+                Some(Token::Op("<=>")) if self.dialect != Dialect::Postgres => BinaryOp::NullSafeEq,
                 Some(Token::Op("~")) if self.dialect == Dialect::Postgres => BinaryOp::Regex {
                     case_insensitive: false,
                     negated: false,
@@ -3325,6 +3336,10 @@ impl Parser {
                 Some(Token::Op("@>")) => BinaryOp::Contains,
                 Some(Token::Op("<@")) => BinaryOp::ContainedBy,
                 Some(Token::Op("&&")) if self.dialect == Dialect::Postgres => BinaryOp::Overlap,
+                Some(Token::Op("<->")) => BinaryOp::VecL2,
+                Some(Token::Op("<=>")) if self.dialect == Dialect::Postgres => BinaryOp::VecCosine,
+                Some(Token::Op("<#>")) => BinaryOp::VecNegInner,
+                Some(Token::Op("<+>")) => BinaryOp::VecL1,
                 _ => return Ok(left),
             };
             self.pos += 1;
