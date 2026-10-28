@@ -161,6 +161,10 @@ fn encode_info(info: &CollectionInfo, out: &mut Vec<u8>) {
     for f in &info.indexes {
         put_str(out, f);
     }
+    out.extend_from_slice(&(info.building.len() as u32).to_le_bytes());
+    for f in &info.building {
+        put_str(out, f);
+    }
     encode_map_body(&info.extra, out);
 }
 

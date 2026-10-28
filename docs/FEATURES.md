@@ -167,6 +167,8 @@
 | **F-DOC-02** | **Document Secondary Indexes** | Up to 4 per collection; equality, range and `IN` predicates use them; results always exact. | v1.1 |
 | **F-DOC-03** | **Document Queries** | Filters (comparison, between, in, prefix, contains, exists / missing, key prefix, and / or / not), ordering, offset / limit, cursors. | v1.1 |
 | **F-DOC-04** | **Document Wire Protocol** | `OP_DOC_*` opcodes with the SVE value encoding (`protocol/PROTOCOL.md`), used by every SDK and the SQL adapter. | v1.1 |
+| **F-DIST-05** | **Networked Raft Runtime & Clustered Serving** | Election timers, pre-vote, per-peer replication, leader lease; servers route writes through consensus, redirect from followers (`NotLeader` + leader address) and serve opt-in follower reads (`--node-id`, `--peers`). | v1.1 |
+| **F-NET-04** | **Session Options & Cluster Info** | `OP_SET_OPTIONS` (follower reads) and `OP_CLUSTER_INFO` (leader discovery for SDKs). | v1.1 |
 | **F-NET-03** | **Rich Status Codes** | `NotLeader`, `Invalid`, `CommitUnknown`, conflict details (write index + current version). | v1.1 |
 
 ---
@@ -182,4 +184,4 @@ The tables above are the target specification. The following rows are **not** fu
 | **F-PIDX-03** | Wired as `EngineConfig::primary_tier = PrimaryTier::Cold` (`TASK-092`): the primary entries and the ordinal table as of the last checkpoint live in an immutable page-structured generation (`<stem>_primary.cold`, sealed when encryption is on); RAM = entries changed since the checkpoint + tombstones + `8 B`/page separators + ~`10 bits`/record Bloom filter. Open maps the tier instead of loading it. Tier switches in both directions. |
 | **F-NET-01** | Readiness polling uses `WSAPoll` / `poll` (not `epoll` / `IOCP`). Idle workers block indefinitely (a per-shard self-wake socket delivers new connections, admin results and shutdown), so idle CPU is `0%` with zero timer wake-ups, but each wake-up is O(connections per shard) in the kernel. |
 | **F-SEC-01** | Bearer tokens only (no HMAC). An unauthenticated server refuses to bind a non-loopback address. Configure tokens with `STORAGE_AUTH_TOKENS=token:role,...` (tokens of at least 16 characters). |
-| **F-DIST-02** | Raft persists term/vote and an append-only log (`RaftStorage`), enforces the vote and log-matching safety rules, and compacts its log (§7) with the engine as the snapshot. Elections and replication are driven by the caller (no internal timers or transport of its own beyond the `OP_RAFT_*` RPCs), and there is no `InstallSnapshot` RPC yet: a follower behind the compaction point must be reseeded from a backup. |
+| **F-DIST-02** | Complete (`TASK-099` – `TASK-101`): persistent term/vote/log, deterministic replicated commands (identical versions on every replica), replica write guard, pre-vote, leader stickiness, lease reads with read-index fallback, `InstallSnapshot`, `CommitUnknown` + idempotent retries, networked runtime over TCP. Membership is static (no reconfiguration yet). |

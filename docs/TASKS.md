@@ -735,3 +735,26 @@ This document defines the strict chronological execution order for building the 
   - `OP_DOC_GET 0x20`, `OP_DOC_WRITE 0x21`, `OP_DOC_QUERY 0x22`, `OP_DOC_ADMIN 0x23` (index builds and drops run on the admin job pool), `OP_TXN 0x24` (typed-frame batch with per-item preconditions: closes the blind `OP_BATCH_PUT` gap), `OP_DOC_INFO 0x25`. New statuses `NotLeader 0x07`, `Invalid 0x08`, `CommitUnknown 0x09`; conflicts report the failing write index and current version.
   - `storage-server` binary serves documents by default (`--records agent` for the legacy typed collection). `StorageClient::doc_get` / `doc_write` / `doc_query` / `doc_command`.
   - **Exit Criteria**: `test_document_api_over_tcp` (concurrent clients, conflicts, idempotency, index job, typed txn, hostile bodies on every new opcode).
+
+## Stage 23: Replication Integrity — Deterministic Replicated Commands, Read-Only Replicas, Safe Reads & a Networked Raft Runtime (`TASK-099` – `TASK-101`)
+
+*(Follow-Up Prompt 2: close the Raft gaps raised in the audit answer.)*
+
+- [x] **TASK-099: Deterministic Replicated Commands & Replica Write Guard (`F-DIST-02`, `RULE-SAFE-09`)**
+  - Log entries carry a `RaftCommand`: `Upsert`, `Delete`, `Ops` (any conditional atomic batch: puts, TTL puts, deletes, field patches, checks, rewrites), `Noop`, `SweepExpired`. Kinds `0`/`1` are the original encoding, so existing logs load.
+  - Apply goes through `StorageEngine::commit_at`: versions are `>=` the log index (identical on every replica and monotonic across delete + re-create); TTL decisions use the leader's proposal time; failed preconditions are replicated *outcomes*, not apply failures; only I/O / memory errors stop the apply loop.
+  - `RaftNode::new` puts the engine in replica mode: every direct write API returns `ReadOnlyReplica` (leader included); snapshot install and resets use internal exact-version paths. Snapshots keep each record's version and TTL.
+  - Proposers wait for the applied outcome (`propose_ops` + `wait_applied`); an unconfirmed write returns `CommitUnknown` (it may still commit: retry with the same request id). A new leader appends a `Noop` (commits earlier-term entries, gives read-index a current-term entry).
+  - **Exit Criteria**: raft unit tests updated for the no-op; `test_replicas_agree_refuse_direct_writes_and_reject_deterministically`.
+- [x] **TASK-100: Networked Raft Runtime (`F-DIST-05`)**
+  - `RaftRuntime`: randomized election timers (deadline sleeps, no busy loop), **pre-vote** (a partitioned node cannot disrupt the cluster when it returns), **leader stickiness** (no votes while a live leader is heard from), one replicator thread per peer with bounded `AppendEntries` (entries and bytes), automatic `InstallSnapshot`, quorum commit with the current-term rule, **leader lease** (90% of the minimum election timeout, measured from the send time of acknowledged requests) with a read-index fallback, replicated TTL sweeps.
+  - `RaftTransport` trait; `LocalNetwork` in-process transport with partitions (round-trips the wire encoding).
+  - **Bug found and fixed**: lock-order deadlock between `propose` (state → outcomes) and `wait_applied` (outcomes → state), caught by a 15-run stress loop; apply now publishes the outcome before advancing `last_applied`.
+  - **Exit Criteria**: `test_partitioned_leader_loses_lease_reports_commit_unknown_and_retries_apply_once`, `test_ttl_sweep_is_replicated_and_snapshot_keeps_versions`; 13 consecutive stress runs green.
+- [x] **TASK-101: Clustered Server, TCP Transport, Redirects & Follower Reads (`F-DIST-05`, `F-NET-04`)**
+  - `TcpRaftTransport` (`OP_RAFT_*`, Admin token, per-peer cached connection, connect / read / write timeouts). `StorageServer::start_cluster` / `start_documents_cluster`: writes (typed and document) run on a bounded worker pool through consensus (never on reactor threads); followers answer `NotLeader` with the leader's id and client address; reads are served by the leader under its lease (else after a read barrier) or by any replica for connections that opt in (`OP_SET_OPTIONS`, bit 0). `OP_CLUSTER_INFO` reports node, leader, term, commit / applied indexes and members.
+  - All typed write opcodes share one path (`write_reply` → `ServerShared::commit`); `OP_MIGRATE_VSHARD` imports through consensus on clustered nodes.
+  - `DocumentStore` metadata cache is validated against the `$meta` document version on every use (correct on followers and after leader changes); index builds are exact under concurrent writes (*building* → rewrite → *ready*).
+  - Binary: `--node-id N --peers 1=host:port,...` and `STORAGE_CLUSTER_TOKEN`.
+  - **Exit Criteria**: `test_three_node_tcp_cluster_writes_redirects_and_failover` (8 consecutive runs green), `test_index_build_stays_exact_under_concurrent_writes`; 3-process smoke test of the release binary elects one leader.
+  - **Documented limit**: static membership (no joint-consensus reconfiguration yet).

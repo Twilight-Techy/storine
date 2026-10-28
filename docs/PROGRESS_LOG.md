@@ -428,3 +428,19 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Security audit**: every new decoder (SVE values, field ops, document writes, filters, queries, `OP_TXN`) bounds counts by the bytes present before allocating, caps nesting at 32, rejects trailing bytes, duplicate map keys, invalid UTF-8 and unknown tags; new opcodes are role- and size-checked at the header stage; system collections (`$meta`, `$idem`) are not writable by clients; long-key hash collisions are reported, never silently overwritten.
 - **Complexity / footprint**: atomic patch = one locked read-modify-write (`O(document)`); document query = index-narrowed candidate scan with exact re-check, `O(candidates)` zero-copy pass + `O(page)` materialization; per-document index overhead 2 B per declared index.
 - **Verification**: `129` workspace tests passing, `0` clippy warnings (new code).
+
+### Stage 23: Replication Integrity (`TASK-099` – `TASK-101`) — 2026-10-28
+
+- **Gaps closed** (audit answer, question 4):
+  1. *In-process simulation only* → networked `RaftRuntime` + TCP transport + clustered server + binary flags.
+  2. *Followers writable* → replica mode on every replicated engine; servers redirect writes to the leader.
+  3. *Only `replicate_put`* → `RaftCommand::Ops` replicates any conditional batch (CAS, deletes, patches, transactions, TTL puts).
+  4. *Raft state in RAM* → already persisted since `TASK-060` / `TASK-074`.
+  5. *Figure-8 commit* → already current-term-only since `TASK-074`; plus the new-leader no-op.
+  6. *"Failed" writes applied later* → `CommitUnknown` + request-id idempotency (applied at most once).
+  7. *Stale reads from a deposed leader* → lease + vote stickiness + pre-vote + read barrier.
+  8. *Versions diverging across replicas* → log-index versions; snapshots keep exact versions and TTLs; TTL decisions at the proposal time.
+- **Bugs found and fixed during the stage**: no-op entries had an empty id that the decoder rejected on restart; a lock-order deadlock (`propose` vs `wait_applied`); the snapshot generator dropped TTLs; stale document metadata on followers / new leaders; an index-build race with concurrent writers; `reindex` materialized whole collections.
+- **Security audit**: Raft RPCs stay Admin-only; peers authenticate with `STORAGE_CLUSTER_TOKEN` (auto-registered, `>= 16` chars, required with auth); every transport call has timeouts; pooled writes are bounded (queue `4096`, `Overloaded` when full); hostile log entries (unknown kinds, truncated payloads, bad op batches) are rejected by bounded decoders.
+- **Concurrency / CPU audit**: timers sleep until their deadline (no busy loops), replicators wait on a condvar with the heartbeat as timeout, consensus waits never run on reactor threads.
+- **Verification**: `134` workspace tests passing; raft runtime tests 13/13 and TCP cluster test 8/8 consecutive runs; release-binary 3-process smoke test.

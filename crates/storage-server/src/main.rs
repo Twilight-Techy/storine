@@ -1,6 +1,12 @@
 //! Standalone binary entrypoint for `storage-server` (`TASK-029`).
 //!
-//! Usage: `storage-server [data_dir] [bind_addr] [--max-connections N] [--once]`
+//! Usage: `storage-server [data_dir] [bind_addr] [--max-connections N] [--records agent]
+//!         [--node-id N --peers 1=host:port,2=host:port,3=host:port] [--once]`
+//!
+//! Cluster mode (`--node-id` + `--peers`, every member listed including this one): the node joins
+//! a Raft group; writes go through consensus on the leader, followers redirect clients to it.
+//! Peers talk Raft over the same port. `STORAGE_CLUSTER_TOKEN` is the Admin token nodes use to
+//! authenticate to each other (it is registered automatically; required with authentication).
 //!
 //! Security configuration (environment):
 //! - `STORAGE_AUTH_TOKENS`: comma-separated `token:role` pairs (`role` = `read` | `write` | `admin`).
@@ -20,8 +26,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use storage_core::{AgentObjectRecord, DocumentStore, EngineConfig, StorageEngine};
-use storage_server::{RbacRole, SecurityConfig, StorageServer, DEFAULT_MAX_CONNECTIONS};
+use std::collections::HashMap;
+
+use storage_core::raft_runtime::{RaftConfig, RaftRuntime};
+use storage_core::{AgentObjectRecord, DocumentStore, EngineConfig, NodeId, RaftNode, StorageEngine};
+use storage_server::{cluster, RbacRole, SecurityConfig, StorageServer, DEFAULT_MAX_CONNECTIONS};
 use storage_types::{Result, StorageError};
 
 fn security_from_env() -> Result<SecurityConfig> {
@@ -66,7 +75,7 @@ fn run() -> Result<()> {
                 skip_next = false;
                 continue;
             }
-            if a == "--max-connections" || a == "--records" {
+            if a == "--max-connections" || a == "--records" || a == "--node-id" || a == "--peers" {
                 skip_next = true;
                 continue;
             }
@@ -108,9 +117,73 @@ fn run() -> Result<()> {
         return park(server, once);
     }
     let store = Arc::new(DocumentStore::open(data_dir, EngineConfig::default())?);
+    let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1));
+    if let (Some(node_id), Some(peers)) = (flag("--node-id"), flag("--peers")) {
+        let node_id: NodeId = node_id
+            .parse()
+            .map_err(|_| StorageError::invalid_key("--node-id must be a number (1-65535)"))?;
+        let members = parse_peers(peers)?;
+        if !members.contains_key(&node_id) {
+            return Err(StorageError::invalid_key("--peers must list this node's own --node-id"));
+        }
+        let token = env::var("STORAGE_CLUSTER_TOKEN").ok();
+        let mut security = security;
+        if let Some(ref t) = token {
+            if t.len() < 16 {
+                return Err(StorageError::invalid_key("STORAGE_CLUSTER_TOKEN must be at least 16 characters"));
+            }
+            if security.require_auth {
+                security = security.with_token(t, RbacRole::Admin);
+            }
+        } else if security.require_auth {
+            return Err(StorageError::invalid_key(
+                "cluster mode with authentication needs STORAGE_CLUSTER_TOKEN (peers authenticate with it)",
+            ));
+        }
+        let mut raft_peers = HashMap::new();
+        for (&id, addr) in &members {
+            if id != node_id {
+                raft_peers.insert(id, cluster::resolve(addr)?);
+            }
+        }
+        let node = Arc::new(RaftNode::new(node_id, Arc::clone(store.engine()))?);
+        let transport = Arc::new(cluster::TcpRaftTransport::new(raft_peers, token, Duration::from_millis(500)));
+        let runtime = RaftRuntime::start(node, members.keys().copied().collect(), transport, RaftConfig::default())?;
+        let server = StorageServer::start_documents_cluster(
+            bind_addr,
+            store,
+            max_connections,
+            security,
+            cluster::ClusterOptions { runtime, client_addrs: members },
+        )?;
+        let mode = format!("documents, raft node {node_id} of {}", flag("--peers").map_or(0, |p| p.split(',').count()));
+        report((server.local_addr(), server.max_connections()), data_dir, auth_enabled, &mode);
+        return park(server, once);
+    }
     let server = StorageServer::start_documents(bind_addr, store, max_connections, security, None)?;
     report((server.local_addr(), server.max_connections()), data_dir, auth_enabled, "documents");
     park(server, once)
+}
+
+/// Parses `1=host:port,2=host:port,...`.
+fn parse_peers(spec: &str) -> Result<HashMap<NodeId, String>> {
+    let mut out = HashMap::new();
+    for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (id, addr) = item
+            .split_once('=')
+            .ok_or_else(|| StorageError::invalid_key("--peers entries must be `id=host:port`"))?;
+        let id: NodeId = id
+            .trim()
+            .parse()
+            .map_err(|_| StorageError::invalid_key("--peers ids must be numbers (1-65535)"))?;
+        if id == 0 || out.insert(id, addr.trim().to_owned()).is_some() {
+            return Err(StorageError::invalid_key("--peers ids must be unique and non-zero"));
+        }
+    }
+    if out.is_empty() {
+        return Err(StorageError::invalid_key("--peers is empty"));
+    }
+    Ok(out)
 }
 
 /// Keeps `server` running until the process is stopped (returns at once with `--once`).

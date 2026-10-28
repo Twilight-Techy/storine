@@ -24,6 +24,8 @@
 //!     - `0x20 = DocGet`, `0x21 = DocWrite`, `0x22 = DocQuery`, `0x23 = DocAdmin`, `0x25 = DocInfo`
 //!       (document API, `protocol/PROTOCOL.md`)
 //!     - `0x24 = Txn` (atomic typed-frame batch with per-item preconditions)
+//!     - `0x26 = SetOptions` (`[flags u8]`: bit 0 = allow possibly stale follower reads)
+//!     - `0x27 = ClusterInfo` (node id, leader, term, commit / applied indexes, member addresses)
 //!   - `id: [u8; 24]` (`InlineId` raw bytes)
 //!   - `body_len: u32`
 //!   - `body: [u8; body_len]`
@@ -55,6 +57,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
+pub mod cluster;
 pub mod documents;
 pub mod security;
 
@@ -110,6 +113,8 @@ pub const OP_DOC_QUERY: u8 = 0x22;
 pub const OP_DOC_ADMIN: u8 = 0x23;
 pub const OP_TXN: u8 = 0x24;
 pub const OP_DOC_INFO: u8 = 0x25;
+pub const OP_SET_OPTIONS: u8 = 0x26;
+pub const OP_CLUSTER_INFO: u8 = 0x27;
 
 pub const STATUS_OK: u8 = 0x00;
 pub const STATUS_NOT_FOUND: u8 = 0x01;
@@ -138,7 +143,9 @@ const fn required_role(op: u8) -> Option<RbacRole> {
     match op {
         OP_AUTH => Some(RbacRole::Unauthenticated),
         OP_GET_RAW_FRAME | OP_STATS | OP_BATCH_GET | OP_QUERY_HYBRID | OP_METRICS | OP_HEALTH
-        | OP_DOC_GET | OP_DOC_QUERY | OP_DOC_INFO => Some(RbacRole::ReadOnly),
+        | OP_DOC_GET | OP_DOC_QUERY | OP_DOC_INFO | OP_SET_OPTIONS | OP_CLUSTER_INFO => {
+            Some(RbacRole::ReadOnly)
+        }
         OP_PUT_RAW_FRAME | OP_DELETE | OP_CAS_PUT | OP_BATCH_PUT | OP_TXN | OP_DOC_WRITE
         | OP_DOC_ADMIN => Some(RbacRole::ReadWrite),
         OP_RAFT_VOTE | OP_RAFT_APPEND | OP_RAFT_SNAPSHOT | OP_MIGRATE_VSHARD | OP_ADMIN_BACKUP
@@ -159,6 +166,7 @@ const fn max_body_len(op: u8) -> usize {
         | OP_MIGRATE_VSHARD | OP_TXN | OP_DOC_WRITE => MAX_PAYLOAD_SIZE as usize,
         // Collection + key, or a query / collection command (filters are small).
         OP_DOC_GET => 2 * 1024 + 16,
+        OP_SET_OPTIONS => 16,
         OP_DOC_QUERY | OP_DOC_ADMIN | OP_DOC_INFO => 1024 * 1024,
         // One snapshot chunk plus its fixed header.
         OP_RAFT_SNAPSHOT => RAFT_SNAPSHOT_CHUNK + 64,
@@ -289,7 +297,18 @@ struct NonBlockingConn {
     limiter: TokenBucket,
     /// Admin job running in the background; no new request is read until it answers.
     pending_job: Option<Receiver<JobResponse>>,
+    /// Read request waiting for a Raft read barrier (executed when `pending_job` answers
+    /// [`STATUS_BARRIER_PASSED`]).
+    deferred: Option<Box<DeferredRequest>>,
+    /// The client accepts possibly stale reads from a follower (`OP_SET_OPTIONS`).
+    follower_reads: bool,
 }
+
+/// `(opcode, key, body)` of a request postponed behind a read barrier.
+type DeferredRequest = (u8, [u8; 24], Vec<u8>);
+
+/// Internal status: a read barrier passed, run the deferred request (never sent on the wire).
+const STATUS_BARRIER_PASSED: u8 = 0xFE;
 
 impl NonBlockingConn {
     #[inline]
@@ -305,6 +324,8 @@ impl NonBlockingConn {
             role: sec.initial_role(),
             limiter: TokenBucket::new(sec.rate_limit_rps, sec.rate_limit_burst),
             pending_job: None,
+            deferred: None,
+            follower_reads: false,
         }
     }
 
@@ -374,7 +395,22 @@ impl StorageServer<DocumentRecord> {
         raft: Option<Arc<RaftNode<DocumentRecord>>>,
     ) -> Result<Self> {
         let engine = Arc::clone(store.engine());
-        Self::start_inner(bind_addr, engine, max_connections, security, raft, Some(store))
+        Self::start_inner(bind_addr, engine, max_connections, security, raft, Some(store), None)
+    }
+
+    /// Starts a clustered document server: the store's writes go through `options.runtime`
+    /// (its node must wrap `store.engine()`).
+    pub fn start_documents_cluster(
+        bind_addr: &str,
+        store: Arc<DocumentStore>,
+        max_connections: usize,
+        security: SecurityConfig,
+        options: cluster::ClusterOptions<DocumentRecord>,
+    ) -> Result<Self> {
+        store.set_commit_sink(Arc::clone(&options.runtime) as Arc<dyn storage_core::CommitSink>);
+        let engine = Arc::clone(store.engine());
+        let raft = Some(Arc::clone(options.runtime.node()));
+        Self::start_inner(bind_addr, engine, max_connections, security, raft, Some(store), Some(options))
     }
 }
 
@@ -385,6 +421,8 @@ struct ServerShared<T: ZeroCopyRecord + Indexable> {
     raft: Option<Arc<RaftNode<T>>>,
     /// Document API (`OP_DOC_*`); `None` when the server hosts only typed records.
     documents: Option<Arc<DocumentStore>>,
+    /// Raft cluster membership (writes through consensus, leader-only reads by default).
+    cluster: Option<cluster::ClusterContext<T>>,
     admin_jobs: AtomicUsize,
     /// Every reactor shard, so `OP_METRICS` can merge their latency histograms.
     shards: Vec<Arc<ReactorShard>>,
@@ -476,9 +514,24 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
         security: SecurityConfig,
         raft: Option<Arc<RaftNode<T>>>,
     ) -> Result<Self> {
-        Self::start_inner(bind_addr, engine, max_connections, security, raft, None)
+        Self::start_inner(bind_addr, engine, max_connections, security, raft, None, None)
     }
 
+    /// Starts a clustered server: every write goes through Raft consensus (`options.runtime`),
+    /// reads are served by the leader (or by followers for clients that opt in), and the node
+    /// answers its peers' Raft RPCs. The runtime's node must wrap `engine`.
+    pub fn start_cluster(
+        bind_addr: &str,
+        engine: Arc<StorageEngine<T>>,
+        max_connections: usize,
+        security: SecurityConfig,
+        options: cluster::ClusterOptions<T>,
+    ) -> Result<Self> {
+        let raft = Some(Arc::clone(options.runtime.node()));
+        Self::start_inner(bind_addr, engine, max_connections, security, raft, None, Some(options))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn start_inner(
         bind_addr: &str,
         engine: Arc<StorageEngine<T>>,
@@ -486,6 +539,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
         security: SecurityConfig,
         raft: Option<Arc<RaftNode<T>>>,
         documents: Option<Arc<DocumentStore>>,
+        cluster_opts: Option<cluster::ClusterOptions<T>>,
     ) -> Result<Self> {
         if security.require_auth && security.token_count() == 0 {
             return Err(StorageError::invalid_key(
@@ -522,6 +576,11 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
             security,
             raft,
             documents,
+            cluster: cluster_opts.map(|o| cluster::ClusterContext {
+                runtime: o.runtime,
+                client_addrs: o.client_addrs,
+                pool: cluster::WorkerPool::new((num_workers * 4).clamp(4, 64), 4096),
+            }),
             admin_jobs: AtomicUsize::new(0),
             shards: shards.clone(),
             slow_log: SlowOperationLog::new(DEFAULT_SLOW_RPC_NS, SLOW_LOG_CAPACITY),
@@ -655,6 +714,9 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
         }
         for handle in self.worker_threads.drain(..) {
             let _ = handle.join();
+        }
+        if let Some(ref c) = self.shared.cluster {
+            c.pool.stop();
         }
     }
 }
@@ -918,8 +980,17 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
     // 0. Deliver the result of a background admin job before reading anything else.
     if let Some(ref rx) = conn.pending_job {
         match rx.try_recv() {
+            Ok((STATUS_BARRIER_PASSED, _, _)) => {
+                conn.pending_job = None;
+                if let Some(req) = conn.deferred.take() {
+                    let (op, raw_id, body) = *req;
+                    return execute_local(conn, shared, shard, op, raw_id, body);
+                }
+                return ConnStep::Progress;
+            }
             Ok((status, ver, body)) => {
                 conn.pending_job = None;
+                conn.deferred = None;
                 return match conn.send_or_queue_response(status, ver, &body) {
                     Ok(()) => ConnStep::Progress,
                     Err(_) => ConnStep::Closed,
@@ -1092,12 +1163,104 @@ const fn op_name(op: u8) -> &'static str {
         OP_DOC_ADMIN => "doc_admin",
         OP_DOC_INFO => "doc_info",
         OP_TXN => "txn",
+        OP_SET_OPTIONS => "set_options",
+        OP_CLUSTER_INFO => "cluster_info",
         _ => "unknown",
     }
 }
 
 /// Executes one fully read request (role and size limits were enforced at the header stage).
 fn execute_request<T: ZeroCopyRecord + Indexable>(
+    conn: &mut NonBlockingConn,
+    shared: &Arc<ServerShared<T>>,
+    shard: &Arc<ReactorShard>,
+    op: u8,
+    raw_id: [u8; 24],
+    body: Vec<u8>,
+) -> ConnStep {
+    match route_cluster(conn, shared, shard, op, raw_id, body) {
+        Ok(step) => step,
+        Err(body) => execute_local(conn, shared, shard, op, raw_id, body),
+    }
+}
+
+/// Cluster routing (`TASK-101`): writes go through consensus on the leader's worker pool and are
+/// redirected by followers; reads are served by the leader under its lease (or after a read
+/// barrier), or by any replica if the client opted into follower reads. Returns `Err(body)` when
+/// the request should simply run locally.
+fn route_cluster<T: ZeroCopyRecord + Indexable>(
+    conn: &mut NonBlockingConn,
+    shared: &Arc<ServerShared<T>>,
+    shard: &Arc<ReactorShard>,
+    op: u8,
+    raw_id: [u8; 24],
+    body: Vec<u8>,
+) -> core::result::Result<ConnStep, Vec<u8>> {
+    let Some(ref cl) = shared.cluster else {
+        return Err(body);
+    };
+    let reply = |conn: &mut NonBlockingConn, (st, v, b): (u8, u64, Vec<u8>)| {
+        if conn.send_or_queue_response(st, v, &b).is_err() {
+            ConnStep::Closed
+        } else {
+            ConnStep::Progress
+        }
+    };
+    let is_leader = cl.runtime.node().is_leader();
+    let wake: Arc<dyn Fn() + Send + Sync> = {
+        let sh = Arc::clone(shard);
+        Arc::new(move || sh.wake())
+    };
+    match op {
+        OP_PUT_RAW_FRAME | OP_CAS_PUT | OP_DELETE | OP_BATCH_PUT | OP_TXN | OP_DOC_WRITE => {
+            if !is_leader {
+                return Ok(reply(conn, cl.not_leader()));
+            }
+            let job_shared = Arc::clone(shared);
+            let job = Box::new(move || write_reply(&job_shared, op, raw_id, &body));
+            match cl.pool.submit(job, wake) {
+                Ok(rx) => {
+                    conn.pending_job = Some(rx);
+                    Ok(ConnStep::Progress)
+                }
+                Err(()) => Ok(reply(conn, (STATUS_OVERLOADED, 0, b"write queue is full".to_vec()))),
+            }
+        }
+        OP_DOC_ADMIN | OP_MIGRATE_VSHARD => {
+            if is_leader {
+                Err(body)
+            } else {
+                Ok(reply(conn, cl.not_leader()))
+            }
+        }
+        OP_GET_RAW_FRAME | OP_BATCH_GET | OP_QUERY_HYBRID | OP_DOC_GET | OP_DOC_QUERY | OP_DOC_INFO => {
+            if conn.follower_reads || (is_leader && cl.runtime.lease_valid()) {
+                return Err(body);
+            }
+            if !is_leader {
+                return Ok(reply(conn, cl.not_leader()));
+            }
+            // Lease expired (e.g. right after an election): confirm leadership first.
+            let rt = Arc::clone(&cl.runtime);
+            let job = Box::new(move || match rt.read_barrier() {
+                Ok(()) => (STATUS_BARRIER_PASSED, 0, Vec::new()),
+                Err(e) => documents::error_reply(&e),
+            });
+            match cl.pool.submit(job, wake) {
+                Ok(rx) => {
+                    conn.pending_job = Some(rx);
+                    conn.deferred = Some(Box::new((op, raw_id, body)));
+                    Ok(ConnStep::Progress)
+                }
+                Err(()) => Ok(reply(conn, (STATUS_OVERLOADED, 0, b"read queue is full".to_vec()))),
+            }
+        }
+        _ => Err(body),
+    }
+}
+
+/// Executes one request on this node (after any cluster routing).
+fn execute_local<T: ZeroCopyRecord + Indexable>(
     conn: &mut NonBlockingConn,
     shared: &Arc<ServerShared<T>>,
     shard: &Arc<ReactorShard>,
@@ -1152,52 +1315,6 @@ fn execute_request<T: ZeroCopyRecord + Indexable>(
                 Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
             }
         }
-        OP_PUT_RAW_FRAME => {
-            let Ok(id) = InlineId::from_raw_bytes(raw_id) else {
-                let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"invalid InlineId");
-                return ConnStep::Progress;
-            };
-            let Ok(aligned) = AlignedBytes::try_copy_from_slice(&body) else {
-                let _ = conn.send_or_queue_response(STATUS_OVERLOADED, 0, b"out of memory");
-                return ConnStep::Progress;
-            };
-            match RecordCodec::decode_owned::<T>(aligned.as_slice()) {
-                Ok((_, owned)) => match engine.put(id, &owned) {
-                    Ok(ver) => conn.send_or_queue_response(STATUS_OK, ver.0, &[]),
-                    Err(e) => {
-                        conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes())
-                    }
-                },
-                Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
-            }
-        }
-        OP_CAS_PUT => {
-            if body.len() < 8 {
-                let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"CAS body missing expected_version");
-                return ConnStep::Progress;
-            }
-            let Ok(id) = InlineId::from_raw_bytes(raw_id) else {
-                let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"invalid InlineId");
-                return ConnStep::Progress;
-            };
-            let expected_ver = Version(read_u64_le(&body, 0));
-            let Ok(aligned) = AlignedBytes::try_copy_from_slice(&body[8..]) else {
-                let _ = conn.send_or_queue_response(STATUS_OVERLOADED, 0, b"out of memory");
-                return ConnStep::Progress;
-            };
-            match RecordCodec::decode_owned::<T>(aligned.as_slice()) {
-                Ok((_, owned)) => match engine.put_cas(id, expected_ver, &owned) {
-                    Ok(ver) => conn.send_or_queue_response(STATUS_OK, ver.0, &[]),
-                    Err(StorageError::VersionConflict { actual, .. }) => {
-                        conn.send_or_queue_response(STATUS_CONFLICT, actual.0, b"CAS version conflict")
-                    }
-                    Err(e) => {
-                        conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes())
-                    }
-                },
-                Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
-            }
-        }
         OP_BATCH_GET => {
             if body.len() < 4 {
                 let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"BatchGet body too short");
@@ -1213,27 +1330,6 @@ fn execute_request<T: ZeroCopyRecord + Indexable>(
                 Err(msg) => conn.send_or_queue_response(STATUS_OVERLOADED, 0, msg),
             }
         }
-        OP_BATCH_PUT => match parse_batch_items::<T>(&body, true) {
-            Ok(items) => {
-                let count = items.len();
-                let tx_res = engine.transaction(|tx| {
-                    for (item_id, rec) in items {
-                        tx.put(item_id, rec);
-                    }
-                    Ok(())
-                });
-                match tx_res {
-                    Ok(()) => conn.send_or_queue_response(STATUS_OK, count as u64, &[]),
-                    Err(StorageError::TransactionAborted { .. }) => {
-                        conn.send_or_queue_response(STATUS_CONFLICT, 0, b"BatchPut conflict")
-                    }
-                    Err(e) => {
-                        conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes())
-                    }
-                }
-            }
-            Err(msg) => conn.send_or_queue_response(STATUS_ERROR, 0, msg.as_bytes()),
-        },
         OP_QUERY_HYBRID => {
             if body.len() < 22 {
                 let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"QueryHybrid body too short");
@@ -1270,17 +1366,6 @@ fn execute_request<T: ZeroCopyRecord + Indexable>(
                 out.extend_from_slice(&id.to_raw_bytes());
             }
             conn.send_or_queue_response(STATUS_OK, page.total_matched as u64, &out)
-        }
-        OP_DELETE => {
-            let Ok(id) = InlineId::from_raw_bytes(raw_id) else {
-                let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"invalid InlineId");
-                return ConnStep::Progress;
-            };
-            match engine.delete(id) {
-                Ok(true) => conn.send_or_queue_response(STATUS_OK, 1, &[]),
-                Ok(false) => conn.send_or_queue_response(STATUS_NOT_FOUND, 0, &[]),
-                Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
-            }
         }
         OP_STATS => {
             let st = engine.stats();
@@ -1354,8 +1439,13 @@ fn execute_request<T: ZeroCopyRecord + Indexable>(
                 Err((status, msg)) => conn.send_or_queue_response(status, 0, msg),
             }
         }
+        // ── Writes: one path for every write opcode (local commit or Raft consensus) ──
+        OP_PUT_RAW_FRAME | OP_CAS_PUT | OP_DELETE | OP_BATCH_PUT | OP_TXN | OP_DOC_WRITE => {
+            let (status, version, out) = write_reply(shared, op, raw_id, &body);
+            conn.send_or_queue_response(status, version, &out)
+        }
         // ── Document API (`TASK-098`) ───────────────────────────────────────────────
-        OP_DOC_GET | OP_DOC_WRITE | OP_DOC_QUERY | OP_DOC_INFO | OP_DOC_ADMIN => {
+        OP_DOC_GET | OP_DOC_QUERY | OP_DOC_INFO | OP_DOC_ADMIN => {
             let Some(ref store) = shared.documents else {
                 let _ = conn.send_or_queue_response(
                     STATUS_INVALID,
@@ -1375,7 +1465,6 @@ fn execute_request<T: ZeroCopyRecord + Indexable>(
             } else {
                 let (status, version, out) = match op {
                     OP_DOC_GET => documents::doc_get(store, &body),
-                    OP_DOC_WRITE => documents::doc_write(store, &body),
                     OP_DOC_QUERY => documents::doc_query(store, &body),
                     OP_DOC_INFO => documents::doc_admin(store, &body, false),
                     _ => documents::doc_admin(store, &body, true),
@@ -1383,9 +1472,13 @@ fn execute_request<T: ZeroCopyRecord + Indexable>(
                 conn.send_or_queue_response(status, version, &out)
             }
         }
-        OP_TXN => {
-            let (status, version, out) = execute_txn(engine, &body);
-            conn.send_or_queue_response(status, version, &out)
+        OP_SET_OPTIONS => {
+            conn.follower_reads = body.first().is_some_and(|f| f & 1 != 0);
+            conn.send_or_queue_response(STATUS_OK, 0, &[])
+        }
+        OP_CLUSTER_INFO => {
+            let out = cluster_info_body(shared);
+            conn.send_or_queue_response(STATUS_OK, 0, &out)
         }
         OP_HEALTH => {
             let st = engine.stats();
@@ -1405,6 +1498,127 @@ fn execute_request<T: ZeroCopyRecord + Indexable>(
     }
 }
 
+/// `OP_CLUSTER_INFO` reply: `u64 node_id | u8 is_leader | u64 leader_id | str leader_addr |
+/// u64 term | u64 commit_index | u64 last_applied | u32 n | (u64 node_id, str addr)*`. A standalone
+/// server reports node `0` as its own leader.
+fn cluster_info_body<T: ZeroCopyRecord + Indexable>(shared: &ServerShared<T>) -> Vec<u8> {
+    use storage_core::document_wire::put_str;
+    let mut out = Vec::with_capacity(128);
+    match shared.cluster {
+        Some(ref cl) => {
+            let st = cl.runtime.status();
+            out.extend_from_slice(&u64::from(st.node_id).to_le_bytes());
+            out.push(u8::from(st.is_leader && cl.runtime.lease_valid()));
+            out.extend_from_slice(&st.leader_id.map_or(0, u64::from).to_le_bytes());
+            let addr = st.leader_id.and_then(|l| cl.client_addrs.get(&l)).cloned().unwrap_or_default();
+            put_str(&mut out, &addr);
+            out.extend_from_slice(&st.term.to_le_bytes());
+            out.extend_from_slice(&st.commit_index.to_le_bytes());
+            out.extend_from_slice(&st.last_applied.to_le_bytes());
+            let mut members: Vec<(&u16, &String)> = cl.client_addrs.iter().collect();
+            members.sort();
+            out.extend_from_slice(&(members.len() as u32).to_le_bytes());
+            for (id, a) in members {
+                out.extend_from_slice(&u64::from(*id).to_le_bytes());
+                put_str(&mut out, a);
+            }
+        }
+        None => {
+            out.extend_from_slice(&0u64.to_le_bytes());
+            out.push(1);
+            out.extend_from_slice(&0u64.to_le_bytes());
+            put_str(&mut out, "");
+            for _ in 0..3 {
+                out.extend_from_slice(&0u64.to_le_bytes());
+            }
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+    }
+    out
+}
+
+impl<T: ZeroCopyRecord + Indexable> ServerShared<T> {
+    /// Commits `ops` atomically: through Raft consensus on a clustered server, else locally.
+    fn commit(&self, ops: Vec<WriteOp<T>>) -> Result<Vec<storage_core::WriteResult>> {
+        match self.cluster {
+            Some(ref c) => c.runtime.commit(ops),
+            None => self.engine.commit(ops),
+        }
+    }
+}
+
+/// Executes any write opcode and returns its reply (runs inline, or on the worker pool when the
+/// server is clustered and must wait for consensus).
+fn write_reply<T: ZeroCopyRecord + Indexable>(
+    shared: &ServerShared<T>,
+    op: u8,
+    raw_id: [u8; 24],
+    body: &[u8],
+) -> (u8, u64, Vec<u8>) {
+    let err = |e: &StorageError| documents::error_reply(e);
+    let decode = |bytes: &[u8]| -> Result<T> {
+        let aligned = AlignedBytes::try_copy_from_slice(bytes)?;
+        Ok(RecordCodec::decode_owned::<T>(aligned.as_slice())?.1)
+    };
+    match op {
+        OP_PUT_RAW_FRAME => {
+            let res = InlineId::from_raw_bytes(raw_id)
+                .and_then(|id| Ok((id, decode(body)?)))
+                .and_then(|(id, rec)| shared.commit(vec![WriteOp::put(id, rec)]));
+            match res {
+                Ok(r) => (STATUS_OK, r.first().and_then(|x| x.version).map_or(0, |v| v.0), Vec::new()),
+                Err(e) => err(&e),
+            }
+        }
+        OP_CAS_PUT => {
+            if body.len() < 8 {
+                return (STATUS_INVALID, 0, b"CAS body missing expected_version".to_vec());
+            }
+            let expected = Version(read_u64_le(body, 0));
+            // `0` means "must not exist" (create-only).
+            let pre = if expected.0 == 0 { Precondition::Absent } else { Precondition::Version(expected) };
+            let res = InlineId::from_raw_bytes(raw_id)
+                .and_then(|id| Ok((id, decode(&body[8..])?)))
+                .and_then(|(id, rec)| shared.commit(vec![WriteOp::put(id, rec).when(pre)]));
+            match res {
+                Ok(r) => (STATUS_OK, r.first().and_then(|x| x.version).map_or(0, |v| v.0), Vec::new()),
+                Err(StorageError::VersionConflict { actual, .. }) => {
+                    (STATUS_CONFLICT, actual.0, b"CAS version conflict".to_vec())
+                }
+                Err(StorageError::ConditionFailed { actual, .. }) => {
+                    (STATUS_CONFLICT, actual.map_or(0, |v| v.0), b"CAS version conflict".to_vec())
+                }
+                Err(e) => err(&e),
+            }
+        }
+        OP_DELETE => {
+            let res = InlineId::from_raw_bytes(raw_id).and_then(|id| shared.commit(vec![WriteOp::delete(id)]));
+            match res {
+                Ok(r) if r.first().is_some_and(|x| x.existed) => (STATUS_OK, 1, Vec::new()),
+                Ok(_) => (STATUS_NOT_FOUND, 0, Vec::new()),
+                Err(e) => err(&e),
+            }
+        }
+        OP_BATCH_PUT => match parse_batch_items::<T>(body, true) {
+            Ok(items) => {
+                let n = items.len() as u64;
+                let ops = items.into_iter().map(|(id, rec)| WriteOp::put(id, rec)).collect();
+                match shared.commit(ops) {
+                    Ok(_) => (STATUS_OK, n, Vec::new()),
+                    Err(e) => err(&e),
+                }
+            }
+            Err(msg) => (STATUS_INVALID, 0, msg.into_bytes()),
+        },
+        OP_TXN => execute_txn(shared, body),
+        OP_DOC_WRITE => match shared.documents {
+            Some(ref store) => documents::doc_write(store, body),
+            None => (STATUS_INVALID, 0, b"this server does not host the document API".to_vec()),
+        },
+        _ => (STATUS_INVALID, 0, b"not a write opcode".to_vec()),
+    }
+}
+
 /// `OP_TXN` precondition / kind codes (`protocol/PROTOCOL.md` §9).
 const TXN_PUT: u8 = 1;
 const TXN_DELETE: u8 = 2;
@@ -1414,7 +1628,7 @@ const TXN_CHECK: u8 = 3;
 /// u8 kind | u32 frame_len | frame)*`, where precondition is `0` none, `1` absent, `2` exists,
 /// `3` version. Replies `u32 count | (u8 exists | u64 version)*`, or `Conflict` with
 /// `u32 index | u8 exists | u64 actual | message`.
-fn execute_txn<T: ZeroCopyRecord + Indexable>(engine: &StorageEngine<T>, body: &[u8]) -> (u8, u64, Vec<u8>) {
+fn execute_txn<T: ZeroCopyRecord + Indexable>(shared: &ServerShared<T>, body: &[u8]) -> (u8, u64, Vec<u8>) {
     use storage_codec::value_wire::SveReader;
     let parse = || -> Result<Vec<WriteOp<T>>> {
         let mut r = SveReader::new(body);
@@ -1456,7 +1670,7 @@ fn execute_txn<T: ZeroCopyRecord + Indexable>(engine: &StorageEngine<T>, body: &
         Err(e) => return documents::error_reply(&e),
     };
     let ids: Vec<InlineId> = ops.iter().map(|o| o.id).collect();
-    match engine.commit(ops) {
+    match shared.commit(ops) {
         Ok(results) => {
             let mut out = Vec::with_capacity(4 + results.len() * 9);
             out.extend_from_slice(&(results.len() as u32).to_le_bytes());
@@ -1691,15 +1905,11 @@ fn run_admin_job<T: ZeroCopyRecord + Indexable>(
                 Err(msg) => return (STATUS_ERROR, 0, msg.into_bytes()),
             };
             let imported = items.len() as u64;
-            // Import atomically: either every shipped record lands or none does.
-            let res = engine.transaction(|tx| {
-                for (id, rec) in items {
-                    tx.put(id, rec);
-                }
-                Ok(())
-            });
+            // Import atomically (through consensus when clustered): every shipped record lands or
+            // none does.
+            let res = shared.commit(items.into_iter().map(|(id, rec)| WriteOp::put(id, rec)).collect());
             match res {
-                Ok(()) => (
+                Ok(_) => (
                     STATUS_OK,
                     imported,
                     format!("shard={shard_id} dest={dest_node} imported={imported}").into_bytes(),
@@ -1723,6 +1933,19 @@ impl StorageClient {
         let stream =
             TcpStream::connect(addr).map_err(|e| StorageError::io("connect StorageClient", e))?;
         let _ = stream.set_nodelay(true);
+        let reader_stream = stream
+            .try_clone()
+            .map_err(|e| StorageError::io("clone client TcpStream", e))?;
+        Ok(Self {
+            reader: BufReader::with_capacity(64 * 1024, reader_stream),
+            writer: BufWriter::with_capacity(64 * 1024, stream),
+        })
+    }
+
+    /// Connects with a connect timeout and per-call read / write timeouts of `timeout`, so a
+    /// dead or partitioned server can never block the caller forever.
+    pub fn connect_timeout(addr: SocketAddr, timeout: Duration) -> Result<Self> {
+        let stream = cluster::connect_with_timeout(addr, timeout)?;
         let reader_stream = stream
             .try_clone()
             .map_err(|e| StorageError::io("clone client TcpStream", e))?;
@@ -2717,7 +2940,7 @@ mod tests {
         let (status, _, _) = c
             .rpc(OP_BATCH_PUT, NO_KEY, &u32::MAX.to_le_bytes())
             .unwrap();
-        assert_eq!(status, STATUS_ERROR);
+        assert_eq!(status, STATUS_INVALID, "malformed requests are reported as Invalid");
         // The server is still alive and serving.
         let id = InlineId::from_static("alive");
         assert_eq!(c.put(id, &AgentObjectRecord::new(id, "ok", 1, 1)).unwrap(), Version(1));

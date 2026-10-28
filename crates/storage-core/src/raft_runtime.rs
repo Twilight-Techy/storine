@@ -304,7 +304,8 @@ impl crate::document::CommitSink for RaftRuntime<crate::document::DocumentRecord
 
 #[inline]
 fn quorum<T: ZeroCopyRecord + Indexable>(s: &Shared<T>) -> usize {
-    (s.peers.len() + 1) / 2 + 1
+    let members = s.peers.len() + 1;
+    members / 2 + 1
 }
 
 fn wake_replicators<T: ZeroCopyRecord + Indexable>(s: &Shared<T>) {

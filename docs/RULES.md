@@ -129,6 +129,12 @@
 - **Exact numbers**: monetary values are `Decimal` (or integer minor units); arithmetic is checked and fails instead of wrapping, saturating or rounding silently; rounding happens only where the caller names a `RoundingMode`.
 - **Retries are safe**: mutating requests that a client may retry (timeouts, `CommitUnknown`) carry a request id and are applied at most once.
 
+### RULE-SAFE-09: Replicated State Changes Only Through Consensus
+- A replicated engine is in replica mode: every write goes through the Raft log and the deterministic apply path (`commit_at` with the log index as minimum version and the leader's proposal time as "now"). Nothing that depends on a replica's local clock, randomness or iteration order may influence applied state.
+- A leader serves reads only under a valid lease (quorum-acknowledged within 90% of the minimum election timeout, with vote stickiness enabled) or after a read-index round; followers serve reads only to clients that explicitly accept staleness.
+- A write whose replication cannot be confirmed is reported as `CommitUnknown`, never as success or failure.
+- Lock order inside a Raft node is `state -> outcomes` and `progress` is never held while taking node state.
+
 ### RULE-CONC-01: Canonical Lock Ordering & Lock-Free I/O
 - Never hold primary index shard locks across disk I/O (`WriteFile`/`fsync`).
 - Multi-record mutations (`update_pair_atomic`, `transaction`, `delete_with_policy`) MUST lock keys in strictly ascending canonical `(CollectionId, InlineId)` order (`StripedLockTable::lock_many`) so AB-BA deadlocks are mathematically impossible.

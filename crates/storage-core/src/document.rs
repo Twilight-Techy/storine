@@ -614,8 +614,11 @@ pub struct DocPage {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CollectionInfo {
     pub name: String,
-    /// Indexed top-level fields (index-backed, at most [`MAX_DOCUMENT_INDEXES`]).
+    /// Indexed top-level fields usable by queries (at most [`MAX_DOCUMENT_INDEXES`] together
+    /// with `building`).
     pub indexes: Vec<String>,
+    /// Indexes being built: maintained by every write already, not yet used by queries.
+    pub building: Vec<String>,
     /// Free-form metadata (e.g. the SQL adapter's table schema).
     pub extra: BTreeMap<String, PropertyValue>,
 }
@@ -635,7 +638,9 @@ impl CommitSink for StorageEngine<DocumentRecord> {
 pub struct DocumentStore {
     engine: Arc<StorageEngine<DocumentRecord>>,
     sink: RwLock<Arc<dyn CommitSink>>,
-    meta: RwLock<FastHashMap<String, CollectionInfo>>,
+    /// Collection metadata cache, validated on every use against the version of the `$meta`
+    /// document (so changes applied by replication or another node are always seen).
+    meta: RwLock<FastHashMap<String, (Option<Version>, CollectionInfo)>>,
 }
 
 impl core::fmt::Debug for DocumentStore {
@@ -687,40 +692,63 @@ impl DocumentStore {
         Arc::clone(&self.sink.read().unwrap_or_else(|p| p.into_inner()))
     }
 
-    /// Re-reads every collection's metadata from the `$meta` collection (after replication or
-    /// a restore).
+    /// Re-reads every collection's metadata from the `$meta` collection.
     pub fn reload_metadata(&self) -> Result<()> {
         let mut map = FastHashMap::default();
         for doc in self.scan_collection(META_COLLECTION)? {
-            map.insert(doc.key.clone(), info_from_fields(&doc.key, &doc.fields));
+            let info = info_from_fields(&doc.key, &doc.fields);
+            map.insert(doc.key.clone(), (Some(doc.version), info));
         }
         *self.meta.write().unwrap_or_else(|p| p.into_inner()) = map;
         Ok(())
     }
 
-    /// Metadata of `collection` (default: no indexes).
+    /// Metadata of `collection` (default: no indexes). Always current: the cached entry is used
+    /// only while the `$meta` document still has the cached version (one primary-index lookup).
     pub fn collection_info(&self, collection: &str) -> CollectionInfo {
+        let empty = || CollectionInfo { name: collection.to_owned(), ..Default::default() };
+        let Ok(id) = document_id(META_COLLECTION, collection) else {
+            return empty();
+        };
+        let current = self.engine.primary_index().version_of(id);
+        if let Some((v, info)) = self.meta.read().unwrap_or_else(|p| p.into_inner()).get(collection) {
+            if *v == current {
+                return info.clone();
+            }
+        }
+        let info = match self.get(META_COLLECTION, collection) {
+            Ok(Some(doc)) => info_from_fields(collection, &doc.fields),
+            _ => empty(),
+        };
         self.meta
-            .read()
+            .write()
             .unwrap_or_else(|p| p.into_inner())
-            .get(collection)
-            .cloned()
-            .unwrap_or_else(|| CollectionInfo { name: collection.to_owned(), ..Default::default() })
+            .insert(collection.to_owned(), (current, info.clone()));
+        info
     }
 
-    /// Collections that have metadata or at least one document... (metadata only: a collection
-    /// is listed once it was declared or written through `create_collection` / `set_collection_extra`).
+    /// Every declared collection (one with metadata: created through an index, the SQL adapter
+    /// or [`Self::set_collection_extra`]), sorted by name.
     pub fn list_collections(&self) -> Vec<CollectionInfo> {
-        let mut v: Vec<CollectionInfo> =
-            self.meta.read().unwrap_or_else(|p| p.into_inner()).values().cloned().collect();
+        if self.reload_metadata().is_err() {
+            return Vec::new();
+        }
+        let mut v: Vec<CollectionInfo> = self
+            .meta
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(|(_, info)| info.clone())
+            .collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
     }
 
     fn index_ids_for(&self, collection: &str) -> Vec<u16> {
-        self.collection_info(collection)
-            .indexes
+        let info = self.collection_info(collection);
+        info.indexes
             .iter()
+            .chain(info.building.iter())
             .map(|f| index_field_id(collection, f))
             .collect()
     }
@@ -1046,6 +1074,10 @@ impl DocumentStore {
             "indexes".to_owned(),
             PropertyValue::List(info.indexes.iter().map(|s| PropertyValue::Text(s.clone())).collect()),
         );
+        fields.insert(
+            "building".to_owned(),
+            PropertyValue::List(info.building.iter().map(|s| PropertyValue::Text(s.clone())).collect()),
+        );
         fields.insert("extra".to_owned(), PropertyValue::Map(info.extra.clone()));
         self.write_internal(
             vec![DocWrite {
@@ -1057,33 +1089,47 @@ impl DocumentStore {
             None,
             true,
         )?;
-        self.meta
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(info.name.clone(), info.clone());
+        // The cache refreshes itself from the new `$meta` version on next use.
         Ok(())
     }
 
     /// Adds a secondary index on the top-level `field` and indexes existing documents.
     /// Fails beyond [`MAX_DOCUMENT_INDEXES`] indexes per collection.
+    ///
+    /// Three steps keep the index exact under concurrent writes: (1) the index is published as
+    /// *building*, so every write from then on maintains it; (2) existing documents are rewritten
+    /// at their current version (a document changed meanwhile already carries the index); (3) the
+    /// index is published as ready and queries start using it.
     pub fn create_index(&self, collection: &str, field: &str) -> Result<()> {
         validate_collection_name(collection, false)?;
         if field.is_empty() || field.contains('.') {
             return Err(StorageError::invalid_value("indexes cover one top-level field"));
         }
         let mut info = self.collection_info(collection);
+        info.name = collection.to_owned();
         if info.indexes.iter().any(|f| f == field) {
             return Ok(());
         }
-        if info.indexes.len() >= MAX_DOCUMENT_INDEXES {
-            return Err(StorageError::invalid_value("a collection has at most 4 secondary indexes"));
+        if !info.building.iter().any(|f| f == field) {
+            if info.indexes.len() + info.building.len() >= MAX_DOCUMENT_INDEXES {
+                return Err(StorageError::invalid_value("a collection has at most 4 secondary indexes"));
+            }
+            info.building.push(field.to_owned());
+            self.save_info(&info)?;
         }
-        info.indexes.push(field.to_owned());
-        info.name = collection.to_owned();
-        // Index existing documents first (rewritten at the same version: OCC versions are not
-        // affected), then publish the index so queries never use a partial index.
-        let ids: Vec<u16> = info.indexes.iter().map(|f| index_field_id(collection, f)).collect();
+        let ids: Vec<u16> = info
+            .indexes
+            .iter()
+            .chain(info.building.iter())
+            .map(|f| index_field_id(collection, f))
+            .collect();
         self.reindex(collection, &ids)?;
+        let mut info = self.collection_info(collection);
+        info.name = collection.to_owned();
+        info.building.retain(|f| f != field);
+        if !info.indexes.iter().any(|f| f == field) {
+            info.indexes.push(field.to_owned());
+        }
         self.save_info(&info)
     }
 
@@ -1102,27 +1148,41 @@ impl DocumentStore {
     }
 
     fn reindex(&self, collection: &str, ids: &[u16]) -> Result<()> {
-        let docs = self.scan_collection(collection)?;
-        for doc in docs {
-            let id = document_id(collection, &doc.key)?;
-            let rec = DocumentRecord {
+        // Page through the collection so memory stays bounded by one page.
+        let mut after: Option<String> = None;
+        loop {
+            let page = self.query(&DocQuery {
                 collection: collection.to_owned(),
-                key: doc.key.clone(),
-                fields: doc.fields,
-                index_ids: ids.to_vec(),
-            };
-            // Same-version rewrite of index metadata only; skipped if the document changed
-            // meanwhile (its new version already carries the current index ids).
-            match self.sink().commit(vec![WriteOp {
-                id,
-                kind: WriteKind::Rewrite(rec),
-                precondition: Precondition::Version(doc.version),
-            }]) {
-                Ok(_) | Err(StorageError::VersionConflict { .. }) => {}
-                Err(e) => return Err(e),
+                limit: Some(1000),
+                after_key: after.clone(),
+                ..Default::default()
+            })?;
+            for doc in page.documents {
+                let id = document_id(collection, &doc.key)?;
+                let rec = DocumentRecord {
+                    collection: collection.to_owned(),
+                    key: doc.key.clone(),
+                    fields: doc.fields,
+                    index_ids: ids.to_vec(),
+                };
+                // Same-version rewrite of index metadata only; skipped if the document changed
+                // or disappeared meanwhile (a newer version already carries the current ids).
+                match self.sink().commit(vec![WriteOp {
+                    id,
+                    kind: WriteKind::Rewrite(rec),
+                    precondition: Precondition::Version(doc.version),
+                }]) {
+                    Ok(_)
+                    | Err(StorageError::VersionConflict { .. })
+                    | Err(StorageError::RecordNotFound { .. }) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            match page.next_after_key {
+                Some(k) => after = Some(k),
+                None => return Ok(()),
             }
         }
-        Ok(())
     }
 
     /// Deletes every document of `collection` and its metadata.
@@ -1200,11 +1260,22 @@ fn info_from_fields(name: &str, fields: &BTreeMap<String, PropertyValue>) -> Col
             .collect(),
         _ => Vec::new(),
     };
+    let building = match fields.get("building") {
+        Some(PropertyValue::List(items)) => items
+            .iter()
+            .filter_map(|v| match v {
+                PropertyValue::Text(s) => Some(s.clone()),
+                _ => None,
+            })
+            .take(MAX_DOCUMENT_INDEXES)
+            .collect(),
+        _ => Vec::new(),
+    };
     let extra = match fields.get("extra") {
         Some(PropertyValue::Map(m)) => m.clone(),
         _ => BTreeMap::new(),
     };
-    CollectionInfo { name: name.to_owned(), indexes, extra }
+    CollectionInfo { name: name.to_owned(), indexes, building, extra }
 }
 
 fn document_from_view(view: &RecordView<'_, DocumentRecord>, collection: &str, key: &str) -> Result<Option<Document>> {
@@ -1450,6 +1521,48 @@ mod tests {
         assert!(s.put("c", "", BTreeMap::new()).is_err());
         assert!(s.put("c", "a\u{0}b", BTreeMap::new()).is_err());
         assert!(s.put("c", "k", fields(&[("a.b", PropertyValue::Null)])).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_index_build_stays_exact_under_concurrent_writes() {
+        let (s, dir) = store("build");
+        let s = Arc::new(s);
+        for i in 0..500i64 {
+            s.put("c", &format!("k{i:04}"), fields(&[("n", PropertyValue::Int64(i % 50))])).unwrap();
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (s, stop) = (Arc::clone(&s), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut i = 0i64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let key = format!("k{:04}", (i * 7919) % 700);
+                    s.put("c", &key, fields(&[("n", PropertyValue::Int64(i % 50))])).unwrap();
+                    i += 1;
+                }
+            })
+        };
+        s.create_index("c", "n").unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        for v in [0i64, 7, 49] {
+            let q = |indexed: bool| {
+                let filter = if indexed {
+                    Filter::Eq("n".into(), PropertyValue::Int64(v))
+                } else {
+                    // Same predicate the index cannot serve (forces a scan).
+                    Filter::Or(vec![Filter::Eq("n".into(), PropertyValue::Int64(v))])
+                };
+                s.query(&DocQuery { collection: "c".into(), filter: Some(filter), ..Default::default() })
+                    .unwrap()
+                    .documents
+                    .into_iter()
+                    .map(|d| d.key)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(q(true), q(false), "value {v}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
