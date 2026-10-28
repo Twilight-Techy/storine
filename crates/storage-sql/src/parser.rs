@@ -1078,8 +1078,9 @@ impl Parser {
             while self.eat_op(",") {
                 names.push(self.table_name()?);
             }
-            self.skip_to_end(); // CASCADE / RESTRICT
-            return Ok(Statement::DropTable { names, if_exists });
+            let cascade = self.eat_kw("cascade");
+            self.skip_to_end(); // RESTRICT
+            return Ok(Statement::DropTable { names, if_exists, cascade });
         }
         if self.eat_kw("index") {
             let _ = self.eat_kw("concurrently");

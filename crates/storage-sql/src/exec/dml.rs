@@ -167,7 +167,7 @@ fn apply_insert(s: &mut Session, table: &Table, key: &str, row: &Row) -> SqlResu
         }
     }
     let mut parents = Vec::new();
-    for fk in &table.foreign_keys {
+    for fk in table.foreign_keys.iter().filter(|_| s.foreign_key_checks()) {
         if let Some((coll, pkey)) = fk_parent(s, table, fk, row)? {
             if read(s, &coll, &pkey)?.is_none() {
                 return Err(SqlError::foreign_key(format!(
@@ -230,7 +230,7 @@ fn apply_update(s: &mut Session, table: &Table, key: &str, version: Option<u64>,
         moves.push((old_entry, nm, uk.name.clone()));
     }
     let mut parents = Vec::new();
-    for fk in &table.foreign_keys {
+    for fk in table.foreign_keys.iter().filter(|_| s.foreign_key_checks()) {
         if fk.columns.iter().all(|c| crate::datum::group_eq(&old[*c], &new[*c])) {
             continue;
         }
@@ -1027,7 +1027,7 @@ pub fn delete(s: &mut Session, del: &Delete, params: &[Datum]) -> SqlResult<Outc
         order_and_limit(&ex, &cols, &mut targets, &del.order_by, del.limit.as_ref())?;
         targets
     };
-    let referenced = !s.engine.catalog.referencing(&table.name).is_empty();
+    let referenced = s.foreign_key_checks() && !s.engine.catalog.referencing(&table.name).is_empty();
     let mut returned = Vec::new();
     let n = targets.len() as u64;
     for (t, _) in targets {

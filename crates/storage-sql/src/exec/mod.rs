@@ -325,6 +325,11 @@ pub fn now_ns() -> i64 {
 }
 
 impl Session {
+    /// MySQL `SET FOREIGN_KEY_CHECKS = 0` turns foreign-key enforcement off for the session.
+    pub fn foreign_key_checks(&self) -> bool {
+        !self.vars.get("foreign_key_checks").is_some_and(|v| v == "0" || v.eq_ignore_ascii_case("off"))
+    }
+
     pub fn in_transaction(&self) -> bool {
         self.txn.as_ref().is_some_and(|t| t.explicit)
     }
@@ -531,7 +536,7 @@ impl Session {
             Statement::Delete(d) => dml::delete(self, d, params),
             Statement::CreateTable(c) => ddl::create_table(self, c, params),
             Statement::CreateIndex(c) => ddl::create_index(self, c),
-            Statement::DropTable { names, if_exists } => ddl::drop_tables(self, names, *if_exists),
+            Statement::DropTable { names, if_exists, cascade } => ddl::drop_tables(self, names, *if_exists, *cascade),
             Statement::DropIndex { names, table, if_exists } => ddl::drop_indexes(self, names, table.as_deref(), *if_exists),
             Statement::AlterTable { table, ops } => ddl::alter_table(self, table, ops),
             Statement::Truncate { tables } => ddl::truncate(self, tables),

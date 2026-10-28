@@ -8,7 +8,7 @@ pub enum Statement {
     Delete(Box<Delete>),
     CreateTable(Box<CreateTable>),
     CreateIndex(Box<CreateIndex>),
-    DropTable { names: Vec<String>, if_exists: bool },
+    DropTable { names: Vec<String>, if_exists: bool, cascade: bool },
     DropIndex { names: Vec<String>, table: Option<String>, if_exists: bool },
     AlterTable { table: String, ops: Vec<AlterOp> },
     Truncate { tables: Vec<String> },

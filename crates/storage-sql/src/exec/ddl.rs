@@ -338,7 +338,7 @@ pub fn create_index(s: &mut Session, ci: &CreateIndex) -> SqlResult<Outcome> {
     Ok(Outcome::command("CREATE INDEX"))
 }
 
-pub fn drop_tables(s: &mut Session, names: &[String], if_exists: bool) -> SqlResult<Outcome> {
+pub fn drop_tables(s: &mut Session, names: &[String], if_exists: bool, cascade: bool) -> SqlResult<Outcome> {
     let mut tables = Vec::new();
     for n in names {
         match s.engine.find_table(n)? {
@@ -350,7 +350,18 @@ pub fn drop_tables(s: &mut Session, names: &[String], if_exists: bool) -> SqlRes
     let dropping: HashSet<String> = tables.iter().map(|t| t.name.to_ascii_lowercase()).collect();
     for t in &tables {
         for (child, fk) in s.engine.catalog.referencing(&t.name) {
-            if !dropping.contains(&child.name.to_ascii_lowercase()) {
+            if dropping.contains(&child.name.to_ascii_lowercase()) {
+                continue;
+            }
+            if cascade || !s.foreign_key_checks() {
+                // CASCADE drops the dependent foreign-key constraints (not the tables).
+                let mut c = (*child).clone();
+                let v = c.version;
+                c.foreign_keys.retain(|f| f.name != fk.name);
+                save_schema(s, &c, Pre::Version(v))?;
+                continue;
+            }
+            {
                 return Err(SqlError::new(
                     "2BP01",
                     format!("cannot drop table {} because constraint {} on table {} depends on it", t.name, fk.name, child.name),

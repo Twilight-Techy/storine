@@ -820,6 +820,31 @@ fn decode_binary(oid: u32, raw: &[u8]) -> SqlResult<Datum> {
         1082 => Datum::Date(i32::from_be_bytes(raw.try_into().map_err(|_| bad())?) + PG_EPOCH_DAYS),
         1114 | 1184 => Datum::Timestamp((i64::from_be_bytes(be8(raw)?) + PG_EPOCH_US) * 1000),
         1083 => Datum::Time(i64::from_be_bytes(be8(raw)?) * 1000),
+        1000 | 1001 | 1003 | 1005 | 1007 | 1009 | 1014 | 1015 | 1016 | 1021 | 1022 | 1115 | 1182 | 1185 | 1231 | 2951 | 199 | 3807 => {
+            // ndim, has-null flag, element type, (length, lower bound) per dimension, elements.
+            let mut b = Body { b: raw, pos: 0 };
+            let ndim = b.i32().map_err(|_| bad())?;
+            let _flags = b.i32().map_err(|_| bad())?;
+            let elem = b.i32().map_err(|_| bad())? as u32;
+            if ndim == 0 {
+                return Ok(Datum::Array(Vec::new()));
+            }
+            if ndim != 1 {
+                return Err(SqlError::unsupported("multi-dimensional arrays"));
+            }
+            let n = b.i32().map_err(|_| bad())?.max(0) as usize;
+            let _lbound = b.i32().map_err(|_| bad())?;
+            let mut items = Vec::with_capacity(n.min(65_536));
+            for _ in 0..n {
+                let len = b.i32().map_err(|_| bad())?;
+                if len < 0 {
+                    items.push(Datum::Null);
+                } else {
+                    items.push(decode_binary(elem, b.take(len as usize).map_err(|_| bad())?)?);
+                }
+            }
+            Datum::Array(items)
+        }
         3802 => Datum::Json(String::from_utf8_lossy(raw.get(1..).unwrap_or(&[])).into_owned()),
         114 => Datum::Json(String::from_utf8_lossy(raw).into_owned()),
         _ => Datum::Text(String::from_utf8(raw.to_vec()).map_err(|_| bad())?),
