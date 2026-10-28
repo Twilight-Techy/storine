@@ -39,7 +39,8 @@ foreach ($accounts->scan() as $d) {       // every document, any collection size
 | --- | --- |
 | `Storine::connect($url, token:, timeout: 5.0, followerReads: false)` | Connection pool to a server or cluster. |
 | `$db->collection($name)` | A collection handle. |
-| `$c->get($key)` | `Document` or `null`. |
+| `$c->get($key, fields: null)` | `Document` or `null`. `fields: ['name', 'meta.size']` returns only those (dotted) paths; nested paths come back nested. |
+| `$c->readBytes($key, $field, $offset, $length)` / `$c->streamBytes($key, $field, chunkSize: 1 << 20)` | Part of a bytes / text field (see *Large values*). |
 | `$c->put($key, $fields, ttl: null)` | Create or replace; returns the version. `ttl` in seconds. |
 | `$c->insert($key, $fields)` | Create only (`ConflictException` if it exists). |
 | `$c->replace($key, $fields)` / `$c->replaceIfVersion($key, $version, $fields)` | Replace an existing document (optionally only at a version). |
@@ -50,6 +51,21 @@ foreach ($accounts->scan() as $d) {       // every document, any collection size
 | `$c->createVectorIndex($field, $dims)` / `$c->dropVectorIndex($field)` / `$c->vectorIndexes()` | Vector indexes for `nearest`; writes of other values to an indexed field are refused. |
 | `$c->createIndex($field)` / `$c->dropIndex($field)` / `$c->info()` / `$c->drop()` | Indexes (up to 16 per collection) and collection management. |
 | `$db->transaction(fn (Transaction $tx) => ...)` | Buffered writes committed atomically when the callable returns (or `$db->transaction()` then `->commit()`); `requireVersion` / `requireExists` add checks. |
+
+**Large values**: a document can hold a large `Bytes` field (a file) next to small metadata. Read the metadata alone
+with `get($key, fields: [...])`, a slice with `readBytes` (a `ByteRange` with `version`, `total` and `data`, or `null` if
+the document does not exist; at most 16 MiB per call, empty `data` past the end), or the whole value chunk by chunk
+with the `streamBytes` generator, which throws `NotFoundException` if the document does not exist and
+`ConflictException` if it changes mid-read:
+
+```php
+$meta = $files->get('f1', fields: ['name', 'meta.size']);
+$head = $files->readBytes('f1', 'data', 0, 4096)->data;
+$out = fopen('cat.png', 'wb');
+foreach ($files->streamBytes('f1', 'data') as $chunk) {
+    fwrite($out, $chunk);
+}
+```
 
 **Values**: `null`, `bool`, `int`, `float`, `Decimal` (exact, up to 38 digits, keeps its scale — use it for money,
 never floats), `string` (UTF-8 text), `Bytes` (binary data), `DateTimeInterface` (stored as UTC; `Timestamp` for

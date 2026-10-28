@@ -37,7 +37,8 @@ accounts.scan { |d| ... }                # every document, any collection size (
 | --- | --- |
 | `Storine.connect(url, token: nil, timeout: 5.0, follower_reads: false)` | Connection pool to a server or cluster (thread-safe). |
 | `db.collection(name)` / `db[name]` | A collection handle. |
-| `c.get(key)` | `Document` or `nil`. |
+| `c.get(key, fields: nil)` | `Document` or `nil`. `fields: ["name", "meta.size"]` returns only those (dotted) paths; nested paths come back nested. |
+| `c.read_bytes(key, field, offset = 0, length = 16 MiB)` / `c.stream_bytes(key, field, chunk_size: 1 << 20)` | Part of a bytes / text field (see *Large values*). |
 | `c.put(key, fields, ttl: nil)` | Create or replace; returns the version. `ttl:` in seconds. |
 | `c.insert(key, fields)` | Create only (`ConflictError` if it exists). |
 | `c.replace(key, fields, if_version: nil)` | Replace an existing document (optionally only at a version). |
@@ -48,6 +49,18 @@ accounts.scan { |d| ... }                # every document, any collection size (
 | `c.create_vector_index(field, dims)` / `c.drop_vector_index(field)` / `c.vector_indexes` | Vector indexes for `nearest`; writes of other values to an indexed field are refused. |
 | `c.create_index(field)` / `c.drop_index(field)` / `c.info` / `c.drop` | Indexes (up to 16 per collection) and collection management. |
 | `db.transaction { \|tx\| ... }` | Buffered writes committed atomically when the block returns (or `tx.commit`); `tx.require(...)` adds a version check. |
+
+**Large values**: a document can hold a large binary field (a file) next to small metadata. Read the metadata alone
+with `get(key, fields: [...])`, a slice with `read_bytes` (a `Storine::ByteRange` with `version`, `total` and `data`, or
+`nil` if the document does not exist; at most 16 MiB per call, empty `data` past the end), or the whole value chunk by
+chunk with `stream_bytes` (yields to a block, or returns an Enumerator), which raises `NotFoundError` if the document
+does not exist and `ConflictError` if it changes mid-read:
+
+```ruby
+meta = files.get("f1", fields: ["name", "meta.size"])
+head = files.read_bytes("f1", "data", 0, 4096).data
+File.open("cat.png", "wb") { |f| files.stream_bytes("f1", "data") { |chunk| f.write(chunk) } }
+```
 
 **Values**: `nil`, `true` / `false`, `Integer` (64- or 128-bit), `Float`, `Storine::Decimal` (exact, up to 38
 digits, keeps its scale — use it for money; `BigDecimal` is accepted too and `#to_d` converts back), `String`

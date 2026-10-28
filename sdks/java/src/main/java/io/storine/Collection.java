@@ -1,5 +1,6 @@
 package io.storine;
 
+import java.io.InputStream;
 import java.time.Duration;
 import java.util.Iterator;
 import java.util.List;
@@ -32,10 +33,106 @@ public final class Collection {
 
     /** The document {@code key}, or empty if it does not exist. */
     public Optional<Document> get(String key) {
-        Storine.Reply r = client.request(Wire.OP_DOC_GET, Wire.get(name, key));
+        return get(key, Wire.get(name, key));
+    }
+
+    /**
+     * {@link #get} returning only the given field paths (such as {@code "name"} or {@code "meta.size"}; at most 256), so
+     * metadata can be read without transferring a large value stored beside it. Nested paths come back nested; missing
+     * paths are left out.
+     */
+    public Optional<Document> getFields(String key, String... paths) {
+        return getFields(key, List.of(paths));
+    }
+
+    /** {@link #getFields(String, String...)} with the paths as a list. */
+    public Optional<Document> getFields(String key, List<String> paths) {
+        return get(key, Wire.getFields(name, key, paths));
+    }
+
+    private Optional<Document> get(String key, byte[] request) {
+        Storine.Reply r = client.request(Wire.OP_DOC_GET, request);
         if (r.status() == Wire.ST_NOT_FOUND) return Optional.empty();
         if (r.status() != Wire.ST_OK) throw Storine.error(r.status(), r.body());
         return Optional.of(new Document(key, r.version(), new Values.Reader(r.body()).fields(1)));
+    }
+
+    /**
+     * Bytes {@code offset .. offset + length} of a bytes (or text) field, without reading the rest of the document;
+     * empty if the document does not exist. {@code length} is at most 16 MiB; past the end of the value, {@code data}
+     * is empty. {@link InvalidException} if the field is missing or not bytes/text.
+     */
+    public Optional<ByteRange> readBytes(String key, String field, long offset, int length) {
+        Storine.Reply r = client.request(Wire.OP_DOC_GET, Wire.getRange(name, key, field, offset, length));
+        if (r.status() == Wire.ST_NOT_FOUND) return Optional.empty();
+        if (r.status() != Wire.ST_OK) throw Storine.error(r.status(), r.body());
+        Wire.Range range = Wire.byteRange(r.body());
+        return Optional.of(new ByteRange(r.version(), range.total(), range.data()));
+    }
+
+    /** {@link #readBytes(String, String, long, int)} of the first 16 MiB. */
+    public Optional<ByteRange> readBytes(String key, String field) {
+        return readBytes(key, field, 0, Wire.MAX_BYTE_RANGE);
+    }
+
+    /** {@link #streamBytes(String, String, int)} in 1 MiB chunks. */
+    public InputStream streamBytes(String key, String field) {
+        return streamBytes(key, field, 1 << 20);
+    }
+
+    /**
+     * A stream over a large bytes (or text) field, fetched {@code chunkSize} bytes at a time. Its reads throw
+     * {@link NotFoundException} if the document does not exist and {@link ConflictException} if it changes while being
+     * read (the chunks would otherwise mix two versions).
+     */
+    public InputStream streamBytes(String key, String field, int chunkSize) {
+        if (chunkSize <= 0 || chunkSize > Wire.MAX_BYTE_RANGE)
+            throw new InvalidException("chunkSize must be between 1 and " + Wire.MAX_BYTE_RANGE);
+        return new InputStream() {
+            private long offset;
+            private Long version;
+            private byte[] buf = new byte[0];
+            private int pos;
+            private boolean done;
+
+            /** Fetches the next chunk; false at the end of the value. */
+            private boolean fill() {
+                while (pos >= buf.length) {
+                    if (done) return false;
+                    ByteRange r = readBytes(key, field, offset, chunkSize)
+                            .orElseThrow(() -> new NotFoundException("document '" + key + "' does not exist", Wire.ST_NOT_FOUND, -1));
+                    if (version != null && r.version() != version)
+                        throw new ConflictException("the document changed while it was being read", -1, r.version());
+                    version = r.version();
+                    offset += r.data().length;
+                    buf = r.data();
+                    pos = 0;
+                    if (buf.length == 0 || Long.compareUnsigned(offset, r.total()) >= 0) done = true;
+                }
+                return true;
+            }
+
+            @Override
+            public int read() {
+                return fill() ? buf[pos++] & 0xFF : -1;
+            }
+
+            @Override
+            public int read(byte[] b, int off, int len) {
+                java.util.Objects.checkFromIndexSize(off, len, b.length);
+                if (len == 0) return 0;
+                if (!fill()) return -1;
+                int n = Math.min(len, buf.length - pos);
+                System.arraycopy(buf, pos, b, off, n);
+                pos += n;
+                return n;
+            }
+
+            @Override
+            public int available() {
+                return buf.length - pos;
+            }
+        };
     }
 
     /** Creates or replaces the document; returns its new version. */

@@ -88,6 +88,8 @@ class VectorTests(unittest.TestCase):
         rid = bytes.fromhex("0102030405060708090a0b0c0d0e0f10")
         built = {
             "get accounts/alice": w.encode_get("accounts", "alice"),
+            "get accounts/alice: bytes 1000..1004 of photo": w.encode_get_range("accounts", "alice", "photo", 1000, 4),
+            "get accounts/alice: fields owner, meta.size": w.encode_get_fields("accounts", "alice", ["owner", "meta.size"]),
             "write: put": w.encode_writes([W("accounts", "alice", 1, 0, 0, d)], None),
             "write: insert (must not exist) with request id": w.encode_writes([W("accounts", "alice", 1, 1, 0, d)], b"\xab" * 16),
             "write: replace if version 7": w.encode_writes([W("accounts", "alice", 1, 3, 7, d)], None),
@@ -133,6 +135,8 @@ class VectorTests(unittest.TestCase):
         self.assertEqual((versions, dup), ([12, None], False))
         total, nxt, docs = w.decode_page(bytes.fromhex(r["page: total 42, next k1, one doc"]["body_hex"]))
         self.assertEqual((total, nxt, docs), (42, "k1", [("k1", 3, {"n": 1})]))
+        total, data = w.decode_byte_range(bytes.fromhex(r["byte range: total 5000, 4 bytes"]["body_hex"]))
+        self.assertEqual((total, data), (5000, bytes.fromhex("deadbeef")))
 
     def test_hostile_bytes_never_crash(self):
         good = bytes.fromhex(VECTORS["values"][-1]["hex"])

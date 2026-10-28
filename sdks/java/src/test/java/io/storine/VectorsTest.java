@@ -136,6 +136,8 @@ class VectorsTest {
         Arrays.fill(ab, (byte) 0xab);
         Map<String, byte[]> built = new HashMap<>();
         built.put("get accounts/alice", Wire.get("accounts", "alice"));
+        built.put("get accounts/alice: bytes 1000..1004 of photo", Wire.getRange("accounts", "alice", "photo", 1000, 4));
+        built.put("get accounts/alice: fields owner, meta.size", Wire.getFields("accounts", "alice", List.of("owner", "meta.size")));
         built.put("write: put", Wire.writes(List.of(Wire.Write.put("accounts", "alice", d, 0, 0, 0)), null));
         built.put("write: insert (must not exist) with request id", Wire.writes(List.of(Wire.Write.put("accounts", "alice", d, 0, 1, 0)), ab));
         built.put("write: replace if version 7", Wire.writes(List.of(Wire.Write.put("accounts", "alice", d, 0, 3, 7)), null));
@@ -187,6 +189,9 @@ class VectorsTest {
         assertEquals(42, p.total());
         assertEquals("k1", p.nextKey());
         assertEquals(new Document("k1", 3, Map.of("n", 1L)), p.docs().get(0));
+        Wire.Range range = Wire.byteRange(r.get("byte range: total 5000, 4 bytes"));
+        assertEquals(5000, range.total());
+        assertArrayEquals(new byte[] {(byte) 0xde, (byte) 0xad, (byte) 0xbe, (byte) 0xef}, range.data());
     }
 
     @Test

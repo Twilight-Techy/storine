@@ -43,6 +43,8 @@ for d in accounts.scan(None) { let d = d?; /* every document, any collection siz
 | `storine::connect(url)` / `connect_with(url, Options { token, timeout, follower_reads, pool_size })` | Connection pool to a server or cluster (`Send + Sync`). |
 | `db.collection(name)` | A collection handle. |
 | `c.get(key)` | `Option<Document>` (`key`, `version`, `fields`, `get(field)`). |
+| `c.get_fields(key, &["name", "meta.size"])` | The document with only those (dotted) paths; nested paths come back nested. |
+| `c.read_bytes(key, field, offset, length)` / `c.stream_bytes(key, field, chunk_size)` | Part of a bytes / text field (see *Large values*). |
 | `c.put(key, fields)` / `c.put_with_ttl(key, fields, ttl)` | Create or replace; returns the version. |
 | `c.insert(key, fields)` | Create only (`Error::Conflict` if it exists). |
 | `c.replace(key, fields)` / `c.replace_if_version(key, version, fields)` | Replace an existing document (optionally only at a version). |
@@ -54,6 +56,19 @@ for d in accounts.scan(None) { let d = d?; /* every document, any collection siz
 | `c.create_index` / `c.drop_index` / `c.info` / `c.drop` | Indexes (up to 16 per collection) and collection management. |
 | `db.transaction(\|tx\| ...)` | Writes committed atomically when the closure returns `Ok`; `tx.require_version` / `tx.require_exists` add checks. |
 | `db.collections()` / `db.cluster_info()` | Introspection. |
+
+**Large values**: a document can hold a large bytes field (a file) next to small metadata. Read the metadata alone
+with `get_fields`, a slice with `read_bytes` (`Option<ByteRange { version, total, data }>`, `None` if the document does
+not exist; at most `MAX_BYTE_RANGE` = 16 MiB per call, empty `data` past the end), or the whole value chunk by chunk
+with `stream_bytes`, an iterator of `Result<Vec<u8>>` that yields `Error::NotFound` if the document does not exist and
+`Error::Conflict` if it changes mid-read:
+
+```rust
+let meta = files.get_fields("f1", &["name", "meta.size"])?;
+let head = files.read_bytes("f1", "data", 0, 4096)?;
+let mut out = std::fs::File::create("cat.png")?;
+for chunk in files.stream_bytes("f1", "data", 1 << 20) { out.write_all(&chunk?)?; }
+```
 
 **Values** (`storine::Value`): `Null`, `Bool`, `Int` (i64; all smaller integer types convert), `UInt` (u64), `Int128`,
 `Float`, `Decimal` (exact, up to 38 digits — use it for money; `dec("19.99")`, `Decimal::parse`, `Decimal::new`), `Text`,

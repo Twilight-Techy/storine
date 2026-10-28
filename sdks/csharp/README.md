@@ -43,6 +43,7 @@ await foreach (var d in accounts.ScanAsync()) { /* every document, any collectio
 | `StorineClient.Connect(url, new StorineOptions { Token, Timeout, FollowerReads, PoolSize })` | Connection pool to a server or cluster. Options are optional. |
 | `db.Collection(name)` | A collection handle. |
 | `c.GetAsync(key)` | `Document` (`Key`, `Version`, `Fields`, `doc["field"]`) or `null`. |
+| `c.GetAsync(key, fields: new[] { "name", "meta.size" })` | `GetAsync` returning only those (dotted) paths. |
 | `c.PutAsync(key, fields, ttl: null)` | Create or replace; returns the version. |
 | `c.InsertAsync(key, fields)` | Create only (`ConflictException` if it exists). |
 | `c.ReplaceAsync(key, fields, ifVersion: null)` | Replace an existing document (optionally only at a version). |
@@ -56,6 +57,16 @@ await foreach (var d in accounts.ScanAsync()) { /* every document, any collectio
 | `db.CollectionsAsync()` / `db.ClusterInfoAsync()` | Introspection. |
 
 Every async method takes an optional `CancellationToken`.
+
+**Large values**: a bytes (or text) field can be read in pieces without fetching the document.
+`c.ReadBytesAsync(key, field, offset = 0, length = 16 MiB)` returns a `ByteRange` (`Version`, `Total`, `Data`; `null`
+if the document does not exist; `Data` is empty past the end). `c.StreamBytesAsync(key, field, chunkSize = 1 MiB)` is
+an `IAsyncEnumerable<ReadOnlyMemory<byte>>` that throws `ConflictException` if the document changes mid-read:
+
+```csharp
+var meta = await files.GetAsync("f1", fields: new[] { "name", "meta.size" }); // skips the blob
+await foreach (var chunk in files.StreamBytesAsync("f1", "data")) await output.WriteAsync(chunk);
+```
 
 **Values**: `null`, `bool`, integer types (`ulong` is stored unsigned), `BigInteger` / `Int128` (up to 128 bits), `double`,
 `decimal` (exact — use it for money; `BigDecimal` for up to 38 digits), `string`, `byte[]`, `DateTime` / `DateTimeOffset` /

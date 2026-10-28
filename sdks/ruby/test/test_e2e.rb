@@ -167,6 +167,31 @@ class SingleNodeTest < Minitest::Test
     assert_equal [], c.vector_indexes
   end
 
+  def test_large_values
+    c = @db.collection("rb_files")
+    blob = Random.bytes(3 * 1024 * 1024 + 17)
+    meta = { "size" => blob.bytesize, "type" => "image/png" }
+    v = c.put("f1", { "data" => blob, "name" => "cat.png", "meta" => meta })
+    d = c.get("f1", fields: ["name", "meta.size", "absent"])
+    assert_equal [{ "name" => "cat.png", "meta" => { "size" => blob.bytesize } }, v], [d.to_h, d.version]
+    assert_nil c.get("nope", fields: ["name"])
+    r = c.read_bytes("f1", "data", 1000, 16)
+    assert_equal [v, blob.bytesize, blob.byteslice(1000, 16)], [r.version, r.total, r.data]
+    assert_equal "".b, c.read_bytes("f1", "data", blob.bytesize + 5, 10).data
+    chunks = c.stream_bytes("f1", "data", chunk_size: 1 << 20).to_a
+    assert_equal 4, chunks.length
+    assert chunks.join == blob, "stream reassembles the value"
+    assert_equal "cat".b, c.read_bytes("f1", "name", 0, 3).data
+    assert_nil c.read_bytes("nope", "data")
+    assert_raises(Storine::NotFoundError) { c.stream_bytes("nope", "data") { nil } }
+    assert_raises(Storine::InvalidError) { c.read_bytes("f1", "meta") } # not bytes
+    assert_raises(Storine::InvalidError) { c.read_bytes("f1", "data", 0, 17 * 1024 * 1024) }
+    stream = c.stream_bytes("f1", "data", chunk_size: 1 << 20)
+    stream.next
+    c.update("f1", Storine.set("name", "dog.png"))
+    assert_raises(Storine::ConflictError) { stream.next }
+  end
+
   def test_ttl_and_errors
     s = @db.collection("sessions")
     s.put("short", { "u" => 1 }, ttl: 0.2)

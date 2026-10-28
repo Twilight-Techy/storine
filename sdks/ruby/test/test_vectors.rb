@@ -73,6 +73,8 @@ class VectorTest < Minitest::Test
     wire = Storine::Wire
     built = {
       "get accounts/alice" => wire.encode_get("accounts", "alice"),
+      "get accounts/alice: bytes 1000..1004 of photo" => wire.encode_get_range("accounts", "alice", "photo", 1000, 4),
+      "get accounts/alice: fields owner, meta.size" => wire.encode_get_fields("accounts", "alice", %w[owner meta.size]),
       "write: put" => wire.encode_writes([W.new("accounts", "alice", 1, 0, 0, d)], nil),
       "write: insert (must not exist) with request id" =>
         wire.encode_writes([W.new("accounts", "alice", 1, 1, 0, d)], "\xAB".b * 16),
@@ -126,6 +128,9 @@ class VectorTest < Minitest::Test
     assert_equal [[12, nil], false], [versions, dup]
     total, nxt, docs = Storine::Wire.decode_page(unhex(r["page: total 42, next k1, one doc"]["body_hex"]))
     assert_equal [42, "k1", [["k1", 3, { "n" => 1 }]]], [total, nxt, docs]
+    range = unhex(r["byte range: total 5000, 4 bytes"]["body_hex"])
+    assert_equal [5000, "\xDE\xAD\xBE\xEF".b], Storine::Wire.decode_byte_range(range)
+    assert_raises(Storine::InvalidError) { Storine::Wire.decode_byte_range(range.byteslice(0...-1)) }
   end
 
   def test_hostile_bytes_never_crash

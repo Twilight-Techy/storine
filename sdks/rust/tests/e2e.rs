@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use storine::{
-    add, append, between, dec, doc, eq, gt, list, matches, set, unset, Client, Error, Options, Query, Value,
+    add, append, between, dec, doc, eq, gt, list, matches, set, unset, ByteRange, Client, Error, Options, Query, Value,
     VectorIndex,
 };
 
@@ -69,6 +69,57 @@ fn single_node() -> Option<(Server, Client, PathBuf)> {
     let port = free_port();
     let server = start(&bin, &dir, port, &[]);
     Some((server, storine::connect(&format!("storine://127.0.0.1:{port}")).unwrap(), dir))
+}
+
+#[test]
+fn large_values() {
+    let Some((_server, db, dir)) = single_node() else { return };
+    let c = db.collection("rs_files");
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let blob: Vec<u8> = (0..3 * 1024 * 1024 + 17)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    let len = blob.len() as u64;
+    let v = c
+        .put(
+            "f1",
+            doc! {"data" => blob.clone(), "name" => "cat.png", "meta" => doc! {"size" => len, "type" => "image/png"}},
+        )
+        .unwrap();
+
+    // Projection: only the named paths, nested paths nested.
+    let d = c.get_fields("f1", &["name", "meta.size", "absent"]).unwrap().unwrap();
+    assert_eq!((d.version, d.fields), (v, doc! {"name" => "cat.png", "meta" => doc! {"size" => len}}));
+    assert!(c.get_fields("nope", &["name"]).unwrap().is_none());
+
+    // Ranges.
+    let r = c.read_bytes("f1", "data", 1000, 16).unwrap().unwrap();
+    assert_eq!(r, ByteRange { version: v, total: len, data: blob[1000..1016].to_vec() });
+    assert!(c.read_bytes("f1", "data", len + 5, 10).unwrap().unwrap().data.is_empty());
+    assert_eq!(c.read_bytes("f1", "name", 0, 3).unwrap().unwrap().data, b"cat");
+    assert!(c.read_bytes("nope", "data", 0, 10).unwrap().is_none());
+    assert!(matches!(c.read_bytes("f1", "meta", 0, 10), Err(Error::Invalid(_)))); // not bytes
+    assert!(matches!(c.read_bytes("f1", "data", 0, 17 * 1024 * 1024), Err(Error::Invalid(_))));
+
+    // Streaming.
+    let chunks: Vec<Vec<u8>> = c.stream_bytes("f1", "data", 1 << 20).collect::<Result<_, _>>().unwrap();
+    assert_eq!(chunks.len(), 4);
+    assert_eq!(chunks.concat(), blob);
+    let mut missing = c.stream_bytes("nope", "data", 1 << 20);
+    assert!(matches!(missing.next(), Some(Err(Error::NotFound { .. }))));
+    assert!(missing.next().is_none());
+    assert!(matches!(c.stream_bytes("f1", "data", 0).next(), Some(Err(Error::Invalid(_)))));
+    let mut chunks = c.stream_bytes("f1", "data", 1 << 20);
+    assert!(chunks.next().unwrap().is_ok());
+    c.update("f1", [set("name", "dog.png")]).unwrap();
+    assert!(matches!(chunks.next(), Some(Err(Error::Conflict { .. }))));
+    drop(db);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

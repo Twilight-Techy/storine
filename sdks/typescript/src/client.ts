@@ -364,6 +364,22 @@ export interface FindOptions {
   offset?: number;
 }
 
+/** Options of `get`. */
+export interface GetOptions {
+  /** Only these (dotted) field paths, e.g. `["name", "meta.size"]` (at most 256). */
+  fields?: readonly string[];
+}
+
+/** A slice of a bytes / text field, from `readBytes`. */
+export interface ByteRange {
+  /** Version of the document the bytes were read from. */
+  version: bigint;
+  /** Length of the whole value in bytes. */
+  total: number;
+  /** The bytes, starting at the requested offset. */
+  data: Uint8Array;
+}
+
 /** Options of `nearest`. */
 export interface NearestOptions {
   /** Number of documents to return (default 10). */
@@ -377,12 +393,52 @@ export interface NearestOptions {
 export class Collection<T extends Fields = Fields> {
   constructor(readonly client: Client, readonly name: string) {}
 
-  /** The document `key`, or `undefined` if it does not exist. */
-  async get(key: string): Promise<Document<T> | undefined> {
-    const r = await this.client.request(w.OP.DOC_GET, w.encodeGet(this.name, key));
+  /**
+   * The document `key`, or `undefined` if it does not exist.
+   *
+   * With `fields` (paths such as `"name"` or `"meta.size"`), only those fields are sent, so metadata
+   * can be read without transferring a large value stored beside it; nested paths come back nested.
+   */
+  async get(key: string, options: GetOptions = {}): Promise<Document<T> | undefined> {
+    const req = options.fields === undefined ? w.encodeGet(this.name, key) : w.encodeGetFields(this.name, key, options.fields);
+    const r = await this.client.request(w.OP.DOC_GET, req);
     if (r.status === w.ST.NOT_FOUND) return undefined;
     if (r.status !== w.ST.OK) throw Client.error(r);
     return { key, version: r.version, fields: new Reader(r.body).fields() as T };
+  }
+
+  /**
+   * Bytes `offset .. offset + length` of a bytes (or text) field, without reading the rest of the
+   * document; `undefined` if the document does not exist. `length` is at most 16 MiB (the default);
+   * past the end of the value, `data` is empty. InvalidError if the field is missing or not bytes/text.
+   */
+  async readBytes(key: string, field: string, offset: number | bigint = 0, length: number = w.MAX_BYTE_RANGE): Promise<ByteRange | undefined> {
+    const r = await this.client.request(w.OP.DOC_GET, w.encodeGetRange(this.name, key, field, offset, length));
+    if (r.status === w.ST.NOT_FOUND) return undefined;
+    if (r.status !== w.ST.OK) throw Client.error(r);
+    const { total, data } = w.decodeByteRange(r.body);
+    return { version: r.version, total, data };
+  }
+
+  /**
+   * Yields a large bytes field chunk by chunk (each at most `chunkSize` bytes, default 1 MiB).
+   * Throws NotFoundError if the document does not exist and ConflictError if it changes while being
+   * read (the chunks would otherwise mix two versions).
+   */
+  async *streamBytes(key: string, field: string, options: { chunkSize?: number; offset?: number } = {}): AsyncGenerator<Uint8Array, void, undefined> {
+    const chunkSize = options.chunkSize ?? 1 << 20;
+    let offset = options.offset ?? 0;
+    let version: bigint | undefined;
+    for (;;) {
+      const r = await this.readBytes(key, field, offset, chunkSize);
+      if (r === undefined) throw new NotFoundError(`document ${JSON.stringify(key)} does not exist`);
+      if (version !== undefined && r.version !== version) throw new ConflictError("the document changed while it was being read", undefined, r.version);
+      version = r.version;
+      if (r.data.length === 0) return;
+      offset += r.data.length;
+      yield r.data;
+      if (offset >= r.total) return;
+    }
   }
 
   /** Creates or replaces the document; returns its new version. `ttl` in seconds. */

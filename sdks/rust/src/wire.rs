@@ -343,6 +343,63 @@ pub(crate) fn encode_get(collection: &str, key: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Most bytes one ranged read ([`Collection::read_bytes`](crate::Collection::read_bytes)) returns: 16 MiB.
+pub const MAX_BYTE_RANGE: u32 = 16 * 1024 * 1024;
+
+/// Most field paths one projected read can name.
+const MAX_PROJECTED_FIELDS: usize = 256;
+
+/// `get` shape 1: `u8 1 | str field | u64 offset | u32 length`.
+pub(crate) fn encode_get_range(collection: &str, key: &str, field: &str, offset: u64, length: u32) -> Result<Vec<u8>> {
+    if length > MAX_BYTE_RANGE {
+        return Err(invalid(format!("length must be at most {MAX_BYTE_RANGE}")));
+    }
+    let mut out = encode_get(collection, key)?;
+    out.push(1);
+    put_str(&mut out, field)?;
+    out.extend_from_slice(&offset.to_le_bytes());
+    out.extend_from_slice(&length.to_le_bytes());
+    Ok(out)
+}
+
+/// `get` shape 2: `u8 2 | u32 count | str path*`.
+pub(crate) fn encode_get_fields(collection: &str, key: &str, paths: &[&str]) -> Result<Vec<u8>> {
+    if paths.len() > MAX_PROJECTED_FIELDS {
+        return Err(invalid(format!("at most {MAX_PROJECTED_FIELDS} fields can be projected")));
+    }
+    let mut out = encode_get(collection, key)?;
+    out.push(2);
+    put_u32(&mut out, paths.len())?;
+    for p in paths {
+        put_str(&mut out, p)?;
+    }
+    Ok(out)
+}
+
+/// `u64 total | u32 n | n bytes` -> (total, data).
+pub(crate) fn decode_byte_range(body: &[u8]) -> Result<(u64, Vec<u8>)> {
+    let mut r = Reader::new(body);
+    let total = r.u64()?;
+    let n = r.u32()? as usize;
+    let data = r.take(n)?.to_vec();
+    if r.remaining() != 0 {
+        return Err(invalid("trailing bytes after byte range"));
+    }
+    Ok((total, data))
+}
+
+/// A slice of a bytes (or text) field, returned by
+/// [`Collection::read_bytes`](crate::Collection::read_bytes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ByteRange {
+    /// Version of the document the bytes were read from.
+    pub version: u64,
+    /// Length of the whole value.
+    pub total: u64,
+    /// The bytes from the requested offset (empty past the end of the value).
+    pub data: Vec<u8>,
+}
+
 pub(crate) fn encode_writes(writes: &[Write], request_id: Option<&[u8; 16]>) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     match request_id {

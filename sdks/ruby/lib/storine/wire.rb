@@ -83,6 +83,9 @@ module Storine
     ST_OK, ST_NOT_FOUND, ST_ERROR, ST_OVERLOADED, ST_CONFLICT, ST_UNAUTHORIZED, ST_RATE_LIMITED,
       ST_NOT_LEADER, ST_INVALID, ST_COMMIT_UNKNOWN = (0..9).to_a
 
+    # Most bytes one ranged read (Collection#read_bytes) returns: 16 MiB.
+    MAX_BYTE_RANGE = 16 * 1024 * 1024
+
     # One write of an atomic request (built by Collection / Transaction methods).
     # kind: 1 put, 2 put+ttl, 3 delete, 4 patch, 5 check; precondition: 0 none, 1 absent,
     # 2 exists, 3 version.
@@ -157,6 +160,42 @@ module Storine
       SVE.put_str(out, collection)
       SVE.put_str(out, key)
       out
+    end
+
+    # `get` shape 1: u8 1 | str field | u64 offset | u32 length (a byte range of one field).
+    def encode_get_range(collection, key, field, offset, length)
+      unless offset.is_a?(Integer) && offset.between?(0, 2**64 - 1)
+        raise InvalidError, "offset must be between 0 and 2**64 - 1"
+      end
+      unless length.is_a?(Integer) && length.between?(0, MAX_BYTE_RANGE)
+        raise InvalidError, "length must be between 0 and #{MAX_BYTE_RANGE}"
+      end
+
+      out = encode_get(collection, key)
+      out << "\x01"
+      SVE.put_str(out, field)
+      out << [offset, length].pack("Q<V")
+    end
+
+    # `get` shape 2: u8 2 | u32 count | str path* (only these dotted paths).
+    def encode_get_fields(collection, key, paths)
+      raise InvalidError, "fields is an Array of field paths" unless paths.is_a?(Array)
+      raise InvalidError, "at most 256 fields can be projected" if paths.length > 256
+
+      out = encode_get(collection, key)
+      out << "\x02" << [paths.length].pack("V")
+      paths.each { |p| SVE.put_str(out, p.to_s) }
+      out
+    end
+
+    # `u64 total | u32 n | n bytes` -> [total, data].
+    def decode_byte_range(body)
+      r = Reader.new(body)
+      total = r.u64
+      data = r.take(r.u32)
+      raise InvalidError, "trailing bytes after byte range" unless r.remaining.zero?
+
+      [total, data]
     end
 
     def encode_writes(writes, request_id)

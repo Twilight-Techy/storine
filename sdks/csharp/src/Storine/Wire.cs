@@ -15,6 +15,12 @@ public sealed record Document(string Key, ulong Version, Doc Fields)
     public double? Score => this["$score"] as double?;
 }
 
+/// <summary>
+/// A slice of a bytes (or text) field read with <c>ReadBytesAsync</c>: <c>Data</c> starts at the requested offset,
+/// <c>Total</c> is the whole value's length and <c>Version</c> the document version it was read from.
+/// </summary>
+public sealed record ByteRange(ulong Version, ulong Total, byte[] Data);
+
 /// <summary>A vector index of a collection (<c>Ready</c>: built from the existing documents).</summary>
 public sealed record VectorIndex(string Field, int Dims, bool Ready);
 
@@ -51,6 +57,46 @@ internal static class Wire
         w.Str(collection);
         w.Str(key);
         return w.ToArray();
+    }
+
+    /// <summary>Most bytes one ranged read returns (16 MiB).</summary>
+    internal const int MaxByteRange = 16 * 1024 * 1024;
+
+    /// <summary><c>OP_DOC_GET</c> with a byte-range shape: bytes <c>offset .. offset + length</c> of one bytes/text field.</summary>
+    internal static byte[] GetRange(string collection, string key, string field, ulong offset, int length)
+    {
+        if (length < 0 || length > MaxByteRange) throw new InvalidException($"length must be between 0 and {MaxByteRange}");
+        var w = new Values.Writer();
+        w.Str(collection);
+        w.Str(key);
+        w.U8(1);
+        w.Str(field);
+        w.U64(offset);
+        w.U32(length);
+        return w.ToArray();
+    }
+
+    /// <summary><c>OP_DOC_GET</c> with a projection shape: only the given (dotted) field paths.</summary>
+    internal static byte[] GetFields(string collection, string key, IReadOnlyList<string> paths)
+    {
+        if (paths.Count > 256) throw new InvalidException("at most 256 fields can be projected");
+        var w = new Values.Writer();
+        w.Str(collection);
+        w.Str(key);
+        w.U8(2);
+        w.U32(paths.Count);
+        foreach (var p in paths) w.Str(p);
+        return w.ToArray();
+    }
+
+    /// <summary><c>u64 total | u32 n | n bytes</c>.</summary>
+    internal static (ulong Total, byte[] Data) ReadByteRange(byte[] body)
+    {
+        var r = new Values.Reader(body);
+        ulong total = r.U64();
+        byte[] data = r.Bytes(r.U32());
+        if (r.Remaining != 0) throw new InvalidException("trailing bytes after byte range");
+        return (total, data);
     }
 
     internal static byte[] Writes(IReadOnlyList<Write> writes, byte[]? requestId)

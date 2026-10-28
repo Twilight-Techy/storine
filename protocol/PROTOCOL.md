@@ -89,8 +89,25 @@ All bodies below start at offset 29 of the request.
 
 ### 5.1 `OP_DOC_GET` (`0x20`, role: read)
 
-Request: `str collection | str key`.
-Response: `Ok` (`version` = document version, body = document body) or `NotFound`.
+Request: `str collection | str key`, optionally followed by one shape:
+
+```
+(none)                                         whole document
+u8 1 | str field | u64 offset | u32 length      a byte range of one field
+u8 2 | u32 count | str path*                    only these fields (count <= 256)
+```
+
+Response: `Ok` (`version` = document version) or `NotFound` (no such document).
+
+- **Whole document**: body = document body.
+- **Byte range**: body = `u64 total | u32 n | n bytes`. `field` (a dotted path) must hold
+  `bytes` or `text` (its UTF-8 bytes), else `Invalid`. `total` is the value's full length; the
+  bytes are `offset .. min(offset + length, total)`, so a read at or past the end returns `n = 0`.
+  `length` is at most 16 MiB (`Invalid` above). Read a large value in chunks, checking that
+  `version` stays the same between chunks.
+- **Fields**: body = document body holding only the listed paths that exist; a nested path
+  `a.b` comes back nested (`{a: {b: …}}`). Use it to read metadata stored beside a large value
+  without transferring the value.
 
 ### 5.2 `OP_DOC_WRITE` (`0x21`, role: write)
 

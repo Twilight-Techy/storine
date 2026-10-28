@@ -8,6 +8,7 @@ import static io.storine.Filter.and;
 import static io.storine.Filter.between;
 import static io.storine.Filter.eq;
 import static io.storine.Filter.gt;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -16,15 +17,18 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -211,6 +215,34 @@ class E2ETest {
         assertThrows(InvalidException.class, () -> c.nearest("emb", new float[] {1, 2}, 1));
         c.dropVectorIndex("emb");
         assertEquals(List.of(), c.vectorIndexes());
+    }
+
+    @Test
+    void largeValues() throws Exception {
+        Collection c = db.collection("java_files");
+        byte[] blob = new byte[3 * 1024 * 1024 + 17];
+        new java.util.Random(7).nextBytes(blob);
+        long v = c.put("f1", Map.of("data", blob, "name", "cat.png", "meta", Map.of("size", blob.length, "type", "image/png")));
+        Document d = c.getFields("f1", "name", "meta.size", "absent").orElseThrow();
+        assertEquals(Map.of("name", "cat.png", "meta", Map.of("size", (long) blob.length)), d.fields());
+        assertEquals(v, d.version());
+        ByteRange r = c.readBytes("f1", "data", 1000, 16).orElseThrow();
+        assertEquals(v, r.version());
+        assertEquals(blob.length, r.total());
+        assertArrayEquals(Arrays.copyOfRange(blob, 1000, 1016), r.data());
+        assertEquals(0, c.readBytes("f1", "data", blob.length + 5, 10).orElseThrow().data().length);
+        try (InputStream in = c.streamBytes("f1", "data", 1 << 20)) {
+            assertArrayEquals(blob, in.readAllBytes());
+        }
+        assertArrayEquals("cat".getBytes(StandardCharsets.UTF_8), c.readBytes("f1", "name", 0, 3).orElseThrow().data());
+        assertTrue(c.readBytes("nope", "data").isEmpty());
+        assertThrows(NotFoundException.class, () -> c.streamBytes("nope", "data").readAllBytes());
+        assertThrows(InvalidException.class, () -> c.readBytes("f1", "meta")); // not bytes
+        assertThrows(InvalidException.class, () -> c.readBytes("f1", "data", 0, 17 * 1024 * 1024));
+        InputStream chunks = c.streamBytes("f1", "data", 1 << 20);
+        assertEquals(1 << 20, chunks.readNBytes(1 << 20).length);
+        c.update("f1", set("name", "dog.png"));
+        assertThrows(ConflictException.class, chunks::readAllBytes);
     }
 
     @Test

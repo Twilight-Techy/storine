@@ -129,7 +129,19 @@ fn build() -> String {
         let mut b = Vec::new();
         storage_core::document_wire::put_str(&mut b, "accounts");
         storage_core::document_wire::put_str(&mut b, "alice");
-        reqs.push(("get accounts/alice".into(), 0x20, b));
+        reqs.push(("get accounts/alice".into(), 0x20, b.clone()));
+        let mut r = b.clone();
+        r.push(1);
+        storage_core::document_wire::put_str(&mut r, "photo");
+        r.extend_from_slice(&1000u64.to_le_bytes());
+        r.extend_from_slice(&4u32.to_le_bytes());
+        reqs.push(("get accounts/alice: bytes 1000..1004 of photo".into(), 0x20, r));
+        let mut f = b;
+        f.push(2);
+        f.extend_from_slice(&2u32.to_le_bytes());
+        storage_core::document_wire::put_str(&mut f, "owner");
+        storage_core::document_wire::put_str(&mut f, "meta.size");
+        reqs.push(("get accounts/alice: fields owner, meta.size".into(), 0x20, f));
     }
     let w = |c: &str, k: &str, op: DocOp, pre: Precondition| DocWrite { collection: c.into(), key: k.into(), op, precondition: pre };
     type WriteCase<'a> = (&'a str, Vec<DocWrite>, Option<[u8; 16]>);
@@ -250,7 +262,12 @@ fn build() -> String {
     let mut pb = Vec::new();
     encode_page(&page, &mut pb);
     let _ = writeln!(out, "    {{\"name\":\"write ok: [v12, deleted]\",\"opcode\":33,\"body_hex\":\"{}\",\"versions\":[\"12\",null],\"duplicate\":false}},", hex(&wr));
-    let _ = writeln!(out, "    {{\"name\":\"page: total 42, next k1, one doc\",\"opcode\":34,\"body_hex\":\"{}\"}}", hex(&pb));
+    let _ = writeln!(out, "    {{\"name\":\"page: total 42, next k1, one doc\",\"opcode\":34,\"body_hex\":\"{}\"}},", hex(&pb));
+    let mut rb = Vec::new();
+    rb.extend_from_slice(&5000u64.to_le_bytes());
+    rb.extend_from_slice(&4u32.to_le_bytes());
+    rb.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+    let _ = writeln!(out, "    {{\"name\":\"byte range: total 5000, 4 bytes\",\"opcode\":32,\"body_hex\":\"{}\"}}", hex(&rb));
     out.push_str("  ]\n}\n");
     out
 }

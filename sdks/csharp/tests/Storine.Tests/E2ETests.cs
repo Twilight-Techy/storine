@@ -236,6 +236,39 @@ public class E2ETests : IClassFixture<SingleNodeFixture>
     }
 
     [Fact]
+    public async Task LargeValues()
+    {
+        if (!Server.Built) return;
+        var c = Db.Collection("cs_files");
+        var blob = new byte[3 * 1024 * 1024 + 17];
+        new Random(7).NextBytes(blob);
+        ulong v = await c.PutAsync("f1", new Doc { ["data"] = blob, ["name"] = "cat.png", ["meta"] = new Doc { ["size"] = blob.Length, ["type"] = "image/png" } });
+        var d = (await c.GetAsync("f1", fields: new[] { "name", "meta.size", "absent" }))!;
+        Assert.Equal(v, d.Version);
+        Assert.Equal(new[] { "meta", "name" }, d.Fields.Keys.OrderBy(k => k, StringComparer.Ordinal));
+        Assert.Equal("cat.png", d["name"]);
+        var meta = (IDictionary<string, object?>)d["meta"]!;
+        Assert.Equal(new[] { "size" }, meta.Keys);
+        Assert.Equal((long)blob.Length, meta["size"]);
+        var r = (await c.ReadBytesAsync("f1", "data", 1000, 16))!;
+        Assert.Equal((v, (ulong)blob.Length), (r.Version, r.Total));
+        Assert.Equal(blob[1000..1016], r.Data);
+        Assert.Empty((await c.ReadBytesAsync("f1", "data", (ulong)blob.Length + 5, 10))!.Data);
+        var all = new MemoryStream();
+        await foreach (var chunk in c.StreamBytesAsync("f1", "data", chunkSize: 1 << 20)) all.Write(chunk.Span);
+        Assert.Equal(blob, all.ToArray());
+        Assert.Equal("cat"u8.ToArray(), (await c.ReadBytesAsync("f1", "name", 0, 3))!.Data);
+        Assert.Null(await c.ReadBytesAsync("nope", "data"));
+        await Assert.ThrowsAsync<NotFoundException>(async () => { await foreach (var _ in c.StreamBytesAsync("nope", "data")) { } });
+        await Assert.ThrowsAsync<InvalidException>(() => c.ReadBytesAsync("f1", "meta")); // not bytes
+        await Assert.ThrowsAsync<InvalidException>(() => c.ReadBytesAsync("f1", "data", 0, 17 * 1024 * 1024));
+        await using var chunks = c.StreamBytesAsync("f1", "data", chunkSize: 1 << 20).GetAsyncEnumerator();
+        Assert.True(await chunks.MoveNextAsync());
+        await c.UpdateAsync("f1", Set("name", "dog.png"));
+        await Assert.ThrowsAsync<ConflictException>(async () => { while (await chunks.MoveNextAsync()) { } });
+    }
+
+    [Fact]
     public async Task TtlAndErrors()
     {
         if (!Server.Built) return;

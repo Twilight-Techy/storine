@@ -1,9 +1,12 @@
 package storine
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"os"
@@ -317,6 +320,59 @@ func TestE2ESingleNode(t *testing.T) {
 		}
 		if vi, err := c.VectorIndexes(ctx); err != nil || len(vi) != 0 {
 			t.Fatal(vi, err)
+		}
+	})
+
+	t.Run("large values", func(t *testing.T) {
+		c := db.Collection("go_files")
+		blob := make([]byte, 3<<20+17)
+		if _, err := rand.Read(blob); err != nil {
+			t.Fatal(err)
+		}
+		v, err := c.Put(ctx, "f1", Doc{"data": blob, "name": "cat.png", "meta": Doc{"size": len(blob), "type": "image/png"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		d, err := c.GetFields(ctx, "f1", "name", "meta.size", "absent")
+		want := Doc{"name": "cat.png", "meta": map[string]any{"size": int64(len(blob))}}
+		if err != nil || d.Version != v || !reflect.DeepEqual(comparable(d.Fields), comparable(want)) {
+			t.Fatalf("projection: %+v %v", d, err)
+		}
+		r, err := c.ReadBytes(ctx, "f1", "data", 1000, 16)
+		if err != nil || r.Version != v || r.Total != uint64(len(blob)) || !bytes.Equal(r.Data, blob[1000:1016]) {
+			t.Fatalf("range: %+v %v", r, err)
+		}
+		if r, err := c.ReadBytes(ctx, "f1", "data", uint64(len(blob)+5), 10); err != nil || len(r.Data) != 0 {
+			t.Fatalf("past end: %+v %v", r, err)
+		}
+		got, err := io.ReadAll(c.StreamBytes(ctx, "f1", "data", 1<<20))
+		if err != nil || !bytes.Equal(got, blob) {
+			t.Fatalf("stream: %d bytes, %v", len(got), err)
+		}
+		if r, err := c.ReadBytes(ctx, "f1", "name", 0, 3); err != nil || string(r.Data) != "cat" {
+			t.Fatalf("text: %+v %v", r, err)
+		}
+		if r, err := c.ReadBytes(ctx, "nope", "data", 0, MaxByteRange); err != nil || r != nil {
+			t.Fatalf("missing doc: %+v %v", r, err)
+		}
+		if _, err := io.ReadAll(c.StreamBytes(ctx, "nope", "data", 0)); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("stream missing doc: %v", err)
+		}
+		if _, err := c.ReadBytes(ctx, "f1", "meta", 0, 16); !errors.Is(err, ErrInvalid) { // not bytes
+			t.Fatalf("non-bytes field: %v", err)
+		}
+		if _, err := c.ReadBytes(ctx, "f1", "data", 0, 17<<20); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("too long: %v", err)
+		}
+		s := c.StreamBytes(ctx, "f1", "data", 1<<20)
+		if _, err := io.ReadFull(s, make([]byte, 1<<20)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Update(ctx, "f1", Set("name", "dog.png")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadAll(s); !errors.Is(err, ErrConflict) {
+			t.Fatalf("update mid-stream: %v", err)
 		}
 	})
 

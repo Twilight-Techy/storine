@@ -211,6 +211,34 @@ function testVectorSearch(): void
     });
 }
 
+function testLargeValues(): void
+{
+    with_server(function (Storine $db) {
+        $c = $db->collection('php_files');
+        $blob = random_bytes(3 * 1024 * 1024 + 17);
+        $v = $c->put('f1', ['data' => new Bytes($blob), 'name' => 'cat.png', 'meta' => ['size' => strlen($blob), 'type' => 'image/png']]);
+        $d = $c->get('f1', fields: ['name', 'meta.size', 'absent']);
+        same([['meta' => ['size' => strlen($blob)], 'name' => 'cat.png'], $v], [$d->toArray(), $d->version]);
+        same(null, $c->get('nope', fields: ['name']));
+        $r = $c->readBytes('f1', 'data', 1000, 16);
+        same([$v, strlen($blob), substr($blob, 1000, 16)], [$r->version, $r->total, $r->data]);
+        same('', $c->readBytes('f1', 'data', strlen($blob) + 5, 10)->data);
+        $chunks = iterator_to_array($c->streamBytes('f1', 'data', chunkSize: 1 << 20), false);
+        same(4, count($chunks));
+        check(implode('', $chunks) === $blob, 'stream reassembles the value');
+        same('cat', $c->readBytes('f1', 'name', 0, 3)->data);
+        same(null, $c->readBytes('nope', 'data'));
+        throws(NotFoundException::class, fn () => iterator_to_array($c->streamBytes('nope', 'data')), 'stream of a missing document');
+        throws(InvalidException::class, fn () => $c->readBytes('f1', 'meta'), 'not bytes');
+        throws(InvalidException::class, fn () => $c->readBytes('f1', 'data', 0, 17 * 1024 * 1024), 'over 16 MiB');
+        throws(InvalidException::class, fn () => $c->readBytes('f1', 'data', -1, 10), 'negative offset');
+        $stream = $c->streamBytes('f1', 'data', chunkSize: 1 << 20);
+        $stream->current();
+        $c->update('f1', FieldOp::set('name', 'dog.png'));
+        throws(ConflictException::class, fn () => $stream->next(), 'document changed mid-stream');
+    });
+}
+
 function testTtlAndErrors(): void
 {
     with_server(function (Storine $db) {

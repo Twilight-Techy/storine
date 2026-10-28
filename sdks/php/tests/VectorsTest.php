@@ -74,6 +74,8 @@ function testRequests(): void
     $rid = (string) hex2bin('0102030405060708090a0b0c0d0e0f10');
     $built = [
         'get accounts/alice' => Wire::encodeGet('accounts', 'alice'),
+        'get accounts/alice: bytes 1000..1004 of photo' => Wire::encodeGetRange('accounts', 'alice', 'photo', 1000, 4),
+        'get accounts/alice: fields owner, meta.size' => Wire::encodeGetFields('accounts', 'alice', ['owner', 'meta.size']),
         'write: put' => Wire::encodeWrites([new Write('accounts', 'alice', 1, 0, 0, $d)], null),
         'write: insert (must not exist) with request id' => Wire::encodeWrites([new Write('accounts', 'alice', 1, 1, 0, $d)], str_repeat("\xAB", 16)),
         'write: replace if version 7' => Wire::encodeWrites([new Write('accounts', 'alice', 1, 3, 7, $d)], null),
@@ -120,6 +122,9 @@ function testResponses(): void
     $r = array_column(vectors()['responses'], null, 'name');
     same([[12, null], false], Wire::decodeWriteResponse((string) hex2bin($r['write ok: [v12, deleted]']['body_hex'])));
     same([42, 'k1', [['k1', 3, ['n' => 1]]]], Wire::decodePage((string) hex2bin($r['page: total 42, next k1, one doc']['body_hex'])));
+    $range = (string) hex2bin($r['byte range: total 5000, 4 bytes']['body_hex']);
+    same([5000, "\xde\xad\xbe\xef"], Wire::decodeByteRange($range));
+    throws(InvalidException::class, fn () => Wire::decodeByteRange(substr($range, 0, -1)), 'truncated byte range');
 }
 
 function testHostileBytesNeverCrash(): void

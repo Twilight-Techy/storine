@@ -130,6 +130,21 @@ fn test_document_api_over_tcp() {
     c.doc_command(OP_TXN, &body).unwrap();
     assert!(c.doc_command(OP_TXN, &body).is_err(), "second create-only must conflict");
 
+    // Large values: ranged reads and projections send only what is asked for.
+    let blob: Vec<u8> = (0..5_000_000u32).map(|i| (i * 7 % 256) as u8).collect();
+    let mut f = BTreeMap::new();
+    f.insert("data".to_string(), PropertyValue::Bytes(blob.clone()));
+    f.insert("name".to_string(), PropertyValue::Text("video.mp4".into()));
+    let vb = c.doc_write(&[put("files", "v1", f, Precondition::None)], None).unwrap().versions[0].unwrap();
+    let r = c.doc_read_bytes("files", "v1", "data", 4_999_000, 4096).unwrap().unwrap();
+    assert_eq!((r.version, r.total, &r.data[..]), (vb, 5_000_000, &blob[4_999_000..]));
+    let d = c.doc_get_fields("files", "v1", &["name"]).unwrap().unwrap();
+    assert_eq!((d.version, d.fields.len()), (vb, 1));
+    assert!(c.doc_read_bytes("files", "v1", "name", 0, 3).unwrap().unwrap().data == b"vid");
+    assert!(c.doc_read_bytes("files", "nope", "data", 0, 1).unwrap().is_none());
+    let err = c.doc_read_bytes("files", "v1", "data", 0, 64 << 20).unwrap_err();
+    assert!(matches!(err, StorageError::Rejected { .. }), "{err:?}");
+
     // Hostile bodies: errors, never a crash; the server keeps answering.
     let junk: Vec<Vec<u8>> = vec![
         vec![],

@@ -13,14 +13,14 @@
 from ._sve import Id, Timestamp, UInt64
 from ._wire import (Filter, FieldOp, add, and_, append, between, contains, eq, exists, ge, gt, in_, key_prefix, le, lt,
                     missing, ne, not_, or_, prefix, set_, unset)
-from .client import Client, Collection, Document, Transaction, connect
+from .client import ByteRange, Client, Collection, Document, Transaction, connect
 from .errors import (ConflictError, InvalidError, NotFoundError, OverloadedError, RateLimitedError, ServerError,
                      StorineError, UnauthorizedError, UnavailableError)
 
 __version__ = "0.1.0"
 
 __all__ = [
-    "connect", "Client", "Collection", "Document", "Transaction",
+    "connect", "Client", "Collection", "Document", "ByteRange", "Transaction",
     "set_", "unset", "add", "append", "FieldOp",
     "eq", "ne", "lt", "le", "gt", "ge", "between", "in_", "prefix", "contains", "exists", "missing", "key_prefix",
     "and_", "or_", "not_", "Filter",

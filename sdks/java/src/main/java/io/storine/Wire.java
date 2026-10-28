@@ -40,6 +40,47 @@ final class Wire {
         return out.toByteArray();
     }
 
+    /** Most bytes one ranged read returns (16 MiB). */
+    static final int MAX_BYTE_RANGE = 16 * 1024 * 1024;
+
+    /** {@code OP_DOC_GET} with a byte-range shape: bytes {@code offset .. offset + length} of one bytes/text field. */
+    static byte[] getRange(String collection, String key, String field, long offset, int length) {
+        if (offset < 0) throw new InvalidException("offset must not be negative");
+        if (length < 0 || length > MAX_BYTE_RANGE)
+            throw new InvalidException("length must be between 0 and " + MAX_BYTE_RANGE);
+        Values.Out out = new Values.Out();
+        out.str(collection);
+        out.str(key);
+        out.u8(1);
+        out.str(field);
+        out.u64(offset);
+        out.u32(length);
+        return out.toByteArray();
+    }
+
+    /** {@code OP_DOC_GET} with a projection shape: only the given (dotted) field paths. */
+    static byte[] getFields(String collection, String key, List<String> paths) {
+        if (paths.size() > 256) throw new InvalidException("at most 256 fields can be projected");
+        Values.Out out = new Values.Out();
+        out.str(collection);
+        out.str(key);
+        out.u8(2);
+        out.u32(paths.size());
+        for (String p : paths) out.str(p);
+        return out.toByteArray();
+    }
+
+    record Range(long total, byte[] data) {}
+
+    /** {@code u64 total | u32 n | n bytes}. */
+    static Range byteRange(byte[] body) {
+        Values.Reader r = new Values.Reader(body);
+        long total = r.u64();
+        byte[] data = r.take(r.u32());
+        if (r.remaining() != 0) throw new InvalidException("trailing bytes after byte range");
+        return new Range(total, data);
+    }
+
     static byte[] writes(List<Write> writes, byte[] requestId) {
         Values.Out out = new Values.Out();
         if (requestId == null) {

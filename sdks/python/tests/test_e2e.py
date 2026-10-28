@@ -167,6 +167,30 @@ class SingleNode(unittest.TestCase):
         c.drop_vector_index("emb")
         self.assertEqual(c.vector_indexes(), [])
 
+    def test_large_values(self):
+        c = self.db.collection("py_files")
+        blob = os.urandom(3 * 1024 * 1024 + 17)
+        v = c.put("f1", {"data": blob, "name": "cat.png", "meta": {"size": len(blob), "type": "image/png"}})
+        d = c.get("f1", fields=["name", "meta.size", "absent"])
+        self.assertEqual((dict(d), d.version), ({"name": "cat.png", "meta": {"size": len(blob)}}, v))
+        r = c.read_bytes("f1", "data", 1000, 16)
+        self.assertEqual((r.version, r.total, r.data), (v, len(blob), blob[1000:1016]))
+        self.assertEqual(c.read_bytes("f1", "data", len(blob) + 5, 10).data, b"")
+        self.assertEqual(b"".join(c.stream_bytes("f1", "data", chunk_size=1 << 20)), blob)
+        self.assertEqual(c.read_bytes("f1", "name", 0, 3).data, b"cat")
+        self.assertIsNone(c.read_bytes("nope", "data"))
+        with self.assertRaises(storine.NotFoundError):
+            list(c.stream_bytes("nope", "data"))
+        with self.assertRaises(storine.InvalidError):
+            c.read_bytes("f1", "meta")  # not bytes
+        with self.assertRaises(storine.InvalidError):
+            c.read_bytes("f1", "data", 0, 17 * 1024 * 1024)
+        chunks = c.stream_bytes("f1", "data", chunk_size=1 << 20)
+        next(chunks)
+        c.update("f1", set_("name", "dog.png"))
+        with self.assertRaises(storine.ConflictError):
+            list(chunks)
+
     def test_ttl_and_errors(self):
         s = self.db.collection("sessions")
         s.put("short", {"u": 1}, ttl=0.2)

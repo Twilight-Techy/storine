@@ -47,6 +47,7 @@ err = accounts.Scan(ctx, nil, func(d *storine.Document) error { ...; return nil 
 | `storine.Connect(url, storine.Options{Token, Timeout, FollowerReads, PoolSize})` | Connection pool to a server or cluster (safe for concurrent use). Options are optional. |
 | `db.Collection(name)` | A collection handle. |
 | `c.Get(ctx, key)` | `*Document` (`Key`, `Version`, `Fields`) or `nil`. |
+| `c.GetFields(ctx, key, paths...)` | `Get` returning only those (dotted) paths, e.g. `"name", "meta.size"`. |
 | `c.Put(ctx, key, fields)` / `c.PutWithTTL(ctx, key, fields, ttl)` | Create or replace; returns the version. |
 | `c.Insert(ctx, key, fields)` | Create only (`ErrConflict` if it exists). |
 | `c.Replace(ctx, key, fields)` / `c.ReplaceIfVersion(ctx, key, version, fields)` | Replace an existing document (optionally only at a version). |
@@ -58,6 +59,17 @@ err = accounts.Scan(ctx, nil, func(d *storine.Document) error { ...; return nil 
 | `c.CreateIndex` / `c.DropIndex` / `c.Info` / `c.Drop` | Indexes (up to 16 per collection) and collection management. |
 | `db.Transaction(ctx, func(tx *Tx) error)` | Writes committed atomically when `fn` returns nil; `tx.RequireVersion` / `tx.RequireExists` add checks. |
 | `db.Collections(ctx)` / `db.ClusterInfo(ctx)` | Introspection. |
+
+**Large values**: a bytes (or text) field can be read in pieces without fetching the document.
+`c.ReadBytes(ctx, key, field, offset, length)` returns `*ByteRange{Version, Total, Data}` (`nil` if the document
+does not exist; `length` up to `MaxByteRange` = 16 MiB; `Data` is empty past the end).
+`c.StreamBytes(ctx, key, field, chunkSize)` is an `io.Reader` fetching `chunkSize` (0: 1 MiB) at a time; its
+`Read` fails with `ErrNotFound` if the document does not exist and `ErrConflict` if it changes mid-read:
+
+```go
+meta, err := files.GetFields(ctx, "f1", "name", "meta.size") // skips the blob
+_, err = io.Copy(out, files.StreamBytes(ctx, "f1", "data", 0))
+```
 
 **Values**: `nil`, `bool`, all integer types (`int`… → int64, `uint64`/`uint` → uint64), `*big.Int` (up to 128 bits),
 `float64`, `storine.Decimal` (exact, up to 38 digits — use it for money; `MustDecimal("19.99")`, `ParseDecimal`, `NewDecimal`),

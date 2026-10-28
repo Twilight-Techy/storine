@@ -26,12 +26,13 @@ mod error;
 mod value;
 mod wire;
 
-pub use client::{connect, connect_with, Client, Collection, Options, Scan, Transaction};
+pub use client::{connect, connect_with, ByteStream, Client, Collection, Options, Scan, Transaction};
 pub use error::{Error, Result};
 pub use value::{dec, decode, encode, Decimal, Doc, Value};
 pub use wire::{
     add, and, append, between, contains, eq, exists, ge, gt, is_in, key_prefix, le, lt, matches, missing, ne, or,
-    prefix, set, unset, ClusterInfo, CollectionInfo, Document, FieldOp, Filter, Query, VectorIndex,
+    prefix, set, unset, ByteRange, ClusterInfo, CollectionInfo, Document, FieldOp, Filter, Query, VectorIndex,
+    MAX_BYTE_RANGE,
 };
 
 #[cfg(test)]

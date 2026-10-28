@@ -84,6 +84,8 @@ test("requests", () => {
   const rid = unhex("0102030405060708090a0b0c0d0e0f10");
   const built: Record<string, Uint8Array> = {
     "get accounts/alice": w.encodeGet("accounts", "alice"),
+    "get accounts/alice: bytes 1000..1004 of photo": w.encodeGetRange("accounts", "alice", "photo", 1000, 4),
+    "get accounts/alice: fields owner, meta.size": w.encodeGetFields("accounts", "alice", ["owner", "meta.size"]),
     "write: put": w.encodeWrites([{ collection: "accounts", key: "alice", kind: 1, fields: d }]),
     "write: insert (must not exist) with request id": w.encodeWrites([{ collection: "accounts", key: "alice", kind: 1, precondition: 1, fields: d }], new Uint8Array(16).fill(0xab)),
     "write: replace if version 7": w.encodeWrites([{ collection: "accounts", key: "alice", kind: 1, precondition: 3, version: 7n, fields: d }]),
@@ -126,6 +128,8 @@ test("responses", () => {
   assert.deepEqual(w.decodeWriteResponse(unhex(r["write ok: [v12, deleted]"].body_hex)), { versions: [12n, null], duplicate: false });
   const page = w.decodePage(unhex(r["page: total 42, next k1, one doc"].body_hex));
   assert.deepEqual(page, { total: 42, next: "k1", docs: [{ key: "k1", version: 3n, fields: { n: 1 } }] });
+  const range = w.decodeByteRange(unhex(r["byte range: total 5000, 4 bytes"].body_hex));
+  assert.deepEqual(range, { total: 5000, data: unhex("deadbeef") });
 });
 
 test("hostile bytes never crash and __proto__ stays data", () => {

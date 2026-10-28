@@ -12,7 +12,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::{invalid, Error, Result};
 use crate::value::{Doc, Reader};
-use crate::wire::{self, ClusterInfo, CollectionInfo, Document, FieldOp, Filter, Nearest, Query, VectorIndex, Write};
+use crate::wire::{
+    self, ByteRange, ClusterInfo, CollectionInfo, Document, FieldOp, Filter, Nearest, Query, VectorIndex, Write,
+    MAX_BYTE_RANGE,
+};
 
 const MAX_BODY: u32 = 256 * 1024 * 1024;
 
@@ -476,6 +479,52 @@ impl Collection<'_> {
         }
     }
 
+    /// The document `key` with only the fields at `paths` (such as `"name"` or `"meta.size"`; nested
+    /// paths come back nested, absent ones are left out), or `None` if it does not exist. Reads
+    /// metadata without transferring a large value stored beside it. At most 256 paths.
+    pub fn get_fields(&self, key: &str, paths: &[&str]) -> Result<Option<Document>> {
+        let r = self.client.request(wire::OP_DOC_GET, &wire::encode_get_fields(&self.name, key, paths)?)?;
+        match r.status {
+            wire::ST_NOT_FOUND => Ok(None),
+            wire::ST_OK => {
+                Ok(Some(Document { key: key.to_owned(), version: r.version, fields: Reader::new(&r.body).fields(1)? }))
+            }
+            s => Err(Client::error(s, &r.body)),
+        }
+    }
+
+    /// Bytes `offset .. offset + length` of the bytes (or text) field `field`, without reading the
+    /// rest of the document; `None` if the document does not exist. `length` is at most
+    /// [`MAX_BYTE_RANGE`] (16 MiB); past the end of the value, `data` is empty. `Error::Invalid` if
+    /// the field is missing or holds another type.
+    pub fn read_bytes(&self, key: &str, field: &str, offset: u64, length: u32) -> Result<Option<ByteRange>> {
+        let body = wire::encode_get_range(&self.name, key, field, offset, length)?;
+        let r = self.client.request(wire::OP_DOC_GET, &body)?;
+        match r.status {
+            wire::ST_NOT_FOUND => Ok(None),
+            wire::ST_OK => {
+                let (total, data) = wire::decode_byte_range(&r.body)?;
+                Ok(Some(ByteRange { version: r.version, total, data }))
+            }
+            s => Err(Client::error(s, &r.body)),
+        }
+    }
+
+    /// A large bytes (or text) field read lazily, chunk by chunk (each at most `chunk_size` bytes,
+    /// 1 ..= 16 MiB). Yields `Error::NotFound` if the document does not exist and `Error::Conflict`
+    /// if it changes while being read (the chunks would otherwise mix two versions).
+    pub fn stream_bytes(&self, key: &str, field: &str, chunk_size: u32) -> ByteStream<'_> {
+        ByteStream {
+            collection: self,
+            key: key.to_owned(),
+            field: field.to_owned(),
+            chunk_size,
+            offset: 0,
+            version: None,
+            done: false,
+        }
+    }
+
     /// Creates or replaces the document; returns its new version.
     pub fn put(&self, key: &str, fields: Doc) -> Result<u64> {
         self.one(Write::put(&self.name, key, fields, 0, 0, 0))
@@ -666,6 +715,67 @@ impl Iterator for Scan<'_> {
                     self.done = true;
                     return Some(Err(e));
                 }
+            }
+        }
+    }
+}
+
+/// The iterator returned by [`Collection::stream_bytes`]: one `Vec<u8>` per chunk, in order.
+#[derive(Debug)]
+pub struct ByteStream<'a> {
+    collection: &'a Collection<'a>,
+    key: String,
+    field: String,
+    chunk_size: u32,
+    offset: u64,
+    version: Option<u64>,
+    done: bool,
+}
+
+impl ByteStream<'_> {
+    fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+        if self.chunk_size == 0 || self.chunk_size > MAX_BYTE_RANGE {
+            return Err(invalid(format!("chunk_size must be between 1 and {MAX_BYTE_RANGE}")));
+        }
+        let Some(r) = self.collection.read_bytes(&self.key, &self.field, self.offset, self.chunk_size)? else {
+            return Err(Error::NotFound {
+                message: format!("document {:?} does not exist", self.key),
+                write_index: None,
+            });
+        };
+        if self.version.is_some_and(|v| v != r.version) {
+            return Err(Error::Conflict {
+                message: "the document changed while it was being read".into(),
+                write_index: None,
+                current_version: Some(r.version),
+            });
+        }
+        self.version = Some(r.version);
+        if r.data.is_empty() {
+            return Ok(None);
+        }
+        self.offset += r.data.len() as u64;
+        self.done = self.offset >= r.total;
+        Ok(Some(r.data))
+    }
+}
+
+impl Iterator for ByteStream<'_> {
+    type Item = Result<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Result<Vec<u8>>> {
+        if self.done {
+            return None;
+        }
+        match self.next_chunk() {
+            Ok(Some(chunk)) => Some(Ok(chunk)),
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
             }
         }
     }

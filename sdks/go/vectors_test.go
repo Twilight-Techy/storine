@@ -1,6 +1,7 @@
 package storine
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -217,8 +218,10 @@ func TestRequestVectors(t *testing.T) {
 	}
 	price := "price"
 	built := map[string][]byte{
-		"get accounts/alice": encodeGet("accounts", "alice"),
-		"write: put":         ws(nil, write{collection: "accounts", key: "alice", kind: 1, fields: d}),
+		"get accounts/alice":                            encodeGet("accounts", "alice"),
+		"get accounts/alice: bytes 1000..1004 of photo": must(encodeGetRange("accounts", "alice", "photo", 1000, 4)),
+		"get accounts/alice: fields owner, meta.size":   must(encodeGetFields("accounts", "alice", []string{"owner", "meta.size"})),
+		"write: put": ws(nil, write{collection: "accounts", key: "alice", kind: 1, fields: d}),
 		"write: insert (must not exist) with request id": ws(ab, write{collection: "accounts", key: "alice", kind: 1, pre: 1, fields: d}),
 		"write: replace if version 7":                    ws(nil, write{collection: "accounts", key: "alice", kind: 1, pre: 3, version: 7, fields: d}),
 		"write: put with ttl 1500 ms":                    ws(nil, must2(putWrite("sessions", "s1", Doc{"u": 1}, 1500*time.Millisecond, 0, 0))),
@@ -283,6 +286,10 @@ func TestResponseVectors(t *testing.T) {
 	if err != nil || p.total != 42 || *p.nextKey != "k1" || len(p.docs) != 1 ||
 		p.docs[0].Key != "k1" || p.docs[0].Version != 3 || p.docs[0].Fields["n"] != int64(1) {
 		t.Fatalf("page: %+v %v", p, err)
+	}
+	total, data, err := decodeByteRange(r["byte range: total 5000, 4 bytes"])
+	if err != nil || total != 5000 || !bytes.Equal(data, []byte{0xde, 0xad, 0xbe, 0xef}) {
+		t.Fatalf("byte range: %d %x %v", total, data, err)
 	}
 }
 

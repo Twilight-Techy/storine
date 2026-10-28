@@ -239,6 +239,45 @@ def encode_get(collection: str, key: str) -> bytes:
     return bytes(out)
 
 
+MAX_BYTE_RANGE = 16 * 1024 * 1024
+"""Most bytes one ranged read returns."""
+
+
+def encode_get_range(collection: str, key: str, field: str, offset: int, length: int) -> bytes:
+    if not 0 <= offset < 1 << 64:
+        raise InvalidError("offset must be between 0 and 2**64 - 1")
+    if not 0 <= length <= MAX_BYTE_RANGE:
+        raise InvalidError(f"length must be between 0 and {MAX_BYTE_RANGE}")
+    out = bytearray(encode_get(collection, key))
+    out.append(1)
+    put_str(out, field)
+    out += struct.pack("<QI", offset, length)
+    return bytes(out)
+
+
+def encode_get_fields(collection: str, key: str, paths: Sequence[str]) -> bytes:
+    if isinstance(paths, str):
+        raise InvalidError("fields is a list of field paths")
+    if len(paths) > 256:
+        raise InvalidError("at most 256 fields can be projected")
+    out = bytearray(encode_get(collection, key))
+    out.append(2)
+    out += struct.pack("<I", len(paths))
+    for p in paths:
+        put_str(out, p)
+    return bytes(out)
+
+
+def decode_byte_range(body: bytes) -> Tuple[int, bytes]:
+    """`u64 total | u32 n | n bytes` -> (total, data)."""
+    r = Reader(body)
+    total = r.u64()
+    data = r.take(r.u32())
+    if r.remaining():
+        raise InvalidError("trailing bytes after byte range")
+    return total, data
+
+
 def encode_writes(writes: Sequence[Write], request_id: Optional[bytes]) -> bytes:
     out = bytearray()
     if request_id is None:

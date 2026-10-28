@@ -522,7 +522,22 @@ func (c *Collection) one(ctx context.Context, w write, err error) (uint64, error
 
 // Get returns the document key, or nil (and no error) if it does not exist.
 func (c *Collection) Get(ctx context.Context, key string) (*Document, error) {
-	status, version, body, err := c.client.request(ctx, opDocGet, encodeGet(c.name, key))
+	return c.get(ctx, key, encodeGet(c.name, key))
+}
+
+// GetFields is Get returning only the given field paths (such as "name" or "meta.size"; at
+// most 256), so metadata can be read without transferring a large value stored beside it.
+// Nested paths come back nested; missing paths are left out.
+func (c *Collection) GetFields(ctx context.Context, key string, paths ...string) (*Document, error) {
+	req, err := encodeGetFields(c.name, key, paths)
+	if err != nil {
+		return nil, err
+	}
+	return c.get(ctx, key, req)
+}
+
+func (c *Collection) get(ctx context.Context, key string, req []byte) (*Document, error) {
+	status, version, body, err := c.client.request(ctx, opDocGet, req)
 	if err != nil {
 		return nil, err
 	}
@@ -537,6 +552,101 @@ func (c *Collection) Get(ctx context.Context, key string) (*Document, error) {
 		return nil, err
 	}
 	return &Document{Key: key, Version: version, Fields: fields}, nil
+}
+
+// ByteRange is a slice of a bytes (or text) field read with ReadBytes.
+type ByteRange struct {
+	Version uint64 // version of the document the bytes were read from
+	Total   uint64 // length of the whole value
+	Data    []byte // the bytes, starting at the requested offset
+}
+
+// ReadBytes returns bytes offset..offset+length of a bytes (or text) field without reading the
+// rest of the document, or nil (and no error) if the document does not exist. length is at most
+// MaxByteRange (16 MiB); past the end of the value, Data is empty. ErrInvalid if the field is
+// missing or not bytes/text.
+func (c *Collection) ReadBytes(ctx context.Context, key, field string, offset uint64, length int) (*ByteRange, error) {
+	req, err := encodeGetRange(c.name, key, field, offset, length)
+	if err != nil {
+		return nil, err
+	}
+	status, version, body, err := c.client.request(ctx, opDocGet, req)
+	if err != nil {
+		return nil, err
+	}
+	if status == stNotFound {
+		return nil, nil
+	}
+	if status != stOK {
+		return nil, statusError(status, body)
+	}
+	total, data, err := decodeByteRange(body)
+	if err != nil {
+		return nil, err
+	}
+	return &ByteRange{Version: version, Total: total, Data: data}, nil
+}
+
+// StreamBytes returns a reader over a large bytes (or text) field that fetches it chunk by chunk
+// (chunkSize bytes per request; 0 means 1 MiB). Read fails with ErrNotFound if the document does
+// not exist and with ErrConflict if it changes while being read (the chunks would otherwise mix
+// two versions).
+func (c *Collection) StreamBytes(ctx context.Context, key, field string, chunkSize int) io.Reader {
+	if chunkSize == 0 {
+		chunkSize = 1 << 20
+	}
+	return &byteStream{ctx: ctx, c: c, key: key, field: field, chunk: chunkSize}
+}
+
+type byteStream struct {
+	ctx        context.Context
+	c          *Collection
+	key, field string
+	chunk      int
+	offset     uint64
+	version    uint64
+	started    bool
+	buf        []byte
+	err        error // sticky: io.EOF once the value is exhausted
+}
+
+func (s *byteStream) Read(p []byte) (int, error) {
+	for len(s.buf) == 0 {
+		if s.err != nil {
+			return 0, s.err
+		}
+		s.fetch()
+	}
+	n := copy(p, s.buf)
+	s.buf = s.buf[n:]
+	return n, nil
+}
+
+func (s *byteStream) fetch() {
+	r, err := s.c.ReadBytes(s.ctx, s.key, s.field, s.offset, s.chunk)
+	switch {
+	case err != nil:
+		s.err = err
+		return
+	case r == nil:
+		s.err = newError(ErrNotFound, stNotFound, fmt.Sprintf("document %q does not exist", s.key))
+		return
+	case s.started && r.Version != s.version:
+		e := newError(ErrConflict, stConflict, "the document changed while it was being read")
+		e.CurrentVersion = r.Version
+		s.err = e
+		return
+	}
+	s.started, s.version = true, r.Version
+	if len(r.Data) == 0 {
+		s.err = io.EOF
+		return
+	}
+	s.offset += uint64(len(r.Data))
+	s.buf = r.Data
+	if s.offset >= r.Total {
+		s.err = io.EOF
+	}
 }
 
 // Put creates or replaces the document; returns its new version.

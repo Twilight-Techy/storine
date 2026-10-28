@@ -36,7 +36,7 @@ db.close();
 | --- | --- |
 | `connect(url, { token, timeoutMs, followerReads, poolSize })` | Lazy connection pool to a server or cluster. |
 | `db.collection(name)` | A collection handle. |
-| `c.get(key)` | `{ key, version, fields }` or `undefined`. |
+| `c.get(key, { fields })` | `{ key, version, fields }` or `undefined`; `fields: ["name", "meta.size"]` returns only those paths. |
 | `c.put(key, fields, { ttl })` | Create or replace; resolves to the version (`bigint`). `ttl` in seconds. |
 | `c.insert(key, fields)` | Create only (`ConflictError` if it exists). |
 | `c.replace(key, fields, { ifVersion })` | Replace an existing document (optionally only at a version). |
@@ -47,6 +47,16 @@ db.close();
 | `c.createVectorIndex(field, dims)`, `c.dropVectorIndex(field)`, `c.vectorIndexes()` | Vector indexes for `nearest` (`[{ field, dims, ready }]`). |
 | `c.createIndex(field)`, `c.dropIndex(field)`, `c.info()`, `c.drop()` | Indexes (up to 16 per collection) and collection management. |
 | `db.transaction(tx => ...)` | Buffered writes committed atomically; `tx.require(...)` adds a version check. |
+
+**Large values**: a bytes (or text) field can be read in pieces without fetching the document.
+`c.readBytes(key, field, offset = 0, length = 16 MiB)` resolves to `{ version, total, data }` (`undefined` if
+the document does not exist; `data` is empty past the end). `c.streamBytes(key, field, { chunkSize = 1 MiB })`
+is an async generator of chunks that throws `ConflictError` if the document changes mid-read:
+
+```ts
+const meta = await files.get("f1", { fields: ["name", "meta.size"] }); // skips the blob
+for await (const chunk of files.streamBytes("f1", "data")) out.write(chunk);
+```
 
 **Values**: `null`, `boolean`, integers (`number` up to 2^53, `bigint` up to 128 bits), floats (`number`;
 `float(5)` forces an integral float), `Decimal` (exact, 38 digits — use it for money), `string`, `Uint8Array`,

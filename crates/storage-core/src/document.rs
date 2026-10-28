@@ -63,6 +63,10 @@ pub const IDEMPOTENCY_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 /// Longest accepted collection name / document key (bytes).
 pub const MAX_NAME_LEN: usize = 255;
 pub const MAX_KEY_LEN: usize = 1024;
+/// Most bytes one ranged read returns (`read_bytes`); larger values are read in several calls.
+pub const MAX_BYTE_RANGE: usize = 16 * 1024 * 1024;
+/// Most field paths one projected read may name (`get_fields`).
+pub const MAX_PROJECTION_FIELDS: usize = 256;
 
 /// A document as stored: collection, key, typed fields and the ids of indexed fields.
 #[derive(Clone, Debug, PartialEq)]
@@ -690,6 +694,17 @@ pub struct Document {
     pub fields: BTreeMap<String, PropertyValue>,
 }
 
+/// A slice of one `Bytes` (or `Text`) field, read by [`DocumentStore::read_bytes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ByteRange {
+    /// Version of the document the slice was read from.
+    pub version: Version,
+    /// Length of the whole value in bytes.
+    pub total: u64,
+    /// Bytes `offset .. offset + data.len()` of the value (empty past its end).
+    pub data: Vec<u8>,
+}
+
 /// What a [`DocWrite`] does.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DocOp {
@@ -930,6 +945,89 @@ impl DocumentStore {
         match self.engine.with_ref(id, |view| document_from_view(&view, collection, key)) {
             Ok(Ok(doc)) => Ok(doc),
             Ok(Err(e)) => Err(e),
+            Err(StorageError::RecordNotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Reads only the named fields of a document (dotted paths reach into nested maps), so small
+    /// metadata can be read without copying a large value stored beside it. Paths that do not
+    /// exist are left out; nested paths come back nested (`a.b` as `{a: {b: ...}}`).
+    pub fn get_fields(&self, collection: &str, key: &str, paths: &[String]) -> Result<Option<Document>> {
+        validate_collection_name(collection, true)?;
+        validate_document_key(key)?;
+        if paths.len() > MAX_PROJECTION_FIELDS {
+            return Err(StorageError::invalid_value("too many projected fields (at most 256)"));
+        }
+        for p in paths {
+            if p.is_empty() || p.split('.').any(str::is_empty) {
+                return Err(StorageError::invalid_value("empty field path or path segment"));
+            }
+        }
+        let id = document_id(collection, key)?;
+        let read = self.engine.with_ref(id, |view| {
+            let a = view.archived();
+            let payload = view.payload();
+            if a.collection.as_str(payload) != collection || a.key.as_str(payload) != key {
+                return None;
+            }
+            let map = a.fields.view(payload);
+            let mut fields = BTreeMap::new();
+            for p in paths {
+                let v = lookup_path(map, p);
+                if !matches!(v, PropertyValueRef::Null) {
+                    insert_path(&mut fields, p, v.to_owned_value());
+                }
+            }
+            Some(Document { key: key.to_owned(), version: view.header().version(), fields })
+        });
+        match read {
+            Ok(doc) => Ok(doc),
+            Err(StorageError::RecordNotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Reads bytes `offset .. offset + len` of a `Bytes` (or `Text`) field without copying the
+    /// rest of the document. `len` is capped at [`MAX_BYTE_RANGE`]; reading past the end returns
+    /// what is there (nothing at or past `total`). `None` if the document does not exist.
+    pub fn read_bytes(
+        &self,
+        collection: &str,
+        key: &str,
+        path: &str,
+        offset: u64,
+        len: usize,
+    ) -> Result<Option<ByteRange>> {
+        validate_collection_name(collection, true)?;
+        validate_document_key(key)?;
+        if len > MAX_BYTE_RANGE {
+            return Err(StorageError::invalid_value("a ranged read returns at most 16 MiB"));
+        }
+        let id = document_id(collection, key)?;
+        let read = self.engine.with_ref(id, |view| {
+            let a = view.archived();
+            let payload = view.payload();
+            if a.collection.as_str(payload) != collection || a.key.as_str(payload) != key {
+                return Ok(None);
+            }
+            let bytes = match lookup_path(a.fields.view(payload), path) {
+                PropertyValueRef::Bytes(b) => b,
+                PropertyValueRef::Text(t) => t.as_bytes(),
+                PropertyValueRef::Null => {
+                    return Err(StorageError::invalid_value("the field to read does not exist"));
+                }
+                _ => {
+                    return Err(StorageError::invalid_value("the field to read is not bytes or text"));
+                }
+            };
+            let total = bytes.len() as u64;
+            let start = offset.min(total) as usize;
+            let end = start.saturating_add(len).min(bytes.len());
+            Ok(Some(ByteRange { version: view.header().version(), total, data: bytes[start..end].to_vec() }))
+        });
+        match read {
+            Ok(r) => r,
             Err(StorageError::RecordNotFound { .. }) => Ok(None),
             Err(e) => Err(e),
         }
@@ -1696,6 +1794,24 @@ fn document_from_view(view: &RecordView<'_, DocumentRecord>, collection: &str, k
     }))
 }
 
+/// Stores `value` at dotted `path`, creating the nested maps on the way.
+fn insert_path(fields: &mut BTreeMap<String, PropertyValue>, path: &str, value: PropertyValue) {
+    match path.split_once('.') {
+        None => {
+            fields.insert(path.to_owned(), value);
+        }
+        Some((head, rest)) => {
+            let slot = fields.entry(head.to_owned()).or_insert_with(|| PropertyValue::Map(BTreeMap::new()));
+            if !matches!(slot, PropertyValue::Map(_)) {
+                *slot = PropertyValue::Map(BTreeMap::new());
+            }
+            if let PropertyValue::Map(m) = slot {
+                insert_path(m, rest, value);
+            }
+        }
+    }
+}
+
 /// Exact numeric view (re-exported for SQL / SDK helpers).
 pub fn exact_decimal(v: &PropertyValue) -> Option<Decimal> {
     as_exact_decimal(v)
@@ -1717,6 +1833,70 @@ mod tests {
 
     fn fields(pairs: &[(&str, PropertyValue)]) -> BTreeMap<String, PropertyValue> {
         pairs.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect()
+    }
+
+    #[test]
+    fn test_ranged_reads_and_projections_copy_only_what_is_asked() {
+        let (s, dir) = store("ranges");
+        let blob: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        let mut meta = BTreeMap::new();
+        meta.insert("size".to_string(), PropertyValue::UInt64(blob.len() as u64));
+        meta.insert("type".to_string(), PropertyValue::Text("image/png".into()));
+        let v = s
+            .put(
+                "files",
+                "f1",
+                fields(&[
+                    ("data", PropertyValue::Bytes(blob.clone())),
+                    ("name", PropertyValue::Text("cat.png".into())),
+                    ("meta", PropertyValue::Map(meta)),
+                    ("note", PropertyValue::Text("héllo".into())),
+                ]),
+            )
+            .unwrap();
+
+        // Ranges: middle, tail (short), past the end (empty), text bytes.
+        let r = s.read_bytes("files", "f1", "data", 1_000_000, 4096).unwrap().unwrap();
+        assert_eq!((r.version, r.total, &r.data[..]), (v, 3_000_000, &blob[1_000_000..1_004_096]));
+        let r = s.read_bytes("files", "f1", "data", 2_999_990, 4096).unwrap().unwrap();
+        assert_eq!(r.data, blob[2_999_990..]);
+        assert!(s.read_bytes("files", "f1", "data", 3_000_000, 10).unwrap().unwrap().data.is_empty());
+        assert!(s.read_bytes("files", "f1", "data", u64::MAX, 10).unwrap().unwrap().data.is_empty());
+        assert_eq!(s.read_bytes("files", "f1", "note", 1, 2).unwrap().unwrap().data, "é".as_bytes());
+        // Reading the whole value chunk by chunk reassembles it exactly.
+        let mut whole = Vec::new();
+        let mut off = 0u64;
+        loop {
+            let r = s.read_bytes("files", "f1", "data", off, 1 << 20).unwrap().unwrap();
+            if r.data.is_empty() {
+                break;
+            }
+            off += r.data.len() as u64;
+            whole.extend_from_slice(&r.data);
+        }
+        assert_eq!(whole, blob);
+        // Errors and absences.
+        assert!(s.read_bytes("files", "f1", "missing", 0, 1).is_err());
+        assert!(s.read_bytes("files", "f1", "meta", 0, 1).is_err());
+        assert!(s.read_bytes("files", "f1", "data", 0, MAX_BYTE_RANGE + 1).is_err());
+        assert!(s.read_bytes("files", "nope", "data", 0, 1).unwrap().is_none());
+
+        // Projections: top-level and nested paths, missing paths left out.
+        let d = s
+            .get_fields("files", "f1", &["name".into(), "meta.size".into(), "absent".into(), "meta.x.y".into()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.version, v);
+        let mut want_meta = BTreeMap::new();
+        want_meta.insert("size".to_string(), PropertyValue::UInt64(3_000_000));
+        assert_eq!(
+            d.fields,
+            fields(&[("name", PropertyValue::Text("cat.png".into())), ("meta", PropertyValue::Map(want_meta))])
+        );
+        assert!(s.get_fields("files", "f1", &[]).unwrap().unwrap().fields.is_empty());
+        assert!(s.get_fields("files", "f1", &["a..b".into()]).is_err());
+        assert!(s.get_fields("files", "nope", &["name".into()]).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

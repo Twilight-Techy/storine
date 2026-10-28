@@ -50,6 +50,7 @@ try (Storine db = Storine.connect("storine://127.0.0.1:7878")) {   // or "storin
 | `Storine.connect(url[, Options.defaults().token(..).timeout(..).followerReads(..).poolSize(..)])` | Connection pool to a server or cluster (thread-safe). |
 | `db.collection(name)` | A collection handle. |
 | `c.get(key)` | `Optional<Document>` (`key()`, `version()`, `fields()`, `get(field)`). |
+| `c.getFields(key, paths...)` | `get` returning only those (dotted) paths, e.g. `"name", "meta.size"`. |
 | `c.put(key, fields[, ttl])` | Create or replace; returns the version. |
 | `c.insert(key, fields)` | Create only (`ConflictException` if it exists). |
 | `c.replace(key, fields)` / `c.replaceIfVersion(key, version, fields)` | Replace an existing document (optionally only at a version). |
@@ -61,6 +62,17 @@ try (Storine db = Storine.connect("storine://127.0.0.1:7878")) {   // or "storin
 | `c.createVectorIndex(field, dims)` / `c.dropVectorIndex(field)` / `c.vectorIndexes()` | Vector indexes for `nearest` (`VectorIndex(field, dims, ready)`). |
 | `db.transaction(tx -> ...)` | Writes committed atomically when the lambda returns; `tx.requireVersion` / `tx.requireExists` add checks. |
 | `db.collections()` / `db.clusterInfo()` | Introspection. |
+
+**Large values**: a bytes (or text) field can be read in pieces without fetching the document.
+`c.readBytes(key, field, offset, length)` returns `Optional<ByteRange>` (`version()`, `total()`, `data()`; empty if
+the document does not exist; `length` up to 16 MiB; `data()` is empty past the end).
+`c.streamBytes(key, field[, chunkSize])` is an `InputStream` fetching 1 MiB (or `chunkSize`) at a time; its reads
+throw `NotFoundException` if the document does not exist and `ConflictException` if it changes mid-read:
+
+```java
+Document meta = files.getFields("f1", "name", "meta.size").orElseThrow(); // skips the blob
+try (InputStream in = files.streamBytes("f1", "data")) { in.transferTo(out); }
+```
 
 **Values**: `null`, `Boolean`, `Byte`/`Short`/`Integer`/`Long` (int64), `UInt64`, `BigInteger` (up to 128 bits), `Float`/`Double`,
 `BigDecimal` (exact, up to 38 digits — use it for money), `String`, `byte[]`, `Instant` (nanoseconds), `UUID`, collections/arrays

@@ -104,6 +104,8 @@ public class VectorsTests
         var built = new Dictionary<string, byte[]>
         {
             ["get accounts/alice"] = Wire.Get("accounts", "alice"),
+            ["get accounts/alice: bytes 1000..1004 of photo"] = Wire.GetRange("accounts", "alice", "photo", 1000, 4),
+            ["get accounts/alice: fields owner, meta.size"] = Wire.GetFields("accounts", "alice", new[] { "owner", "meta.size" }),
             ["write: put"] = Ws(null, Wire.Write.Put("accounts", "alice", d, 0, 0, 0)),
             ["write: insert (must not exist) with request id"] = Ws(ab, Wire.Write.Put("accounts", "alice", d, 0, 1, 0)),
             ["write: replace if version 7"] = Ws(null, Wire.Write.Put("accounts", "alice", d, 0, 3, 7)),
@@ -153,6 +155,9 @@ public class VectorsTests
         Assert.Equal(42u, p.Total);
         Assert.Equal("k1", p.NextKey);
         Assert.Equal(("k1", 3ul, 1L), (p.Docs[0].Key, p.Docs[0].Version, (long)p.Docs[0]["n"]!));
+        var (total, data) = Wire.ReadByteRange(r["byte range: total 5000, 4 bytes"]);
+        Assert.Equal(5000ul, total);
+        Assert.Equal(new byte[] { 0xde, 0xad, 0xbe, 0xef }, data);
     }
 
     [Fact]

@@ -1,6 +1,7 @@
 // End-to-end tests against a real storage-server (single node and a 3-node cluster).
 import assert from "node:assert/strict";
 import { ChildProcess, spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import * as net from "node:net";
 import { tmpdir } from "node:os";
@@ -146,6 +147,33 @@ test("vector search", { skip }, async () => {
   await assert.rejects(c.nearest("emb", [1, 2], { k: 1 }), s.InvalidError);
   await c.dropVectorIndex("emb");
   assert.deepEqual(await c.vectorIndexes(), []);
+});
+
+test("large values: projection, byte ranges and streaming", { skip }, async () => {
+  const c = db.collection("ts_files");
+  const blob = new Uint8Array(randomBytes(3 * 1024 * 1024 + 17));
+  const v = await c.put("f1", { data: blob, name: "cat.png", meta: { size: blob.length, type: "image/png" } });
+  const d = await c.get("f1", { fields: ["name", "meta.size", "absent"] });
+  assert.deepEqual(d, { key: "f1", version: v, fields: { name: "cat.png", meta: { size: blob.length } } });
+  const r = await c.readBytes("f1", "data", 1000, 16);
+  assert.deepEqual(r, { version: v, total: blob.length, data: blob.subarray(1000, 1016) });
+  assert.equal((await c.readBytes("f1", "data", blob.length + 5, 10))!.data.length, 0);
+  const parts: Uint8Array[] = [];
+  for await (const chunk of c.streamBytes("f1", "data", { chunkSize: 1 << 20 })) parts.push(chunk);
+  assert.ok(Buffer.concat(parts).equals(Buffer.from(blob)));
+  assert.equal(new TextDecoder().decode((await c.readBytes("f1", "name", 0, 3))!.data), "cat");
+  assert.equal(await c.readBytes("nope", "data"), undefined);
+  await assert.rejects(async () => {
+    for await (const _ of c.streamBytes("nope", "data")) { /* drain */ }
+  }, s.NotFoundError);
+  await assert.rejects(c.readBytes("f1", "meta"), s.InvalidError); // not bytes
+  await assert.rejects(c.readBytes("f1", "data", 0, 17 * 1024 * 1024), s.InvalidError);
+  const chunks = c.streamBytes("f1", "data", { chunkSize: 1 << 20 });
+  await chunks.next();
+  await c.update("f1", s.set("name", "dog.png"));
+  await assert.rejects(async () => {
+    for await (const _ of chunks) { /* drain */ }
+  }, s.ConflictError);
 });
 
 test("three-node cluster: redirects and failover", { skip, timeout: 60000 }, async () => {

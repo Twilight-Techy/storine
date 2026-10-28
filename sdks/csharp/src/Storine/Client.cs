@@ -449,12 +449,62 @@ public sealed class Collection
         (await client.CommitAsync(new[] { w }, ct).ConfigureAwait(false))[0] ?? 0;
 
     /// <summary>The document <paramref name="key"/>, or null if it does not exist.</summary>
-    public async Task<Document?> GetAsync(string key, CancellationToken ct = default)
+    public Task<Document?> GetAsync(string key, CancellationToken ct = default) => GetAsync(key, Wire.Get(Name, key), ct);
+
+    /// <summary>
+    /// <see cref="GetAsync(string, CancellationToken)"/> returning only the given field paths (such as <c>"name"</c> or
+    /// <c>"meta.size"</c>; at most 256), so metadata can be read without transferring a large value stored beside it.
+    /// Nested paths come back nested; missing paths are left out.
+    /// </summary>
+    public Task<Document?> GetAsync(string key, IEnumerable<string> fields, CancellationToken ct = default) =>
+        GetAsync(key, Wire.GetFields(Name, key, fields.ToList()), ct);
+
+    private async Task<Document?> GetAsync(string key, byte[] request, CancellationToken ct)
     {
-        var r = await client.RequestAsync(Wire.OpDocGet, Wire.Get(Name, key), ct).ConfigureAwait(false);
+        var r = await client.RequestAsync(Wire.OpDocGet, request, ct).ConfigureAwait(false);
         if (r.Status == Wire.StNotFound) return null;
         if (r.Status != Wire.StOk) throw StorineClient.Error(r.Status, r.Body);
         return new Document(key, r.Version, new Values.Reader(r.Body).Fields(1));
+    }
+
+    /// <summary>
+    /// Bytes <c>offset .. offset + length</c> of a bytes (or text) field, without reading the rest of the document; null if
+    /// the document does not exist. <paramref name="length"/> is at most 16 MiB (the default); past the end of the value,
+    /// <c>Data</c> is empty. <see cref="InvalidException"/> if the field is missing or not bytes/text.
+    /// </summary>
+    public async Task<ByteRange?> ReadBytesAsync(string key, string field, ulong offset = 0, int length = Wire.MaxByteRange,
+        CancellationToken ct = default)
+    {
+        var req = Wire.GetRange(Name, key, field, offset, length);
+        var r = await client.RequestAsync(Wire.OpDocGet, req, ct).ConfigureAwait(false);
+        if (r.Status == Wire.StNotFound) return null;
+        if (r.Status != Wire.StOk) throw StorineClient.Error(r.Status, r.Body);
+        var (total, data) = Wire.ReadByteRange(r.Body);
+        return new ByteRange(r.Version, total, data);
+    }
+
+    /// <summary>
+    /// A large bytes (or text) field, chunk by chunk (each at most <paramref name="chunkSize"/> bytes, default 1 MiB).
+    /// Throws <see cref="NotFoundException"/> if the document does not exist and <see cref="ConflictException"/> if it
+    /// changes while being read (the chunks would otherwise mix two versions).
+    /// </summary>
+    public async IAsyncEnumerable<ReadOnlyMemory<byte>> StreamBytesAsync(string key, string field, int chunkSize = 1 << 20,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        ulong offset = 0;
+        ulong? version = null;
+        while (true)
+        {
+            var r = await ReadBytesAsync(key, field, offset, chunkSize, ct).ConfigureAwait(false)
+                ?? throw new NotFoundException($"document '{key}' does not exist", Wire.StNotFound);
+            if (version is not null && r.Version != version)
+                throw new ConflictException("the document changed while it was being read", -1, r.Version);
+            version = r.Version;
+            if (r.Data.Length == 0) yield break;
+            offset += (ulong)r.Data.Length;
+            yield return r.Data;
+            if (offset >= r.Total) yield break;
+        }
     }
 
     /// <summary>Creates or replaces the document (expiring after <paramref name="ttl"/> if given); returns its new version.</summary>

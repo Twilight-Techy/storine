@@ -22,6 +22,11 @@ module Storine
     def score = self["$score"]
   end
 
+  # A slice of a bytes (or text) field, returned by Collection#read_bytes: `data` (binary String)
+  # starts at the requested offset and is empty past the end of the value; `total` is the whole
+  # value's length and `version` the version of the document it was read from.
+  ByteRange = Struct.new(:version, :total, :data)
+
   # One TCP connection speaking the binary protocol.
   class Connection
     ZERO_KEY = ("\x00" * 24).b.freeze
@@ -350,12 +355,57 @@ module Storine
     end
 
     # The document `key`, or nil if it does not exist.
-    def get(key)
-      status, version, body = client.request(Wire::OP_DOC_GET, Wire.encode_get(name, key), idempotent: true)
+    #
+    # With `fields:` (paths such as "name" or "meta.size"; nested paths come back nested), only
+    # those fields are sent, so metadata can be read without transferring a large value beside it.
+    def get(key, fields: nil)
+      req = fields.nil? ? Wire.encode_get(name, key) : Wire.encode_get_fields(name, key, fields.to_a)
+      status, version, body = client.request(Wire::OP_DOC_GET, req, idempotent: true)
       return nil if status == Wire::ST_NOT_FOUND
 
       client.raise_for(status, body) unless status == Wire::ST_OK
       Document.new(key, version, Reader.new(body).map)
+    end
+
+    # Bytes `offset ... offset + length` of a bytes (or text) field as a ByteRange, without reading
+    # the rest of the document; nil if the document does not exist. `length` is at most 16 MiB;
+    # past the end of the value, `data` is empty. InvalidError if the field is missing or of
+    # another type.
+    def read_bytes(key, field, offset = 0, length = Wire::MAX_BYTE_RANGE)
+      req = Wire.encode_get_range(name, key, field, offset, length)
+      status, version, body = client.request(Wire::OP_DOC_GET, req, idempotent: true)
+      return nil if status == Wire::ST_NOT_FOUND
+
+      client.raise_for(status, body) unless status == Wire::ST_OK
+      total, data = Wire.decode_byte_range(body)
+      ByteRange.new(version, total, data)
+    end
+
+    # Yields a large bytes (or text) field chunk by chunk (binary Strings of at most `chunk_size`
+    # bytes); an Enumerator without a block. Raises NotFoundError if the document does not exist
+    # and ConflictError if it changes while being read (the chunks would otherwise mix two versions).
+    def stream_bytes(key, field, chunk_size: 1 << 20, offset: 0)
+      return enum_for(:stream_bytes, key, field, chunk_size: chunk_size, offset: offset) unless block_given?
+      unless chunk_size.is_a?(Integer) && chunk_size.between?(1, Wire::MAX_BYTE_RANGE)
+        raise InvalidError, "chunk_size must be between 1 and #{Wire::MAX_BYTE_RANGE}"
+      end
+
+      version = nil
+      loop do
+        r = read_bytes(key, field, offset, chunk_size)
+        raise NotFoundError.new("document #{key.inspect} does not exist", Wire::ST_NOT_FOUND) if r.nil?
+        if version && r.version != version
+          raise ConflictError.new("the document changed while it was being read", nil, r.version)
+        end
+
+        version = r.version
+        break if r.data.empty?
+
+        offset += r.data.bytesize
+        yield r.data
+        break if offset >= r.total
+      end
+      nil
     end
 
     # Creates or replaces the document; returns its new version. `ttl:` in seconds.

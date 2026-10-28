@@ -172,8 +172,9 @@ const fn max_body_len(op: u8) -> usize {
         OP_RAFT_VOTE => 64,
         OP_PUT_RAW_FRAME | OP_CAS_PUT | OP_BATCH_GET | OP_BATCH_PUT | OP_RAFT_APPEND
         | OP_MIGRATE_VSHARD | OP_TXN | OP_DOC_WRITE => MAX_PAYLOAD_SIZE as usize,
-        // Collection + key, or a query / collection command (filters are small).
-        OP_DOC_GET => 2 * 1024 + 16,
+        // Collection + key (+ a byte range or up to 256 projected paths); a query / collection
+        // command (filters are small).
+        OP_DOC_GET => 128 * 1024,
         OP_SET_OPTIONS => 16,
         OP_CLUSTER_CHANGE => 512,
         OP_DOC_QUERY | OP_DOC_ADMIN | OP_DOC_INFO => 1024 * 1024,
@@ -2357,6 +2358,63 @@ impl StorageClient {
             STATUS_OK => {
                 let fields = storage_codec::value_wire::SveReader::new(&resp).map_body()?;
                 Ok(Some(storage_core::Document { key: key.to_owned(), version: Version(version), fields }))
+            }
+            STATUS_NOT_FOUND => Ok(None),
+            s => Err(remote_error(s, version, &resp)),
+        }
+    }
+
+    /// Reads only the named fields (dotted paths) of a document.
+    pub fn doc_get_fields(
+        &mut self,
+        collection: &str,
+        key: &str,
+        paths: &[&str],
+    ) -> Result<Option<storage_core::Document>> {
+        let mut body = Vec::new();
+        storage_core::document_wire::put_str(&mut body, collection);
+        storage_core::document_wire::put_str(&mut body, key);
+        body.push(2);
+        body.extend_from_slice(&(paths.len() as u32).to_le_bytes());
+        for p in paths {
+            storage_core::document_wire::put_str(&mut body, p);
+        }
+        let (status, version, resp) = self.rpc(OP_DOC_GET, NO_KEY, &body)?;
+        match status {
+            STATUS_OK => {
+                let fields = storage_codec::value_wire::SveReader::new(&resp).map_body()?;
+                Ok(Some(storage_core::Document { key: key.to_owned(), version: Version(version), fields }))
+            }
+            STATUS_NOT_FOUND => Ok(None),
+            s => Err(remote_error(s, version, &resp)),
+        }
+    }
+
+    /// Reads `len` bytes at `offset` of a `Bytes` / `Text` field (`None` if the document does not
+    /// exist).
+    pub fn doc_read_bytes(
+        &mut self,
+        collection: &str,
+        key: &str,
+        field: &str,
+        offset: u64,
+        len: u32,
+    ) -> Result<Option<storage_core::ByteRange>> {
+        let mut body = Vec::new();
+        storage_core::document_wire::put_str(&mut body, collection);
+        storage_core::document_wire::put_str(&mut body, key);
+        body.push(1);
+        storage_core::document_wire::put_str(&mut body, field);
+        body.extend_from_slice(&offset.to_le_bytes());
+        body.extend_from_slice(&len.to_le_bytes());
+        let (status, version, resp) = self.rpc(OP_DOC_GET, NO_KEY, &body)?;
+        match status {
+            STATUS_OK => {
+                let bad = || StorageError::invalid_value("malformed byte range reply");
+                let total = u64::from_le_bytes(resp.get(..8).ok_or_else(bad)?.try_into().map_err(|_| bad())?);
+                let n = u32::from_le_bytes(resp.get(8..12).ok_or_else(bad)?.try_into().map_err(|_| bad())?) as usize;
+                let data = resp.get(12..).filter(|d| d.len() == n).ok_or_else(bad)?.to_vec();
+                Ok(Some(storage_core::ByteRange { version: Version(version), total, data }))
             }
             STATUS_NOT_FOUND => Ok(None),
             s => Err(remote_error(s, version, &resp)),

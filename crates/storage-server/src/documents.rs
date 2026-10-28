@@ -78,22 +78,73 @@ fn index_of(ids: &[InlineId], id: InlineId) -> usize {
     ids.iter().position(|&x| x == id).unwrap_or(u32::MAX as usize)
 }
 
-/// `OP_DOC_GET`: `str collection | str key` -> `map` (version in the header).
+/// What an `OP_DOC_GET` asks for after the collection and key.
+enum GetShape {
+    Whole,
+    /// `u8 1 | str field | u64 offset | u32 length` -> `u64 total | u32 n | n bytes`.
+    Range { field: String, offset: u64, len: u32 },
+    /// `u8 2 | u32 count | str path*` -> `map` of only those fields.
+    Fields(Vec<String>),
+}
+
+/// `OP_DOC_GET`: `str collection | str key [| shape]` -> `map`, a byte range or a projected
+/// `map` (version in the header).
 pub(crate) fn doc_get(store: &DocumentStore, body: &[u8]) -> Reply {
     let mut r = SveReader::new(body);
-    let parsed = (|| -> storage_types::Result<(String, String)> {
+    let parsed = (|| -> storage_types::Result<(String, String, GetShape)> {
         let c = r.str()?.to_owned();
         let k = r.str()?.to_owned();
+        let shape = if r.remaining() == 0 {
+            GetShape::Whole
+        } else {
+            match r.u8()? {
+                1 => {
+                    let field = r.str()?.to_owned();
+                    let offset = r.u64()?;
+                    let len = r.u32()?;
+                    GetShape::Range { field, offset, len }
+                }
+                2 => {
+                    let n = r.u32()? as usize;
+                    if n > storage_core::MAX_PROJECTION_FIELDS {
+                        return Err(StorageError::invalid_value("too many projected fields (at most 256)"));
+                    }
+                    let mut paths = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        paths.push(r.str()?.to_owned());
+                    }
+                    GetShape::Fields(paths)
+                }
+                _ => return Err(StorageError::invalid_value("unknown get shape")),
+            }
+        };
         if r.remaining() != 0 {
             return Err(StorageError::invalid_value("trailing bytes after get request"));
         }
-        Ok((c, k))
+        Ok((c, k, shape))
     })();
-    let (c, k) = match parsed {
+    let (c, k, shape) = match parsed {
         Ok(v) => v,
         Err(e) => return error_reply(&e),
     };
-    match store.get(&c, &k) {
+    let doc = match shape {
+        GetShape::Range { field, offset, len } => {
+            return match store.read_bytes(&c, &k, &field, offset, len as usize) {
+                Ok(Some(range)) => {
+                    let mut out = Vec::with_capacity(12 + range.data.len());
+                    out.extend_from_slice(&range.total.to_le_bytes());
+                    out.extend_from_slice(&(range.data.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&range.data);
+                    (STATUS_OK, range.version.0, out)
+                }
+                Ok(None) => (STATUS_NOT_FOUND, 0, Vec::new()),
+                Err(e) => error_reply(&e),
+            };
+        }
+        GetShape::Fields(paths) => store.get_fields(&c, &k, &paths),
+        GetShape::Whole => store.get(&c, &k),
+    };
+    match doc {
         Ok(Some(doc)) => {
             let mut out = Vec::new();
             encode_map_body(&doc.fields, &mut out);

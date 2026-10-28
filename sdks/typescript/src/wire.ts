@@ -184,6 +184,46 @@ export function encodeGet(collection: string, key: string): Uint8Array {
   return w.finish();
 }
 
+/** Most bytes one ranged read (`readBytes`) returns: 16 MiB. */
+export const MAX_BYTE_RANGE = 16 * 1024 * 1024;
+
+/** `OP_DOC_GET` with a byte-range shape: bytes `offset .. offset + length` of one bytes/text field. */
+export function encodeGetRange(collection: string, key: string, field: string, offset: number | bigint, length: number): Uint8Array {
+  const off = BigInt(offset);
+  if (off < 0n || off >= 1n << 64n) throw new InvalidError("offset must be between 0 and 2^64 - 1");
+  if (!Number.isInteger(length) || length < 0 || length > MAX_BYTE_RANGE) throw new InvalidError(`length must be between 0 and ${MAX_BYTE_RANGE}`);
+  const w = new Writer();
+  w.str(collection);
+  w.str(key);
+  w.u8(1);
+  w.str(field);
+  w.u64(off);
+  w.u32(length);
+  return w.finish();
+}
+
+/** `OP_DOC_GET` with a projection shape: only the given (dotted) field paths. */
+export function encodeGetFields(collection: string, key: string, paths: readonly string[]): Uint8Array {
+  if (typeof paths === "string" || !Array.isArray(paths)) throw new InvalidError("fields is a list of field paths");
+  if (paths.length > 256) throw new InvalidError("at most 256 fields can be projected");
+  const w = new Writer();
+  w.str(collection);
+  w.str(key);
+  w.u8(2);
+  w.u32(paths.length);
+  for (const p of paths) w.str(p);
+  return w.finish();
+}
+
+/** `u64 total | u32 n | n bytes` -> `{ total, data }`. */
+export function decodeByteRange(body: Uint8Array): { total: number; data: Uint8Array } {
+  const r = new Reader(body);
+  const total = Number(r.u64());
+  const data = r.take(r.u32());
+  if (r.remaining()) throw new InvalidError("trailing bytes after byte range");
+  return { total, data };
+}
+
 export function encodeWrites(writes: Write[], requestId?: Uint8Array): Uint8Array {
   const w = new Writer();
   if (requestId) {

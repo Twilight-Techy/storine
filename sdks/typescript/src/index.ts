@@ -11,7 +11,7 @@
  */
 
 export { connect, Client, Collection, Transaction } from "./client";
-export type { ConnectOptions, Document, FindOptions, IfVersion, NearestOptions } from "./client";
+export type { ByteRange, ConnectOptions, Document, FindOptions, GetOptions, IfVersion, NearestOptions } from "./client";
 export {
   add, and, append, between, contains, eq, exists, ge, gt, isIn, keyPrefix, le, lt, missing, ne, not, or, prefix, set, unset,
 } from "./wire";

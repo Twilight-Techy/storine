@@ -35,7 +35,8 @@ pub use backup::{
 pub use catalog::{CatalogTransaction, CollectionMeta, DatabaseCatalog, ErasedCollectionEngine};
 pub use document::{
     CollectionInfo, CommitSink, DocOp, DocPage, DocQuery, DocWrite, Direction, Document,
-    DocumentRecord, DocumentStore, Filter, WriteSummary, MAX_DOCUMENT_INDEXES,
+    DocumentRecord, DocumentStore, Filter, WriteSummary, ByteRange, MAX_BYTE_RANGE, MAX_DOCUMENT_INDEXES,
+    MAX_PROJECTION_FIELDS,
 };
 pub use engine::{
     EncryptionConfig, IndexTier, PrimaryTier, ResealReport, Precondition, WriteKind, WriteOp, WriteResult,

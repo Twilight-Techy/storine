@@ -8,7 +8,7 @@ import socket
 import struct
 import threading
 import time
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import _wire as w
@@ -35,6 +35,15 @@ class Document(dict):
     def score(self) -> Optional[float]:
         """Similarity of a `nearest` result (None for other queries)."""
         return self.get("$score")
+
+
+class ByteRange(NamedTuple):
+    """A slice of a bytes / text field: `data` starts at the requested offset; `total` is the
+    whole value's length and `version` the document version it was read from."""
+
+    version: int
+    total: int
+    data: bytes
 
 
 class _Connection:
@@ -344,14 +353,55 @@ class Collection(_Writer):
         self.client = client
         self.name = name
 
-    def get(self, key: str) -> Optional[Document]:
-        """The document `key`, or `None` if it does not exist."""
-        status, version, body = self.client._request(w.OP_DOC_GET, w.encode_get(self.name, key), idempotent=True)
+    def get(self, key: str, *, fields: Optional[Sequence[str]] = None) -> Optional[Document]:
+        """The document `key`, or `None` if it does not exist.
+
+        With `fields` (paths such as `"name"` or `"meta.size"`), only those fields are sent, so
+        metadata can be read without transferring a large value stored beside it.
+        """
+        req = w.encode_get(self.name, key) if fields is None else w.encode_get_fields(self.name, key, list(fields))
+        status, version, body = self.client._request(w.OP_DOC_GET, req, idempotent=True)
         if status == w.ST_NOT_FOUND:
             return None
         if status != w.ST_OK:
             self.client._raise(status, body)
         return Document(key, version, Reader(body).map())
+
+    def read_bytes(self, key: str, field: str, offset: int = 0, length: int = w.MAX_BYTE_RANGE) -> Optional[ByteRange]:
+        """Bytes `offset .. offset + length` of a bytes (or text) field, without reading the rest
+        of the document; `None` if the document does not exist. `length` is at most 16 MiB; past
+        the end of the value, `data` is empty."""
+        req = w.encode_get_range(self.name, key, field, offset, length)
+        status, version, body = self.client._request(w.OP_DOC_GET, req, idempotent=True)
+        if status == w.ST_NOT_FOUND:
+            return None
+        if status != w.ST_OK:
+            self.client._raise(status, body)
+        total, data = w.decode_byte_range(body)
+        return ByteRange(version, total, data)
+
+    def stream_bytes(self, key: str, field: str, *, chunk_size: int = 1 << 20, offset: int = 0) -> Iterator[bytes]:
+        """Yields a large bytes field chunk by chunk (each at most `chunk_size` bytes).
+
+        Raises NotFoundError if the document does not exist and ConflictError if it changes
+        while being read (the chunks would otherwise mix two versions).
+        """
+        if not 0 < chunk_size <= w.MAX_BYTE_RANGE:
+            raise InvalidError(f"chunk_size must be between 1 and {w.MAX_BYTE_RANGE}")
+        version = None
+        while True:
+            r = self.read_bytes(key, field, offset, chunk_size)
+            if r is None:
+                raise NotFoundError(f"document {key!r} does not exist")
+            if version is not None and r.version != version:
+                raise ConflictError("the document changed while it was being read", current_version=r.version)
+            version = r.version
+            if not r.data:
+                return
+            offset += len(r.data)
+            yield r.data
+            if offset >= r.total:
+                return
 
     def put(self, key: str, fields: Dict[str, Any], *, ttl: Optional[float] = None) -> int:
         """Creates or replaces the document; returns its new version. `ttl` in seconds."""

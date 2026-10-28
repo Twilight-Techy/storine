@@ -228,6 +228,55 @@ func encodeGet(collection, key string) []byte {
 	return w.b
 }
 
+// MaxByteRange is the most bytes one ReadBytes call returns (16 MiB).
+const MaxByteRange = 16 << 20
+
+// encodeGetRange is OP_DOC_GET with a byte-range shape: bytes offset..offset+length of one field.
+func encodeGetRange(collection, key, field string, offset uint64, length int) ([]byte, error) {
+	if length < 0 || length > MaxByteRange {
+		return nil, invalidf("length must be between 0 and %d", MaxByteRange)
+	}
+	w := &writer{b: encodeGet(collection, key)}
+	w.u8(1)
+	w.str(field)
+	w.u64(offset)
+	w.u32(uint32(length))
+	return w.b, nil
+}
+
+// encodeGetFields is OP_DOC_GET with a projection shape: only the given (dotted) paths.
+func encodeGetFields(collection, key string, paths []string) ([]byte, error) {
+	if len(paths) > 256 {
+		return nil, invalidf("at most 256 fields can be projected")
+	}
+	w := &writer{b: encodeGet(collection, key)}
+	w.u8(2)
+	w.u32(uint32(len(paths)))
+	for _, p := range paths {
+		w.str(p)
+	}
+	return w.b, nil
+}
+
+// decodeByteRange decodes `u64 total | u32 n | n bytes`.
+func decodeByteRange(body []byte) (total uint64, data []byte, err error) {
+	r := &reader{b: body}
+	if total, err = r.u64(); err != nil {
+		return 0, nil, err
+	}
+	n, err := r.u32()
+	if err != nil {
+		return 0, nil, err
+	}
+	if data, err = r.take(int(n)); err != nil {
+		return 0, nil, err
+	}
+	if r.remaining() != 0 {
+		return 0, nil, invalidf("trailing bytes after byte range")
+	}
+	return total, data, nil
+}
+
 func encodeWrites(writes []write, requestID []byte) ([]byte, error) {
 	w := &writer{}
 	if requestID == nil {

@@ -218,6 +218,14 @@ fn requests() {
     let ttl = u64::try_from(Duration::from_millis(1500).as_millis()).unwrap();
     let mut built: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
     built.insert("get accounts/alice", encode_get("accounts", "alice").unwrap());
+    built.insert(
+        "get accounts/alice: bytes 1000..1004 of photo",
+        encode_get_range("accounts", "alice", "photo", 1000, 4).unwrap(),
+    );
+    built.insert(
+        "get accounts/alice: fields owner, meta.size",
+        encode_get_fields("accounts", "alice", &["owner", "meta.size"]).unwrap(),
+    );
     built.insert("write: put", ws(None, vec![Write::put("accounts", "alice", d.clone(), 0, 0, 0)]));
     built.insert(
         "write: insert (must not exist) with request id",
@@ -321,6 +329,9 @@ fn responses() {
     let p = decode_page(&r["page: total 42, next k1, one doc"]).unwrap();
     assert_eq!((p.total, p.next_key.as_deref()), (42, Some("k1")));
     assert_eq!(p.docs, vec![Document { key: "k1".into(), version: 3, fields: doc! {"n" => 1} }]);
+    let (total, data) = decode_byte_range(&r["byte range: total 5000, 4 bytes"]).unwrap();
+    assert_eq!((total, data), (5000, vec![0xde, 0xad, 0xbe, 0xef]));
+    assert!(matches!(decode_byte_range(&r["byte range: total 5000, 4 bytes"][..15]), Err(Error::Invalid(_))));
 }
 
 #[test]

@@ -13,10 +13,16 @@ final class Collection
     {
     }
 
-    /** The document `$key`, or null if it does not exist. */
-    public function get(string $key): ?Document
+    /**
+     * The document `$key`, or null if it does not exist. With `fields:` (paths such as `'name'` or
+     * `'meta.size'`; nested paths come back nested), only those fields are sent, so metadata can be
+     * read without transferring a large value stored beside it.
+     * @param ?list<string> $fields
+     */
+    public function get(string $key, ?array $fields = null): ?Document
     {
-        [$status, $version, $body] = $this->client->request(Wire::OP_DOC_GET, Wire::encodeGet($this->name, $key), true);
+        $req = $fields === null ? Wire::encodeGet($this->name, $key) : Wire::encodeGetFields($this->name, $key, array_values($fields));
+        [$status, $version, $body] = $this->client->request(Wire::OP_DOC_GET, $req, true);
         if ($status === Wire::ST_NOT_FOUND) {
             return null;
         }
@@ -24,6 +30,57 @@ final class Collection
             $this->client->fail($status, $body);
         }
         return new Document($key, $version, (new Reader($body))->map());
+    }
+
+    /**
+     * Bytes `$offset .. $offset + $length` of a bytes (or text) field, without reading the rest of
+     * the document; null if the document does not exist. `$length` is at most 16 MiB; past the end
+     * of the value, `data` is empty. InvalidException if the field is missing or of another type.
+     */
+    public function readBytes(string $key, string $field, int $offset = 0, int $length = Wire::MAX_BYTE_RANGE): ?ByteRange
+    {
+        $req = Wire::encodeGetRange($this->name, $key, $field, $offset, $length);
+        [$status, $version, $body] = $this->client->request(Wire::OP_DOC_GET, $req, true);
+        if ($status === Wire::ST_NOT_FOUND) {
+            return null;
+        }
+        if ($status !== Wire::ST_OK) {
+            $this->client->fail($status, $body);
+        }
+        [$total, $data] = Wire::decodeByteRange($body);
+        return new ByteRange($version, $total, $data);
+    }
+
+    /**
+     * Yields a large bytes (or text) field chunk by chunk (each at most `$chunkSize` bytes, as a
+     * string). Throws NotFoundException if the document does not exist and ConflictException if it
+     * changes while being read (the chunks would otherwise mix two versions).
+     * @return \Generator<int, string>
+     */
+    public function streamBytes(string $key, string $field, int $chunkSize = 1 << 20, int $offset = 0): \Generator
+    {
+        if ($chunkSize < 1 || $chunkSize > Wire::MAX_BYTE_RANGE) {
+            throw new InvalidException('chunkSize must be between 1 and ' . Wire::MAX_BYTE_RANGE);
+        }
+        $version = null;
+        while (true) {
+            $r = $this->readBytes($key, $field, $offset, $chunkSize);
+            if ($r === null) {
+                throw new NotFoundException("document '$key' does not exist", Wire::ST_NOT_FOUND);
+            }
+            if ($version !== null && $r->version !== $version) {
+                throw new ConflictException('the document changed while it was being read', null, $r->version);
+            }
+            $version = $r->version;
+            if ($r->data === '') {
+                return;
+            }
+            $offset += strlen($r->data);
+            yield $r->data;
+            if ($offset >= $r->total) {
+                return;
+            }
+        }
     }
 
     /** Creates or replaces the document; returns its new version. `$ttl` in seconds. */

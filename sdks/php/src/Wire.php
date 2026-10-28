@@ -11,6 +11,8 @@ final class Wire
         OP_DOC_INFO = 0x25, OP_SET_OPTIONS = 0x26, OP_CLUSTER_INFO = 0x27;
     public const ST_OK = 0, ST_NOT_FOUND = 1, ST_ERROR = 2, ST_OVERLOADED = 3, ST_CONFLICT = 4, ST_UNAUTHORIZED = 5,
         ST_RATE_LIMITED = 6, ST_NOT_LEADER = 7, ST_INVALID = 8, ST_COMMIT_UNKNOWN = 9;
+    /** Most bytes one ranged read returns (16 MiB). */
+    public const MAX_BYTE_RANGE = 16 * 1024 * 1024;
 
     public static function encodeGet(string $collection, string $key): string
     {
@@ -18,6 +20,48 @@ final class Wire
         Sve::putStr($out, $collection);
         Sve::putStr($out, $key);
         return $out;
+    }
+
+    /** `get` shape 1: `u8 1 | str field | u64 offset | u32 length` (a byte range of one field). */
+    public static function encodeGetRange(string $collection, string $key, string $field, int $offset, int $length): string
+    {
+        if ($offset < 0) {
+            throw new InvalidException('offset must not be negative');
+        }
+        if ($length < 0 || $length > self::MAX_BYTE_RANGE) {
+            throw new InvalidException('length must be between 0 and ' . self::MAX_BYTE_RANGE);
+        }
+        $out = self::encodeGet($collection, $key) . "\x01";
+        Sve::putStr($out, $field);
+        return $out . pack('PV', $offset, $length);
+    }
+
+    /**
+     * `get` shape 2: `u8 2 | u32 count | str path*` (only these dotted paths).
+     * @param list<string> $paths
+     */
+    public static function encodeGetFields(string $collection, string $key, array $paths): string
+    {
+        if (count($paths) > 256) {
+            throw new InvalidException('at most 256 fields can be projected');
+        }
+        $out = self::encodeGet($collection, $key) . "\x02" . pack('V', count($paths));
+        foreach ($paths as $p) {
+            Sve::putStr($out, $p);
+        }
+        return $out;
+    }
+
+    /** @return array{0: int, 1: string} total, data (`u64 total | u32 n | n bytes`) */
+    public static function decodeByteRange(string $body): array
+    {
+        $r = new Reader($body);
+        $total = $r->u64Int();
+        $data = $r->take($r->u32());
+        if ($r->remaining() !== 0) {
+            throw new InvalidException('trailing bytes after byte range');
+        }
+        return [$total, $data];
     }
 
     /** @param list<Write> $writes */
