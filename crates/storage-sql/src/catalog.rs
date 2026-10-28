@@ -26,6 +26,10 @@ pub const TABLES: &str = "_sql_tables";
 pub const UNIQUE: &str = "_sql_unique";
 pub const SEQUENCES: &str = "_sql_seq";
 pub const LOCKS: &str = "_sql_locks";
+/// Reference markers: touched by every write that makes a row point at a parent row, so a
+/// concurrent parent delete that scanned before the child committed fails instead of
+/// leaving an orphan.
+pub const REFS: &str = "_sql_refs";
 
 /// Collections the gateway keeps for itself (hidden from table listings).
 pub fn is_internal(collection: &str) -> bool {

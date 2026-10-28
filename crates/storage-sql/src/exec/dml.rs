@@ -11,7 +11,7 @@ use crate::ast::{
     BinaryOp, DataType, Delete, Expr, Insert, InsertSource, OnConflict, Query, RefAction,
     SelectItem, SetExpr, TableRef, Update,
 };
-use crate::catalog::{encode_key, Row, Table, LOCKS, SEQUENCES, UNIQUE};
+use crate::catalog::{encode_key, Row, Table, LOCKS, REFS, SEQUENCES, UNIQUE};
 use crate::datum::{cast, Datum};
 use crate::error::{SqlError, SqlResult};
 use crate::exec::eval::{Env, Exec};
@@ -207,6 +207,43 @@ fn fk_parent(
         .map(|m| (UNIQUE.to_owned(), m)))
 }
 
+/// Key of the reference marker of parent row `(collection, key)`.
+fn ref_marker(collection: &str, key: &str) -> String {
+    let mut id = Vec::with_capacity(collection.len() + key.len() + 1);
+    id.extend_from_slice(collection.as_bytes());
+    id.push(0);
+    id.extend_from_slice(key.as_bytes());
+    crate::hash::hex(&crate::hash::sha256(&id))[..40].to_owned()
+}
+
+/// Buffers the checks that a row now references parent `(coll, pkey)`: the parent must exist at
+/// commit, and its reference marker is touched (a blind write: children never conflict).
+fn reference_parent(
+    txn: &mut super::Txn,
+    table: &str,
+    coll: String,
+    pkey: String,
+    constraint: String,
+) {
+    txn.check(Write {
+        collection: REFS.into(),
+        key: ref_marker(&coll, &pkey),
+        op: Op::Put(Doc::new()),
+        pre: Pre::None,
+        tag: Tag::Internal,
+    });
+    txn.check(Write {
+        collection: coll,
+        key: pkey,
+        op: Op::Check,
+        pre: Pre::Exists,
+        tag: Tag::Parent {
+            table: table.to_owned(),
+            constraint,
+        },
+    });
+}
+
 fn marker_doc(row_key: &str) -> Doc {
     let mut d = Doc::new();
     d.insert("row".into(), Value::Text(row_key.to_owned()));
@@ -261,16 +298,7 @@ fn apply_insert(s: &mut Session, table: &Table, key: &str, row: &Row) -> SqlResu
         );
     }
     for (coll, pkey, name) in parents {
-        txn.check(Write {
-            collection: coll,
-            key: pkey,
-            op: Op::Check,
-            pre: Pre::Exists,
-            tag: Tag::Parent {
-                table: table.name.clone(),
-                constraint: name,
-            },
-        });
+        reference_parent(txn, &table.name, coll, pkey, name);
     }
     Ok(())
 }
@@ -386,16 +414,7 @@ fn apply_update(
         }
     }
     for (coll, pkey, name) in parents {
-        txn.check(Write {
-            collection: coll,
-            key: pkey,
-            op: Op::Check,
-            pre: Pre::Exists,
-            tag: Tag::Parent {
-                table: table.name.clone(),
-                constraint: name,
-            },
-        });
+        reference_parent(txn, &table.name, coll, pkey, name);
     }
     Ok(())
 }
@@ -454,6 +473,8 @@ enum Action {
         old: Row,
         new: Row,
     },
+    /// Fail the commit if a child referenced the parent after `pre` was observed.
+    Pin { marker: String, pre: Pre },
 }
 
 /// Deletes a row and applies the referential actions of the foreign keys that point at it.
@@ -486,9 +507,35 @@ fn plan_and_apply_delete(
                 old,
                 new,
             } => apply_update(s, &table, &key, version, &old, &new)?,
+            Action::Pin { marker, pre } => s.txn_mut().check(Write {
+                collection: REFS.into(),
+                key: marker,
+                op: Op::Check,
+                pre,
+                tag: Tag::Internal,
+            }),
         }
     }
     Ok(())
+}
+
+/// The document children of `ref_cols` point at: the row itself for its primary key, else the
+/// unique marker of that key (as `fk_parent` resolves it on the child side).
+fn parent_identity(
+    table: &Table,
+    key: &str,
+    ref_cols: &[usize],
+    row: &Row,
+) -> SqlResult<Option<(String, String)>> {
+    if ref_cols == table.primary_key.as_slice() {
+        return Ok(Some((table.collection.clone(), key.to_owned())));
+    }
+    match table.uniques.iter().find(|u| u.columns == ref_cols) {
+        Some(uk) => Ok(table
+            .unique_marker(uk, row)?
+            .map(|m| (UNIQUE.to_owned(), m))),
+        None => Ok(None),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -544,6 +591,25 @@ fn plan_delete(
             })
             .reduce(|a, b| Expr::binary(BinaryOp::And, a, b));
         let Some(cond) = cond else { continue };
+        // Pin the parent's reference marker *before* looking for children: a child committed
+        // after this read changes the marker and fails this delete (40001), and the retry
+        // then sees the child.
+        if let Some(parent_id) = parent_identity(table, key, &ref_cols, old)? {
+            let mk = ref_marker(&parent_id.0, &parent_id.1);
+            // This transaction's own children are seen by the scan below (and their marker
+            // writes would fail a version check in the same batch).
+            let own = s
+                .txn
+                .as_ref()
+                .is_some_and(|t| t.checks.iter().any(|w| w.collection == REFS && w.key == mk));
+            if !own && seen.insert((REFS.to_owned(), mk.clone())) {
+                let v = s.engine.store.get(REFS, &mk)?.map(|d| d.version);
+                plan.push(Action::Pin {
+                    marker: mk,
+                    pre: v.map_or(Pre::Absent, Pre::Version),
+                });
+            }
+        }
         let ex = Exec::new(s, &[]);
         let conjs = conjuncts(&cond);
         let cols = table_cols(&child);

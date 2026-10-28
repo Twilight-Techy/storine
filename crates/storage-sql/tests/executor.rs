@@ -517,3 +517,54 @@ fn databases_are_separate_namespaces() {
         .new_session(Dialect::Postgres, "app", Some("test_shop"));
     assert_eq!(err(&mut fresh, "SELECT * FROM notes"), "42P01");
 }
+
+#[test]
+fn parent_delete_racing_a_child_insert_never_leaves_an_orphan() {
+    let db = setup("fkrace");
+    let mut a = db.engine.new_session(Dialect::Postgres, "app", None);
+    let mut b = db.engine.new_session(Dialect::Postgres, "app", None);
+    ok(
+        &mut a,
+        "CREATE TABLE owners (id INT PRIMARY KEY, email TEXT UNIQUE)",
+    );
+    ok(
+        &mut a,
+        "CREATE TABLE pets (id SERIAL PRIMARY KEY, owner INT REFERENCES owners(id))",
+    );
+    ok(
+        &mut a,
+        "CREATE TABLE tags (id SERIAL PRIMARY KEY, owner_email TEXT REFERENCES owners(email))",
+    );
+    ok(&mut a, "INSERT INTO owners VALUES (1, 'a@x'), (2, 'b@x')");
+
+    // A deletes the parent (no children yet); B adds a child and commits first.
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "DELETE FROM owners WHERE id = 1");
+    ok(&mut b, "INSERT INTO pets (owner) VALUES (1)");
+    assert_eq!(err(&mut a, "COMMIT"), "40001");
+    assert_eq!(one(&mut a, "SELECT count(*) FROM owners WHERE id = 1"), "1");
+    // Retried, the delete now sees the child.
+    assert_eq!(err(&mut a, "DELETE FROM owners WHERE id = 1"), "23503");
+
+    // The same through a unique-key reference.
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "DELETE FROM owners WHERE id = 2");
+    ok(&mut b, "INSERT INTO tags (owner_email) VALUES ('b@x')");
+    assert_eq!(err(&mut a, "COMMIT"), "40001");
+    assert_eq!(
+        one(&mut a, "SELECT count(*) FROM tags t LEFT JOIN owners o ON o.email = t.owner_email WHERE o.id IS NULL"),
+        "0"
+    );
+
+    // Children added in the deleting transaction itself are seen, not a conflict.
+    ok(&mut a, "INSERT INTO owners VALUES (3, 'c@x')");
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "INSERT INTO pets (owner) VALUES (3)");
+    assert_eq!(err(&mut a, "DELETE FROM owners WHERE id = 3"), "23503");
+    ok(&mut a, "ROLLBACK");
+    // And unrelated concurrent children do not block a delete.
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "DELETE FROM owners WHERE id = 3");
+    ok(&mut b, "INSERT INTO pets (owner) VALUES (1)");
+    ok(&mut a, "COMMIT");
+}
