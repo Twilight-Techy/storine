@@ -529,3 +529,22 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - **The clients wrap tokens differently.** mssql-jdbc sends a plain GSS Kerberos token with mutual authentication (AP-REP returned); SqlClient (MIT GSSAPI) and go-mssqldb (gokrb5) send SPNEGO without it.
   - **go-mssqldb mangles some SPNs.** It canonicalizes the SPN host through a CNAME lookup and drops the last character of an answer without a trailing dot, so `localhost` became `localhos`. Its test uses an SPN host name that does not resolve.
 - **Verification**: `tests/clients/kerberos/realm.sh` creates a throwaway MIT realm (KDC, user, service keytab, ticket cache). `run_all.sh` starts a storine-sql with that keytab. SqlClient, mssql-jdbc and go-mssqldb then log in as `ann`, and a ticket for a service the keytab lacks is refused with the reason.
+
+### Stage 23 (completion): Cluster membership changes (`TASK-121`) — 2026-10-28
+
+- **Why**: membership was the last documented Raft limit: a cluster could not grow, shrink or replace a node without being rebuilt.
+- **Design**: single-server changes (Raft thesis §4). Joint consensus is not needed when one voter changes at a time, because any majority of the old configuration overlaps any majority of the new one.
+- **Safety rules**:
+  - A configuration takes effect when appended, not when committed, and is rolled back with a truncated suffix.
+  - Only one change is in flight at a time.
+  - A leader may propose a change only after committing an entry of its own term. This fixes the known single-server-change bug: a leader elected in a newer term could otherwise act on an uncommitted configuration from an earlier one.
+  - Learners never count towards commit, leases or elections.
+  - A self-removing leader steps down only after the change commits.
+- **Persistence**: compaction would otherwise drop the configuration with the entries that carry it. It is now persisted at the compaction point (`_raft.members`) and carried by snapshots, so a node caught up by `InstallSnapshot` learns members it never saw in its log.
+- **Verification**:
+  - Three new runtime tests passed 15 consecutive runs. They cover: grow 3→4 and quorum 3 of 4 (the leader plus the new node cannot commit); leader self-removal and re-election; learners not counted; refused changes (two voters at once, promoting a voter, removing an unknown member, a follower proposing); and configuration through compaction, snapshot and restart.
+  - A TCP cluster test passed 10 runs. A release-binary smoke test used three processes, a fourth joined with `--join` through `storage-cli cluster add` sent to a follower, then removed the leader (the joined node was elected), then restarted a node with stale `--peers`.
+- **Bug found and fixed along the way (document index builds, `TASK-097` / `TASK-101`)**:
+  - Under machine load, `test_index_build_stays_exact_under_concurrent_writes` failed in 36 of 160 runs: an indexed query missed a document that a full scan found.
+  - **Cause**: a writer read the collection's index ids, then the build published the index as *building*, then the writer committed with the stale ids. The rebuild pass then skipped that document on its version conflict, assuming the newer version already carried the index; it did not. A field patch could slip through the same way, since a patch keeps the index ids already stored on the document.
+  - **Fix**: every document write now checks, in its own atomic commit, that the collection's `$meta` version is still the one its index ids came from. On a mismatch it is rebuilt with fresh ids (bounded retries). The rebuild pass re-reads and rewrites a document that changed under it instead of skipping it. Under the same load the failure rate is now 0 of 160.

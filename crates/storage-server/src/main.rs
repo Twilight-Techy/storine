@@ -1,12 +1,19 @@
 //! Standalone binary entrypoint for `storage-server` (`TASK-029`).
 //!
 //! Usage: `storage-server [data_dir] [bind_addr] [--max-connections N] [--records agent]
-//!         [--node-id N --peers 1=host:port,2=host:port,3=host:port] [--once]`
+//!         [--node-id N (--peers 1=host:port,2=host:port,3=host:port | --join)] [--once]`
 //!
 //! Cluster mode (`--node-id` + `--peers`, every member listed including this one): the node joins
 //! a Raft group; writes go through consensus on the leader, followers redirect clients to it.
 //! Peers talk Raft over the same port. `STORAGE_CLUSTER_TOKEN` is the Admin token nodes use to
 //! authenticate to each other (it is registered automatically; required with authentication).
+//! `--peers` only bootstraps a new cluster: once the cluster changes its membership
+//! (`storage-cli cluster ...`, `OP_CLUSTER_CHANGE`), the configuration in the Raft log wins.
+//!
+//! Growing a cluster (`TASK-121`): start the new node with `--node-id N --join` (no `--peers`;
+//! it waits, without campaigning, for the leader to add it), then ask the leader to add it:
+//! `storage-cli cluster <leader> add N host:port` (it joins as a learner and is promoted to
+//! voter once it has caught up).
 //!
 //! Security configuration (environment):
 //! - `STORAGE_AUTH_TOKENS`: comma-separated `token:role` pairs (`role` = `read` | `write` | `admin`).
@@ -28,6 +35,7 @@ use std::time::Duration;
 
 use std::collections::HashMap;
 
+use storage_core::raft::{Member, Membership};
 use storage_core::raft_runtime::{RaftConfig, RaftRuntime};
 use storage_core::{AgentObjectRecord, DocumentStore, EngineConfig, NodeId, RaftNode, StorageEngine};
 use storage_server::{cluster, RbacRole, SecurityConfig, StorageServer, DEFAULT_MAX_CONNECTIONS};
@@ -118,12 +126,16 @@ fn run() -> Result<()> {
     }
     let store = Arc::new(DocumentStore::open(data_dir, EngineConfig::default())?);
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1));
-    if let (Some(node_id), Some(peers)) = (flag("--node-id"), flag("--peers")) {
+    let join = args.iter().any(|a| a == "--join");
+    if let (Some(node_id), true) = (flag("--node-id"), flag("--peers").is_some() || join) {
         let node_id: NodeId = node_id
             .parse()
             .map_err(|_| StorageError::invalid_key("--node-id must be a number (1-65535)"))?;
-        let members = parse_peers(peers)?;
-        if !members.contains_key(&node_id) {
+        let members = match flag("--peers") {
+            Some(peers) => parse_peers(peers)?,
+            None => HashMap::new(),
+        };
+        if !join && !members.contains_key(&node_id) {
             return Err(StorageError::invalid_key("--peers must list this node's own --node-id"));
         }
         let token = env::var("STORAGE_CLUSTER_TOKEN").ok();
@@ -148,15 +160,28 @@ fn run() -> Result<()> {
         }
         let node = Arc::new(RaftNode::new(node_id, Arc::clone(store.engine()))?);
         let transport = Arc::new(cluster::TcpRaftTransport::new(raft_peers, token, Duration::from_millis(500)));
-        let runtime = RaftRuntime::start(node, members.keys().copied().collect(), transport, RaftConfig::default())?;
+        // A joining node starts without a configuration (it never campaigns) and learns the
+        // cluster's from the leader.
+        let bootstrap = if join {
+            Membership::default()
+        } else {
+            Membership::new(
+                members.iter().map(|(&id, addr)| Member { id, addr: addr.clone(), voter: true }).collect(),
+            )?
+        };
+        let runtime = RaftRuntime::start_with_membership(node, bootstrap, transport, RaftConfig::default())?;
         let server = StorageServer::start_documents_cluster(
             bind_addr,
             store,
             max_connections,
             security,
-            cluster::ClusterOptions { runtime, client_addrs: members },
+            cluster::ClusterOptions { runtime, client_addrs: members.clone() },
         )?;
-        let mode = format!("documents, raft node {node_id} of {}", flag("--peers").map_or(0, |p| p.split(',').count()));
+        let mode = if join {
+            format!("documents, raft node {node_id} waiting to be added to a cluster")
+        } else {
+            format!("documents, raft node {node_id} of {}", members.len())
+        };
         report((server.local_addr(), server.max_connections()), data_dir, auth_enabled, &mode);
         return park(server, once);
     }

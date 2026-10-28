@@ -192,7 +192,8 @@ exact (index hits are re-checked).
 |---|---|---|---|
 | `OP_AUTH` `0x0C` | – | token (UTF-8) | `Ok`, `version` = role (`1` read, `2` write, `3` admin) or `Unauthorized` |
 | `OP_SET_OPTIONS` `0x26` | read | `u8 flags` (bit 0: allow possibly stale follower reads) | `Ok` |
-| `OP_CLUSTER_INFO` `0x27` | read | – | `u64 node_id | u8 is_leader | u64 leader_id | str leader_addr | u64 term | u64 commit | u64 applied | u32 n | (u64 node_id | str addr)*` |
+| `OP_CLUSTER_INFO` `0x27` | read | – | `u64 node_id | u8 is_leader | u64 leader_id | str leader_addr | u64 term | u64 commit | u64 applied | u32 n | (u64 node_id | str addr)* | n × u8 role` (`1` voter, `0` learner; absent from servers before membership changes) |
+| `OP_CLUSTER_CHANGE` `0x28` | admin | `u8 action | u16 node_id | str addr` (action `1` add voter, `2` add learner, `3` promote, `4` remove; `addr` for adds) | `Ok` once the change is applied; `NotLeader` on followers; `Invalid` when refused (change in flight, more than one voter, unknown member) |
 | `OP_HEALTH` `0x13` | read | – | JSON text |
 
 A standalone server reports `node_id = 0`, `is_leader = 1`.

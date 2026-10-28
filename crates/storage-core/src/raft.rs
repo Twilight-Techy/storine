@@ -11,6 +11,12 @@
 //! - Durable hard state (fsynced before any vote/ack) and an append-only checksummed log.
 //! - `InstallSnapshot` (Raft §7, `TASK-089`): a follower behind the leader's compacted log is
 //!   caught up by streaming a point-in-time snapshot of the leader's engine in chunks.
+//! - Membership changes (Raft thesis §4, `TASK-121`): the cluster configuration is a log entry
+//!   ([`RaftCommand::Config`]) that takes effect as soon as it is appended. Changes are made one
+//!   voter at a time (any two majorities of consecutive configurations overlap), only one may be
+//!   in flight, and a leader proposes one only after committing an entry of its own term.
+//!   Learners receive the log but neither vote nor count towards quorum. Snapshots carry the
+//!   configuration, and the configuration at the compaction point is persisted.
 //!
 //! Transport and election timers are driven by the caller: `RaftReplicationGroup` delivers
 //! messages in-process, and `storage-server` exposes `RequestVote` / `AppendEntries` over TCP
@@ -55,6 +61,114 @@ pub enum RaftCommand {
     Noop,
     /// Removes every record whose TTL expired at `now_ns` (deterministic on every replica).
     SweepExpired { now_ns: u64 },
+    /// New cluster configuration (`TASK-121`), effective from the moment it is appended.
+    Config(Membership),
+}
+
+/// One cluster member: its node id, the address it serves on (Raft RPCs and clients), and
+/// whether it votes (a non-voting *learner* only receives the log).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Member {
+    pub id: NodeId,
+    pub addr: String,
+    pub voter: bool,
+}
+
+/// Largest cluster configuration accepted (members) and member address length (bytes).
+const MAX_MEMBERS: usize = 256;
+const MAX_MEMBER_ADDR: usize = 255;
+
+/// A cluster configuration: members sorted by id, ids unique.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Membership {
+    members: Vec<Member>,
+}
+
+impl Membership {
+    /// Builds a configuration; fails on duplicate ids, id `0`, too many members or long addresses.
+    pub fn new(mut members: Vec<Member>) -> Result<Self> {
+        members.sort_by_key(|m| m.id);
+        if members.len() > MAX_MEMBERS
+            || members.windows(2).any(|w| w[0].id == w[1].id)
+            || members.iter().any(|m| m.id == 0 || m.addr.len() > MAX_MEMBER_ADDR)
+        {
+            return Err(StorageError::invalid_value(
+                "cluster configuration: member ids must be unique and non-zero, addresses at most 255 bytes, at most 256 members",
+            ));
+        }
+        Ok(Self { members })
+    }
+
+    /// Every id a voter, with no addresses (static bootstrap from a list of ids).
+    pub fn voters_from_ids(ids: impl IntoIterator<Item = NodeId>) -> Result<Self> {
+        Self::new(ids.into_iter().map(|id| Member { id, addr: String::new(), voter: true }).collect())
+    }
+
+    pub fn members(&self) -> &[Member] {
+        &self.members
+    }
+
+    pub fn get(&self, id: NodeId) -> Option<&Member> {
+        self.members.iter().find(|m| m.id == id)
+    }
+
+    pub fn contains(&self, id: NodeId) -> bool {
+        self.get(id).is_some()
+    }
+
+    pub fn is_voter(&self, id: NodeId) -> bool {
+        self.get(id).is_some_and(|m| m.voter)
+    }
+
+    pub fn voters(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.members.iter().filter(|m| m.voter).map(|m| m.id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    /// `count u16 | (id u16 | voter u8 | addr_len u16 | addr)*`
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + self.members.len() * 24);
+        out.extend_from_slice(&(self.members.len() as u16).to_le_bytes());
+        for m in &self.members {
+            out.extend_from_slice(&m.id.to_le_bytes());
+            out.push(u8::from(m.voter));
+            out.extend_from_slice(&(m.addr.len() as u16).to_le_bytes());
+            out.extend_from_slice(m.addr.as_bytes());
+        }
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let bad = || StorageError::corrupted_header("malformed cluster configuration");
+        let count = usize::from(read_u16_le(bytes.get(..2).ok_or_else(bad)?, 0));
+        if count > MAX_MEMBERS {
+            return Err(bad());
+        }
+        let mut at = 2usize;
+        let mut members = Vec::with_capacity(count);
+        for _ in 0..count {
+            let head = bytes.get(at..at + 5).ok_or_else(bad)?;
+            let len = usize::from(read_u16_le(head, 3));
+            let addr = bytes.get(at + 5..at + 5 + len).ok_or_else(bad)?;
+            members.push(Member {
+                id: read_u16_le(head, 0),
+                voter: match head[2] {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(bad()),
+                },
+                addr: String::from_utf8(addr.to_vec()).map_err(|_| bad())?,
+            });
+            at += 5 + len;
+        }
+        if at != bytes.len() {
+            return Err(bad());
+        }
+        Self::new(members).map_err(|_| bad())
+    }
 }
 
 /// Replicated Raft log entry.
@@ -416,9 +530,12 @@ impl InstallSnapshotResp {
 pub const RAFT_SNAPSHOT_CHUNK: usize = 1 << 20;
 
 // Snapshot file: `magic | last_index u64 | last_term u64 | count u64 | header_check u64`, then
-// `count` x `[id 24B | frame_len u32 | check u64 | frame]` with
-// `check = checksum(frame) ^ checksum(id).rotate_left(29)`.
-const SNAPSHOT_MAGIC: &[u8; 8] = b"STGESNP1";
+// (version 2) the cluster configuration `config_index u64 | len u32 | Membership | check u64`
+// (`len` 0: none), then `count` x `[id 24B | frame_len u32 | check u64 | frame]` with
+// `check = checksum(frame) ^ checksum(id).rotate_left(29)`. Version 1 files (no configuration)
+// are still read.
+const SNAPSHOT_MAGIC_V1: &[u8; 8] = b"STGESNP1";
+const SNAPSHOT_MAGIC: &[u8; 8] = b"STGESNP2";
 const SNAPSHOT_HEADER_LEN: usize = 40;
 const SNAPSHOT_RECORD_HEADER: usize = 24 + 4 + 8;
 
@@ -427,6 +544,42 @@ struct SnapshotMeta {
     last_index: u64,
     last_term: u64,
     count: u64,
+    /// Version 2: a cluster configuration block follows the header.
+    v2: bool,
+}
+
+/// Upper bound of an encoded configuration block.
+const MAX_CONFIG_BLOCK: usize = 2 + MAX_MEMBERS * (5 + MAX_MEMBER_ADDR);
+
+fn encode_config_block(config: Option<&(u64, Membership)>) -> Vec<u8> {
+    let (index, bytes) = config.map_or((0, Vec::new()), |(i, m)| (*i, m.encode()));
+    let mut out = index.to_le_bytes().to_vec();
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&bytes);
+    let check = checksum_payload(&out);
+    out.extend_from_slice(&check.to_le_bytes());
+    out
+}
+
+fn read_config_block(r: &mut impl Read) -> Result<Option<(u64, Membership)>> {
+    let io = |e| StorageError::io("read raft snapshot configuration", e);
+    let mut head = [0u8; 12];
+    r.read_exact(&mut head).map_err(io)?;
+    let len = read_u32_le(&head, 8) as usize;
+    if len > MAX_CONFIG_BLOCK {
+        return Err(StorageError::corrupted_header("raft snapshot configuration too large"));
+    }
+    let mut rest = vec![0u8; len + 8];
+    r.read_exact(&mut rest).map_err(io)?;
+    let mut covered = head.to_vec();
+    covered.extend_from_slice(&rest[..len]);
+    if checksum_payload(&covered) != read_u64_le(&rest, len) {
+        return Err(StorageError::corrupted_header("raft snapshot configuration checksum mismatch"));
+    }
+    if len == 0 {
+        return Ok(None);
+    }
+    Ok(Some((read_u64_le(&head, 0), Membership::decode(&rest[..len])?)))
 }
 
 impl SnapshotMeta {
@@ -445,13 +598,16 @@ impl SnapshotMeta {
         let hdr = bytes
             .get(..SNAPSHOT_HEADER_LEN)
             .ok_or_else(|| StorageError::corrupted_header("raft snapshot header truncated"))?;
-        if &hdr[0..8] != SNAPSHOT_MAGIC || checksum_payload(&hdr[0..32]) != read_u64_le(hdr, 32) {
+        if (&hdr[0..8] != SNAPSHOT_MAGIC && &hdr[0..8] != SNAPSHOT_MAGIC_V1)
+            || checksum_payload(&hdr[0..32]) != read_u64_le(hdr, 32)
+        {
             return Err(StorageError::corrupted_header("raft snapshot header invalid"));
         }
         Ok(Self {
             last_index: read_u64_le(hdr, 8),
             last_term: read_u64_le(hdr, 16),
             count: read_u64_le(hdr, 24),
+            v2: &hdr[0..8] == SNAPSHOT_MAGIC,
         })
     }
 
@@ -474,12 +630,13 @@ fn snapshot_record_check(id: &[u8; 24], frame: &[u8]) -> u64 {
 fn for_each_snapshot_record(
     path: &Path,
     mut f: impl FnMut(InlineId, &AlignedBytes) -> Result<()>,
-) -> Result<SnapshotMeta> {
+) -> Result<(SnapshotMeta, Option<(u64, Membership)>)> {
     let io = |e| StorageError::io("read raft snapshot", e);
     let mut r = BufReader::with_capacity(RAFT_SNAPSHOT_CHUNK, File::open(path).map_err(io)?);
     let mut hdr = [0u8; SNAPSHOT_HEADER_LEN];
     r.read_exact(&mut hdr).map_err(io)?;
     let meta = SnapshotMeta::decode(&hdr)?;
+    let config = if meta.v2 { read_config_block(&mut r)? } else { None };
     let mut frame = Vec::new();
     for _ in 0..meta.count {
         let mut rh = [0u8; SNAPSHOT_RECORD_HEADER];
@@ -503,27 +660,34 @@ fn for_each_snapshot_record(
     if r.read(&mut [0u8; 1]).map_err(io)? != 0 {
         return Err(StorageError::corrupted_header("trailing bytes after raft snapshot records"));
     }
-    Ok(meta)
+    Ok((meta, config))
 }
 
 // Entry layout: `term u64 | index u64 | id 24B | aux u64 | kind u8 | len u32 | payload`.
 // `kind`: 0 delete, 1 upsert (payload = frame), 2 ops batch, 3 no-op, 4 TTL sweep (`aux` =
-// `now_ns`). Kinds 0 and 1 are the original format, so existing logs stay readable.
+// `now_ns`), 5 cluster configuration (payload = `Membership::encode`). Kinds 0 and 1 are the
+// original format, so existing logs stay readable.
 const ENTRY_DELETE: u8 = 0;
 const ENTRY_UPSERT: u8 = 1;
 const ENTRY_OPS: u8 = 2;
 const ENTRY_NOOP: u8 = 3;
 const ENTRY_SWEEP: u8 = 4;
+const ENTRY_CONFIG: u8 = 5;
 
 fn encode_log_entry(entry: &RaftLogEntry, out: &mut Vec<u8>) {
     out.extend_from_slice(&entry.term.to_le_bytes());
     out.extend_from_slice(&entry.index.to_le_bytes());
+    let config;
     let (id, aux, kind, payload): (InlineId, u64, u8, &[u8]) = match &entry.command {
         RaftCommand::Upsert { id, frame } => (*id, entry.index, ENTRY_UPSERT, frame.as_slice()),
         RaftCommand::Delete { id } => (*id, entry.index, ENTRY_DELETE, &[]),
         RaftCommand::Ops(bytes) => (InlineId::EMPTY, 0, ENTRY_OPS, bytes.as_slice()),
         RaftCommand::Noop => (InlineId::EMPTY, 0, ENTRY_NOOP, &[]),
         RaftCommand::SweepExpired { now_ns } => (InlineId::EMPTY, *now_ns, ENTRY_SWEEP, &[]),
+        RaftCommand::Config(m) => {
+            config = m.encode();
+            (InlineId::EMPTY, 0, ENTRY_CONFIG, config.as_slice())
+        }
     };
     out.extend_from_slice(&id.to_raw_bytes());
     out.extend_from_slice(&aux.to_le_bytes());
@@ -556,6 +720,7 @@ fn decode_log_entry(bytes: &[u8], cursor: usize) -> Result<(RaftLogEntry, usize)
         ENTRY_OPS => RaftCommand::Ops(AlignedBytes::try_copy_from_slice(payload)?),
         ENTRY_NOOP => RaftCommand::Noop,
         ENTRY_SWEEP => RaftCommand::SweepExpired { now_ns: aux },
+        ENTRY_CONFIG => RaftCommand::Config(Membership::decode(payload)?),
         _ => return Err(StorageError::corrupted_header("unknown RaftLogEntry kind")),
     };
     Ok((RaftLogEntry { term, index, command }, end))
@@ -581,6 +746,14 @@ struct RaftState {
     snapshot_index: u64,
     /// Term of the entry at `snapshot_index` (`0` when nothing was compacted).
     snapshot_term: u64,
+    /// Cluster configuration in force at the compaction point, with the index of the entry that
+    /// set it (persisted in `<stem>_raft.members`).
+    base_config: Option<(u64, Membership)>,
+    /// Configuration entries currently in `log`, in log order (kept in step with `log`).
+    configs: Vec<(u64, Membership)>,
+    /// Configuration used when neither the log nor the compaction point has one (the static
+    /// member list a node is started with; empty for a node joining an existing cluster).
+    bootstrap: Membership,
 }
 
 impl RaftState {
@@ -595,7 +768,64 @@ impl RaftState {
             last_applied: 0,
             snapshot_index: 0,
             snapshot_term: 0,
+            base_config: None,
+            configs: Vec::new(),
+            bootstrap: Membership::default(),
         }
+    }
+
+    // Every change to `log` goes through these four so `configs` stays in step with it.
+
+    fn push_entry(&mut self, entry: RaftLogEntry) {
+        if let RaftCommand::Config(m) = &entry.command {
+            self.configs.push((entry.index, m.clone()));
+        }
+        self.log.push(entry);
+    }
+
+    /// Drops `log[pos..]` (a conflicting suffix): configurations in it are rolled back.
+    fn truncate_log(&mut self, pos: usize) {
+        if let Some(first) = self.log.get(pos).map(|e| e.index) {
+            self.configs.retain(|(i, _)| *i < first);
+        }
+        self.log.truncate(pos);
+    }
+
+    /// Drops `log[..count]` (compaction / snapshot install); the latest configuration among the
+    /// dropped entries becomes the base configuration.
+    fn drain_log(&mut self, count: usize) {
+        let count = count.min(self.log.len());
+        let Some(last) = count.checked_sub(1).map(|i| self.log[i].index) else {
+            return;
+        };
+        let keep = self.configs.iter().position(|(i, _)| *i > last).unwrap_or(self.configs.len());
+        if let Some(latest) = self.configs.drain(..keep).next_back() {
+            self.base_config = Some(latest);
+        }
+        self.log.drain(..count);
+    }
+
+    fn clear_log(&mut self) {
+        self.configs.clear();
+        self.log.clear();
+    }
+
+    /// The configuration in force (latest appended), with the index that set it (`0`: bootstrap).
+    fn membership(&self) -> (u64, &Membership) {
+        self.configs
+            .last()
+            .or(self.base_config.as_ref())
+            .map_or((0, &self.bootstrap), |(i, m)| (*i, m))
+    }
+
+    /// The latest configuration at or before `index` (what a snapshot at `index` carries).
+    fn membership_at(&self, index: u64) -> Option<(u64, Membership)> {
+        self.configs
+            .iter()
+            .rev()
+            .find(|(i, _)| *i <= index)
+            .or(self.base_config.as_ref().filter(|(i, _)| *i <= index))
+            .cloned()
     }
 
     #[inline]
@@ -649,6 +879,39 @@ struct RaftStorage {
     recv_path: PathBuf,
     /// Present while a received snapshot is being applied to the engine.
     installing_path: PathBuf,
+    /// Cluster configuration at the compaction point (`TASK-121`).
+    members_path: PathBuf,
+}
+
+const MEMBERS_MAGIC: u32 = 0x4d46_5452; // "RTFM": raft members
+
+impl RaftStorage {
+    /// Persists the configuration at the compaction point (before the entries carrying it are
+    /// dropped from the log): `magic u32 | check u64 | index u64 | Membership::encode`.
+    fn save_members(&self, base: &(u64, Membership)) -> Result<()> {
+        let mut payload = base.0.to_le_bytes().to_vec();
+        payload.extend_from_slice(&base.1.encode());
+        let mut full = MEMBERS_MAGIC.to_le_bytes().to_vec();
+        full.extend_from_slice(&checksum_payload(&payload).to_le_bytes());
+        full.extend_from_slice(&payload);
+        atomic_write_replace(&self.members_path, &full, true)
+    }
+
+    fn load_members(&self) -> Result<Option<(u64, Membership)>> {
+        if !self.members_path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&self.members_path).map_err(|e| StorageError::io("read raft members", e))?;
+        if bytes.len() < 20 || read_u32_le(&bytes, 0) != MEMBERS_MAGIC {
+            return Err(StorageError::corrupted_header("raft members file invalid"));
+        }
+        let payload = &bytes[12..];
+        let (expected, actual) = (read_u64_le(&bytes, 4), checksum_payload(payload));
+        if expected != actual {
+            return Err(StorageError::checksum_mismatch(expected, actual));
+        }
+        Ok(Some((read_u64_le(payload, 0), Membership::decode(&payload[8..])?)))
+    }
 }
 
 impl RaftStorage {
@@ -720,6 +983,7 @@ impl RaftStorage {
             return Ok(None);
         }
         let mut st = RaftState::new();
+        st.base_config = self.load_members()?;
         let mut legacy_log = Vec::new();
         if self.meta_path.exists() {
             let bytes = fs::read(&self.meta_path).map_err(|e| StorageError::io("read raft.meta", e))?;
@@ -777,13 +1041,15 @@ impl RaftStorage {
                 if entry.index != st.last_log_index() + 1 {
                     return Err(StorageError::corrupted_header("raft log index gap"));
                 }
-                st.log.push(entry);
+                st.push_entry(entry);
             }
             if pos < raw.len() {
                 self.rewrite_log(&st.log)?;
             }
         } else if !legacy_log.is_empty() {
-            st.log = legacy_log;
+            for entry in legacy_log {
+                st.push_entry(entry);
+            }
             self.rewrite_log(&st.log)?;
             self.save_hard_state(&st)?;
         }
@@ -861,6 +1127,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             snapshot_path: dir.join(format!("{stem}_raft.snapshot")),
             recv_path: dir.join(format!("{stem}_raft.snapshot.recv")),
             installing_path: dir.join(format!("{stem}_raft.installing")),
+            members_path: dir.join(format!("{stem}_raft.members")),
         };
         let initial_state = storage.load()?.unwrap_or_else(RaftState::new);
         let node = Self {
@@ -1037,7 +1304,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 st.leader_id = None;
                 return false;
             }
-            st.log.push(entry);
+            st.push_entry(entry);
             true
         } else {
             false
@@ -1054,7 +1321,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         let (prev, _) = st.last_log_index_and_term();
         let entry = RaftLogEntry { term: st.current_term, index: prev + 1, command };
         self.storage.append_log(core::slice::from_ref(&entry))?;
-        st.log.push(entry);
+        st.push_entry(entry);
         self.outcomes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1160,7 +1427,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         });
         let entry = RaftLogEntry::record(st.current_term, next_idx, id, frame);
         self.storage.append_log(core::slice::from_ref(&entry))?;
-        st.log.push(entry.clone());
+        st.push_entry(entry.clone());
         self.outcomes.lock().unwrap_or_else(|p| p.into_inner()).awaited.insert(next_idx);
         Ok((entry, prev_idx, prev_term))
     }
@@ -1235,6 +1502,64 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             entries: st.log[start..end].to_vec(),
             leader_commit: st.commit_index,
         })
+    }
+
+    // ── Membership (`TASK-121`) ─────────────────────────────────────────────────────────────
+
+    /// Sets the configuration used while neither the log nor the compaction point has one: the
+    /// static member list the node is started with (empty for a node joining a cluster).
+    pub fn set_bootstrap_membership(&self, members: Membership) {
+        self.lock_state().bootstrap = members;
+    }
+
+    /// The configuration in force on this node (the latest appended one).
+    pub fn membership(&self) -> Membership {
+        self.lock_state().membership().1.clone()
+    }
+
+    /// The configuration in force and whether it is committed (no change in flight).
+    pub fn membership_state(&self) -> (Membership, bool) {
+        let st = self.lock_state();
+        let (index, m) = st.membership();
+        (m.clone(), index <= st.commit_index)
+    }
+
+    /// Leader: proposes the configuration `next` and returns its log index. Refused unless the
+    /// previous change is committed, this leader has committed an entry of its own term (Raft
+    /// thesis §4.1, the single-server change fix), and `next` changes at most one voter.
+    pub fn propose_membership(&self, next: Membership) -> Result<u64> {
+        {
+            let st = self.lock_state();
+            if st.role != RaftRole::Leader {
+                return Err(StorageError::NotLeader { leader: st.leader_id.map(u64::from) });
+            }
+            let (index, current) = st.membership();
+            if index > st.commit_index {
+                return Err(StorageError::invalid_value(
+                    "a cluster membership change is already in progress; retry once it commits",
+                ));
+            }
+            if st.term_at(st.commit_index) != Some(st.current_term) {
+                return Err(StorageError::invalid_value(
+                    "the new leader has not committed an entry of its term yet; retry shortly",
+                ));
+            }
+            let changed = current
+                .voters()
+                .filter(|&v| !next.is_voter(v))
+                .chain(next.voters().filter(|&v| !current.is_voter(v)))
+                .count();
+            if changed > 1 {
+                return Err(StorageError::invalid_value(
+                    "cluster membership changes add, promote or remove one voter at a time",
+                ));
+            }
+            if next.voters().next().is_none() {
+                return Err(StorageError::invalid_value("a cluster needs at least one voter"));
+            }
+        }
+        // `propose` re-checks leadership under the same lock it appends with.
+        self.propose(RaftCommand::Config(next))
     }
 
     /// `true` while this node believes it is the leader.
@@ -1321,11 +1646,11 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                             "leader tried to overwrite a committed Raft entry",
                         ));
                     }
-                    st.log.truncate(pos);
+                    st.truncate_log(pos);
                     truncated = true;
                 }
                 new_from.get_or_insert(st.log.len());
-                st.log.push(entry);
+                st.push_entry(entry);
             }
             if truncated {
                 self.storage.rewrite_log(&st.log)?;
@@ -1370,7 +1695,16 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             }
         }
         self.apply_committed()?;
-        Ok(self.commit_index())
+        // A leader that the committed configuration no longer counts as a voter steps down
+        // (it kept replicating until then, without counting itself, Raft thesis §4.2.2).
+        let mut st = self.lock_state();
+        let (index, m) = st.membership();
+        // (An empty configuration means none is known: the in-process group is unmanaged.)
+        if index <= st.commit_index && !m.is_empty() && !m.is_voter(self.node_id) && st.role == RaftRole::Leader {
+            st.role = RaftRole::Follower;
+            st.leader_id = None;
+        }
+        Ok(st.commit_index)
     }
 
     /// Applies committed-but-unapplied entries in order. `last_applied` only advances after an
@@ -1444,13 +1778,16 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             .term_at(index)
             .ok_or_else(|| StorageError::corrupted_header("raft compaction point is missing"))?;
         let drop_count = (index - st.snapshot_index) as usize;
+        // The configuration at the new compaction point outlives the entries that carry it.
+        if let Some(base) = st.membership_at(index).filter(|b| Some(b) != st.base_config.as_ref()) {
+            self.storage.save_members(&base)?;
+        }
         st.snapshot_index = index;
         st.snapshot_term = term;
         // Compaction point first, then the shorter log: the loader skips covered entries, so a
         // crash between the two writes is harmless.
         self.storage.save_hard_state(&st)?;
-        let drop_count = drop_count.min(st.log.len());
-        st.log.drain(..drop_count);
+        st.drain_log(drop_count);
         self.storage.rewrite_log(&st.log)?;
         Ok(index)
     }
@@ -1537,15 +1874,16 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     ///
     /// Assumes the replicated engine is written only through Raft (as replication requires).
     fn generate_snapshot(&self) -> Result<SnapshotMeta> {
-        let (last_index, last_term, read, ids) = {
+        let (last_index, last_term, config, read, ids) = {
             let _apply = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
             let st = self.lock_state();
             let last_index = st.last_applied;
             let last_term = st
                 .term_at(last_index)
                 .ok_or_else(|| StorageError::corrupted_header("raft snapshot point is missing"))?;
+            let config = st.membership_at(last_index);
             drop(st);
-            (last_index, last_term, self.engine.begin_read_snapshot(), self.engine.live_ids())
+            (last_index, last_term, config, self.engine.begin_read_snapshot(), self.engine.live_ids())
         };
         let mut tmp = self.storage.snapshot_path.as_os_str().to_os_string();
         tmp.push(".tmp");
@@ -1553,6 +1891,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         let io = |e| StorageError::io("write raft snapshot", e);
         let mut w = BufWriter::with_capacity(RAFT_SNAPSHOT_CHUNK, File::create(&tmp).map_err(io)?);
         w.write_all(&[0u8; SNAPSHOT_HEADER_LEN]).map_err(io)?;
+        w.write_all(&encode_config_block(config.as_ref())).map_err(io)?;
         let mut count = 0u64;
         for id in ids {
             let Some((version, ttl, record)) = read.get_with_ttl(id)? else {
@@ -1570,7 +1909,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             count += 1;
         }
         drop(read);
-        let meta = SnapshotMeta { last_index, last_term, count };
+        let meta = SnapshotMeta { last_index, last_term, count, v2: true };
         let mut file = w.into_inner().map_err(|e| io(e.into_error()))?;
         file.seek(SeekFrom::Start(0))
             .and_then(|_| file.write_all(&meta.encode()))
@@ -1659,7 +1998,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         let recv = &self.storage.recv_path;
         // 1. Verify everything before touching the engine.
         let mut ids = FastHashSet::default();
-        let meta = for_each_snapshot_record(recv, |id, _| {
+        let (meta, config) = for_each_snapshot_record(recv, |id, _| {
             ids.insert(id);
             Ok(())
         })?;
@@ -1681,13 +2020,20 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         }
         self.engine.sync_wal()?;
         // 4. Raft state: keep log entries after the snapshot only if the log agrees at its end.
+        //    The snapshot's configuration becomes the base one (persisted first).
         {
             let mut st = self.lock_state();
+            if let Some(ref c) = config {
+                self.storage.save_members(c)?;
+            }
             match st.pos_of(last_index) {
                 Some(pos) if st.log.get(pos).is_some_and(|e| e.term == last_term) => {
-                    st.log.drain(..=pos);
+                    st.drain_log(pos + 1);
                 }
-                _ => st.log.clear(),
+                _ => st.clear_log(),
+            }
+            if config.is_some() {
+                st.base_config = config;
             }
             st.snapshot_index = last_index;
             st.snapshot_term = last_term;
@@ -1727,7 +2073,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             }
             self.engine.sync_wal()?;
             let mut st = self.lock_state();
-            st.log.clear();
+            st.clear_log();
             st.snapshot_index = 0;
             st.snapshot_term = 0;
             st.commit_index = 0;
@@ -1764,7 +2110,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 Ok((now_ns, ops)) => self.engine.commit_at(ops, min, now_ns),
                 Err(e) => Err(e),
             },
-            RaftCommand::Noop => Ok(Vec::new()),
+            RaftCommand::Noop | RaftCommand::Config(_) => Ok(Vec::new()),
             RaftCommand::SweepExpired { now_ns } => self.engine.sweep_expired_at(*now_ns).map(|_| Vec::new()),
         };
         match outcome {

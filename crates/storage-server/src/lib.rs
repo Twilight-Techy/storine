@@ -115,6 +115,14 @@ pub const OP_TXN: u8 = 0x24;
 pub const OP_DOC_INFO: u8 = 0x25;
 pub const OP_SET_OPTIONS: u8 = 0x26;
 pub const OP_CLUSTER_INFO: u8 = 0x27;
+/// Admin: changes the cluster membership (`TASK-121`); see [`StorageClient::cluster_change`].
+pub const OP_CLUSTER_CHANGE: u8 = 0x28;
+
+/// `OP_CLUSTER_CHANGE` actions.
+pub const CLUSTER_ADD_VOTER: u8 = 1;
+pub const CLUSTER_ADD_LEARNER: u8 = 2;
+pub const CLUSTER_PROMOTE: u8 = 3;
+pub const CLUSTER_REMOVE: u8 = 4;
 
 pub const STATUS_OK: u8 = 0x00;
 pub const STATUS_NOT_FOUND: u8 = 0x01;
@@ -149,7 +157,7 @@ const fn required_role(op: u8) -> Option<RbacRole> {
         OP_PUT_RAW_FRAME | OP_DELETE | OP_CAS_PUT | OP_BATCH_PUT | OP_TXN | OP_DOC_WRITE
         | OP_DOC_ADMIN => Some(RbacRole::ReadWrite),
         OP_RAFT_VOTE | OP_RAFT_APPEND | OP_RAFT_SNAPSHOT | OP_MIGRATE_VSHARD | OP_ADMIN_BACKUP
-        | OP_ADMIN_COMPACT | OP_ADMIN_CHECKPOINT => Some(RbacRole::Admin),
+        | OP_ADMIN_COMPACT | OP_ADMIN_CHECKPOINT | OP_CLUSTER_CHANGE => Some(RbacRole::Admin),
         _ => None,
     }
 }
@@ -167,6 +175,7 @@ const fn max_body_len(op: u8) -> usize {
         // Collection + key, or a query / collection command (filters are small).
         OP_DOC_GET => 2 * 1024 + 16,
         OP_SET_OPTIONS => 16,
+        OP_CLUSTER_CHANGE => 512,
         OP_DOC_QUERY | OP_DOC_ADMIN | OP_DOC_INFO => 1024 * 1024,
         // One snapshot chunk plus its fixed header.
         OP_RAFT_SNAPSHOT => RAFT_SNAPSHOT_CHUNK + 64,
@@ -1172,6 +1181,7 @@ const fn op_name(op: u8) -> &'static str {
         OP_TXN => "txn",
         OP_SET_OPTIONS => "set_options",
         OP_CLUSTER_INFO => "cluster_info",
+        OP_CLUSTER_CHANGE => "cluster_change",
         _ => "unknown",
     }
 }
@@ -1225,6 +1235,21 @@ fn route_cluster<T: ZeroCopyRecord + Indexable>(
             }
             let job_shared = Arc::clone(shared);
             let job = Box::new(move || write_reply(&job_shared, op, raw_id, &body));
+            match cl.pool.submit(job, wake) {
+                Ok(rx) => {
+                    conn.pending_job = Some(rx);
+                    Ok(ConnStep::Progress)
+                }
+                Err(()) => Ok(reply(conn, (STATUS_OVERLOADED, 0, b"write queue is full".to_vec()))),
+            }
+        }
+        OP_CLUSTER_CHANGE => {
+            if !is_leader {
+                return Ok(reply(conn, cl.not_leader()));
+            }
+            // Waits for catch-up and consensus: on the worker pool, never on a reactor thread.
+            let rt = Arc::clone(&cl.runtime);
+            let job = Box::new(move || cluster_change(&rt, &body));
             match cl.pool.submit(job, wake) {
                 Ok(rx) => {
                     conn.pending_job = Some(rx);
@@ -1487,6 +1512,7 @@ fn execute_local<T: ZeroCopyRecord + Indexable>(
             let out = cluster_info_body(shared);
             conn.send_or_queue_response(STATUS_OK, 0, &out)
         }
+        OP_CLUSTER_CHANGE => conn.send_or_queue_response(STATUS_INVALID, 0, b"not a clustered server"),
         OP_HEALTH => {
             let st = engine.stats();
             let health = format!(
@@ -1505,9 +1531,42 @@ fn execute_local<T: ZeroCopyRecord + Indexable>(
     }
 }
 
+/// How long a new voter may take to catch up before `OP_CLUSTER_CHANGE` gives up.
+const CLUSTER_CATCH_UP: Duration = Duration::from_secs(60);
+
+/// Runs one `OP_CLUSTER_CHANGE` request: `u8 action | u16 node_id | str addr` (`addr` is used
+/// by the add actions).
+fn cluster_change<T: ZeroCopyRecord + Indexable>(rt: &storage_core::raft_runtime::RaftRuntime<T>, body: &[u8]) -> cluster::JobResponse {
+    let parsed = (|| {
+        let action = *body.first()?;
+        let id = u16::from_le_bytes([*body.get(1)?, *body.get(2)?]);
+        let len = u32::from_le_bytes(body.get(3..7)?.try_into().ok()?) as usize;
+        let addr = core::str::from_utf8(body.get(7..7 + len)?).ok()?;
+        (body.len() == 7 + len && id != 0).then_some((action, id, addr))
+    })();
+    let Some((action, id, addr)) = parsed else {
+        return (STATUS_INVALID, 0, b"malformed cluster change".to_vec());
+    };
+    let result = match action {
+        CLUSTER_ADD_VOTER if !addr.is_empty() => rt.add_voter(id, addr, CLUSTER_CATCH_UP),
+        CLUSTER_ADD_LEARNER if !addr.is_empty() => rt.add_learner(id, addr),
+        CLUSTER_PROMOTE => rt.promote(id, CLUSTER_CATCH_UP),
+        CLUSTER_REMOVE => rt.remove_member(id),
+        CLUSTER_ADD_VOTER | CLUSTER_ADD_LEARNER => {
+            return (STATUS_INVALID, 0, b"adding a member needs its address".to_vec())
+        }
+        _ => return (STATUS_INVALID, 0, b"unknown cluster change action".to_vec()),
+    };
+    match result {
+        Ok(()) => (STATUS_OK, 0, Vec::new()),
+        Err(e) => documents::error_reply(&e),
+    }
+}
+
 /// `OP_CLUSTER_INFO` reply: `u64 node_id | u8 is_leader | u64 leader_id | str leader_addr |
-/// u64 term | u64 commit_index | u64 last_applied | u32 n | (u64 node_id, str addr)*`. A standalone
-/// server reports node `0` as its own leader.
+/// u64 term | u64 commit_index | u64 last_applied | u32 n | (u64 node_id, str addr)*`, then
+/// (`TASK-121`) `n` x `u8 role` (`1` voter, `0` learner). A standalone server reports node `0`
+/// as its own leader.
 fn cluster_info_body<T: ZeroCopyRecord + Indexable>(shared: &ServerShared<T>) -> Vec<u8> {
     use storage_core::document_wire::put_str;
     let mut out = Vec::with_capacity(128);
@@ -1517,18 +1576,19 @@ fn cluster_info_body<T: ZeroCopyRecord + Indexable>(shared: &ServerShared<T>) ->
             out.extend_from_slice(&u64::from(st.node_id).to_le_bytes());
             out.push(u8::from(st.is_leader && cl.runtime.lease_valid()));
             out.extend_from_slice(&st.leader_id.map_or(0, u64::from).to_le_bytes());
-            let addr = st.leader_id.and_then(|l| cl.client_addrs.get(&l)).cloned().unwrap_or_default();
+            let addr = st.leader_id.map(|l| cl.addr_of(l)).unwrap_or_default();
             put_str(&mut out, &addr);
             out.extend_from_slice(&st.term.to_le_bytes());
             out.extend_from_slice(&st.commit_index.to_le_bytes());
             out.extend_from_slice(&st.last_applied.to_le_bytes());
-            let mut members: Vec<(&u16, &String)> = cl.client_addrs.iter().collect();
-            members.sort();
+            let membership = cl.runtime.membership();
+            let members = membership.members();
             out.extend_from_slice(&(members.len() as u32).to_le_bytes());
-            for (id, a) in members {
-                out.extend_from_slice(&u64::from(*id).to_le_bytes());
-                put_str(&mut out, a);
+            for m in members {
+                out.extend_from_slice(&u64::from(m.id).to_le_bytes());
+                put_str(&mut out, &cl.addr_of(m.id));
             }
+            out.extend(members.iter().map(|m| u8::from(m.voter)));
         }
         None => {
             out.extend_from_slice(&0u64.to_le_bytes());
@@ -2202,6 +2262,21 @@ impl StorageClient {
     pub fn raft_install_snapshot(&mut self, req: &InstallSnapshotReq) -> Result<(u8, u64, Vec<u8>)> {
         let wire = req.to_wire_bytes();
         self.rpc(OP_RAFT_SNAPSHOT, NO_KEY, &wire)
+    }
+
+    /// Changes the cluster membership on the leader (`OP_CLUSTER_CHANGE`, Admin role, `TASK-121`):
+    /// `action` is [`CLUSTER_ADD_VOTER`] (joins as a learner, promoted once caught up),
+    /// [`CLUSTER_ADD_LEARNER`], [`CLUSTER_PROMOTE`] or [`CLUSTER_REMOVE`]; `addr` is the new
+    /// member's `host:port` (add actions). A follower answers `NotLeader` with the leader's id.
+    pub fn cluster_change(&mut self, action: u8, node_id: storage_core::NodeId, addr: &str) -> Result<()> {
+        let mut body = vec![action];
+        body.extend_from_slice(&node_id.to_le_bytes());
+        storage_core::document_wire::put_str(&mut body, addr);
+        let (status, version, resp) = self.rpc(OP_CLUSTER_CHANGE, NO_KEY, &body)?;
+        if status == STATUS_OK {
+            return Ok(());
+        }
+        Err(remote_error(status, version, &resp))
     }
 
     /// Ships record frames for a virtual shard migration over TCP (`OP_MIGRATE_VSHARD`).

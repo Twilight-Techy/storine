@@ -42,6 +42,9 @@ pub const MAX_DOCUMENT_INDEXES: usize = 4;
 const COLLECTION_FIELD_ID: u16 = u16::MAX;
 /// Reserved collection holding collection metadata (index declarations, SQL schemas).
 pub const META_COLLECTION: &str = "$meta";
+
+/// Times a write is rebuilt because the collection metadata changed under it (index builds).
+const MAX_METADATA_RETRIES: usize = 64;
 /// Reserved collection holding idempotency markers.
 pub const IDEMPOTENCY_COLLECTION: &str = "$idem";
 /// How long an idempotency marker is kept (a retry after this window is applied again).
@@ -706,14 +709,20 @@ impl DocumentStore {
     /// Metadata of `collection` (default: no indexes). Always current: the cached entry is used
     /// only while the `$meta` document still has the cached version (one primary-index lookup).
     pub fn collection_info(&self, collection: &str) -> CollectionInfo {
+        self.collection_info_versioned(collection).1
+    }
+
+    /// [`Self::collection_info`] and the `$meta` version it is at least as new as (`None`: no
+    /// metadata document).
+    fn collection_info_versioned(&self, collection: &str) -> (Option<Version>, CollectionInfo) {
         let empty = || CollectionInfo { name: collection.to_owned(), ..Default::default() };
         let Ok(id) = document_id(META_COLLECTION, collection) else {
-            return empty();
+            return (None, empty());
         };
         let current = self.engine.primary_index().version_of(id);
         if let Some((v, info)) = self.meta.read().unwrap_or_else(|p| p.into_inner()).get(collection) {
             if *v == current {
-                return info.clone();
+                return (current, info.clone());
             }
         }
         let info = match self.get(META_COLLECTION, collection) {
@@ -724,7 +733,7 @@ impl DocumentStore {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .insert(collection.to_owned(), (current, info.clone()));
-        info
+        (current, info)
     }
 
     /// Every declared collection (one with metadata: created through an index, the SQL adapter
@@ -744,13 +753,17 @@ impl DocumentStore {
         v
     }
 
-    fn index_ids_for(&self, collection: &str) -> Vec<u16> {
-        let info = self.collection_info(collection);
-        info.indexes
+    /// The index ids every write to `collection` must carry, and the `$meta` version they come
+    /// from.
+    fn index_ids_for(&self, collection: &str) -> (Option<Version>, Vec<u16>) {
+        let (version, info) = self.collection_info_versioned(collection);
+        let ids = info
+            .indexes
             .iter()
             .chain(info.building.iter())
             .map(|f| index_field_id(collection, f))
-            .collect()
+            .collect();
+        (version, ids)
     }
 
     // ── Reads ──
@@ -946,18 +959,53 @@ impl DocumentStore {
         request_id: Option<[u8; 16]>,
         allow_system: bool,
     ) -> Result<WriteSummary> {
+        // A write carries the index ids of the collection metadata it read, and checks in the
+        // same atomic commit that this metadata is still current. If an index build started (or
+        // finished) in between, the write is rebuilt with the new ids: no document can slip past
+        // a build with stale ids.
+        let meta_ids: Vec<InlineId> = writes
+            .iter()
+            .filter(|w| !w.collection.starts_with('$'))
+            .filter_map(|w| document_id(META_COLLECTION, &w.collection).ok())
+            .collect();
+        for _ in 0..MAX_METADATA_RETRIES {
+            match self.write_attempt(&writes, request_id, allow_system) {
+                Err(StorageError::ConditionFailed { id, .. } | StorageError::VersionConflict { id, .. })
+                    if meta_ids.contains(&id) =>
+                {
+                    continue
+                }
+                other => return other,
+            }
+        }
+        Err(StorageError::resource_exhausted(
+            "collection metadata kept changing during the write (index builds); retry",
+        ))
+    }
+
+    fn write_attempt(
+        &self,
+        writes: &[DocWrite],
+        request_id: Option<[u8; 16]>,
+        allow_system: bool,
+    ) -> Result<WriteSummary> {
         if writes.is_empty() {
             return Ok(WriteSummary { versions: Vec::new(), duplicate: false });
         }
-        let mut ops = Vec::with_capacity(writes.len() + 1);
+        let mut ops = Vec::with_capacity(writes.len() + 2);
         let mut targets = Vec::with_capacity(writes.len());
-        for w in &writes {
+        // `$meta` version each written collection's index ids were taken from.
+        let mut meta_checks: Vec<(String, Option<Version>)> = Vec::new();
+        for w in writes {
             validate_collection_name(&w.collection, allow_system)?;
             validate_document_key(&w.key)?;
             let id = document_id(&w.collection, &w.key)?;
             self.check_no_collision(id, &w.collection, &w.key)?;
             targets.push((w.collection.clone(), w.key.clone()));
-            let index_ids = self.index_ids_for(&w.collection);
+            let (meta_version, index_ids) = self.index_ids_for(&w.collection);
+            if !w.collection.starts_with('$') && !meta_checks.iter().any(|(c, _)| *c == w.collection) {
+                meta_checks.push((w.collection.clone(), meta_version));
+            }
             let make = |fields: &BTreeMap<String, PropertyValue>| DocumentRecord {
                 collection: w.collection.clone(),
                 key: w.key.clone(),
@@ -978,6 +1026,13 @@ impl DocumentStore {
                 DocOp::Check => WriteKind::Check,
             };
             ops.push(WriteOp { id, kind, precondition: w.precondition });
+        }
+        for (collection, version) in meta_checks {
+            ops.push(WriteOp {
+                id: document_id(META_COLLECTION, &collection)?,
+                kind: WriteKind::Check,
+                precondition: version.map_or(Precondition::Absent, Precondition::Version),
+            });
         }
         if let Some(rid) = request_id {
             let key = hex16(&rid);
@@ -1159,23 +1214,28 @@ impl DocumentStore {
             })?;
             for doc in page.documents {
                 let id = document_id(collection, &doc.key)?;
-                let rec = DocumentRecord {
-                    collection: collection.to_owned(),
-                    key: doc.key.clone(),
-                    fields: doc.fields,
-                    index_ids: ids.to_vec(),
-                };
-                // Same-version rewrite of index metadata only; skipped if the document changed
-                // or disappeared meanwhile (a newer version already carries the current ids).
-                match self.sink().commit(vec![WriteOp {
-                    id,
-                    kind: WriteKind::Rewrite(rec),
-                    precondition: Precondition::Version(doc.version),
-                }]) {
-                    Ok(_)
-                    | Err(StorageError::VersionConflict { .. })
-                    | Err(StorageError::RecordNotFound { .. }) => {}
-                    Err(e) => return Err(e),
+                let mut current = Some(doc);
+                // Same-version rewrite of the index ids only. A document changed meanwhile is
+                // re-read and rewritten at its new version: a patch keeps the ids it had, so a
+                // newer version is not necessarily indexed yet.
+                while let Some(doc) = current.take() {
+                    let rec = DocumentRecord {
+                        collection: collection.to_owned(),
+                        key: doc.key.clone(),
+                        fields: doc.fields,
+                        index_ids: ids.to_vec(),
+                    };
+                    match self.sink().commit(vec![WriteOp {
+                        id,
+                        kind: WriteKind::Rewrite(rec),
+                        precondition: Precondition::Version(doc.version),
+                    }]) {
+                        Ok(_) | Err(StorageError::RecordNotFound { .. }) => {}
+                        Err(StorageError::VersionConflict { .. } | StorageError::ConditionFailed { .. }) => {
+                            current = self.get(collection, &doc.key)?;
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
             match page.next_after_key {

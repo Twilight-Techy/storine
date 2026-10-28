@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use storage_codec::ZeroCopyRecord;
 use storage_core::raft::{
-    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, RequestVoteReq,
-    RequestVoteResp,
+    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, Membership,
+    RequestVoteReq, RequestVoteResp,
 };
 use storage_core::raft_runtime::{RaftRuntime, RaftTransport};
 use storage_core::NodeId;
@@ -21,13 +21,17 @@ use storage_types::{Result, StorageError};
 
 use crate::{StorageClient, STATUS_OK};
 
+/// A peer's cached connection (`None` until first used or after a failure).
+type PeerConn = Arc<Mutex<Option<StorageClient>>>;
+
 /// Sends Raft RPCs to peers over TCP (`OP_RAFT_*`, Admin role), one cached connection per peer,
 /// reconnecting on failure. Every call is bounded by `timeout`.
 pub struct TcpRaftTransport {
-    peers: HashMap<NodeId, SocketAddr>,
+    /// Raft address and cached connection of every known peer. Members added to the cluster
+    /// later are learned from the configuration ([`RaftTransport::update_members`]).
+    peers: Mutex<HashMap<NodeId, (SocketAddr, PeerConn)>>,
     token: Option<String>,
     timeout: Duration,
-    conns: HashMap<NodeId, Mutex<Option<StorageClient>>>,
 }
 
 impl core::fmt::Debug for TcpRaftTransport {
@@ -40,18 +44,20 @@ impl TcpRaftTransport {
     /// `peers`: node id -> Raft address of every other node; `token`: an Admin token accepted by
     /// every peer (required when peers enforce authentication).
     pub fn new(peers: HashMap<NodeId, SocketAddr>, token: Option<String>, timeout: Duration) -> Self {
-        let conns = peers.keys().map(|&p| (p, Mutex::new(None))).collect();
-        Self { peers, token, timeout, conns }
+        let peers = peers
+            .into_iter()
+            .map(|(id, addr)| (id, (addr, Arc::new(Mutex::new(None)))))
+            .collect();
+        Self { peers: Mutex::new(peers), token, timeout }
     }
 
     fn call(&self, peer: NodeId, f: impl Fn(&mut StorageClient) -> Result<(u8, u64, Vec<u8>)>) -> Result<Vec<u8>> {
-        let addr = *self
+        let (addr, slot) = self
             .peers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
             .get(&peer)
-            .ok_or_else(|| StorageError::invalid_key("unknown raft peer"))?;
-        let slot = self
-            .conns
-            .get(&peer)
+            .map(|(a, c)| (*a, Arc::clone(c)))
             .ok_or_else(|| StorageError::invalid_key("unknown raft peer"))?;
         let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
         for attempt in 0..2 {
@@ -99,6 +105,18 @@ impl RaftTransport for TcpRaftTransport {
     fn install_snapshot(&self, peer: NodeId, req: &InstallSnapshotReq) -> Result<InstallSnapshotResp> {
         let body = self.call(peer, |c| c.raft_install_snapshot(req))?;
         InstallSnapshotResp::from_wire_bytes(&body)
+    }
+
+    /// Learns the address of members added to the configuration; a changed address drops the
+    /// cached connection. Members without an address keep the one given at start-up.
+    fn update_members(&self, members: &Membership) {
+        let mut peers = self.peers.lock().unwrap_or_else(|p| p.into_inner());
+        for m in members.members().iter().filter(|m| !m.addr.is_empty()) {
+            let Ok(addr) = resolve(&m.addr) else { continue };
+            if peers.get(&m.id).is_none_or(|(a, _)| *a != addr) {
+                peers.insert(m.id, (addr, Arc::new(Mutex::new(None))));
+            }
+        }
     }
 }
 
@@ -202,7 +220,8 @@ impl WorkerPool {
 /// worker pool.
 pub struct ClusterOptions<T: ZeroCopyRecord + Indexable> {
     pub runtime: Arc<RaftRuntime<T>>,
-    /// Client-facing address (`host:port`) of every node, used in `NotLeader` redirects.
+    /// Client-facing address (`host:port`) of the nodes known at start-up, used in `NotLeader`
+    /// redirects; members added later are found through the cluster configuration.
     pub client_addrs: HashMap<NodeId, String>,
 }
 
@@ -219,13 +238,21 @@ pub(crate) struct ClusterContext<T: ZeroCopyRecord + Indexable> {
 }
 
 impl<T: ZeroCopyRecord + Indexable> ClusterContext<T> {
+    /// Client address of node `id`: from the cluster configuration, else the start-up list.
+    pub(crate) fn addr_of(&self, id: NodeId) -> String {
+        self.runtime
+            .membership()
+            .get(id)
+            .map(|m| m.addr.clone())
+            .filter(|a| !a.is_empty())
+            .or_else(|| self.client_addrs.get(&id).cloned())
+            .unwrap_or_default()
+    }
+
     /// `NotLeader` reply: version = leader node id (`0` unknown), body = leader client address.
     pub(crate) fn not_leader(&self) -> JobResponse {
         let leader = self.runtime.node().leader_id();
-        let addr = leader
-            .and_then(|l| self.client_addrs.get(&l))
-            .cloned()
-            .unwrap_or_default();
+        let addr = leader.map(|l| self.addr_of(l)).unwrap_or_default();
         (crate::STATUS_NOT_LEADER, leader.map_or(0, u64::from), addr.into_bytes())
     }
 }

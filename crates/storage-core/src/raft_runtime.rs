@@ -17,9 +17,12 @@
 //!   acknowledged request was **sent**), otherwise after a read-index round, so a deposed leader
 //!   never serves stale data;
 //! - a write whose outcome cannot be confirmed returns [`StorageError::CommitUnknown`]; clients
-//!   retry with the same request id (applied at most once).
+//!   retry with the same request id (applied at most once);
+//! - membership follows the configuration in the log (`TASK-121`): quorums, votes and leases
+//!   count voters only, learners just receive the log, a new member joins as a learner and is
+//!   promoted once caught up, and a node that is not a voter never starts an election.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -31,8 +34,8 @@ use storage_types::{Result, StorageError};
 
 use crate::engine::{WriteOp, WriteResult};
 use crate::raft::{
-    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, RaftCommand,
-    RaftNode, RequestVoteReq, RequestVoteResp, RAFT_SNAPSHOT_CHUNK,
+    AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, InstallSnapshotResp, Member,
+    Membership, RaftCommand, RaftNode, RequestVoteReq, RequestVoteResp, RAFT_SNAPSHOT_CHUNK,
 };
 use crate::sharding::NodeId;
 
@@ -41,6 +44,8 @@ pub trait RaftTransport: Send + Sync {
     fn request_vote(&self, peer: NodeId, req: &RequestVoteReq) -> Result<RequestVoteResp>;
     fn append_entries(&self, peer: NodeId, req: &AppendEntriesReq) -> Result<AppendEntriesResp>;
     fn install_snapshot(&self, peer: NodeId, req: &InstallSnapshotReq) -> Result<InstallSnapshotResp>;
+    /// The cluster configuration changed: learn the addresses of new members.
+    fn update_members(&self, _members: &Membership) {}
 }
 
 /// Timing and batching of the runtime.
@@ -96,7 +101,6 @@ pub struct ClusterStatus {
 
 struct Shared<T: ZeroCopyRecord + Indexable> {
     node: Arc<RaftNode<T>>,
-    peers: Vec<NodeId>,
     transport: Arc<dyn RaftTransport>,
     config: RaftConfig,
     shutdown: AtomicBool,
@@ -107,28 +111,46 @@ struct Shared<T: ZeroCopyRecord + Indexable> {
     /// Term in which `progress` was initialized (reset on every new leadership).
     progress_term: AtomicU64,
     rng: AtomicU64,
+    /// Peers with a running replicator thread.
+    replicating: Mutex<HashSet<NodeId>>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
+    /// Configuration last handed to the transport.
+    known_members: Mutex<Membership>,
 }
 
 /// A running Raft replica: owns the election timer and one replicator thread per peer.
 pub struct RaftRuntime<T: ZeroCopyRecord + Indexable> {
     shared: Arc<Shared<T>>,
-    threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl<T: ZeroCopyRecord + Indexable> core::fmt::Debug for RaftRuntime<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RaftRuntime")
             .field("node_id", &self.shared.node.node_id())
-            .field("peers", &self.shared.peers)
+            .field("members", &self.shared.node.membership())
             .finish_non_exhaustive()
     }
 }
 
 impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
-    /// Starts the runtime for `node` with the given peers (excluding the node itself).
+    /// Starts the runtime for `node`; `members` lists every voter of a new cluster, this node
+    /// included (all voters, no addresses). An empty list starts a node that joins an existing
+    /// cluster: it waits for a leader to add it ([`Self::add_voter`]).
     pub fn start(
         node: Arc<RaftNode<T>>,
-        peers: Vec<NodeId>,
+        members: Vec<NodeId>,
+        transport: Arc<dyn RaftTransport>,
+        config: RaftConfig,
+    ) -> Result<Arc<Self>> {
+        let members = Membership::voters_from_ids(members)?;
+        Self::start_with_membership(node, members, transport, config)
+    }
+
+    /// [`Self::start`] with a full bootstrap configuration (addresses, learners). The bootstrap
+    /// only applies until the log carries a configuration of its own.
+    pub fn start_with_membership(
+        node: Arc<RaftNode<T>>,
+        bootstrap: Membership,
         transport: Arc<dyn RaftTransport>,
         config: RaftConfig,
     ) -> Result<Arc<Self>> {
@@ -139,7 +161,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
                 "raft timing: heartbeat must be < half the minimum election timeout, and min <= max",
             ));
         }
-        let peers: Vec<NodeId> = peers.into_iter().filter(|&p| p != node.node_id()).collect();
+        node.set_bootstrap_membership(bootstrap);
         node.set_vote_stickiness(Some(config.election_timeout_min));
         let seed = 0x9E37_79B9_7F4A_7C15u64 ^ (u64::from(node.node_id()) << 32) ^ u64::from(
             std::time::SystemTime::now()
@@ -148,7 +170,6 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
         );
         let shared = Arc::new(Shared {
             node,
-            peers,
             transport,
             config,
             shutdown: AtomicBool::new(false),
@@ -157,29 +178,20 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
             progress: Mutex::new(HashMap::new()),
             progress_term: AtomicU64::new(0),
             rng: AtomicU64::new(seed | 1),
+            replicating: Mutex::new(HashSet::new()),
+            threads: Mutex::new(Vec::new()),
+            known_members: Mutex::new(Membership::default()),
         });
-        let rt = Arc::new(Self { shared: Arc::clone(&shared), threads: Mutex::new(Vec::new()) });
-        let mut threads = Vec::with_capacity(1 + shared.peers.len());
         {
             let s = Arc::clone(&shared);
-            threads.push(
-                thread::Builder::new()
-                    .name("storine-raft-timer".into())
-                    .spawn(move || timer_loop(&s))
-                    .map_err(|e| StorageError::io("spawn raft timer", e))?,
-            );
+            let timer = thread::Builder::new()
+                .name("storine-raft-timer".into())
+                .spawn(move || timer_loop(&s))
+                .map_err(|e| StorageError::io("spawn raft timer", e))?;
+            shared.threads.lock().unwrap_or_else(|p| p.into_inner()).push(timer);
         }
-        for &peer in &shared.peers {
-            let s = Arc::clone(&shared);
-            threads.push(
-                thread::Builder::new()
-                    .name(format!("storine-raft-peer-{peer}"))
-                    .spawn(move || replicator_loop(&s, peer))
-                    .map_err(|e| StorageError::io("spawn raft replicator", e))?,
-            );
-        }
-        *rt.threads.lock().unwrap_or_else(|p| p.into_inner()) = threads;
-        Ok(rt)
+        reconcile_members(&shared);
+        Ok(Arc::new(Self { shared }))
     }
 
     #[inline]
@@ -216,11 +228,103 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
     }
 
     fn after_propose(&self) {
-        if self.shared.peers.is_empty() {
-            // Single-node cluster: the leader alone is a quorum.
-            let _ = advance_commit(&self.shared);
-        }
+        reconcile_members(&self.shared);
+        // A lone voter is a quorum by itself.
+        let _ = advance_commit(&self.shared);
         wake_replicators(&self.shared);
+    }
+
+    // ── Membership changes (`TASK-121`) ─────────────────────────────────────────────────────
+
+    /// The cluster configuration in force on this node.
+    pub fn membership(&self) -> Membership {
+        self.shared.node.membership()
+    }
+
+    /// Leader: adds `id` (serving on `addr`) as a learner: it receives the log but does not vote.
+    pub fn add_learner(&self, id: NodeId, addr: &str) -> Result<()> {
+        self.change(|m| {
+            if m.contains(id) {
+                return Err(StorageError::invalid_value("the node is already a cluster member"));
+            }
+            let mut members = m.members().to_vec();
+            members.push(Member { id, addr: addr.to_owned(), voter: false });
+            Membership::new(members)
+        })
+    }
+
+    /// Leader: makes the learner `id` a voter, once it has caught up with the log (waits up to
+    /// `catch_up` for that).
+    pub fn promote(&self, id: NodeId, catch_up: Duration) -> Result<()> {
+        if !self.membership().get(id).is_some_and(|m| !m.voter) {
+            return Err(StorageError::invalid_value("only a learner can be promoted"));
+        }
+        self.wait_caught_up(id, catch_up)?;
+        self.change(|m| {
+            let members = m
+                .members()
+                .iter()
+                .map(|x| Member { voter: x.voter || x.id == id, ..x.clone() })
+                .collect();
+            Membership::new(members)
+        })
+    }
+
+    /// Leader: adds `id` as a voter the safe way: as a learner first, promoted once caught up
+    /// (so the cluster never waits on a member that has no data yet).
+    pub fn add_voter(&self, id: NodeId, addr: &str, catch_up: Duration) -> Result<()> {
+        match self.membership().get(id) {
+            Some(m) if m.voter => return Ok(()),
+            Some(_) => {}
+            None => self.add_learner(id, addr)?,
+        }
+        self.promote(id, catch_up)
+    }
+
+    /// Leader: removes `id` (a voter or a learner). Removing the leader itself makes it step
+    /// down once the change commits; the remaining voters elect a new one.
+    pub fn remove_member(&self, id: NodeId) -> Result<()> {
+        self.change(|m| {
+            if !m.contains(id) {
+                return Err(StorageError::invalid_value("the node is not a cluster member"));
+            }
+            Membership::new(m.members().iter().filter(|x| x.id != id).cloned().collect())
+        })
+    }
+
+    fn change(&self, f: impl FnOnce(&Membership) -> Result<Membership>) -> Result<()> {
+        let next = f(&self.shared.node.membership())?;
+        let index = self.shared.node.propose_membership(next)?;
+        self.after_propose();
+        self.shared.node.wait_applied(index, self.shared.config.commit_timeout).map(|_| ())
+    }
+
+    /// Waits until the leader knows `id` stores the whole committed log.
+    fn wait_caught_up(&self, id: NodeId, timeout: Duration) -> Result<()> {
+        let s = &self.shared;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !s.node.is_leader() {
+                return Err(StorageError::NotLeader { leader: s.node.leader_id().map(u64::from) });
+            }
+            let target = s.node.commit_index();
+            let matched = s
+                .progress
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&id)
+                .map_or(0, |p| p.match_index);
+            if matched >= target {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(StorageError::resource_exhausted(
+                    "the new member did not catch up with the log in time (is it running and reachable?)",
+                ));
+            }
+            wake_replicators(s);
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Linearizable read barrier: returns once this node may serve a read that reflects every
@@ -255,8 +359,11 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
         if !s.node.is_leader() {
             return false;
         }
-        if s.peers.is_empty() {
-            return true;
+        let members = s.node.membership();
+        let self_votes = members.is_voter(s.node.node_id());
+        let peers: Vec<NodeId> = members.voters().filter(|&v| v != s.node.node_id()).collect();
+        if peers.is_empty() {
+            return self_votes;
         }
         let lease = s.config.election_timeout_min.mul_f64(0.9);
         let term = s.node.current_term();
@@ -266,8 +373,8 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
         if s.progress_term.load(Ordering::Acquire) != term {
             return false;
         }
-        let mut fresh = 1usize; // the leader itself
-        for p in &s.peers {
+        let mut fresh = usize::from(self_votes);
+        for p in &peers {
             if progress
                 .get(p)
                 .and_then(|pp| pp.acked_sent_at)
@@ -276,16 +383,21 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
                 fresh += 1;
             }
         }
-        fresh >= quorum(s)
+        fresh >= quorum(&members)
     }
 
     /// Stops all runtime threads (the node keeps its durable state).
     pub fn stop(&self) {
         self.shared.shutdown.store(true, Ordering::Release);
         wake_replicators(&self.shared);
-        let threads = core::mem::take(&mut *self.threads.lock().unwrap_or_else(|p| p.into_inner()));
-        for t in threads {
-            let _ = t.join();
+        loop {
+            let threads = core::mem::take(&mut *self.shared.threads.lock().unwrap_or_else(|p| p.into_inner()));
+            if threads.is_empty() {
+                break;
+            }
+            for t in threads {
+                let _ = t.join();
+            }
         }
     }
 }
@@ -302,10 +414,46 @@ impl crate::document::CommitSink for RaftRuntime<crate::document::DocumentRecord
     }
 }
 
+/// Votes needed among the voters of `members`.
 #[inline]
-fn quorum<T: ZeroCopyRecord + Indexable>(s: &Shared<T>) -> usize {
-    let members = s.peers.len() + 1;
-    members / 2 + 1
+fn quorum(members: &Membership) -> usize {
+    members.voters().count() / 2 + 1
+}
+
+/// Voters other than this node.
+fn voter_peers<T: ZeroCopyRecord + Indexable>(s: &Shared<T>, members: &Membership) -> Vec<NodeId> {
+    members.voters().filter(|&v| v != s.node.node_id()).collect()
+}
+
+/// Starts a replicator for every member without one and hands new addresses to the transport.
+/// Replicators of removed members stop by themselves once the removal commits.
+fn reconcile_members<T: ZeroCopyRecord + Indexable + 'static>(s: &Arc<Shared<T>>) {
+    if s.shutdown.load(Ordering::Acquire) {
+        return;
+    }
+    let members = s.node.membership();
+    {
+        let mut known = s.known_members.lock().unwrap_or_else(|p| p.into_inner());
+        if *known != members {
+            s.transport.update_members(&members);
+            *known = members.clone();
+        }
+    }
+    let me = s.node.node_id();
+    let mut running = s.replicating.lock().unwrap_or_else(|p| p.into_inner());
+    for m in members.members().iter().filter(|m| m.id != me) {
+        if running.contains(&m.id) {
+            continue;
+        }
+        let (sh, peer) = (Arc::clone(s), m.id);
+        if let Ok(h) = thread::Builder::new()
+            .name(format!("storine-raft-peer-{peer}"))
+            .spawn(move || replicator_loop(&sh, peer))
+        {
+            running.insert(peer);
+            s.threads.lock().unwrap_or_else(|p| p.into_inner()).push(h);
+        }
+    }
 }
 
 fn wake_replicators<T: ZeroCopyRecord + Indexable>(s: &Shared<T>) {
@@ -332,10 +480,11 @@ fn election_timeout<T: ZeroCopyRecord + Indexable>(s: &Shared<T>) -> Duration {
 }
 
 /// Election timer and leader housekeeping. Sleeps until the next deadline (no busy loop).
-fn timer_loop<T: ZeroCopyRecord + Indexable>(s: &Arc<Shared<T>>) {
+fn timer_loop<T: ZeroCopyRecord + Indexable + 'static>(s: &Arc<Shared<T>>) {
     let mut timeout = election_timeout(s);
     let mut last_sweep = Instant::now();
     while !s.shutdown.load(Ordering::Acquire) {
+        reconcile_members(s);
         if s.node.is_leader() {
             if s.node.engine().has_ttl_records() && last_sweep.elapsed() >= s.config.sweep_interval {
                 last_sweep = Instant::now();
@@ -343,9 +492,7 @@ fn timer_loop<T: ZeroCopyRecord + Indexable>(s: &Arc<Shared<T>>) {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
                 if s.node.propose(RaftCommand::SweepExpired { now_ns }).is_ok() {
-                    if s.peers.is_empty() {
-                        let _ = advance_commit(s);
-                    }
+                    let _ = advance_commit(s);
                     wake_replicators(s);
                 }
             }
@@ -353,6 +500,11 @@ fn timer_loop<T: ZeroCopyRecord + Indexable>(s: &Arc<Shared<T>>) {
             continue;
         }
         let since = s.node.since_contact();
+        if since >= timeout && !s.node.membership().is_voter(s.node.node_id()) {
+            // Learners, removed nodes and nodes still waiting to join never campaign.
+            s.node.touch_contact();
+            continue;
+        }
         if since >= timeout {
             run_election(s);
             timeout = election_timeout(s);
@@ -371,10 +523,13 @@ fn sleep_interruptibly<T: ZeroCopyRecord + Indexable>(s: &Shared<T>, d: Duration
 }
 
 /// Asks every peer in parallel; returns the responses that arrived.
-fn ask_votes<T: ZeroCopyRecord + Indexable>(s: &Shared<T>, req: RequestVoteReq) -> Vec<RequestVoteResp> {
+fn ask_votes<T: ZeroCopyRecord + Indexable>(
+    s: &Shared<T>,
+    voters: &[NodeId],
+    req: RequestVoteReq,
+) -> Vec<RequestVoteResp> {
     thread::scope(|scope| {
-        let handles: Vec<_> = s
-            .peers
+        let handles: Vec<_> = voters
             .iter()
             .map(|&p| {
                 let t = Arc::clone(&s.transport);
@@ -386,11 +541,13 @@ fn ask_votes<T: ZeroCopyRecord + Indexable>(s: &Shared<T>, req: RequestVoteReq) 
 }
 
 fn run_election<T: ZeroCopyRecord + Indexable>(s: &Arc<Shared<T>>) {
+    let members = s.node.membership();
+    let peers = voter_peers(s, &members);
     // Pre-vote first: only a candidate that could win increments its term.
-    if !s.peers.is_empty() {
+    if !peers.is_empty() {
         let pre = s.node.pre_vote_request();
-        let granted = 1 + ask_votes(s, pre).iter().filter(|r| r.vote_granted).count();
-        if granted < quorum(s) {
+        let granted = 1 + ask_votes(s, &peers, pre).iter().filter(|r| r.vote_granted).count();
+        if granted < quorum(&members) {
             s.node.touch_contact();
             return;
         }
@@ -400,7 +557,7 @@ fn run_election<T: ZeroCopyRecord + Indexable>(s: &Arc<Shared<T>>) {
     };
     s.node.touch_contact();
     let mut votes = 1usize;
-    for resp in ask_votes(s, req) {
+    for resp in ask_votes(s, &peers, req) {
         if resp.term > req.term {
             let _ = s.node.observe_term(resp.term);
             return;
@@ -409,35 +566,43 @@ fn run_election<T: ZeroCopyRecord + Indexable>(s: &Arc<Shared<T>>) {
             votes += 1;
         }
     }
-    if votes >= quorum(s) && s.node.become_leader(req.term) {
+    if votes >= quorum(&members) && s.node.become_leader(req.term) {
         let next = s.node.last_log_index() + 1;
         {
             let mut progress = s.progress.lock().unwrap_or_else(|p| p.into_inner());
             progress.clear();
-            for &p in &s.peers {
-                progress.insert(p, PeerProgress { next_index: next, match_index: 0, acked_sent_at: None });
+            for m in members.members().iter().filter(|m| m.id != s.node.node_id()) {
+                progress.insert(m.id, PeerProgress { next_index: next, match_index: 0, acked_sent_at: None });
             }
             s.progress_term.store(req.term, Ordering::Release);
         }
-        if s.peers.is_empty() {
-            let _ = advance_commit(s);
-        }
+        let _ = advance_commit(s);
         wake_replicators(s);
     }
 }
 
 /// Commits the highest index stored on a quorum (current-term rule enforced by the node).
+/// Commits the highest index stored on a quorum of voters (current-term rule enforced by the
+/// node). The leader counts itself only while it is a voter.
 fn advance_commit<T: ZeroCopyRecord + Indexable>(s: &Shared<T>) -> Result<u64> {
+    if !s.node.is_leader() {
+        return Ok(s.node.commit_index());
+    }
+    let members = s.node.membership();
     let mut matches: Vec<u64> = {
         let progress = s.progress.lock().unwrap_or_else(|p| p.into_inner());
-        s.peers
+        voter_peers(s, &members)
             .iter()
             .map(|p| progress.get(p).map_or(0, |pp| pp.match_index))
             .collect()
     };
-    matches.push(s.node.last_log_index());
+    if members.is_voter(s.node.node_id()) {
+        matches.push(s.node.last_log_index());
+    }
     matches.sort_unstable_by(|a, b| b.cmp(a));
-    let quorum_index = matches[quorum(s) - 1];
+    let Some(&quorum_index) = matches.get(quorum(&members) - 1) else {
+        return Ok(s.node.commit_index());
+    };
     s.node.advance_leader_commit(quorum_index)
 }
 
@@ -522,6 +687,18 @@ fn send_snapshot<T: ZeroCopyRecord + Indexable>(s: &Shared<T>, peer: NodeId, ter
 fn replicator_loop<T: ZeroCopyRecord + Indexable>(s: &Arc<Shared<T>>, peer: NodeId) {
     let mut seen_gen = 0u64;
     while !s.shutdown.load(Ordering::Acquire) {
+        {
+            // A removed member keeps receiving the log until its removal commits.
+            let (members, committed) = s.node.membership_state();
+            if !members.contains(peer) && committed {
+                let mut running = s.replicating.lock().unwrap_or_else(|p| p.into_inner());
+                if !s.node.membership().contains(peer) {
+                    running.remove(&peer);
+                    s.progress.lock().unwrap_or_else(|p| p.into_inner()).remove(&peer);
+                    return;
+                }
+            }
+        }
         if s.node.is_leader() {
             let ok = replicate_once(s, peer);
             // Keep sending while the peer is behind (catch-up), otherwise wait for new entries or
@@ -552,8 +729,10 @@ fn replicator_loop<T: ZeroCopyRecord + Indexable>(s: &Arc<Shared<T>>, peer: Node
 
 /// Sends one heartbeat round to every peer in parallel (read-index confirmation).
 fn heartbeat_round<T: ZeroCopyRecord + Indexable>(s: &Shared<T>) -> Result<()> {
+    let members = s.node.membership();
+    let peers = voter_peers(s, &members);
     thread::scope(|scope| {
-        for &p in &s.peers {
+        for &p in &peers {
             scope.spawn(move || {
                 let _ = replicate_once(s, p);
             });
@@ -687,6 +866,24 @@ mod tests {
             Self { base, net, engines, nodes, runtimes }
         }
 
+        /// Starts node `id` with no configuration: it waits to be added to the cluster.
+        fn join(&mut self, id: NodeId) -> usize {
+            let e = Arc::new(
+                StorageEngine::<DocumentRecord>::open(self.base.join(format!("n{id}")), EngineConfig::default()).unwrap(),
+            );
+            let node = Arc::new(RaftNode::new(id, Arc::clone(&e)).unwrap());
+            self.net.add(Arc::clone(&node));
+            let rt = RaftRuntime::start(Arc::clone(&node), Vec::new(), self.net.transport(id), fast()).unwrap();
+            self.engines.push(e);
+            self.nodes.push(node);
+            self.runtimes.push(rt);
+            self.nodes.len() - 1
+        }
+
+        fn put(&self, l: usize, key: &str) -> Result<Vec<WriteResult>> {
+            self.runtimes[l].commit(vec![WriteOp::put(did("m", key), doc("m", key, &[]))])
+        }
+
         fn leader(&self, timeout: Duration) -> usize {
             let deadline = Instant::now() + timeout;
             loop {
@@ -697,6 +894,18 @@ mod tests {
                     return leaders[0];
                 }
                 assert!(Instant::now() < deadline, "no single leader elected");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        /// A leader among `idx` only.
+        fn leader_among(&self, idx: &[usize], timeout: Duration) -> usize {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Some(&i) = idx.iter().find(|&&i| self.runtimes[i].lease_valid()) {
+                    return i;
+                }
+                assert!(Instant::now() < deadline, "no leader among {idx:?}");
                 thread::sleep(Duration::from_millis(10));
             }
         }
@@ -886,5 +1095,141 @@ mod tests {
         }
         c.wait_converged(&[0, 1, 2]);
         assert_eq!(c.state(lag), c.state(l));
+    }
+
+    fn voters(m: &Membership) -> Vec<NodeId> {
+        m.voters().collect()
+    }
+
+    #[test]
+    fn test_membership_add_voter_then_remove_the_leader() {
+        let mut c = Cluster::new("members", 3);
+        let l = c.leader(Duration::from_secs(5));
+        for i in 0..30 {
+            c.put(l, &format!("k{i}")).unwrap();
+        }
+        // A fourth node joins: learner first, promoted once it has the log.
+        let n4 = c.join(4);
+        c.runtimes[l].add_voter(4, "n4:1", Duration::from_secs(5)).unwrap();
+        c.wait_converged(&[0, 1, 2, n4]);
+        for i in [0, 1, 2, n4] {
+            assert_eq!(voters(&c.nodes[i].membership()), vec![1, 2, 3, 4], "node {i}");
+            assert_eq!(c.state(i), c.state(l), "node {i}");
+        }
+        assert_eq!(c.nodes[n4].membership().get(4).unwrap().addr, "n4:1");
+        // Four voters need three acknowledgements: the leader and node 4 alone cannot commit.
+        let others: Vec<usize> = (0..3).filter(|&i| i != l).collect();
+        for &i in &others {
+            c.net.set_isolated(c.nodes[i].node_id(), true);
+        }
+        assert!(matches!(c.put(l, "lonely"), Err(StorageError::CommitUnknown { .. })));
+        for &i in &others {
+            c.net.set_isolated(c.nodes[i].node_id(), false);
+        }
+        let l = c.leader(Duration::from_secs(5));
+        c.put(l, "after-heal").unwrap();
+        // Remove the leader itself: it steps down once the change commits, the rest elect a new one.
+        let old = c.nodes[l].node_id();
+        c.runtimes[l].remove_member(old).unwrap();
+        let rest: Vec<usize> = (0..4).filter(|&i| i != l).collect();
+        let new = c.leader_among(&rest, Duration::from_secs(5));
+        assert!(!c.nodes[l].is_leader());
+        c.put(new, "without-old-leader").unwrap();
+        c.wait_converged(&rest);
+        for &i in &rest {
+            assert!(!c.nodes[i].membership().contains(old), "node {i}");
+            assert_eq!(c.state(i), c.state(new));
+        }
+        // The removed node never takes over again.
+        let until = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < until {
+            assert!(!c.runtimes[l].lease_valid());
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn test_learners_do_not_count_and_change_rules_hold() {
+        let mut c = Cluster::new("learner", 3);
+        let l = c.leader(Duration::from_secs(5));
+        c.put(l, "a").unwrap();
+        let n4 = c.join(4);
+        c.runtimes[l].add_learner(4, "n4:1").unwrap();
+        c.put(l, "b").unwrap();
+        c.wait_converged(&[0, 1, 2, n4]);
+        assert_eq!(c.state(n4), c.state(l), "a learner receives the log");
+        assert_eq!(voters(&c.nodes[n4].membership()), vec![1, 2, 3]);
+        // Leader + learner are not a quorum of three voters.
+        let others: Vec<usize> = (0..3).filter(|&i| i != l).collect();
+        for &i in &others {
+            c.net.set_isolated(c.nodes[i].node_id(), true);
+        }
+        assert!(matches!(c.put(l, "c"), Err(StorageError::CommitUnknown { .. })));
+        for &i in &others {
+            c.net.set_isolated(c.nodes[i].node_id(), false);
+        }
+        let l = c.leader_among(&[0, 1, 2], Duration::from_secs(5));
+        // Rules: followers refuse, two voters at once are refused, voters cannot be promoted,
+        // unknown members cannot be removed.
+        let f = (0..3).find(|&i| i != l).unwrap();
+        assert!(matches!(c.runtimes[f].add_learner(9, "x"), Err(StorageError::NotLeader { .. })));
+        let two_new = Membership::new(
+            c.nodes[l]
+                .membership()
+                .members()
+                .iter()
+                .cloned()
+                .chain([5, 6].map(|id| Member { id, addr: String::new(), voter: true }))
+                .collect(),
+        )
+        .unwrap();
+        assert!(c.nodes[l].propose_membership(two_new).is_err());
+        assert!(c.runtimes[l].promote(1, Duration::from_millis(100)).is_err());
+        assert!(c.runtimes[l].remove_member(42).is_err());
+        assert!(Membership::new(vec![
+            Member { id: 1, addr: String::new(), voter: true },
+            Member { id: 1, addr: String::new(), voter: false },
+        ])
+        .is_err());
+        // The learner is promoted later, and removed again.
+        c.runtimes[l].promote(4, Duration::from_secs(5)).unwrap();
+        assert_eq!(voters(&c.nodes[l].membership()), vec![1, 2, 3, 4]);
+        c.runtimes[l].remove_member(4).unwrap();
+        assert_eq!(voters(&c.nodes[l].membership()), vec![1, 2, 3]);
+        c.put(l, "d").unwrap();
+    }
+
+    #[test]
+    fn test_membership_survives_compaction_snapshots_and_restart() {
+        let mut c = Cluster::new("members_snap", 3);
+        let l = c.leader(Duration::from_secs(5));
+        let n4 = c.join(4);
+        c.runtimes[l].add_voter(4, "n4:1", Duration::from_secs(5)).unwrap();
+        for i in 0..40 {
+            c.put(l, &format!("k{i}")).unwrap();
+        }
+        c.wait_converged(&[0, 1, 2, n4]);
+        // Compact past the configuration entry everywhere it matters.
+        let applied = c.nodes[l].last_applied();
+        c.nodes[l].compact_log_through(applied).unwrap();
+        let f = (0..3).find(|&i| i != l).unwrap();
+        c.nodes[f].compact_log_through(c.nodes[f].last_applied()).unwrap();
+        // Node 5 joins after the compaction: it catches up through a snapshot that carries the
+        // configuration (node 4 included), then gets the entry that adds it.
+        let n5 = c.join(5);
+        c.runtimes[l].add_voter(5, "n5:1", Duration::from_secs(5)).unwrap();
+        c.put(l, "after-5").unwrap();
+        c.wait_converged(&[0, 1, 2, n4, n5]);
+        assert!(c.nodes[n5].snapshot_index() > 0, "node 5 was caught up by a snapshot");
+        assert_eq!(voters(&c.nodes[n5].membership()), vec![1, 2, 3, 4, 5]);
+        assert_eq!(c.state(n5), c.state(l));
+        // A restarted replica (same files) reads its configuration back: compaction point
+        // configuration from `_raft.members`, newer ones from the log.
+        for i in [f, n5] {
+            c.nodes[i].compact_log_through(c.nodes[i].last_applied()).unwrap();
+            let again = RaftNode::new(c.nodes[i].node_id(), Arc::clone(&c.engines[i])).unwrap();
+            assert_eq!(again.membership(), c.nodes[i].membership(), "node {i}");
+            assert_eq!(voters(&again.membership()), vec![1, 2, 3, 4, 5]);
+        }
     }
 }

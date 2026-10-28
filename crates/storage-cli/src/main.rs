@@ -54,8 +54,14 @@ fn print_usage() {
          \x20 remote-backup <addr> <backup_name>                Trigger remote backup under the server's backup root (admin)\n\
          \x20 remote-checkpoint <addr>                          Trigger remote incremental checkpoint (admin)\n\
          \x20 remote-metrics <addr>                             Scrape Prometheus metrics from remote server\n\
+         \x20 cluster <addr> members                            List cluster members, roles and the leader\n\
+         \x20 cluster <addr> add <id> <host:port>               Add a voter (learner until caught up) (admin)\n\
+         \x20 cluster <addr> add-learner <id> <host:port>       Add a non-voting learner (admin)\n\
+         \x20 cluster <addr> promote <id>                       Promote a caught-up learner to voter (admin)\n\
+         \x20 cluster <addr> remove <id>                        Remove a member, the leader included (admin)\n\
          \n\
          Remote commands authenticate with the STORAGE_TOKEN environment variable when set.\n\
+         cluster changes can be sent to any member: a follower's redirect to the leader is followed.\n\
          backup / archive-wal / restore-pitr enable WAL archiving (required for PITR)."
     );
 }
@@ -353,11 +359,110 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
             print!("{metrics}");
             Ok(())
         }
+        "cluster" => cluster_command(args),
         _ => {
             print_usage();
             Err(storage_types::StorageError::invalid_key("unknown CLI command"))
         }
     }
+}
+
+/// One cluster member as `OP_CLUSTER_INFO` reports it.
+struct MemberInfo {
+    id: u64,
+    addr: String,
+    voter: bool,
+}
+
+/// `(leader id, leader address, term, commit index, members)` from an `OP_CLUSTER_INFO` reply.
+fn parse_cluster_info(b: &[u8]) -> Option<(u64, String, u64, u64, Vec<MemberInfo>)> {
+    let u32_at = |i: usize| -> Option<usize> { Some(u32::from_le_bytes(b.get(i..i + 4)?.try_into().ok()?) as usize) };
+    let u64_at = |i: usize| -> Option<u64> { Some(u64::from_le_bytes(b.get(i..i + 8)?.try_into().ok()?)) };
+    let str_at = |i: usize| -> Option<(String, usize)> {
+        let len = u32_at(i)?;
+        Some((String::from_utf8_lossy(b.get(i + 4..i + 4 + len)?).into_owned(), i + 4 + len))
+    };
+    let leader = u64_at(9)?;
+    let (leader_addr, mut at) = str_at(17)?;
+    let (term, commit) = (u64_at(at)?, u64_at(at + 8)?);
+    at += 24;
+    let n = u32_at(at)?;
+    at += 4;
+    let mut members = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        let id = u64_at(at)?;
+        let (addr, next) = str_at(at + 8)?;
+        members.push(MemberInfo { id, addr, voter: true });
+        at = next;
+    }
+    // Roles follow the member list (servers before `TASK-121` omit them: all voters).
+    for m in &mut members {
+        if let Some(&role) = b.get(at) {
+            m.voter = role == 1;
+            at += 1;
+        }
+    }
+    Some((leader, leader_addr, term, commit, members))
+}
+
+fn cluster_command(args: &[String]) -> storage_types::Result<()> {
+    use storage_server::{CLUSTER_ADD_LEARNER, CLUSTER_ADD_VOTER, CLUSTER_PROMOTE, CLUSTER_REMOVE, OP_CLUSTER_INFO};
+    use storage_types::StorageError;
+    let addr = parse_addr(args.get(1))?;
+    let sub = args.get(2).map(String::as_str).unwrap_or("members");
+    let id = || -> storage_types::Result<u16> {
+        args.get(3)
+            .and_then(|v| v.parse::<u16>().ok())
+            .filter(|&v| v != 0)
+            .ok_or_else(|| StorageError::invalid_key("missing or invalid <id> (1-65535)"))
+    };
+    let member_addr = || -> storage_types::Result<&str> {
+        args.get(4)
+            .map(String::as_str)
+            .ok_or_else(|| StorageError::invalid_key("missing <host:port> of the new member"))
+    };
+    let (action, node, new_addr) = match sub {
+        "members" => {
+            let mut client = connect_remote(addr)?;
+            let (_, info) = client.doc_command(OP_CLUSTER_INFO, &[])?;
+            let (leader, leader_addr, term, commit, members) = parse_cluster_info(&info)
+                .ok_or_else(|| StorageError::corrupted_header("malformed cluster info"))?;
+            println!("leader {leader} ({leader_addr}), term {term}, commit index {commit}");
+            for m in members {
+                let role = if m.voter { "voter" } else { "learner" };
+                let mark = if m.id == leader { "  (leader)" } else { "" };
+                println!("  {:>5}  {:<7}  {}{mark}", m.id, role, m.addr);
+            }
+            return Ok(());
+        }
+        "add" => (CLUSTER_ADD_VOTER, id()?, member_addr()?),
+        "add-learner" => (CLUSTER_ADD_LEARNER, id()?, member_addr()?),
+        "promote" => (CLUSTER_PROMOTE, id()?, ""),
+        "remove" => (CLUSTER_REMOVE, id()?, ""),
+        _ => {
+            print_usage();
+            return Err(StorageError::invalid_key("unknown cluster command"));
+        }
+    };
+    let mut client = connect_remote(addr)?;
+    let result = match client.cluster_change(action, node, new_addr) {
+        Err(StorageError::NotLeader { .. }) => {
+            // Ask the follower where the leader is and send the change there.
+            let (_, info) = client.doc_command(OP_CLUSTER_INFO, &[])?;
+            let leader_addr = parse_cluster_info(&info)
+                .map(|i| i.1)
+                .filter(|a| !a.is_empty())
+                .ok_or_else(|| StorageError::invalid_key("the cluster has no leader right now; retry"))?;
+            let leader = leader_addr
+                .parse::<SocketAddr>()
+                .map_err(|_| StorageError::invalid_key("the leader's address is not host:port"))?;
+            connect_remote(leader)?.cluster_change(action, node, new_addr)
+        }
+        other => other,
+    };
+    result?;
+    println!("OK: cluster {sub} {node}");
+    Ok(())
 }
 
 /// Connects to a remote server, authenticating with `STORAGE_TOKEN` when it is set.

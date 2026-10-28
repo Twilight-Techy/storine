@@ -734,7 +734,7 @@ This document defines the strict chronological execution order for building the 
   - `storage-server` binary serves documents by default (`--records agent` for the legacy typed collection). `StorageClient::doc_get` / `doc_write` / `doc_query` / `doc_command`.
   - **Exit Criteria**: `test_document_api_over_tcp` (concurrent clients, conflicts, idempotency, index job, typed txn, hostile bodies on every new opcode).
 
-## Stage 23: Replication Integrity — Deterministic Replicated Commands, Read-Only Replicas, Safe Reads & a Networked Raft Runtime (`TASK-099` – `TASK-101`)
+## Stage 23: Replication Integrity — Deterministic Replicated Commands, Read-Only Replicas, Safe Reads, a Networked Raft Runtime & Membership Changes (`TASK-099` – `TASK-101`, `TASK-121`)
 
 *(Follow-Up Prompt 2: close the Raft gaps raised in the audit answer.)*
 
@@ -755,7 +755,16 @@ This document defines the strict chronological execution order for building the 
   - `DocumentStore` metadata cache is validated against the `$meta` document version on every use (correct on followers and after leader changes); index builds are exact under concurrent writes (*building* → rewrite → *ready*).
   - Binary: `--node-id N --peers 1=host:port,...` and `STORAGE_CLUSTER_TOKEN`.
   - **Exit Criteria**: `test_three_node_tcp_cluster_writes_redirects_and_failover` (8 consecutive runs green), `test_index_build_stays_exact_under_concurrent_writes`; 3-process smoke test of the release binary elects one leader.
-  - **Documented limit**: static membership (no joint-consensus reconfiguration yet).
+  - Static membership at the time; membership changes followed in `TASK-121`.
+
+- [x] **TASK-121: Cluster Membership Changes (`F-DIST-02`, `F-DIST-05`)** (`storage-core/src/raft.rs`, `raft_runtime.rs`, `storage-server`, `storage-cli`)
+  - The configuration is a log entry (`RaftCommand::Config`, entry kind 5) in force from the moment it is appended and rolled back with a truncated suffix. Changes are single-server (Raft thesis §4.1): at most one voter added, promoted or removed per change, one change in flight, and only after the leader has committed an entry of its own term.
+  - Learners receive the log but neither vote nor count towards commit, leases or elections. `add_voter` adds a learner, waits until it has the committed log, then promotes it. A leader that removes itself keeps replicating without counting itself and steps down when the change commits. Nodes that are not voters never campaign.
+  - The configuration at the compaction point is persisted (`<stem>_raft.members`), and snapshots carry it (format `STGESNP2`; version 1 still read). The start-up `--peers` list only bootstraps a new cluster.
+  - Runtime: per-member replicator threads start and stop with the configuration; the TCP transport learns new members' addresses from it; redirects and `OP_CLUSTER_INFO` use it (members now with roles).
+  - Server: `OP_CLUSTER_CHANGE 0x28` (Admin; add voter / add learner / promote / remove; leader only, followers answer `NotLeader`), run on the worker pool. Binary: `--node-id N --join` starts a node that waits to be added. CLI: `storage-cli cluster <addr> members | add | add-learner | promote | remove` (follows a follower's redirect).
+  - **Also fixed**: a race in document index builds: a write that read the index ids just before a build started could commit without the new index. Every write now checks the collection's `$meta` version in its own commit (rebuilt on a change), and the rebuild pass retries changed documents instead of skipping them.
+  - **Exit Criteria**: `test_membership_add_voter_then_remove_the_leader`, `test_learners_do_not_count_and_change_rules_hold`, `test_membership_survives_compaction_snapshots_and_restart` (15 consecutive runs green), `test_cluster_grows_and_the_leader_removes_itself_over_tcp` (10 runs green); a release-binary smoke test grew 3 processes to 4 through `storage-cli`, removed the leader (the joined node was elected), and restarted a node with its stale `--peers`, which kept the log's configuration.
 
 ## Stage 24: Windows Readiness Reactor — AFD Poll over IOCP (`TASK-102`)
 
