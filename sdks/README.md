@@ -16,7 +16,7 @@ Official clients of the Storine document API. Every SDK:
 | Language | Directory | Money type | Tests |
 | --- | --- | --- | --- |
 | Python 3.8+ | [`python/`](python) | `decimal.Decimal` | `python3 -m unittest discover -s tests` |
-| TypeScript / Node.js 18+ | [`typescript/`](typescript) | `Decimal` (exact, string-backed) | `npm test` |
+| TypeScript / Node.js 18+ | [`typescript/`](typescript) | `Decimal` (exact, `bigint` mantissa) | `npm test` |
 | Go 1.21+ | [`go/`](go) | `storine.Decimal` | `go test -race .` |
 | Java 17+ | [`java/`](java) | `java.math.BigDecimal` | `mvn test` |
 | C# / .NET 8+ | [`csharp/`](csharp) | `decimal` (or `BigDecimal` beyond 28 digits) | `dotnet test` |
