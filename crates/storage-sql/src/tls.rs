@@ -1,9 +1,13 @@
-//! A zero-dependency TLS 1.3 server (RFC 8446) for the PostgreSQL and MySQL endpoints.
+//! A zero-dependency TLS server for the PostgreSQL, MySQL and SQL Server endpoints: TLS 1.3
+//! (RFC 8446), and TLS 1.2 (RFC 5246) for clients that offer nothing newer.
 //!
 //! Scope, chosen for what every current client library offers:
-//! - cipher suite `TLS_CHACHA20_POLY1305_SHA256`, key exchange `x25519` (with a
+//! - TLS 1.3: cipher suite `TLS_CHACHA20_POLY1305_SHA256`, key exchange `x25519` (with a
 //!   HelloRetryRequest when the client guessed another group first), certificates signed with
 //!   `ed25519`;
+//! - TLS 1.2: `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (RFC 7905) with `x25519` and an
+//!   `ed25519` signature (RFC 8422), extended master secret (RFC 7627), secure renegotiation
+//!   indication (renegotiation itself is refused);
 //! - full handshakes only (no session resumption, no 0-RTT), no client certificates;
 //! - `KeyUpdate` in both directions, `close_notify`, fatal alerts on every protocol error.
 //!
@@ -24,6 +28,9 @@ use crate::hash::{base64_decode, base64_encode, ct_eq, hmac_sha256, sha256};
 
 const TLS13: u16 = 0x0304;
 const CHACHA20_POLY1305_SHA256: u16 = 0x1303;
+const TLS12: u16 = 0x0303;
+const ECDHE_ECDSA_CHACHA20_POLY1305: u16 = 0xcca9;
+const EMPTY_RENEGOTIATION_INFO_SCSV: u16 = 0x00ff;
 const X25519: u16 = 0x001d;
 const ED25519: u16 = 0x0807;
 
@@ -34,6 +41,9 @@ const CT_APPLICATION_DATA: u8 = 23;
 
 const HS_CLIENT_HELLO: u8 = 1;
 const HS_SERVER_HELLO: u8 = 2;
+const HS_SERVER_KEY_EXCHANGE: u8 = 12;
+const HS_SERVER_HELLO_DONE: u8 = 14;
+const HS_CLIENT_KEY_EXCHANGE: u8 = 16;
 const HS_ENCRYPTED_EXTENSIONS: u8 = 8;
 const HS_CERTIFICATE: u8 = 11;
 const HS_CERTIFICATE_VERIFY: u8 = 15;
@@ -331,6 +341,9 @@ struct Keys {
     key: [u8; 32],
     iv: [u8; 12],
     seq: u64,
+    /// TLS 1.2 record protection (RFC 7905): the content type is in the record header and
+    /// the additional data is `seq || type || version || length`.
+    tls12: bool,
 }
 
 impl Keys {
@@ -346,7 +359,28 @@ impl Keys {
             key,
             iv,
             seq: 0,
+            tls12: false,
         }
+    }
+
+    fn tls12(key: [u8; 32], iv: [u8; 12]) -> Keys {
+        Keys {
+            secret: [0; 32],
+            key,
+            iv,
+            seq: 0,
+            tls12: true,
+        }
+    }
+
+    /// TLS 1.2 additional data for a record of `ct` with `len` plaintext bytes.
+    fn aad12(&self, ct: u8, len: usize) -> [u8; 13] {
+        let mut aad = [0u8; 13];
+        aad[..8].copy_from_slice(&self.seq.to_be_bytes());
+        aad[8] = ct;
+        aad[9..11].copy_from_slice(&TLS12.to_be_bytes());
+        aad[11..].copy_from_slice(&(len as u16).to_be_bytes());
+        aad
     }
 
     /// The next generation of these keys (`KeyUpdate`).
@@ -366,6 +400,17 @@ impl Keys {
     fn seal(&mut self, ct: u8, content: &[u8]) -> io::Result<Vec<u8>> {
         if self.seq == u64::MAX {
             return Err(tls_err("record sequence number exhausted"));
+        }
+        if self.tls12 {
+            let mut rec = Vec::with_capacity(5 + content.len() + 16);
+            rec.extend_from_slice(&[ct, 0x03, 0x03]);
+            rec.extend_from_slice(&((content.len() + 16) as u16).to_be_bytes());
+            rec.extend_from_slice(content);
+            let aad = self.aad12(ct, content.len());
+            let tag = seal_in_place(&self.key, &self.nonce(), &aad, &mut rec[5..]);
+            rec.extend_from_slice(&tag);
+            self.seq += 1;
+            return Ok(rec);
         }
         let mut inner = Vec::with_capacity(content.len() + 1 + 16 + 5);
         inner.extend_from_slice(&[CT_APPLICATION_DATA, 0x03, 0x03, 0, 0]);
@@ -394,6 +439,16 @@ impl Keys {
         let tag_at = body.len() - 16;
         let tag: [u8; 16] = body[tag_at..].try_into().unwrap_or([0; 16]);
         body.truncate(tag_at);
+        if self.tls12 {
+            let aad = self.aad12(header[0], body.len());
+            open_in_place(&self.key, &self.nonce(), &aad, body, &tag)
+                .map_err(|_| alert_error(ALERT_BAD_RECORD_MAC, "record authentication failed"))?;
+            self.seq += 1;
+            if body.len() > MAX_FRAGMENT {
+                return Err(alert_error(ALERT_RECORD_OVERFLOW, "record too large"));
+            }
+            return Ok(header[0]);
+        }
         open_in_place(&self.key, &self.nonce(), header, body, &tag)
             .map_err(|_| alert_error(ALERT_BAD_RECORD_MAC, "record authentication failed"))?;
         self.seq += 1;
@@ -629,6 +684,11 @@ fn u16_list(b: &[u8]) -> Vec<u16> {
 
 #[derive(Default)]
 struct ClientHello {
+    legacy_version: u16,
+    random: [u8; 32],
+    /// TLS 1.2: extended_master_secret offered; renegotiation_info (or its SCSV) offered.
+    ems: bool,
+    secure_renegotiation: bool,
     session_id: Vec<u8>,
     suites: Vec<u16>,
     versions: Vec<u16>,
@@ -645,19 +705,22 @@ fn parse_client_hello(msg: &[u8]) -> io::Result<ClientHello> {
         b: &msg[4..],
         pos: 0,
     };
-    let mut ch = ClientHello::default();
-    c.u16()?; // legacy_version
-    c.take(32)?; // random
+    let mut ch = ClientHello {
+        legacy_version: c.u16()?,
+        random: c.take(32)?.try_into().unwrap_or([0; 32]),
+        ..ClientHello::default()
+    };
     ch.session_id = c.vec8()?.to_vec();
     if ch.session_id.len() > 32 {
         return Err(alert_error(ALERT_ILLEGAL_PARAMETER, "session id too long"));
     }
     ch.suites = u16_list(c.vec16()?);
+    ch.secure_renegotiation = ch.suites.contains(&EMPTY_RENEGOTIATION_INFO_SCSV);
     let compression = c.vec8()?;
-    if compression != [0] {
+    if !compression.contains(&0) {
         return Err(alert_error(
             ALERT_ILLEGAL_PARAMETER,
-            "TLS 1.3 requires null compression",
+            "the client offers no null compression",
         ));
     }
     if c.done() {
@@ -678,6 +741,17 @@ fn parse_client_hello(msg: &[u8]) -> io::Result<ClientHello> {
         let mut d = Cursor { b: data, pos: 0 };
         match kind {
             0x002b => ch.versions = u16_list(d.vec8()?),
+            0x0017 => ch.ems = true,
+            0xff01 => {
+                if d.vec8()?.is_empty() {
+                    ch.secure_renegotiation = true;
+                } else {
+                    return Err(alert_error(
+                        ALERT_HANDSHAKE_FAILURE,
+                        "renegotiation is not supported",
+                    ));
+                }
+            }
             0x000a => ch.groups = u16_list(d.vec16()?),
             0x000d => ch.sig_algs = u16_list(d.vec16()?),
             0x0033 => {
@@ -801,6 +875,9 @@ fn handshake<R: Read, W: Write>(
         ));
     }
     let mut ch = parse_client_hello(&ch_msg)?;
+    if !ch.versions.contains(&TLS13) && ch.legacy_version >= TLS12 {
+        return handshake12(r, w, cfg, alpn, &mut hs, &ch, &ch_msg);
+    }
     check_offer(&ch)?;
     let mut transcript: Vec<u8> = Vec::new();
     if ch.x25519_share.is_none() {
@@ -965,6 +1042,192 @@ fn handshake<R: Read, W: Write>(
     Ok((Keys::new(c_ap), Keys::new(s_ap), Vec::new()))
 }
 
+// ── TLS 1.2 ──
+
+/// TLS 1.2's PRF: P_SHA256(secret, label || seed).
+fn prf(secret: &[u8], label: &str, seed: &[u8], len: usize) -> Vec<u8> {
+    let mut ls = label.as_bytes().to_vec();
+    ls.extend_from_slice(seed);
+    let mut a = hmac_sha256(secret, &ls).to_vec();
+    let mut out = Vec::with_capacity(len + 32);
+    while out.len() < len {
+        let mut m = a.clone();
+        m.extend_from_slice(&ls);
+        out.extend_from_slice(&hmac_sha256(secret, &m));
+        a = hmac_sha256(secret, &a).to_vec();
+    }
+    out.truncate(len);
+    out
+}
+
+/// A TLS 1.2 server handshake (after ClientHello): ServerHello, Certificate,
+/// ServerKeyExchange (x25519 signed with ed25519), ServerHelloDone; then the client's
+/// ClientKeyExchange, ChangeCipherSpec and Finished; then ours.
+fn handshake12<R: Read, W: Write>(
+    r: &mut R,
+    w: &mut W,
+    cfg: &TlsConfig,
+    alpn: &str,
+    hs: &mut HandshakeReader,
+    ch: &ClientHello,
+    ch_msg: &[u8],
+) -> io::Result<(Keys, Keys, Vec<u8>)> {
+    if !ch.suites.contains(&ECDHE_ECDSA_CHACHA20_POLY1305) {
+        return Err(alert_error(
+            ALERT_HANDSHAKE_FAILURE,
+            "the client offers neither TLS 1.3 nor TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+        ));
+    }
+    if !ch.groups.contains(&X25519) {
+        return Err(alert_error(
+            ALERT_HANDSHAKE_FAILURE,
+            "the client does not support x25519",
+        ));
+    }
+    if !ch.sig_algs.contains(&ED25519) {
+        return Err(alert_error(
+            ALERT_HANDSHAKE_FAILURE,
+            "the client does not accept ed25519 certificates",
+        ));
+    }
+    let mut transcript = ch_msg.to_vec();
+    let random: [u8; 32] = os_random_array()?;
+
+    // ServerHello.
+    let mut exts = Vec::new();
+    if ch.secure_renegotiation {
+        exts.push(ext(0xff01, &[0]));
+    }
+    if ch.ems {
+        exts.push(ext(0x0017, &[]));
+    }
+    exts.push(ext(0x000b, &[1, 0])); // ec_point_formats: uncompressed
+    if ch.has_alpn && ch.alpn.iter().any(|p| p == alpn.as_bytes()) {
+        let mut list = vec![alpn.len() as u8];
+        list.extend_from_slice(alpn.as_bytes());
+        let mut body = (list.len() as u16).to_be_bytes().to_vec();
+        body.extend_from_slice(&list);
+        exts.push(ext(0x0010, &body));
+    }
+    let mut sh = TLS12.to_be_bytes().to_vec();
+    sh.extend_from_slice(&random);
+    sh.push(0); // no session id: no resumption
+    sh.extend_from_slice(&ECDHE_ECDSA_CHACHA20_POLY1305.to_be_bytes());
+    sh.push(0);
+    let all = exts.concat();
+    sh.extend_from_slice(&(all.len() as u16).to_be_bytes());
+    sh.extend_from_slice(&all);
+    let mut flight = handshake_msg(HS_SERVER_HELLO, &sh);
+
+    // Certificate (TLS 1.2 form: no per-certificate extensions).
+    let mut entries = Vec::new();
+    for cert in &cfg.chain {
+        entries.extend_from_slice(&(cert.len() as u32).to_be_bytes()[1..]);
+        entries.extend_from_slice(cert);
+    }
+    let mut cert_body = (entries.len() as u32).to_be_bytes()[1..].to_vec();
+    cert_body.extend_from_slice(&entries);
+    flight.extend_from_slice(&handshake_msg(HS_CERTIFICATE, &cert_body));
+
+    // ServerKeyExchange: named curve x25519, our public key, signed with the certificate key.
+    let secret: [u8; 32] = os_random_array()?;
+    let public = x25519_public(&secret);
+    let mut params = vec![3u8];
+    params.extend_from_slice(&X25519.to_be_bytes());
+    params.push(32);
+    params.extend_from_slice(&public);
+    let mut signed = ch.random.to_vec();
+    signed.extend_from_slice(&random);
+    signed.extend_from_slice(&params);
+    let sig = cfg.key.sign(&signed);
+    let mut ske = params;
+    ske.extend_from_slice(&ED25519.to_be_bytes());
+    ske.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+    ske.extend_from_slice(&sig);
+    flight.extend_from_slice(&handshake_msg(HS_SERVER_KEY_EXCHANGE, &ske));
+    flight.extend_from_slice(&handshake_msg(HS_SERVER_HELLO_DONE, &[]));
+    transcript.extend_from_slice(&flight);
+    for chunk in flight.chunks(MAX_FRAGMENT) {
+        w.write_all(&plain_record(CT_HANDSHAKE, chunk))?;
+    }
+    w.flush()?;
+
+    // ClientKeyExchange.
+    let (kind, cke) = hs.next(r, None)?;
+    if kind != HS_CLIENT_KEY_EXCHANGE {
+        return Err(alert_error(
+            ALERT_UNEXPECTED_MESSAGE,
+            "expected ClientKeyExchange",
+        ));
+    }
+    let client_pub: [u8; 32] = cke
+        .get(4..)
+        .and_then(|b| b.split_first())
+        .filter(|(n, rest)| **n == 32 && rest.len() == 32)
+        .and_then(|(_, rest)| rest.try_into().ok())
+        .ok_or_else(|| alert_error(ALERT_DECODE_ERROR, "bad ClientKeyExchange"))?;
+    let shared = x25519(&secret, &client_pub);
+    if shared == [0; 32] {
+        return Err(alert_error(ALERT_ILLEGAL_PARAMETER, "invalid x25519 share"));
+    }
+    transcript.extend_from_slice(&cke);
+    let master = if ch.ems {
+        prf(&shared, "extended master secret", &sha256(&transcript), 48)
+    } else {
+        let mut seed = ch.random.to_vec();
+        seed.extend_from_slice(&random);
+        prf(&shared, "master secret", &seed, 48)
+    };
+    let mut seed = random.to_vec();
+    seed.extend_from_slice(&ch.random);
+    let block = prf(&master, "key expansion", &seed, 88);
+    let arr32 = |b: &[u8]| -> [u8; 32] { b.try_into().unwrap_or([0; 32]) };
+    let arr12 = |b: &[u8]| -> [u8; 12] { b.try_into().unwrap_or([0; 12]) };
+    let mut c_keys = Keys::tls12(arr32(&block[..32]), arr12(&block[64..76]));
+    let mut s_keys = Keys::tls12(arr32(&block[32..64]), arr12(&block[76..88]));
+
+    // The client's ChangeCipherSpec, then its encrypted Finished.
+    if !hs.buf.is_empty() {
+        return Err(alert_error(
+            ALERT_UNEXPECTED_MESSAGE,
+            "handshake data before ChangeCipherSpec",
+        ));
+    }
+    let (header, body) = read_record(r)?;
+    match header[0] {
+        CT_CHANGE_CIPHER_SPEC if body == [1] => {}
+        CT_ALERT => return Err(peer_alert(&body)),
+        _ => {
+            return Err(alert_error(
+                ALERT_UNEXPECTED_MESSAGE,
+                "expected ChangeCipherSpec",
+            ))
+        }
+    }
+    let (header, mut body) = read_record(r)?;
+    if header[0] != CT_HANDSHAKE || c_keys.open(&header, &mut body)? != CT_HANDSHAKE {
+        return Err(alert_error(
+            ALERT_UNEXPECTED_MESSAGE,
+            "expected the client Finished",
+        ));
+    }
+    let expected = prf(&master, "client finished", &sha256(&transcript), 12);
+    if body.len() != 16 || body[0] != HS_FINISHED || !ct_eq(&body[4..], &expected) {
+        return Err(alert_error(
+            ALERT_DECRYPT_ERROR,
+            "client Finished does not verify",
+        ));
+    }
+    transcript.extend_from_slice(&body);
+
+    // Ours.
+    let verify = prf(&master, "server finished", &sha256(&transcript), 12);
+    w.write_all(&plain_record(CT_CHANGE_CIPHER_SPEC, &[1]))?;
+    w.write_all(&s_keys.seal(CT_HANDSHAKE, &handshake_msg(HS_FINISHED, &verify))?)?;
+    w.flush()?;
+    Ok((c_keys, s_keys, Vec::new()))
+}
+
 /// What every ClientHello (including the one after a HelloRetryRequest) must offer.
 fn check_offer(ch: &ClientHello) -> io::Result<()> {
     if !ch.versions.contains(&TLS13) {
@@ -1035,6 +1298,15 @@ impl<R> std::fmt::Debug for TlsReader<R> {
 }
 
 impl<R> TlsReader<R> {
+    /// The negotiated protocol version, for logs: `"TLS 1.3"` or `"TLS 1.2"`.
+    pub fn version(&self) -> &'static str {
+        if self.keys.tls12 {
+            "TLS 1.2"
+        } else {
+            "TLS 1.3"
+        }
+    }
+
     /// The underlying stream, ending TLS in this direction (TDS login-only encryption).
     pub fn into_inner(self) -> R {
         self.inner
@@ -1054,7 +1326,7 @@ impl<R: Read> Read for TlsReader<R> {
                     "change_cipher_spec after the handshake",
                 ));
             }
-            if header[0] != CT_APPLICATION_DATA {
+            if header[0] != CT_APPLICATION_DATA && !self.keys.tls12 {
                 return Err(alert_error(
                     ALERT_UNEXPECTED_MESSAGE,
                     "plaintext record after the handshake",

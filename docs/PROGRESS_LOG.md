@@ -471,7 +471,7 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - REPEATABLE READ / SERIALIZABLE behaved as READ COMMITTED. Reads are now validated at commit.
   - `nextval` silently created unknown sequences.
 - **Security**: SCRAM-SHA-256 / native-password authentication with constant-time comparison; every protocol message length bounded (`MAX_MESSAGE`); COPY records and fields bounded; recursion depth limits (views 32, FK cascades 32); validated-read and recursive-CTE row caps; no statement is silently ignored except session settings that do not apply.
-- **Known limitations** (documented in `crates/storage-sql/README.md`): no TLS yet (`TASK-117`), DDL not transactional, one schema per database, SERIALIZABLE does not detect range phantoms, no stored procedures / triggers, no TDS yet (`TASK-118`).
+- **Known limitations** (documented in `crates/storage-sql/README.md`): DDL not transactional, one schema per database, SERIALIZABLE does not detect range phantoms, no stored procedures / triggers.
 - **TLS (`TASK-117`)**:
   - Built in-house to keep the zero-dependency rule: X25519 / Ed25519 with five 51-bit limbs, Montgomery ladder and constant-time selects; Barrett reduction mod L; SHA-512; HKDF; a TLS 1.3 server state machine.
   - Verified against RFC 7748, RFC 8032 and RFC 8448 values. `openssl verify` accepts the generated certificate.
@@ -479,3 +479,16 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - Bounds: records ≤ 2^14 + 256 bytes, handshake messages ≤ 64 KiB, sequence numbers checked; fatal alerts on every protocol error.
   - Every ClientHello, including the one after a HelloRetryRequest, must offer TLS 1.3, ChaCha20-Poly1305 and Ed25519.
   - Ephemeral keys come from the OS CSPRNG. The private key file is created with mode 0600.
+- **SQL Server endpoint (`TASK-118`)**:
+  - Built in stages, each driven by real clients: the TDS transport and token streams (pymssql at TDS 7.1 and 7.4), RPC with typed parameters (go-mssqldb, mssql-jdbc, tedious), TLS, then T-SQL and the catalogs ORMs read (SQLAlchemy, Sequelize, TypeORM, GORM, EF Core, Hibernate, Prisma).
+  - `MERGE` executes each action as an ordinary INSERT / UPDATE / DELETE, so constraints, versioned writes and identity values behave exactly as for those statements (EF Core batches inserts this way; GORM upserts this way).
+  - Declared T-SQL types (`datetime` vs `datetime2`, `varchar` vs `nvarchar`) and constraint names (primary keys, defaults) are now part of the stored schema, because migration tools (TypeORM, Prisma) compare them; Prisma's `db push` round-trips with no drift.
+  - Interoperability findings, each fixed and covered by a suite:
+    - go-mssqldb never sends its TLS 1.3 Finished inside PRELOGIN. Its first application record, which decrypts only under keys derived from the whole handshake, is accepted in its place.
+    - Microsoft.Data.SqlClient mis-reads NVARCHAR(MAX) characters split across packets. PLP chunks now end one byte before a packet boundary whenever a character would straddle it.
+    - tedious caps TDS 7 encryption at TLS 1.2 (as SQL Server on Windows does), so the TLS server gained TLS 1.2: `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` with x25519 and an Ed25519 signature, extended master secret, renegotiation refused.
+    - `SET IMPLICIT_TRANSACTIONS OFF` inside EF Core's transaction committed it (it was mapped onto MySQL's `autocommit = 1`). It is now separate.
+    - SQL Server statement errors do not abort a transaction (XACT_ABORT OFF), and constraint errors carry SQL Server's message wording, which Sequelize and others match.
+    - Integer literals, `COUNT` and integer expression results are `int`, not `bigint` (SqlClient's `GetInt32` refuses `bigint`; tedious returns `bigint` as strings).
+  - Shared fixes found along the way: `ALTER TABLE IF EXISTS` on a missing table is a no-op; `information_schema.sequences` lists sequences (Hibernate schema validation); `ORDER BY t.col` after a UNION names the output column; VALUES columns are typed from their values.
+  - Verification: `run_all.sh` now runs 14 suites, all passing; the SQL Server suites cover every encryption mode, including TDS 8 strict with certificate verification.

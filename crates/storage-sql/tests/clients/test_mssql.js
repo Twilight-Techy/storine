@@ -92,7 +92,7 @@ async function main() {
     await assert.rejects(exec(c, "INSERT INTO td_acct (owner, balance) VALUES ('ann', 1)"), (e) => e.number === 2627);
     c.close();
     // encrypt: true (TLS inside TDS 7.4), and TDS 8 strict mode against the pinned certificate.
-    const modes = [];
+    const modes = [[true, {}]];
     if (process.env.STORINE_TLS_CERT) {
       const ca = require("fs").readFileSync(process.env.STORINE_TLS_CERT);
       modes.push(["strict", { serverName: "localhost", trustServerCertificate: false, cryptoCredentialsDetails: { ca } }]);

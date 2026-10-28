@@ -36,6 +36,10 @@ It is engineered for workloads requiring **sub-microsecond reads (`~200 ns` p50)
   - Per-record policy (`Indexable::protection`): encrypt confidential records, authenticate-only (plaintext + MAC, tamper-proof) the rest.
 - **Sharded Non-Blocking TCP Server (`StorageServer`)**:
   - Fixed pool of `ReactorShard` worker threads multiplexing non-blocking sockets (`NonBlockingConn`, `~88 bytes` per idle connection) with zero-allocation vectored `IoSlice` socket writes and dynamic `max_connections` admission control.
+- **Client SDKs** ([`sdks/`](sdks)):
+  - Python, TypeScript, Go, Java, C# and Rust clients with one shared API, no runtime dependencies, exact decimals, at-most-once retries and automatic leader failover, all checked against the same protocol vectors ([`protocol/PROTOCOL.md`](protocol/PROTOCOL.md)).
+- **SQL Gateway for Existing Apps (`storine-sql`)** ([`crates/storage-sql`](crates/storage-sql/README.md)):
+  - Speaks the PostgreSQL, MySQL and SQL Server wire protocols and their SQL dialects, so applications built on psycopg, node-postgres, JDBC, ADO.NET, Django, Rails, Laravel, Prisma, Hibernate, Entity Framework and others run on Storine by changing only the connection string. Writes are versioned (no lost updates), constraints are enforced atomically, and TLS 1.3 / 1.2 is built in.
 
 ---
 
@@ -94,6 +98,7 @@ flowchart TD
 | **`storage-core`** | [`crates/storage-core`](crates/storage-core) | Unified `StorageEngine<T>`, `RecordRef<T>`, `WriteCoalescer`, `StripedLockTable`, hybrid query planner, and chaos crash-recovery tests. |
 | **`storage-server`** | [`crates/storage-server`](crates/storage-server) | Sharded non-blocking TCP event reactor (`StorageServer<T>`) and binary client (`StorageClient`) with runtime `max_connections` admission control. |
 | **`storage-cli`** | [`crates/storage-cli`](crates/storage-cli) | Command-line inspection, CRUD, hybrid search, compaction, and diagnostics utility. |
+| **`storage-sql`** | [`crates/storage-sql`](crates/storage-sql) | `storine-sql`: PostgreSQL / MySQL / SQL Server wire-compatible SQL gateway over Storine documents (see its [README](crates/storage-sql/README.md)). |
 | **`benches`** | [`benches`](benches) | Release benchmark harness with custom `TrackingAllocator` enforcing `0.00` heap allocations on hot read paths. |
 
 ---
@@ -214,6 +219,16 @@ cargo run --release -p storage-cli -- stats ./data
 cargo run --release -p storage-cli -- compact ./data
 ```
 Backups and point-in-time recovery: `backup <db_dir> <backup_dir>`, `archive-wal <db_dir> <backup_dir>`, `restore-pitr <backup_dir> <restore_dir> <ts_ns>` (these open the engine with WAL archiving enabled, which PITR requires). Remote admin commands (`remote-health`, `remote-backup`, ...) authenticate with `STORAGE_TOKEN`.
+
+### Run the SQL Gateway
+```bash
+cargo build --release -p storage-sql
+# Embedded database; PostgreSQL on :5432, MySQL on :3306, SQL Server on :1433 (TLS on by default)
+target/release/storine-sql --data ./sql_data --user app:secret
+# Or in front of a running Storine server / cluster
+target/release/storine-sql --storine storine://h1:7878,h2:7878,h3:7878 --user app:secret
+```
+Then use `postgresql://app:secret@127.0.0.1:5432/shop`, `mysql://app:secret@127.0.0.1:3306/shop` or `Server=tcp:127.0.0.1,1433;Database=shop;User ID=app;Password=secret;TrustServerCertificate=true` in the application. Details, supported SQL and limitations: [`crates/storage-sql/README.md`](crates/storage-sql/README.md).
 
 ---
 

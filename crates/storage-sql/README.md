@@ -1,36 +1,42 @@
-# storine-sql: PostgreSQL and MySQL for existing apps
+# storine-sql: PostgreSQL, MySQL and SQL Server for existing apps
 
-`storine-sql` lets applications that already talk to PostgreSQL or MySQL use Storine by
-**changing only their connection string**. It speaks the PostgreSQL v3 and MySQL wire
-protocols, understands both SQL dialects, and emulates the catalogs that drivers and ORMs
-introspect (`pg_catalog`, `information_schema`, `SHOW ...`). Your tables are stored as
-Storine documents, so you keep Storine's durability, replication and exact decimals.
+`storine-sql` lets applications that already talk to PostgreSQL, MySQL or Microsoft SQL Server
+use Storine by **changing only their connection string**. It speaks the PostgreSQL v3, MySQL
+and TDS (SQL Server) wire protocols, understands the three SQL dialects (including T-SQL), and
+emulates the catalogs that drivers and ORMs introspect (`pg_catalog`, `information_schema`,
+`SHOW ...`, `sys.*`, the `sp_*` metadata procedures). Your tables are stored as Storine
+documents, so you keep Storine's durability, replication and exact decimals.
 
 ```text
-storine-sql --data ./db                      # embedded database: PostgreSQL on 127.0.0.1:5432, MySQL on 127.0.0.1:3306
+storine-sql --data ./db                      # embedded database: PostgreSQL on 127.0.0.1:5432, MySQL on :3306, SQL Server on :1433
 storine-sql --storine storine://h1,h2,h3     # or in front of a running Storine server / cluster
-            [--pg 0.0.0.0:5432] [--mysql 0.0.0.0:3306] [--no-pg] [--no-mysql]
+            [--pg 0.0.0.0:5432] [--mysql 0.0.0.0:3306] [--mssql 0.0.0.0:1433]
+            [--no-pg] [--no-mysql] [--no-mssql]
             [--user name:password]...        # without --user every client is trusted (keep it on localhost)
             [--database shop]                # name of the default database (default: storine)
             [--tls-cert chain.pem --tls-key key.pem | --no-tls] [--require-tls]
 ```
 
-Then point the application at it, exactly as you would at PostgreSQL or MySQL:
+Then point the application at it, exactly as you would at the database it was written for:
 
 ```text
 postgresql://app:secret@127.0.0.1:5432/shop
 mysql://app:secret@127.0.0.1:3306/shop
+Server=tcp:127.0.0.1,1433;Database=shop;User ID=app;Password=secret;TrustServerCertificate=true
 ```
 
 Users can also come from `STORINE_SQL_USERS=name:password,name2:password2`. PostgreSQL clients
 authenticate with SCRAM-SHA-256, MySQL clients with `mysql_native_password` (both standard; no
-plaintext passwords on the wire). Set `STORINE_SQL_LOG=1` to log every statement.
+plaintext passwords on the wire). SQL Server clients use SQL Server authentication, whose
+password travels inside the (always TLS-encrypted, when TLS is on) login packet, as with SQL
+Server itself. Set `STORINE_SQL_LOG=1` to log every statement.
 
 ## TLS
 
-Both endpoints speak **TLS 1.3**, implemented in-house like the rest of Storine (no OpenSSL):
-`TLS_CHACHA20_POLY1305_SHA256` with `x25519` key exchange and an Ed25519 certificate.
-It is on by default:
+All three endpoints speak **TLS 1.3 and TLS 1.2**, implemented in-house like the rest of
+Storine (no OpenSSL): `TLS_CHACHA20_POLY1305_SHA256` (TLS 1.3) or
+`TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` (TLS 1.2, with extended master secret), always
+with `x25519` key exchange and an Ed25519 certificate. It is on by default:
 
 - With `--data DIR`, a self-signed certificate for `localhost`, `127.0.0.1` and `::1` is
   created once in `DIR/tls/` (`server.crt`, `server.key` with mode 0600) and reused. Clients
@@ -39,10 +45,16 @@ It is on by default:
 - `--tls-cert chain.pem --tls-key key.pem` serves your own certificate. The key must be
   Ed25519 (`openssl genpkey -algorithm ed25519 -out key.pem`, then have your CA sign it).
 - `--require-tls` refuses clients that stay in plaintext; `--no-tls` turns TLS off.
+- SQL Server: every encryption mode works. `Encrypt=Optional` / `encrypt=false` encrypts the
+  login only (like SQL Server), `Encrypt=Mandatory` / `encrypt=true` the whole connection
+  (TLS inside the TDS 7.x PRELOGIN exchange), and `Encrypt=Strict` / `encrypt=strict` is TDS
+  8.0 (TLS first, ALPN `tds/8.0`). Drivers verify the certificate unless told to trust it
+  (`TrustServerCertificate=true`), exactly as with a self-signed SQL Server certificate.
 
-Verified with OpenSSL (libpq, psycopg, asyncpg, PyMySQL, PHP, Ruby, `openssl s_client`,
-including HelloRetryRequest and KeyUpdate), Java's JSSE (pgJDBC, Connector/J), .NET (Npgsql,
-MySqlConnector), Go's `crypto/tls` (pgx, go-sql-driver) and Node (pg, mysql2). Clients
+Verified with OpenSSL (libpq, psycopg, asyncpg, PyMySQL, PHP, Ruby, tedious, Prisma,
+`openssl s_client`, including HelloRetryRequest, KeyUpdate and TLS 1.2), Java's JSSE (pgJDBC,
+Connector/J, mssql-jdbc), .NET (Npgsql, MySqlConnector, Microsoft.Data.SqlClient), Go's
+`crypto/tls` (pgx, go-sql-driver, go-mssqldb; TLS 1.3 and 1.2) and Node (pg, mysql2). Clients
 restricted to AES cipher suites or to RSA/ECDSA certificates (some FIPS configurations)
 cannot connect.
 
@@ -60,6 +72,16 @@ Every suite below runs against a real `storine-sql` (`tests/clients/run_all.sh`)
 | PHP | PDO (pgsql, mysql; native and emulated prepares), pgsql, mysqli | Laravel Eloquent and schema builder |
 | Ruby | pg, trilogy | ActiveRecord 8 (migrations, locking, `update_counters`) |
 | CLI | `psql`, `mysql` | |
+
+SQL Server (TDS 7.1 - 7.4 and 8.0):
+
+| Language | Drivers | ORMs / query builders |
+|---|---|---|
+| Python | pymssql (FreeTDS) | SQLAlchemy 2 (`mssql+pymssql`: `create_all`, reflection) |
+| Node.js | tedious, mssql | Sequelize (`sync({ alter })`), TypeORM (schema sync), Prisma 6 (`db push`, exact introspection round trip) |
+| Go | go-mssqldb | GORM (`sqlserver` driver, MERGE upserts) |
+| Java | mssql-jdbc | Hibernate 6 (`SQLServerDialect`, `hbm2ddl` create and validate) |
+| .NET | Microsoft.Data.SqlClient | Entity Framework Core (SqlServer provider: batched MERGE inserts, `ExecuteUpdate`, concurrency tokens) |
 
 Each suite also checks money handling under concurrency: parallel `balance = balance + x`
 updates, transfers between rows in transactions, and stale-version rejection all come out exact.
@@ -89,12 +111,26 @@ updates, transfers between rows in transactions, and stale-version rejection all
   `jsonb_build_object`, `json_agg`, `JSON_EXTRACT`, ...), array, regex, conditional and
   aggregate functions of both dialects, plus the catalog functions ORMs call (`format_type`,
   `pg_get_indexdef`, `pg_get_constraintdef`, `col_description`, `current_schemas`, ...).
+- **T-SQL** (SQL Server endpoint): `TOP`, `OFFSET ... FETCH`, `[bracketed]` names,
+  `OUTPUT INSERTED.* / DELETED.* [INTO @t]`, `MERGE`, `UPDATE e ... FROM t AS e` / `DELETE e
+  FROM ...`, `DECLARE` (scalars and `TABLE` variables), `IF ... ELSE`, `EXEC` / `EXEC (sql)`,
+  `sp_executesql`, `IDENTITY`, `NEXT VALUE FOR`, `ALTER COLUMN`, `ADD [CONSTRAINT] DEFAULT ...
+  FOR`, `SET` options (`NOCOUNT`, `IMPLICIT_TRANSACTIONS`, ...), string `+`, and the usual
+  built-ins (`ISNULL`, `LEN`, `CHARINDEX`, `DATEADD`, `DATEDIFF`, `DATEPART`, `EOMONTH`,
+  `CONVERT`, `TRY_CAST`, `IIF`, `NEWID`, `SCOPE_IDENTITY`, `OBJECT_ID`, `SERVERPROPERTY`, ...).
+  Catalogs: `sys.*` (objects, tables, columns, types, indexes, keys, foreign keys, defaults,
+  identity columns, sequences, databases, ...), `INFORMATION_SCHEMA`, and the procedures
+  drivers call (`sp_tables`, `sp_columns`, `sp_pkeys`, `sp_fkeys`, `sp_statistics`,
+  `sp_helpindex`, `sp_rename`). Declared types (`datetime` vs `datetime2`, `varchar` vs
+  `nvarchar`) and constraint names are kept, so migration tools see their schema unchanged.
 - **Protocol features**: PostgreSQL simple and extended query protocol (named and unnamed
   statements and portals, parameter type inference, text and binary formats including
   `numeric` and arrays), `COPY ... FROM STDIN` / `TO STDOUT` in text, CSV and binary formats
   (psql `\copy`, psycopg `copy()`, asyncpg `copy_records_to_table`), MySQL text protocol and
   `COM_STMT_*` binary prepared statements, multi-statement queries, `LAST_INSERT_ID()`,
-  `ROW_COUNT()`, `FOUND_ROWS()`, server status flags.
+  `ROW_COUNT()`, `FOUND_ROWS()`, server status flags; TDS SQL batches, RPC (`sp_executesql`,
+`sp_prepare` / `sp_execute` / `sp_prepexec` / `sp_unprepare`) with typed parameters including
+`NVARCHAR(MAX)` / `VARBINARY(MAX)`, transaction-manager requests, multiple result sets.
 
 ## Transactions and money safety
 
@@ -105,8 +141,8 @@ commit fail instead of being overwritten. **No lost updates.**
 
 - **Autocommit statements** that lose such a race are re-run transparently, so `UPDATE acct SET
   balance = balance - 10 WHERE id = 1` from many connections at once is always exact.
-- **Explicit transactions** report SQLSTATE `40001` (MySQL error `1213`), which drivers and ORMs
-  retry. `SELECT ... FOR UPDATE` takes row locks (honoring `lock_timeout` / `NOWAIT` / `SKIP LOCKED`).
+- **Explicit transactions** report SQLSTATE `40001` (MySQL error `1213`, SQL Server error
+  `1205`), which drivers and ORMs retry. `SELECT ... FOR UPDATE` takes row locks (honoring `lock_timeout` / `NOWAIT` / `SKIP LOCKED`).
 - **Isolation levels**:
   - `READ COMMITTED` (PostgreSQL's default) and MySQL's default `REPEATABLE-READ` behave like those engines.
   - PostgreSQL `REPEATABLE READ` / `SERIALIZABLE` and MySQL `SERIALIZABLE` validate every row
@@ -130,8 +166,12 @@ what Django's and Rails' test databases and Prisma's shadow databases rely on.
 
 ## Known limitations
 
-- **TLS**: TLS 1.3 only, ChaCha20-Poly1305 only, Ed25519 certificates only (see above). No
+- **TLS**: TLS 1.3 and 1.2, ChaCha20-Poly1305 only, Ed25519 certificates only (see above). No
   client-certificate authentication.
+- **SQL Server**: SQL authentication only (no Windows / Entra ID authentication), one schema
+  (`dbo`), no MARS (one active result per connection, as with `MultipleActiveResultSets=false`),
+  no stored procedures of your own, cursors or temporary `#tables`; a statement error leaves the
+  transaction open (`XACT_ABORT OFF`), as SQL Server does.
 - **DDL is applied immediately**, even inside a transaction (MySQL behavior). On the
   PostgreSQL endpoint, a `ROLLBACK` undoes the transaction's data changes but not its `CREATE
   / ALTER / DROP`. A migration that fails halfway leaves the steps it already ran.
@@ -150,13 +190,13 @@ what Django's and Rails' test databases and Prisma's shadow databases rely on.
   statements fail with SQLSTATE `0A000` and a message naming the feature; nothing else is
   silently ignored except session settings that do not apply (e.g. `SET search_path`, `SET
   NAMES`).
-- **SQL Server (TDS)** and **SQLite** endpoints are not available yet.
+- An **SQLite** endpoint is not available (SQLite is an in-process library, not a server).
 
 ## Development
 
 ```text
 cargo test -p storage-sql                       # executor and unit tests (embedded store)
 cargo build --release -p storage-sql
-target/release/storine-sql --data /tmp/db --pg 127.0.0.1:55432 --mysql 127.0.0.1:53306 &
+target/release/storine-sql --data /tmp/db --pg 127.0.0.1:55432 --mysql 127.0.0.1:53306 --mssql 127.0.0.1:51433 &
 crates/storage-sql/tests/clients/run_all.sh     # every real-client suite whose toolchain is installed
 ```

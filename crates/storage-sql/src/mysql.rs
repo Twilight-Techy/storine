@@ -269,7 +269,7 @@ impl Conn {
         let tcp = w.into_inner().map_err(|e| e.into_error())?;
         let (tr, tw) = crate::tls::accept(r, tcp, cfg, "mysql")?;
         if crate::log_enabled() {
-            eprintln!("[mysql {}] TLS 1.3 established", self.session.id);
+            eprintln!("[mysql {}] {} established", self.session.id, tr.version());
         }
         self.r = Input::Tls(tr);
         self.w = Output::Tls(BufWriter::with_capacity(16 * 1024, tw));

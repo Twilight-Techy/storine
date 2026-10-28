@@ -796,7 +796,7 @@ impl Conn {
         };
         flag.store(false, Ordering::Relaxed);
         if crate::log_enabled() {
-            eprintln!("[tds {}] TLS 1.3 established", self.session.id);
+            eprintln!("[tds {}] {} established", self.session.id, tr.version());
         }
         self.r = Input::Tls(tr);
         self.w = Output::Tls(BufWriter::with_capacity(16 * 1024, tw));

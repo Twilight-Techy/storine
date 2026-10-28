@@ -171,6 +171,24 @@
 | **F-NET-04** | **Session Options & Cluster Info** | `OP_SET_OPTIONS` (follower reads) and `OP_CLUSTER_INFO` (leader discovery for SDKs). | v1.1 |
 | **F-NET-03** | **Rich Status Codes** | `NotLeader`, `Invalid`, `CommitUnknown`, conflict details (write index + current version). | v1.1 |
 
+### 6.11 Client SDKs (`F-SDK-*`, Stage 25)
+
+| Feature ID | Feature Name | Description | Target Tier |
+| :--- | :--- | :--- | :--- |
+| **F-SDK-01** | **Protocol Specification & Golden Vectors** | `protocol/PROTOCOL.md` plus byte-exact request/response vectors every SDK must reproduce. | v1.1 |
+| **F-SDK-02** | **Official SDKs** | Python, TypeScript, Go, Java, C# and Rust (`sdks/<language>/`): the same API in each language, no runtime dependencies, exact decimals, at-most-once retries, leader discovery and failover. PHP and Ruby planned (`TASK-110`, `TASK-111`). | v1.1 |
+
+### 6.12 SQL Gateway (`F-SQL-*`, Stage 26)
+
+| Feature ID | Feature Name | Description | Target Tier |
+| :--- | :--- | :--- | :--- |
+| **F-SQL-01** | **PostgreSQL, MySQL & SQL Server Wire Protocols** | `storine-sql` (`crates/storage-sql`) speaks PostgreSQL v3, MySQL and TDS 7.1 – 8.0, so existing drivers and ORMs connect by changing only the connection string. | v1.2 |
+| **F-SQL-02** | **Three SQL Dialects** | PostgreSQL, MySQL and T-SQL syntax and functions over one executor: joins, subqueries, CTEs (recursive), window functions, `MERGE`, upserts, `RETURNING` / `OUTPUT`, views, sequences, databases. | v1.2 |
+| **F-SQL-03** | **Catalog Emulation** | `pg_catalog`, `information_schema`, `SHOW`, `sys.*` and the `sp_*` metadata procedures, faithful enough for ORM migrations and introspection (Django, Rails, Prisma, EF Core, Hibernate, TypeORM, ...). | v1.2 |
+| **F-SQL-04** | **Money-Safe Transactions** | Versioned writes (no lost updates), REPEATABLE READ / SERIALIZABLE read validation, row locks, constraints enforced by atomic preconditions (race-free foreign keys), exact decimals on every wire format. | v1.2 |
+| **F-SQL-05** | **Zero-Dependency TLS** | TLS 1.3 and 1.2 (ChaCha20-Poly1305, x25519, Ed25519) on all three endpoints, including every SQL Server encryption mode and TDS 8 strict. | v1.2 |
+| **F-SQL-06** | **Real-Client Compatibility Matrix** | `tests/clients/run_all.sh`: 14 suites over Python, Node, Go, Java, .NET, PHP and Ruby drivers and ORMs. | v1.2 |
+
 ---
 
 ## 7. Verified Implementation Status (full-project audits, 2026-10-20/21, `TASK-067` – `TASK-081`)

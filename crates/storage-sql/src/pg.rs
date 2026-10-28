@@ -180,7 +180,7 @@ impl Conn {
                     let tcp = plain_w.into_inner().map_err(|e| e.into_error())?;
                     let (tr, tw) = crate::tls::accept(plain_r, tcp, cfg, "postgresql")?;
                     if crate::log_enabled() {
-                        eprintln!("[pg] TLS 1.3 established");
+                        eprintln!("[pg] {} established", tr.version());
                     }
                     break (
                         Box::new(tr),

@@ -6,6 +6,7 @@ package sqlclients
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"os"
 	"sync"
@@ -288,6 +289,24 @@ func TestTLS(t *testing.T) {
 		}
 		c.Close(ctx)
 	}
+	// TLS 1.2 (crypto/tls capped): ECDHE x25519, ChaCha20-Poly1305, Ed25519 signature.
+	cfg, err := pgx.ParseConfig("postgres://app:x@" + pgAddr + "/shop?sslmode=require")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.TLSConfig.MaxVersion = tls.VersionTLS12
+	c12, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("TLS 1.2: %v", err)
+	}
+	if state := c12.PgConn().Conn().(*tls.Conn).ConnectionState(); state.Version != tls.VersionTLS12 {
+		t.Fatalf("negotiated %x, want TLS 1.2", state.Version)
+	}
+	var big string
+	if err := c12.QueryRow(ctx, "SELECT repeat('y', 100000)").Scan(&big); err != nil || len(big) != 100000 {
+		t.Fatalf("large result over TLS 1.2: %v (%d bytes)", err, len(big))
+	}
+	c12.Close(ctx)
 	db, err := sql.Open("mysql", "root@tcp("+myAddr+")/shop?tls=skip-verify")
 	if err != nil {
 		t.Fatal(err)

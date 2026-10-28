@@ -134,20 +134,24 @@ def run_all():
 
     import os, ssl
 
-    @section("TLS: psycopg sslmode=verify-full (pinned certificate) and PyMySQL with TLS")
+    @section("TLS 1.3 and 1.2: psycopg sslmode=verify-full (pinned certificate), PyMySQL")
     def _():
         cert = os.environ.get("STORINE_TLS_CERT")
         mode = f"sslmode=verify-full sslrootcert={cert}" if cert else "sslmode=require"
-        with psycopg.connect(f"host=localhost port={PG_PORT} user=app dbname=shop {mode}") as c:
-            assert c.info.pgconn.ssl_in_use
-            assert len(c.execute("SELECT repeat('p', 100000)").fetchone()[0]) == 100000
-        ctx = ssl.create_default_context(cafile=cert) if cert else ssl._create_unverified_context()
+        for version in ("TLSv1.3", "TLSv1.2"):
+            dsn = f"host=localhost port={PG_PORT} user=app dbname=shop {mode} ssl_max_protocol_version={version}"
+            with psycopg.connect(dsn) as c:
+                assert c.info.pgconn.ssl_in_use
+                assert len(c.execute("SELECT repeat('p', 100000)").fetchone()[0]) == 100000
         import pymysql as _pm
-        m = _pm.connect(host="localhost", port=MY_PORT, user="root", database="shop", ssl=ctx)
-        cur = m.cursor()
-        cur.execute("SELECT 6 * 7")
-        assert cur.fetchone() == (42,)
-        m.close()
+        for version in (ssl.TLSVersion.TLSv1_3, ssl.TLSVersion.TLSv1_2):
+            ctx = ssl.create_default_context(cafile=cert) if cert else ssl._create_unverified_context()
+            ctx.maximum_version = version
+            m = _pm.connect(host="localhost", port=MY_PORT, user="root", database="shop", ssl=ctx)
+            cur = m.cursor()
+            cur.execute("SELECT 6 * 7")
+            assert cur.fetchone() == (42,)
+            m.close()
 
     import asyncpg
 
