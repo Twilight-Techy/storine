@@ -28,6 +28,31 @@ class MssqlTest {
         assertTrue(e.getMessage().contains("use SQL Server authentication"), e.getMessage());
     }
 
+    /**
+     * Kerberos (integrated security with authenticationScheme=JavaKerberos) against a server
+     * started with --kerberos-keytab: STORINE_MSSQL_KRB5 names it, STORINE_KRB5_DIR the test
+     * realm made by kerberos/realm.sh (krb5.conf, and ann's ticket cache from kinit).
+     */
+    @Test
+    void kerberosLogin() throws Exception {
+        String addr = System.getenv("STORINE_MSSQL_KRB5"), dir = System.getenv("STORINE_KRB5_DIR");
+        if (addr == null || dir == null) return;
+        System.setProperty("java.security.krb5.conf", dir + "/krb5.conf");
+        String url = "jdbc:sqlserver://" + addr.replace("127.0.0.1", "localhost")
+            + ";databaseName=shop;encrypt=true;trustServerCertificate=true;loginTimeout=10;"
+            + "integratedSecurity=true;authenticationScheme=JavaKerberos";
+        try (Connection c = DriverManager.getConnection(url);
+             ResultSet rs = c.createStatement().executeQuery("SELECT SUSER_NAME()")) {
+            assertTrue(rs.next());
+            assertEquals("ann", rs.getString(1));
+        }
+        // A ticket for a service whose key the server does not hold is refused with the reason.
+        int port = Integer.parseInt(addr.substring(addr.lastIndexOf(':') + 1));
+        SQLException e = assertThrows(SQLException.class, () -> DriverManager.getConnection(
+            url + ";serverSpn=MSSQLSvc/other.storine.test:" + port + "@STORINE.TEST").close());
+        assertTrue(e.getMessage().contains("no key for MSSQLSvc/other.storine.test"), e.getMessage());
+    }
+
     /** A JWT signed with the test issuer's key (tests/clients/oidc/test-key.pem). */
     static String mintToken(String keyFile, String extraClaims) throws Exception {
         java.util.Base64.Encoder b64 = java.util.Base64.getUrlEncoder().withoutPadding();

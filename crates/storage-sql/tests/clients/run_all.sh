@@ -24,27 +24,49 @@ PYTHON=${PYTHON:-python3}
 # The server's certificate, for the suites that verify it (storine-sql --data DIR keeps it in DIR/tls).
 [ -n "${STORINE_DATA:-}" ] && [ -f "$STORINE_DATA/tls/server.crt" ] && export STORINE_TLS_CERT="$STORINE_DATA/tls/server.crt"
 failed=()
+have() { command -v "$1" >/dev/null 2>&1; }
 BIN=${STORINE_SQL_BIN:-../../../../target/release/storine-sql}
 
-# Login methods beyond passwords get a private storine-sql: OpenID Connect access tokens from
-# a test issuer whose signing key is oidc/test-key.pem.
+# Private instances listen above Linux's ephemeral port range (32768-60999), where no client
+# connection can be holding the port. Login methods beyond passwords get private instances: OpenID Connect access
+# tokens from a test issuer whose signing key is oidc/test-key.pem, and Kerberos (when MIT
+# Kerberos' krb5kdc, kdb5_util and kinit are installed).
 if [ -x "$BIN" ]; then
   authdir=$(mktemp -d)
-  "$BIN" --data "$authdir" --no-pg --no-mysql --mssql 127.0.0.1:51633 --user sa:x \
+  "$BIN" --data "$authdir" --no-pg --no-mysql --mssql 127.0.0.1:61633 --user sa:x \
     --oidc-issuer https://id.storine.test/realms/test --oidc-audience storine \
     --oidc-jwks "$PWD/oidc/jwks.json" >"$authdir.log" 2>&1 &
   authpid=$!
-  trap 'kill $authpid 2>/dev/null; rm -rf "$authdir" "$authdir.log"' EXIT
-  for _ in $(seq 50); do (echo >/dev/tcp/127.0.0.1/51633) 2>/dev/null && break; sleep 0.2; done
-  export STORINE_MSSQL_AUTH=127.0.0.1:51633 STORINE_OIDC_KEY="$PWD/oidc/test-key.pem"
+  for _ in $(seq 50); do (echo >/dev/tcp/127.0.0.1/61633) 2>/dev/null && break; sleep 0.2; done
+  export STORINE_MSSQL_AUTH=127.0.0.1:61633 STORINE_OIDC_KEY="$PWD/oidc/test-key.pem"
 fi
+# Kerberos: a throwaway MIT realm (kerberos/realm.sh) and a storine-sql with its service keytab.
+if [ -x "$BIN" ] && have krb5kdc && have kdb5_util && have kinit; then
+  krbdir=$(mktemp -d)
+  if kerberos/realm.sh "$krbdir/realm" 18888 61733 >"$krbdir/realm.log" 2>&1; then
+    . "$krbdir/realm/env"
+    "$BIN" --data "$krbdir/db" --no-pg --no-mysql --mssql 127.0.0.1:61733 --user sa:x \
+      --kerberos-keytab "$STORINE_KRB5_KEYTAB" >"$krbdir/server.log" 2>&1 &
+    krbpid=$!
+    for _ in $(seq 50); do (echo >/dev/tcp/127.0.0.1/61733) 2>/dev/null && break; sleep 0.2; done
+    export STORINE_MSSQL_KRB5=127.0.0.1:61733
+  else
+    echo "   (Kerberos realm setup failed: see $krbdir/realm.log; Kerberos tests skipped)"
+  fi
+fi
+cleanup() {
+  [ -n "${authpid:-}" ] && kill "$authpid" 2>/dev/null && rm -rf "$authdir" "$authdir.log"
+  [ -n "${krbpid:-}" ] && kill "$krbpid" 2>/dev/null
+  [ -f "${krbdir:-/nonexistent}/realm/kdc.pid" ] && kill "$(cat "$krbdir/realm/kdc.pid")" 2>/dev/null
+  [ -n "${krbdir:-}" ] && rm -rf "$krbdir"
+}
+trap cleanup EXIT
 
 run() {
   local name=$1; shift
   echo "== $name"
   if "$@"; then echo "   passed"; else echo "   FAILED"; failed+=("$name"); fi
 }
-have() { command -v "$1" >/dev/null 2>&1; }
 
 run python "$PYTHON" test_python.py "$PG" "$MY"
 run django-postgres "$PYTHON" django/test_django.py postgres "$PG"
@@ -75,10 +97,10 @@ have ruby && run activerecord ruby ruby/test_activerecord.rb "$PG" "$MY"
 # Prisma's `db push` owns the whole database, so it gets a private, empty storine-sql.
 if have node && [ -x "$BIN" ] && node -e 'require.resolve("prisma/package.json")' 2>/dev/null; then
   dir=$(mktemp -d)
-  "$BIN" --data "$dir" --pg 127.0.0.1:55532 --mysql 127.0.0.1:53406 --mssql 127.0.0.1:51533 >"$dir.log" 2>&1 &
+  "$BIN" --data "$dir" --pg 127.0.0.1:61532 --mysql 127.0.0.1:61406 --mssql 127.0.0.1:61533 >"$dir.log" 2>&1 &
   pid=$!
-  for _ in $(seq 50); do (echo >/dev/tcp/127.0.0.1/55532) 2>/dev/null && break; sleep 0.2; done
-  run prisma node prisma/test_prisma.js 55532 53406 51533
+  for _ in $(seq 50); do (echo >/dev/tcp/127.0.0.1/61532) 2>/dev/null && break; sleep 0.2; done
+  run prisma node prisma/test_prisma.js 61532 61406 61533
   kill "$pid"; wait "$pid" 2>/dev/null; rm -rf "$dir" "$dir.log"
 fi
 

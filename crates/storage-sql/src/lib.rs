@@ -1,6 +1,7 @@
 //! Storine SQL gateway: lets applications and ORMs written for PostgreSQL or MySQL use Storine
 //! unchanged, by speaking their wire protocols and SQL dialects over the document API.
 
+pub mod aes;
 pub mod ast;
 pub mod catalog;
 pub mod copy;
@@ -10,6 +11,7 @@ pub mod error;
 pub mod exec;
 pub mod fmt;
 pub mod hash;
+pub mod kerberos;
 pub mod lexer;
 pub mod mysql;
 pub mod oidc;

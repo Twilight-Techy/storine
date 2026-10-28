@@ -29,6 +29,8 @@ pub struct Auth {
     pub users: HashMap<String, String>,
     /// Accept OpenID Connect access tokens from this issuer.
     pub oidc: Option<Arc<crate::oidc::Oidc>>,
+    /// Accept Kerberos (integrated) logins for the service keys in this keytab.
+    pub kerberos: Option<Arc<crate::kerberos::Kerberos>>,
     pub tls: Option<Arc<crate::tls::TlsConfig>>,
     pub require_tls: bool,
 }
@@ -69,6 +71,7 @@ const TK_ERROR: u8 = 0xaa;
 const TK_RETURNVALUE: u8 = 0xac;
 const TK_LOGINACK: u8 = 0xad;
 const TK_FEATUREEXTACK: u8 = 0xae;
+const TK_SSPI: u8 = 0xed;
 const TK_ROW: u8 = 0xd1;
 const TK_ENVCHANGE: u8 = 0xe3;
 const TK_DONE: u8 = 0xfd;
@@ -735,6 +738,16 @@ impl Conn {
             c.send(PT_REPLY, &t.b)
         };
         let mut fedauth_ack = false;
+        let mut sspi_reply = Vec::new();
+        if crate::log_enabled() {
+            eprintln!(
+                "[tds {}] LOGIN7: user {:?}, integrated {}, fedauth {}",
+                c.session.id,
+                l.user,
+                l.integrated.as_ref().map_or(0, Vec::len),
+                l.fedauth.is_some()
+            );
+        }
         let user = if let Some(f) = &l.fedauth {
             match (&auth.oidc, f.library) {
                 (Some(oidc), 0x01) => match oidc.verify(&f.token) {
@@ -766,14 +779,36 @@ impl Conn {
                         .into(),
                 ),
             }
-        } else if l.integrated.is_some() {
-            return refuse(
-                &mut c,
-                "Login failed: integrated (Windows / Kerberos / NTLM) authentication is not \
-                 supported by Storine SQL; use SQL Server authentication (User ID and Password in \
-                 the connection string)."
-                    .into(),
-            );
+        } else if let Some(token) = &l.integrated {
+            let Some(krb) = &auth.kerberos else {
+                return refuse(
+                    &mut c,
+                    "Login failed: integrated (Kerberos) authentication is not enabled on this \
+                     server; start storine-sql with --kerberos-keytab, or use SQL Server \
+                     authentication (User ID and Password in the connection string)."
+                        .into(),
+                );
+            };
+            match krb.accept(token) {
+                Ok(a) => {
+                    if crate::log_enabled() {
+                        eprintln!(
+                            "[tds {}] Kerberos login as {} ({}-byte reply)",
+                            c.session.id,
+                            a.user,
+                            a.reply.len()
+                        );
+                    }
+                    sspi_reply = a.reply;
+                    a.user
+                }
+                Err(why) => {
+                    return refuse(
+                        &mut c,
+                        format!("Login failed: Kerberos authentication failed: {why}."),
+                    )
+                }
+            }
         } else {
             if !auth.users.is_empty() {
                 let ok = auth
@@ -791,6 +826,15 @@ impl Conn {
             }
         };
         c.session.user = user;
+        if !sspi_reply.is_empty() {
+            // SSPI: the server's last security token (the AP-REP of mutual authentication), in
+            // a message of its own as SQL Server sends it (go-mssqldb reads nothing after it).
+            let mut sspi = Tokens::default();
+            sspi.u8(TK_SSPI)
+                .bytes(&(sspi_reply.len() as u16).to_le_bytes())
+                .bytes(&sspi_reply);
+            c.send(PT_REPLY, &sspi.b)?;
+        }
         let mut t = Tokens::default();
         if !l.database.is_empty() {
             if let Err(e) = c.session.use_database(&l.database) {
@@ -1476,9 +1520,14 @@ fn parse_login7(b: &[u8]) -> Result<Login, SqlError> {
     let version = u32::from_be_bytes(u32_at(4).to_le_bytes());
     // OptionFlags2 bit 0x80: integrated security (an SSPI blob follows at ibSSPI / cbSSPI).
     let integrated = b[25] & 0x80 != 0 || u16_at(80) > 0;
+    // cbSSPI 0xFFFF: the length is in cbSSPILong (offset 90), for tokens of 64 KiB or more.
+    let sspi_len = match u16_at(80) {
+        0xffff => u32_at(90) as usize,
+        n => n,
+    };
     let sspi = b
-        .get(u16_at(78)..u16_at(78) + u16_at(80))
-        .unwrap_or(&[])
+        .get(u16_at(78)..u16_at(78) + sspi_len)
+        .ok_or_else(bad)?
         .to_vec();
     // OptionFlags3 bit 0x10: a FeatureExt block, which may request FEDAUTH (feature 0x02).
     let mut fedauth = None;

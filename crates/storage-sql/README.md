@@ -29,7 +29,8 @@ Users can also come from `STORINE_SQL_USERS=name:password,name2:password2`. Post
 authenticate with SCRAM-SHA-256, MySQL clients with `mysql_native_password` (both standard; no
 plaintext passwords on the wire). SQL Server clients use SQL Server authentication, whose
 password travels inside the (always TLS-encrypted, when TLS is on) login packet, as with SQL
-Server itself. Set `STORINE_SQL_LOG=1` to log every statement.
+Server itself; they can also log in with an OpenID Connect access token or Kerberos (below).
+Set `STORINE_SQL_LOG=1` to log every statement.
 
 ## TLS
 
@@ -88,6 +89,39 @@ storine-sql --data /var/lib/storine-sql \
   the application and pass it.
 - Use TLS (`Encrypt=true`, the default for these drivers), since the token is a bearer
   credential.
+## SQL Server: Kerberos (integrated) logins
+
+`Integrated Security=true` / `Trusted_Connection=yes` (SqlClient, ODBC),
+`integratedSecurity=true;authenticationScheme=JavaKerberos` (mssql-jdbc) and
+`authenticator=krb5` (go-mssqldb) log in with the user's Kerberos ticket. The ticket can come
+from **any realm**: MIT Kerberos, Heimdal, FreeIPA, Samba AD or Active Directory, on Linux,
+macOS or Windows clients. Give `storine-sql` the service's keytab:
+
+```text
+# MIT / FreeIPA: create the service principal and export its keys
+kadmin -q "addprinc -randkey MSSQLSvc/db.example.com:1433"
+kadmin -q "ktadd -k /etc/storine/storine-sql.keytab MSSQLSvc/db.example.com:1433"
+# (Active Directory: setspn -S MSSQLSvc/db.example.com:1433 svc-storine, then ktpass or adcli)
+
+storine-sql --data /var/lib/storine-sql --mssql 0.0.0.0:1433 \
+  --kerberos-keytab /etc/storine/storine-sql.keytab
+```
+
+- Clients ask for the service principal `MSSQLSvc/<host>:<port>`, so the host name in the
+  connection string must be one the keytab has a key for (a keytab may hold several).
+- Accepted: AP-REQs wrapped in SPNEGO or plain GSS-API Kerberos tokens, with the AES encryption
+  types (aes256/aes128-cts-hmac-sha1-96, aes256-cts-hmac-sha384-192,
+  aes128-cts-hmac-sha256-128). RC4 and DES are refused, as is NTLM.
+- Checked: the ticket decrypts with the keytab and has not expired; the authenticator matches
+  the ticket's client and is within 5 minutes of the server clock; replays are rejected. With
+  mutual authentication (the default for most drivers) the server returns an AP-REP proving
+  it holds the key.
+- The session user is the client principal without the realm (`ann@EXAMPLE.COM` → `ann`) when
+  the realm is the service's own; users from other realms keep it (`ann@OTHER.ORG`).
+  `--kerberos-keep-realm` keeps it always.
+- The keytab is re-read when it changes (key rotation). Keep it readable only by the server
+  (mode 0600).
+
 ## Tested clients
 
 Every suite below runs against a real `storine-sql` (`tests/clients/run_all.sh`):
@@ -199,9 +233,9 @@ what Django's and Rails' test databases and Prisma's shadow databases rely on.
 
 - **TLS**: TLS 1.3 and 1.2, ChaCha20-Poly1305 only, Ed25519 certificates only (see above). No
   client-certificate authentication.
-- **SQL Server**: SQL authentication and OpenID Connect access tokens. Integrated (Windows /
-  Kerberos / NTLM) logins are refused with an error saying so; Kerberos (any realm: MIT,
-  Heimdal, FreeIPA, Samba AD, Active Directory) is the planned, platform-neutral addition. One schema
+- **SQL Server**: logins by password, OpenID Connect access token or Kerberos; NTLM and the
+  driver-driven sign-in workflows (`Authentication=ActiveDirectoryPassword` and similar) are
+  refused with an explanation. One schema
   (`dbo`), no MARS (one active result per connection, as with `MultipleActiveResultSets=false`),
   no stored procedures of your own, cursors or temporary `#tables`; a statement error leaves the
   transaction open (`XACT_ABORT OFF`), as SQL Server does.

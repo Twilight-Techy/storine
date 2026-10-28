@@ -131,6 +131,22 @@ public class MssqlTests
         }
     }
 
+    // Kerberos: Integrated Security through the platform's GSSAPI (MIT libgssapi_krb5 on
+    // Linux), using the ticket cache from kinit. STORINE_MSSQL_KRB5 names a server started with
+    // --kerberos-keytab for MSSQLSvc/localhost:<port> (kerberos/realm.sh, run_all.sh).
+    [Fact]
+    public async Task KerberosLogin()
+    {
+        var addr = Environment.GetEnvironmentVariable("STORINE_MSSQL_KRB5");
+        if (addr == null) return;
+        var port = addr.Split(':')[1];
+        await using var c = new SqlConnection(
+            $"Server=tcp:localhost,{port};Database=shop;Integrated Security=true;Encrypt=Optional;TrustServerCertificate=true;Connect Timeout=10");
+        await c.OpenAsync();
+        await using var q = new SqlCommand("SELECT SUSER_NAME()", c);
+        Assert.Equal("ann", await q.ExecuteScalarAsync());
+    }
+
     [Fact]
     public async Task SqlClientTls()
     {

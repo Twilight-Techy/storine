@@ -499,7 +499,7 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Money**: neither language has a decimal type that keeps a scale (Ruby's `BigDecimal` turns `1234.50` into `1234.5`; PHP has none, and its integers are 64-bit), so each SDK has its own exact `Decimal` (128-bit mantissa, scale up to 38) with exact add / sub / mul and comparisons; PHP's 128-bit conversions are done in pure PHP (`BigInt`), with no extension required.
 - **Verification**: both pass every value, document, request and response vector byte for byte (Ruby 196 assertions, PHP 199), reject every truncation of a hostile value, and pass the shared end-to-end suite against a real server: CRUD and types, 800 concurrent exact deposits (Ruby threads, PHP forked processes), atomic transactions, queries and indexes, TTL, and the 3-node cluster with the leader killed (every deposit applied exactly once).
 
-### Stage 26 (continued): SQL Server logins beyond passwords (`TASK-119`) — 2026-10-28
+### Stage 26 (continued): SQL Server logins beyond passwords (`TASK-119`, `TASK-120`) — 2026-10-28
 
 - **Why**: drivers offer two other login methods: integrated security (Kerberos) and access tokens. Both must work without tying a deployment to one cloud or to Windows. Access tokens are therefore accepted from any OpenID Connect issuer, and Kerberos (`TASK-120`) from any realm.
 - **Access tokens (`TASK-119`)**:
@@ -514,3 +514,18 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - Unit tests cover RFC 7515 and EdDSA tokens: expired, not yet valid, foreign issuer, wrong audience, another key, a tampered payload, `alg: none`, an unknown `kid`, and JWKS rotation.
   - `run_all.sh` starts a private storine-sql trusting a test issuer (`tests/clients/oidc/`). SqlClient (`AccessToken`), mssql-jdbc (`accessToken`), go-mssqldb (`NewAccessTokenConnector`) and tedious (`azure-active-directory-access-token`) each sign tokens with their platform's own crypto. They log in as the token's user, and are refused for a wrong audience, a foreign issuer, an expired token or a forged signature.
   - A server without `--oidc-*` explains how to enable token logins.
+- **Kerberos (`TASK-120`)**:
+  - `kerberos.rs` is a service-side acceptor. It unwraps SPNEGO (Kerberos or Microsoft's Kerberos OID offered first; NTLM is refused with a hint) or a plain RFC 4121 token, down to the AP-REQ.
+  - The ticket is decrypted with the keytab's key, chosen by principal, kvno and enctype. The ticket's validity times are then checked with a 5-minute skew, and the "invalid" flag must be clear.
+  - The authenticator is decrypted with the session key. It must name the ticket's client, and its time must be within the skew. Replays are rejected by an in-memory cache.
+  - When mutual authentication is requested, the server answers with an AP-REP (EncAPRepPart under the session key, key usage 12), wrapped for SPNEGO when the client used it.
+  - Keytabs are parsed in format 0x0502, holes included, and re-read on change.
+  - Crypto is in-house, per the zero-dependency rule:
+    - AES-128/256 (`aes.rs`) uses AES-NI when the CPU has it (constant time), else a byte-oriented software fallback, plus RFC 3962 CBC-CTS.
+    - Key derivation is RFC 3961 n-fold / DK for the SHA-1 types and RFC 8009 KDF-HMAC-SHA2 for the SHA-2 types, with a generic HMAC.
+  - All of it is checked against FIPS 197, the RFC 3962 CTS vectors, RFC 3961 n-fold, RFC 8009 derived keys, and a unit test that builds AP-REQs from scratch. That test covers both framings and two enctypes: AP-REP contents, replay, expired, not-yet-valid, a skewed authenticator, a wrong service key, a missing key, no mutual authentication, and NTLM.
+- **Interoperability findings**:
+  - **The SSPI reply must be a message of its own.** go-mssqldb stops reading a response at the SSPI token and waits for the next message, so a reply carrying SSPI and LOGINACK together hung it. The SSPI token now goes in its own message, as SQL Server sends it. SqlClient and mssql-jdbc accept either.
+  - **The clients wrap tokens differently.** mssql-jdbc sends a plain GSS Kerberos token with mutual authentication (AP-REP returned); SqlClient (MIT GSSAPI) and go-mssqldb (gokrb5) send SPNEGO without it.
+  - **go-mssqldb mangles some SPNs.** It canonicalizes the SPN host through a CNAME lookup and drops the last character of an answer without a trailing dot, so `localhost` became `localhos`. Its test uses an SPN host name that does not resolve.
+- **Verification**: `tests/clients/kerberos/realm.sh` creates a throwaway MIT realm (KDC, user, service keytab, ticket cache). `run_all.sh` starts a storine-sql with that keytab. SqlClient, mssql-jdbc and go-mssqldb then log in as `ann`, and a ticket for a service the keytab lacks is refused with the reason.
