@@ -10,8 +10,34 @@ import org.junit.jupiter.api.Test;
 /** Microsoft's JDBC driver (pure Java TDS) against the SQL Server endpoint. */
 class MssqlTest {
     static String url() {
+        return url("encrypt=false"); // login-only encryption
+    }
+
+    static String url(String encryption) {
         String a = System.getenv().getOrDefault("STORINE_MSSQL", "127.0.0.1:51433");
-        return "jdbc:sqlserver://" + a + ";databaseName=shop;encrypt=false;user=sa;password=x";
+        return "jdbc:sqlserver://" + a + ";databaseName=shop;user=sa;password=x;" + encryption;
+    }
+
+    /** Full TLS inside TDS 7.4, and TDS 8 strict mode verifying the pinned certificate. */
+    @Test
+    void tls() throws Exception {
+        java.util.List<String> modes = new java.util.ArrayList<>(java.util.List.of("encrypt=true;trustServerCertificate=true"));
+        String cert = System.getenv("STORINE_TLS_CERT");
+        if (cert != null) {
+            // serverCertificate pins the certificate (strict mode only).
+            modes.add("encrypt=strict;hostNameInCertificate=localhost;serverCertificate=" + cert);
+        }
+        String big = "x".repeat(100_000);
+        for (String mode : modes) {
+            try (Connection c = DriverManager.getConnection(url(mode));
+                 PreparedStatement ps = c.prepareStatement("SELECT ? + 'y'")) {
+                ps.setString(1, big);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next(), mode);
+                    assertEquals(big + "y", rs.getString(1), mode);
+                }
+            }
+        }
     }
 
     @Test

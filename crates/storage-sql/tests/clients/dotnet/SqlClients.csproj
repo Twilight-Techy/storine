@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <!-- Real .NET clients against storine-sql: Npgsql, MySqlConnector and EF Core on both.
-       storine-sql must be listening (STORINE_PG / STORINE_MYSQL, default 127.0.0.1:55432 / :53306).
+  <!-- Real .NET clients against storine-sql: Npgsql, MySqlConnector, Microsoft.Data.SqlClient and EF Core.
+       storine-sql must be listening (STORINE_PG / STORINE_MYSQL / STORINE_MSSQL, default 127.0.0.1:55432 / :53306 / :51433).
        dotnet test -->
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
@@ -16,5 +16,6 @@
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="8.0.10" />
     <PackageReference Include="MySqlConnector" Version="2.3.7" />
     <PackageReference Include="Pomelo.EntityFrameworkCore.MySql" Version="8.0.2" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.2" />
   </ItemGroup>
 </Project>

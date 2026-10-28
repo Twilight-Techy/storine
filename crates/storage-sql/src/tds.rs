@@ -8,8 +8,9 @@
 //! ENVCHANGE (database, packet size, transaction begin / commit / rollback), RETURNVALUE.
 
 use std::collections::HashMap;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
@@ -108,6 +109,8 @@ fn from_utf16(b: &[u8]) -> String {
 #[derive(Default)]
 pub(crate) struct Tokens {
     pub(crate) b: Vec<u8>,
+    /// Payload bytes per packet of the response this buffer becomes (0: unknown).
+    room: usize,
 }
 
 impl Tokens {
@@ -345,8 +348,23 @@ impl Wire {
                     bytes_of(d)
                 };
                 t.u64(data.len() as u64);
-                for chunk in data.chunks(8000) {
-                    t.u32(chunk.len() as u32).bytes(chunk);
+                let text = matches!(self, Wire::NVarChar(_));
+                let mut rest = &data[..];
+                while !rest.is_empty() {
+                    let mut n = rest.len().min(8000);
+                    let start = t.b.len() + 4;
+                    if text && t.room > 0 && start % 2 == 1 {
+                        // Characters would straddle packet boundaries, which SqlClient's PLP
+                        // reader mishandles: end the chunk one byte before the packet does, so
+                        // only the next chunk header straddles.
+                        let mut fit = t.room - start % t.room - 1;
+                        if fit == 0 {
+                            fit = t.room;
+                        }
+                        n = n.min(fit);
+                    }
+                    t.u32(n as u32).bytes(&rest[..n]);
+                    rest = &rest[n..];
                 }
                 t.u32(0);
             }
@@ -446,8 +464,83 @@ fn guid_bytes(u: &[u8; 16]) -> [u8; 16] {
 
 // ── connection ──
 
+// PRELOGIN encryption values.
+const ENCRYPT_OFF: u8 = 0; // login only
+const ENCRYPT_ON: u8 = 1;
+const ENCRYPT_NOT_SUP: u8 = 2;
+const ENCRYPT_REQ: u8 = 3;
+
+/// The socket under TLS. During a TDS 7.x handshake (`framed`), TLS records travel inside
+/// PRELOGIN packets; afterwards, and in TDS 8 strict mode, they go straight on the socket.
+struct SocketReader {
+    inner: BufReader<TcpStream>,
+    framed: Arc<AtomicBool>,
+    /// Payload bytes left in the current PRELOGIN packet.
+    left: usize,
+}
+
+impl Read for SocketReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.left == 0
+            && self.framed.load(Ordering::Relaxed)
+            && matches!(self.inner.fill_buf()?.first(), Some(0x14..=0x17))
+        {
+            // A bare TLS record where a PRELOGIN packet was expected: the client has
+            // finished its handshake (see `tls::accept_tds7`).
+            self.framed.store(false, Ordering::Relaxed);
+        }
+        if !self.framed.load(Ordering::Relaxed) {
+            return self.inner.read(buf);
+        }
+        while self.left == 0 {
+            let mut h = [0u8; 8];
+            self.inner.read_exact(&mut h)?;
+            self.left = usize::from(u16::from_be_bytes([h[2], h[3]])).saturating_sub(8);
+        }
+        let n = buf.len().min(self.left);
+        let n = self.inner.read(&mut buf[..n])?;
+        self.left -= n;
+        Ok(n)
+    }
+}
+
+struct SocketWriter {
+    inner: TcpStream,
+    framed: Arc<AtomicBool>,
+    /// The handshake flight being collected into PRELOGIN packets.
+    flight: Vec<u8>,
+}
+
+impl Write for SocketWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.framed.load(Ordering::Relaxed) {
+            self.flight.extend_from_slice(buf);
+            return Ok(buf.len());
+        }
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.flight.is_empty() {
+            let chunks: Vec<&[u8]> = self.flight.chunks(4096 - 8).collect();
+            let last = chunks.len() - 1;
+            let mut out = Vec::with_capacity(self.flight.len() + 8 * chunks.len());
+            for (i, c) in chunks.iter().enumerate() {
+                let len = (c.len() + 8) as u16;
+                out.extend_from_slice(&[PT_PRELOGIN, u8::from(i == last)]);
+                out.extend_from_slice(&len.to_be_bytes());
+                out.extend_from_slice(&[0, 0, (i + 1) as u8, 0]);
+                out.extend_from_slice(c);
+            }
+            self.flight.clear();
+            self.inner.write_all(&out)?;
+        }
+        self.inner.flush()
+    }
+}
+
 enum Input {
     Plain(BufReader<TcpStream>),
+    Tls(crate::tls::TlsReader<SocketReader>),
     Switching,
 }
 
@@ -455,6 +548,7 @@ impl Read for Input {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Input::Plain(r) => r.read(buf),
+            Input::Tls(r) => r.read(buf),
             Input::Switching => Err(io::Error::other("connection is switching to TLS")),
         }
     }
@@ -462,6 +556,7 @@ impl Read for Input {
 
 enum Output {
     Plain(BufWriter<TcpStream>),
+    Tls(BufWriter<crate::tls::TlsWriter<SocketWriter>>),
     Switching,
 }
 
@@ -469,12 +564,14 @@ impl Write for Output {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Output::Plain(w) => w.write(buf),
+            Output::Tls(w) => w.write(buf),
             Output::Switching => Err(io::Error::other("connection is switching to TLS")),
         }
     }
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Output::Plain(w) => w.flush(),
+            Output::Tls(w) => w.flush(),
             Output::Switching => Ok(()),
         }
     }
@@ -515,6 +612,14 @@ impl Conn {
             prepared: HashMap::new(),
             next_handle: 1,
         };
+        // TDS 8 (strict encryption): TLS first, with PRELOGIN inside it.
+        let mut strict = false;
+        if let (Some(cfg), Input::Plain(r)) = (&auth.tls, &mut c.r) {
+            if r.fill_buf()?.first() == Some(&0x16) {
+                c.start_tls(cfg, false)?;
+                strict = true;
+            }
+        }
         // PRELOGIN.
         let (kind, pre) = c.read_message()?;
         if kind != PT_PRELOGIN {
@@ -526,12 +631,33 @@ impl Conn {
         let client_encryption = prelogin_option(&pre, 0x01)
             .and_then(|v| v.first().copied())
             .unwrap_or(2);
-        // Encryption is negotiated in a later stage; for now: none (ENCRYPT_NOT_SUP).
-        let _ = (&auth.tls, client_encryption);
-        let reply = prelogin_reply(2);
-        c.send(PT_REPLY, &reply)?;
+        let encryption = match (&auth.tls, client_encryption) {
+            _ if strict => ENCRYPT_NOT_SUP, // already encrypted
+            (None, _) => ENCRYPT_NOT_SUP,
+            (Some(_), ENCRYPT_NOT_SUP) if auth.require_tls => ENCRYPT_REQ,
+            (Some(_), ENCRYPT_NOT_SUP) => ENCRYPT_NOT_SUP,
+            (Some(_), ENCRYPT_OFF) if !auth.require_tls => ENCRYPT_OFF,
+            (Some(_), _) => ENCRYPT_ON,
+        };
+        if crate::log_enabled() {
+            eprintln!(
+                "[tds {}] PRELOGIN encryption: client {client_encryption}, server {encryption}{}",
+                c.session.id,
+                if strict { " (TDS 8 strict)" } else { "" }
+            );
+        }
+        c.send(PT_REPLY, &prelogin_reply(encryption))?;
+        if encryption == ENCRYPT_REQ {
+            return Ok(()); // the client cannot encrypt; SQL Server closes the connection too
+        }
+        if let (Some(cfg), ENCRYPT_ON | ENCRYPT_OFF) = (&auth.tls, encryption) {
+            c.start_tls(cfg, true)?;
+        }
         // LOGIN7.
         let (kind, login) = c.read_message()?;
+        if encryption == ENCRYPT_OFF {
+            c.stop_tls()?; // login-only encryption: the rest of the connection is plaintext
+        }
         if kind != PT_LOGIN7 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -547,7 +673,12 @@ impl Conn {
                 return c.send(PT_REPLY, &t.b);
             }
         };
-        c.version = l.version.min(TDS74);
+        // TDS 8 (0x08000000) is TDS 7.4 inside TLS.
+        c.version = if l.version == 0x0800_0000 {
+            TDS74
+        } else {
+            l.version.min(TDS74)
+        };
         c.packet_size = l.packet_size.clamp(512, 32_767);
         if !auth.users.is_empty() {
             let ok = auth
@@ -594,6 +725,57 @@ impl Conn {
         c.requests()
     }
 
+    /// Replaces the plaintext streams with a TLS session over the same socket; `framed` for the
+    /// TDS 7.x handshake carried in PRELOGIN packets.
+    fn start_tls(&mut self, cfg: &crate::tls::TlsConfig, framed: bool) -> io::Result<()> {
+        self.w.flush()?;
+        let (Input::Plain(r), Output::Plain(w)) = (
+            std::mem::replace(&mut self.r, Input::Switching),
+            std::mem::replace(&mut self.w, Output::Switching),
+        ) else {
+            return Err(io::Error::other("TLS requested twice"));
+        };
+        let tcp = w.into_inner().map_err(|e| e.into_error())?;
+        let flag = Arc::new(AtomicBool::new(framed));
+        let reader = SocketReader {
+            inner: r,
+            framed: Arc::clone(&flag),
+            left: 0,
+        };
+        let writer = SocketWriter {
+            inner: tcp,
+            framed: Arc::clone(&flag),
+            flight: Vec::new(),
+        };
+        let (tr, tw) = if framed {
+            crate::tls::accept_tds7(reader, writer, cfg)?
+        } else {
+            crate::tls::accept(reader, writer, cfg, "tds/8.0")?
+        };
+        flag.store(false, Ordering::Relaxed);
+        if crate::log_enabled() {
+            eprintln!("[tds {}] TLS 1.3 established", self.session.id);
+        }
+        self.r = Input::Tls(tr);
+        self.w = Output::Tls(BufWriter::with_capacity(16 * 1024, tw));
+        Ok(())
+    }
+
+    /// Back to plaintext after the login (encryption negotiated as login only).
+    fn stop_tls(&mut self) -> io::Result<()> {
+        self.w.flush()?;
+        let (Input::Tls(r), Output::Tls(w)) = (
+            std::mem::replace(&mut self.r, Input::Switching),
+            std::mem::replace(&mut self.w, Output::Switching),
+        ) else {
+            return Err(io::Error::other("TLS is not active"));
+        };
+        let w = w.into_inner().map_err(|e| e.into_error())?.into_inner();
+        self.r = Input::Plain(r.into_inner().inner);
+        self.w = Output::Plain(BufWriter::new(w.inner));
+        Ok(())
+    }
+
     fn requests(&mut self) -> io::Result<()> {
         loop {
             let (kind, msg) = match self.read_message() {
@@ -601,7 +783,10 @@ impl Conn {
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return Err(e),
             };
-            let mut t = Tokens::default();
+            let mut t = Tokens {
+                b: Vec::new(),
+                room: self.packet_size - 8,
+            };
             match kind {
                 PT_SQL_BATCH => self.sql_batch(&msg, &mut t),
                 PT_RPC => self.rpc(&msg, &mut t),

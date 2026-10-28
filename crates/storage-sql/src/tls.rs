@@ -475,6 +475,10 @@ fn handshake_msg(kind: u8, body: &[u8]) -> Vec<u8> {
 /// Reads handshake messages, reassembling them across records.
 struct HandshakeReader {
     buf: Vec<u8>,
+    /// See [`accept_tds7`]: application keys that may replace the client Finished, and the
+    /// first application data once they did.
+    app_keys: Option<Keys>,
+    app_data: Option<Vec<u8>>,
 }
 
 impl HandshakeReader {
@@ -513,6 +517,32 @@ impl HandshakeReader {
                 }
                 (CT_ALERT, None) => return Err(peer_alert(&body)),
                 (CT_HANDSHAKE, None) => self.buf.extend_from_slice(&body),
+                (CT_APPLICATION_DATA, Some(k)) if self.app_keys.is_some() => {
+                    let mut hs_body = body.clone();
+                    match k.open(&header, &mut hs_body) {
+                        Ok(CT_HANDSHAKE) => self.buf.extend_from_slice(&hs_body),
+                        Ok(CT_ALERT) => return Err(peer_alert(&hs_body)),
+                        Ok(_) => {
+                            return Err(alert_error(
+                                ALERT_UNEXPECTED_MESSAGE,
+                                "unexpected record during the handshake",
+                            ))
+                        }
+                        Err(e) => {
+                            // Not under the handshake keys: application data is the only other
+                            // record that authenticates (it needs the same handshake secrets).
+                            let app = self.app_keys.as_mut().ok_or(e)?;
+                            if app.open(&header, &mut body)? != CT_APPLICATION_DATA {
+                                return Err(alert_error(
+                                    ALERT_UNEXPECTED_MESSAGE,
+                                    "unexpected record during the handshake",
+                                ));
+                            }
+                            self.app_data = Some(body);
+                            return Ok((0, Vec::new()));
+                        }
+                    }
+                }
                 (CT_APPLICATION_DATA, Some(k)) => match k.open(&header, &mut body)? {
                     CT_HANDSHAKE => self.buf.extend_from_slice(&body),
                     CT_ALERT => return Err(peer_alert(&body)),
@@ -691,19 +721,43 @@ fn parse_client_hello(msg: &[u8]) -> io::Result<ClientHello> {
 /// Runs a TLS 1.3 server handshake on `r` / `w` and returns the encrypted streams.
 /// `alpn` is the application protocol to agree on when the client offers ALPN.
 pub fn accept<R: Read, W: Write>(
+    r: R,
+    w: W,
+    cfg: &TlsConfig,
+    alpn: &str,
+) -> io::Result<(TlsReader<R>, TlsWriter<W>)> {
+    accept_inner(r, w, cfg, alpn, false)
+}
+
+/// [`accept`] for the TLS handshake that TDS 7.x carries in PRELOGIN packets. Some clients
+/// (go-mssqldb) never send their TLS 1.3 Finished there: their wrapper only flushes a
+/// handshake packet before its next read, which TLS 1.2 always had and TLS 1.3 does not.
+/// Their first application record is accepted in its place: it decrypts only under keys
+/// derived from the full handshake through the server Finished, which proves the same as
+/// the client Finished would.
+pub fn accept_tds7<R: Read, W: Write>(
+    r: R,
+    w: W,
+    cfg: &TlsConfig,
+) -> io::Result<(TlsReader<R>, TlsWriter<W>)> {
+    accept_inner(r, w, cfg, "", true)
+}
+
+fn accept_inner<R: Read, W: Write>(
     mut r: R,
     mut w: W,
     cfg: &TlsConfig,
     alpn: &str,
+    tds7: bool,
 ) -> io::Result<(TlsReader<R>, TlsWriter<W>)> {
-    match handshake(&mut r, &mut w, cfg, alpn) {
-        Ok((read_keys, write_keys)) => {
+    match handshake(&mut r, &mut w, cfg, alpn, tds7) {
+        Ok((read_keys, write_keys, plain)) => {
             let update = Arc::new(AtomicBool::new(false));
             Ok((
                 TlsReader {
                     inner: r,
                     keys: read_keys,
-                    plain: Vec::new(),
+                    plain,
                     pos: 0,
                     update: Arc::clone(&update),
                     closed: false,
@@ -732,8 +786,13 @@ fn handshake<R: Read, W: Write>(
     w: &mut W,
     cfg: &TlsConfig,
     alpn: &str,
-) -> io::Result<(Keys, Keys)> {
-    let mut hs = HandshakeReader { buf: Vec::new() };
+    tds7: bool,
+) -> io::Result<(Keys, Keys, Vec<u8>)> {
+    let mut hs = HandshakeReader {
+        buf: Vec::new(),
+        app_keys: None,
+        app_data: None,
+    };
     let (kind, mut ch_msg) = hs.next(r, None)?;
     if kind != HS_CLIENT_HELLO {
         return Err(alert_error(
@@ -876,7 +935,13 @@ fn handshake<R: Read, W: Write>(
     let s_ap = derive_secret(&master, "s ap traffic", &th_server_finished);
 
     // The client's Finished.
+    if tds7 {
+        hs.app_keys = Some(Keys::new(c_ap));
+    }
     let (kind, fin) = hs.next(r, Some(&mut c_keys))?;
+    if let (Some(data), Some(keys)) = (hs.app_data.take(), hs.app_keys.take()) {
+        return Ok((keys, Keys::new(s_ap), data));
+    }
     if kind != HS_FINISHED {
         return Err(alert_error(
             ALERT_UNEXPECTED_MESSAGE,
@@ -897,7 +962,7 @@ fn handshake<R: Read, W: Write>(
             "data after the client Finished in the same record",
         ));
     }
-    Ok((Keys::new(c_ap), Keys::new(s_ap)))
+    Ok((Keys::new(c_ap), Keys::new(s_ap), Vec::new()))
 }
 
 /// What every ClientHello (including the one after a HelloRetryRequest) must offer.
@@ -966,6 +1031,13 @@ impl<R> std::fmt::Debug for TlsReader<R> {
         f.debug_struct("TlsReader")
             .field("closed", &self.closed)
             .finish_non_exhaustive()
+    }
+}
+
+impl<R> TlsReader<R> {
+    /// The underlying stream, ending TLS in this direction (TDS login-only encryption).
+    pub fn into_inner(self) -> R {
+        self.inner
     }
 }
 
@@ -1075,6 +1147,11 @@ impl<W: Write> TlsWriter<W> {
     }
 
     /// Sends `close_notify`.
+    /// The underlying stream, ending TLS in this direction (TDS login-only encryption).
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+
     pub fn close(&mut self) -> io::Result<()> {
         let record = self.keys.seal(CT_ALERT, &[1, ALERT_CLOSE_NOTIFY])?;
         self.inner.write_all(&record)?;

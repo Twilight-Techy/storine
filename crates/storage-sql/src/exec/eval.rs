@@ -667,6 +667,18 @@ impl<'a> Exec<'a> {
                 (Some(x), Some(y)) => Datum::Bool(x != y),
                 _ => Datum::Null,
             },
+            // T-SQL: `+` on two strings concatenates.
+            Add if self.dialect() == Dialect::MsSql
+                && matches!((&a, &b), (Datum::Text(_), Datum::Text(_))) =>
+            {
+                match (a, b) {
+                    (Datum::Text(mut x), Datum::Text(y)) => {
+                        x.push_str(&y);
+                        Datum::Text(x)
+                    }
+                    _ => Datum::Null,
+                }
+            }
             Add => arith('+', &a, &b)?,
             Sub => arith('-', &a, &b)?,
             Mul => arith('*', &a, &b)?,

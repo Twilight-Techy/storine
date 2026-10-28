@@ -2,6 +2,8 @@ package sqlclients
 
 import (
 	"database/sql"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -83,5 +85,38 @@ func TestMSSQL(t *testing.T) {
 	var nullable sql.NullTime
 	if err := db.QueryRow("SELECT COUNT(*), MAX(at) FROM go_ms WHERE at IS NULL").Scan(&n, &nullable); err != nil || n != 0 || nullable.Valid {
 		t.Fatalf("nulls: %v %d %v", err, n, nullable)
+	}
+}
+
+// Every encryption mode: login-only (encrypt=false), full TLS inside TDS 7.4 (encrypt=true),
+// TDS 8 strict, and certificate verification when STORINE_TLS_CERT names the server's.
+func TestMSSQLTLS(t *testing.T) {
+	host, port, _ := strings.Cut(msAddr, ":")
+	modes := []string{"false&TrustServerCertificate=true", "true&TrustServerCertificate=true"}
+	if cert := os.Getenv("STORINE_TLS_CERT"); cert != "" {
+		// Strict mode always verifies the certificate. go-mssqldb wants a .pem name.
+		pem, err := os.ReadFile(cert)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cert = t.TempDir() + "/server.pem"
+		if err := os.WriteFile(cert, pem, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		pin := "&certificate=" + url.QueryEscape(cert) + "&hostNameInCertificate=localhost"
+		modes = append(modes, "true"+pin, "strict"+pin)
+	}
+	for _, mode := range modes {
+		db, err := sql.Open("sqlserver", "sqlserver://sa:x@"+host+":"+port+"?database=shop&encrypt="+mode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var s string
+		big := strings.Repeat("x", 100_000)
+		if err := db.QueryRow("SELECT @p1 + 'y'", big).Scan(&s); err != nil || s != big+"y" {
+			db.Close()
+			t.Fatalf("encrypt=%s: %v (%d bytes)", mode, err, len(s))
+		}
+		db.Close()
 	}
 }
