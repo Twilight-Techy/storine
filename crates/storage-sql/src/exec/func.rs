@@ -1591,7 +1591,6 @@ pub const RESERVED_WORDS: &[&str] = &[
 ];
 
 pub fn table_function(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Rel> {
-    let _ = ex;
     match name {
         "generate_series" => {
             if args.len() < 2 || null_if_any(args) {
@@ -1793,10 +1792,21 @@ pub fn table_function(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Re
                     .collect(),
             })
         }
-        other => Err(SqlError::new(
-            "42883",
-            format!("function {other}() does not exist (not supported by Storine SQL as a table)"),
-        )),
+        // A scalar function in FROM is a one-row table named after it
+        // (`SELECT * FROM current_schema()`).
+        other => {
+            let v = scalar(ex, other, args).map_err(|e| {
+                if e.code == "42883" {
+                    SqlError::new("42883", format!("function {other}() does not exist"))
+                } else {
+                    e
+                }
+            })?;
+            Ok(Rel {
+                cols: vec![ColMeta::new(other, None)],
+                rows: vec![vec![v]],
+            })
+        }
     }
 }
 

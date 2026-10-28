@@ -1587,18 +1587,24 @@ fn information_schema(
                         }),
                         num_scale.map_or(N, i),
                         c.datetime_precision().map_or(N, i),
-                        if matches!(
-                            c.ty,
-                            DataType::Text | DataType::Varchar(_) | DataType::Char(_)
-                        ) {
+                        // Character set and collation: MySQL names them; PostgreSQL leaves
+                        // the default collation NULL.
+                        if mysql
+                            && matches!(
+                                c.ty,
+                                DataType::Text | DataType::Varchar(_) | DataType::Char(_)
+                            )
+                        {
                             t("utf8mb4")
                         } else {
                             N
                         },
-                        if matches!(
-                            c.ty,
-                            DataType::Text | DataType::Varchar(_) | DataType::Char(_)
-                        ) {
+                        if mysql
+                            && matches!(
+                                c.ty,
+                                DataType::Text | DataType::Varchar(_) | DataType::Char(_)
+                            )
+                        {
                             t("utf8mb4_0900_ai_ci")
                         } else {
                             N

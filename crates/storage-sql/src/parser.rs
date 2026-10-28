@@ -2660,6 +2660,14 @@ impl Parser {
             if self.eat_op("::") {
                 if let Some(f) = self.reg_cast() {
                     e = func(f, vec![e]);
+                    // `x::regtype::text` is the type's name, as format_type spells it.
+                    if f == "regtype"
+                        && self.is_op("::")
+                        && matches!(self.peek_at(1), Some(Token::Word { text, .. }) if ["text", "varchar", "name"].contains(&text.to_ascii_lowercase().as_str()))
+                    {
+                        self.pos += 2;
+                        e = func("format_type", vec![e, Expr::Null]);
+                    }
                     continue;
                 }
                 let (ty, _) = self.data_type()?;
@@ -3073,7 +3081,12 @@ impl Parser {
         } else {
             0
         };
-        let f = match self.peek_at(off).and_then(Token::keyword).as_deref() {
+        // Quoted too: TypeORM writes ::"regtype".
+        let word = match self.peek_at(off) {
+            Some(Token::Word { text, .. }) => Some(text.to_ascii_lowercase()),
+            _ => None,
+        };
+        let f = match word.as_deref() {
             Some("regclass") => "regclass",
             Some("regtype") => "regtype",
             Some("regnamespace") => "regnamespace",
