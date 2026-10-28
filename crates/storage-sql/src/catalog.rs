@@ -51,6 +51,11 @@ pub struct Column {
     pub auto_increment: bool,
     /// Value of rows written before the column was added (`ALTER TABLE ... ADD COLUMN ... DEFAULT`).
     pub missing: Option<Datum>,
+    /// The type as written in T-SQL (`datetime`, `varchar(50)`), reported by the SQL Server
+    /// catalogs; `None`: derived from `ty`.
+    pub declared: Option<String>,
+    /// Name of the default constraint (T-SQL `CONSTRAINT DF_x DEFAULT ...`).
+    pub default_name: Option<String>,
 }
 
 impl Column {
@@ -126,6 +131,8 @@ pub struct Table {
     pub indexes: Vec<IndexDef>,
     pub foreign_keys: Vec<FkDef>,
     pub checks: Vec<CheckDef>,
+    /// Name of the primary key constraint, when one was given.
+    pub pk_name: Option<String>,
     /// Version of the schema document.
     pub version: u64,
 }
@@ -246,6 +253,12 @@ impl Table {
                             m.insert("precision".into(), Value::Int(i64::from(p)));
                         }
                         m.insert("not_null".into(), Value::Bool(c.not_null));
+                        if let Some(d) = &c.declared {
+                            m.insert("declared".into(), Value::Text(d.clone()));
+                        }
+                        if let Some(d) = &c.default_name {
+                            m.insert("default_name".into(), Value::Text(d.clone()));
+                        }
                         m.insert("auto_increment".into(), Value::Bool(c.auto_increment));
                         m.insert(
                             "default".into(),
@@ -265,6 +278,9 @@ impl Table {
             ),
         );
         d.insert("primary_key".into(), names(&self.primary_key));
+        if let Some(n) = &self.pk_name {
+            d.insert("pk_name".into(), Value::Text(n.clone()));
+        }
         let keys = |ks: Vec<(&String, &Vec<usize>)>| {
             Value::List(
                 ks.into_iter()
@@ -374,6 +390,11 @@ impl Table {
                     Some(sql) => Some(parse_expr(sql, Dialect::Postgres)?),
                     None => None,
                 },
+                declared: m.get("declared").and_then(Value::as_str).map(str::to_owned),
+                default_name: m
+                    .get("default_name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
             });
         }
         let mut t = Table {
@@ -385,6 +406,10 @@ impl Table {
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             checks: Vec::new(),
+            pk_name: doc
+                .get("pk_name")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             version,
         };
         let positions = |t: &Table, v: &Value| -> SqlResult<Vec<usize>> {
@@ -636,6 +661,8 @@ mod tests {
             default: None,
             auto_increment: false,
             missing: None,
+            declared: None,
+            default_name: None,
         };
         Table {
             name: "Accounts".into(),
@@ -675,6 +702,7 @@ mod tests {
                 name: "positive".into(),
                 expr: parse_expr("balance >= 0", Dialect::Postgres).unwrap(),
             }],
+            pk_name: Some("PK_accounts".into()),
             version: 3,
         }
     }

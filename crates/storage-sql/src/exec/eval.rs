@@ -255,6 +255,8 @@ impl<'a> Exec<'a> {
             Expr::Str(s) => Datum::Text(s.clone()),
             Expr::Blob(b) => Datum::Bytes(b.clone()),
             Expr::Param(i) => self.param(*i)?,
+            // T-SQL passes DEFAULT for omitted function arguments.
+            Expr::Default if self.dialect() == Dialect::MsSql => Datum::Null,
             Expr::Default => {
                 return Err(SqlError::syntax(
                     "DEFAULT is not allowed in this context".into(),

@@ -226,6 +226,18 @@ impl Parser {
         self.pos >= self.tokens.len()
     }
 
+    /// The end of the current statement: end of input, `;`, or (T-SQL) the keyword that starts
+    /// the next one.
+    fn statement_end(&self) -> bool {
+        self.at_end()
+            || self.is_op(";")
+            || (self.dialect == Dialect::MsSql
+                && self
+                    .peek()
+                    .and_then(Token::keyword)
+                    .is_some_and(|k| TSQL_STATEMENT_STARTS.contains(&k.as_str())))
+    }
+
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
     }
@@ -360,6 +372,18 @@ impl Parser {
 
     /// A possibly qualified name `a.b.c`; returns `(schema, name)`.
     fn object_name(&mut self) -> SqlResult<(Option<String>, String)> {
+        // T-SQL table variables: `@name`.
+        if self.dialect == Dialect::MsSql {
+            if let Some(Token::Variable {
+                name,
+                system: false,
+            }) = self.peek()
+            {
+                let n = format!("@{}", name.to_ascii_lowercase());
+                self.pos += 1;
+                return Ok((None, n));
+            }
+        }
         let mut parts = vec![self.ident()?];
         while self.eat_op(".") {
             parts.push(self.ident()?);
@@ -533,6 +557,48 @@ impl Parser {
                     statement: Box::new(self.statement()?),
                 })
             }
+            "execute" | "exec" if self.dialect == Dialect::MsSql => {
+                self.pos += 1;
+                if self.eat_op("(") {
+                    let sql = self.expr()?;
+                    self.expect_op(")")?;
+                    return Ok(Statement::ExecProc {
+                        name: String::new(),
+                        args: vec![(None, sql)],
+                    });
+                }
+                // EXEC @status = proc ...
+                if matches!(self.peek(), Some(Token::Variable { .. })) && self.is_op_at(1, "=") {
+                    self.pos += 2;
+                }
+                let (_, name) = self.object_name()?;
+                let mut args = Vec::new();
+                while !self.statement_end() {
+                    let named = match (self.peek(), self.peek_at(1)) {
+                        (Some(Token::Variable { name, .. }), Some(Token::Op("="))) => {
+                            Some(name.clone())
+                        }
+                        _ => None,
+                    };
+                    if named.is_some() {
+                        self.pos += 2;
+                    }
+                    let e = if self.eat_kw("default") {
+                        Expr::Null
+                    } else {
+                        self.expr()?
+                    };
+                    let _ = self.eat_kw("output") || self.eat_kw("out");
+                    args.push((named, e));
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+                Ok(Statement::ExecProc {
+                    name: name.to_ascii_lowercase(),
+                    args,
+                })
+            }
             "execute" | "exec" => {
                 self.pos += 1;
                 let name = self.ident()?;
@@ -614,8 +680,32 @@ impl Parser {
                 _ => return Err(self.unexpected("a @variable")),
             };
             let _ = self.eat_kw("as");
-            if self.is_kw("table") || self.is_kw("cursor") {
-                return Err(SqlError::unsupported("table variables and cursors"));
+            if self.eat_kw("table") {
+                // DECLARE @t TABLE (col type [constraints], ...)
+                self.expect_op("(")?;
+                let mut columns = Vec::new();
+                loop {
+                    if self.is_kw("primary")
+                        || self.is_kw("unique")
+                        || self.is_kw("index")
+                        || self.is_kw("check")
+                    {
+                        self.table_constraint()?;
+                    } else {
+                        columns.push(self.column_def()?);
+                    }
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+                self.expect_op(")")?;
+                return Ok(Statement::DeclareTable {
+                    name: format!("@{}", name.to_ascii_lowercase()),
+                    columns,
+                });
+            }
+            if self.is_kw("cursor") {
+                return Err(SqlError::unsupported("cursors"));
             }
             let (ty, _) = self.data_type()?;
             let value = if self.eat_op("=") {
@@ -716,7 +806,7 @@ impl Parser {
                 // option lists (SET ANSI_NULLS, QUOTED_IDENTIFIER ON) do not apply.
                 if let Some(on) = ["on", "off"].into_iter().find(|w| self.is_kw(w)) {
                     self.pos += 1;
-                    if self.at_end() {
+                    if self.statement_end() {
                         // Implicit transactions are autocommit turned off.
                         return Ok(if name == "implicit_transactions" {
                             Statement::Set {
@@ -1256,24 +1346,41 @@ impl Parser {
             auto_increment: serial,
             references: None,
             check: None,
+            declared: (self.dialect == Dialect::MsSql)
+                .then(|| tokens_sql(&self.tokens[start..self.pos], self.dialect).ok())
+                .flatten()
+                .map(|s| {
+                    s.to_ascii_lowercase()
+                        .replace(" (", "(")
+                        .replace(" )", ")")
+                        .replace(" , ", ",")
+                        .replace("( ", "(")
+                }),
+            names: Default::default(),
         };
+        let mut pending: Option<String> = None;
         loop {
+            let name = pending.take();
             if self.eat_kw("constraint") {
-                self.ident()?;
+                pending = Some(self.ident()?);
             } else if self.eat_kws(&["not", "null"]) {
                 col.not_null = true;
             } else if self.eat_kw("null") {
                 col.not_null = false;
             } else if self.eat_kw("default") {
                 col.default = Some(self.unary()?);
+                col.names.default = name;
             } else if self.eat_kws(&["primary", "key"]) {
                 let _ = self.eat_kw("asc") || self.eat_kw("desc");
                 let _ = self.eat_kw("clustered") || self.eat_kw("nonclustered");
                 col.primary_key = true;
                 col.not_null = true;
+                col.names.primary_key = name;
             } else if self.eat_kw("unique") {
                 self.eat_kw("key");
+                let _ = self.eat_kw("clustered") || self.eat_kw("nonclustered");
                 col.unique = true;
+                col.names.unique = name;
             } else if self.eat_kw("auto_increment") || self.eat_kw("autoincrement") {
                 col.auto_increment = true;
             } else if self.eat_kw("identity") {
@@ -1294,14 +1401,19 @@ impl Parser {
                 } else {
                     return Err(SqlError::unsupported("generated (computed) columns"));
                 }
-            } else if self.is_kw("references") {
+            } else if self.is_kw("references") || self.is_kw("foreign") {
+                if self.eat_kw("foreign") {
+                    self.expect_kw("key")?;
+                }
                 let mut fk = self.references()?;
                 fk.columns = vec![col.name.clone()];
                 col.references = Some(fk);
+                col.names.foreign_key = name;
             } else if self.eat_kw("check") {
                 self.expect_op("(")?;
                 col.check = Some(self.expr()?);
                 self.expect_op(")")?;
+                col.names.check = name;
             } else if self.eat_kw("collate") {
                 self.object_name()?;
             } else if self.eat_kw("comment") {
@@ -1779,6 +1891,27 @@ impl Parser {
     }
 
     fn alter_op(&mut self) -> SqlResult<AlterOp> {
+        // T-SQL `ADD [CONSTRAINT name] DEFAULT expr FOR column`.
+        if self.dialect == Dialect::MsSql
+            && self.is_kw("add")
+            && (self.is_kw_at(1, "default")
+                || (self.is_kw_at(1, "constraint") && self.is_kw_at(3, "default")))
+        {
+            self.pos += 1;
+            let name = if self.eat_kw("constraint") {
+                Some(self.ident()?)
+            } else {
+                None
+            };
+            self.expect_kw("default")?;
+            let e = self.unary()?;
+            self.expect_kw("for")?;
+            let column = self.ident()?;
+            return Ok(AlterOp::AlterColumn {
+                name: column,
+                change: AlterColumn::SetNamedDefault(name, e),
+            });
+        }
         if self.eat_kw("add") {
             if self.is_kw("constraint")
                 || self.is_kw("primary")
@@ -1792,7 +1925,7 @@ impl Parser {
             }
             self.eat_kw("column");
             let if_not_exists = self.eat_kws(&["if", "not", "exists"]);
-            let column = self.column_def()?;
+            let column = Box::new(self.column_def()?);
             let _ = self.eat_kw("first") || (self.eat_kw("after") && self.ident().is_ok());
             return Ok(AlterOp::AddColumn {
                 column,
@@ -1851,6 +1984,10 @@ impl Parser {
                     self.expr()?;
                 }
                 AlterColumn::Type(ty)
+            } else if self.dialect == Dialect::MsSql {
+                // T-SQL `ALTER COLUMN c type [NULL | NOT NULL]`: a redefinition.
+                self.pos -= 1;
+                AlterColumn::Redefine(Box::new(self.column_def()?))
             } else {
                 return Err(SqlError::unsupported("this ALTER COLUMN form"));
             };
@@ -1922,8 +2059,10 @@ impl Parser {
             ins.columns = self.ident_list()?;
         }
         // T-SQL OUTPUT INSERTED.* (as RETURNING).
+        let mut into = None;
         if self.eat_kw("output") {
             ins.returning = self.output_items()?;
+            into = self.output_into()?;
         }
         if self.eat_kws(&["default", "values"]) {
             ins.source = InsertSource::DefaultValues;
@@ -1983,10 +2122,35 @@ impl Parser {
         if self.eat_kw("returning") {
             ins.returning = self.select_items()?;
         }
-        Ok(Statement::Insert(Box::new(ins)))
+        Ok(Self::wrap_output(Statement::Insert(Box::new(ins)), into))
     }
 
     /// T-SQL `OUTPUT INSERTED.a, INSERTED.*` → select items.
+    /// `OUTPUT ... INTO @table [(columns)]`.
+    fn output_into(&mut self) -> SqlResult<Option<(String, Vec<String>)>> {
+        if !self.eat_kw("into") {
+            return Ok(None);
+        }
+        let target = self.table_name()?;
+        let cols = if self.is_op("(") {
+            self.ident_list()?
+        } else {
+            Vec::new()
+        };
+        Ok(Some((target, cols)))
+    }
+
+    fn wrap_output(st: Statement, into: Option<(String, Vec<String>)>) -> Statement {
+        match into {
+            Some((target, columns)) => Statement::OutputInto {
+                target,
+                columns,
+                inner: Box::new(st),
+            },
+            None => st,
+        }
+    }
+
     fn output_items(&mut self) -> SqlResult<Vec<SelectItem>> {
         let items = self.select_items()?;
         Ok(items
@@ -2071,8 +2235,10 @@ impl Parser {
             order_by: Vec::new(),
             limit: None,
         };
+        let mut into = None;
         if self.eat_kw("output") {
             up.returning = self.output_items()?;
+            into = self.output_into()?;
         }
         if self.eat_kw("from") {
             up.from = self.table_list()?;
@@ -2089,7 +2255,7 @@ impl Parser {
         if self.eat_kw("returning") {
             up.returning = self.select_items()?;
         }
-        Ok(Statement::Update(Box::new(up)))
+        Ok(Self::wrap_output(Statement::Update(Box::new(up)), into))
     }
 
     fn delete(&mut self) -> SqlResult<Statement> {
@@ -2108,8 +2274,10 @@ impl Parser {
             order_by: Vec::new(),
             limit: None,
         };
+        let mut into = None;
         if self.eat_kw("output") {
             del.returning = self.output_items()?;
+            into = self.output_into()?;
         }
         if self.eat_kw("using") {
             del.using = self.table_list()?;
@@ -2126,7 +2294,7 @@ impl Parser {
         if self.eat_kw("returning") {
             del.returning = self.select_items()?;
         }
-        Ok(Statement::Delete(Box::new(del)))
+        Ok(Self::wrap_output(Statement::Delete(Box::new(del)), into))
     }
 
     // ── queries ──
@@ -2393,9 +2561,37 @@ impl Parser {
                 let q = self.ident()?;
                 self.pos += 2;
                 items.push(SelectItem::Wildcard(Some(q)));
+            } else if self.dialect == Dialect::MsSql
+                && matches!(self.peek(), Some(Token::Word { .. }) | Some(Token::Str(_)))
+                && self.is_op_at(1, "=")
+            {
+                // T-SQL `SELECT total = SUM(x)`.
+                let alias = match self.next() {
+                    Some(Token::Str(s)) => s,
+                    _ => {
+                        self.pos -= 1;
+                        self.ident()?
+                    }
+                };
+                self.pos += 1;
+                let expr = self.expr()?;
+                items.push(SelectItem::Expr {
+                    expr,
+                    alias: Some(alias),
+                });
             } else {
                 let expr = self.expr()?;
-                let alias = self.opt_alias()?;
+                // `AS 'name'` / `'name'`: a string literal alias (SQL Server, MySQL).
+                let alias = match self.peek_at(usize::from(self.is_kw("as"))) {
+                    Some(Token::Str(_)) if self.dialect != Dialect::Postgres => {
+                        self.eat_kw("as");
+                        match self.next() {
+                            Some(Token::Str(s)) => Some(s),
+                            _ => None,
+                        }
+                    }
+                    _ => self.opt_alias()?,
+                };
                 items.push(SelectItem::Expr { expr, alias });
             }
             if !self.eat_op(",") {

@@ -13,6 +13,7 @@ mod ddl;
 mod dml;
 mod eval;
 mod func;
+pub mod mssql;
 mod regex;
 mod select;
 pub mod system;
@@ -298,6 +299,7 @@ impl Engine {
                 .to_owned(),
             vars: default_vars(dialect),
             user_vars: HashMap::new(),
+            table_vars: HashMap::new(),
             txn: None,
             last_insert_id: 0,
             prepared: HashMap::new(),
@@ -379,6 +381,57 @@ pub struct OutCol {
     pub ty: DataType,
     /// Source table and column (for drivers that report it).
     pub table: Option<String>,
+}
+
+/// A T-SQL table variable: typed columns and its rows, private to the session.
+#[derive(Debug, Clone, Default)]
+pub struct TableVar {
+    pub columns: Vec<(String, DataType)>,
+    pub rows: Vec<Vec<Datum>>,
+}
+
+impl Session {
+    /// Appends rows to a table variable (`columns`: the target columns, empty for all).
+    pub(crate) fn table_var_append(
+        &mut self,
+        name: &str,
+        columns: &[String],
+        rows: Vec<Vec<Datum>>,
+    ) -> SqlResult<()> {
+        let tv = self.table_vars.get_mut(name).ok_or_else(|| {
+            SqlError::new(
+                "42P01",
+                format!("Must declare the table variable \"{name}\"."),
+            )
+        })?;
+        let targets: Vec<usize> = if columns.is_empty() {
+            (0..tv.columns.len()).collect()
+        } else {
+            columns
+                .iter()
+                .map(|c| {
+                    tv.columns
+                        .iter()
+                        .position(|(n, _)| n.eq_ignore_ascii_case(c))
+                        .ok_or_else(|| SqlError::undefined_column(c))
+                })
+                .collect::<SqlResult<_>>()?
+        };
+        for r in rows {
+            if r.len() != targets.len() {
+                return Err(SqlError::syntax(
+                    "Column name or number of supplied values does not match table definition."
+                        .into(),
+                ));
+            }
+            let mut row = vec![Datum::Null; tv.columns.len()];
+            for (v, &k) in r.into_iter().zip(&targets) {
+                row[k] = crate::datum::cast(&v, &tv.columns[k].1)?;
+            }
+            tv.rows.push(row);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -594,6 +647,8 @@ pub struct Session {
     pub database: String,
     pub vars: HashMap<String, String>,
     pub user_vars: HashMap<String, Datum>,
+    /// T-SQL table variables by name (with the `@`).
+    pub table_vars: HashMap<String, TableVar>,
     pub txn: Option<Txn>,
     pub last_insert_id: i64,
     pub prepared: HashMap<String, (Statement, usize)>,
@@ -856,7 +911,9 @@ impl Session {
                     // The statement's own changes are undone either way; PostgreSQL also aborts
                     // the transaction, MySQL keeps it usable.
                     txn.rollback_to(mark);
-                    if self.dialect != Dialect::MySql && e.code != "0A000" {
+                    // SQL Server (XACT_ABORT OFF) keeps it too.
+                    if !matches!(self.dialect, Dialect::MySql | Dialect::MsSql) && e.code != "0A000"
+                    {
                         txn.failed = true;
                     }
                 }
@@ -1061,6 +1118,38 @@ impl Session {
                 Ok(Outcome::command("DECLARE"))
             }
             Statement::If { .. } => unreachable!("IF is dispatched by execute"),
+            Statement::DeclareTable { name, columns } => {
+                self.table_vars.insert(
+                    name.clone(),
+                    TableVar {
+                        columns: columns.iter().map(|c| (c.name.clone(), c.ty.clone())).collect(),
+                        rows: Vec::new(),
+                    },
+                );
+                Ok(Outcome::command("DECLARE"))
+            }
+            Statement::OutputInto {
+                target,
+                columns,
+                inner,
+            } => {
+                let out = self.run(inner, params)?;
+                let Outcome::Rows(rs) = out else {
+                    return Ok(out);
+                };
+                let n = rs.rows.len();
+                self.table_var_append(target, columns, rs.rows)?;
+                let verb = match inner.as_ref() {
+                    Statement::Insert(_) => "INSERT 0",
+                    Statement::Update(_) => "UPDATE",
+                    _ => "DELETE",
+                };
+                Ok(Outcome::Command {
+                    tag: format!("{verb} {n}"),
+                    affected: n as u64,
+                    last_insert_id: None,
+                })
+            }
             Statement::Use(db) => {
                 self.use_database(db)?;
                 Ok(Outcome::command("USE"))
@@ -1185,6 +1274,7 @@ impl Session {
                     .insert(name.to_ascii_lowercase(), ((**statement).clone(), 0));
                 Ok(Outcome::command("PREPARE"))
             }
+            Statement::ExecProc { name, args } => mssql::exec_proc(self, name, args, params),
             Statement::Execute { name, args } => {
                 let (stmt, _) = self
                     .prepared

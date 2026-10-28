@@ -59,6 +59,17 @@ pub enum Statement {
         then: Box<Statement>,
         otherwise: Option<Box<Statement>>,
     },
+    /// T-SQL `DECLARE @t TABLE (...)`: a table variable (named with its `@`).
+    DeclareTable {
+        name: String,
+        columns: Vec<ColumnDef>,
+    },
+    /// T-SQL `INSERT / UPDATE / DELETE ... OUTPUT ... INTO @t [(columns)]`.
+    OutputInto {
+        target: String,
+        columns: Vec<String>,
+        inner: Box<Statement>,
+    },
     /// `USE db`: switches the session to another database.
     Use(String),
     Explain(Box<Statement>),
@@ -98,6 +109,12 @@ pub enum Statement {
         args: Vec<Expr>,
     },
     Deallocate(Option<String>),
+    /// T-SQL `EXEC [schema.]procedure [@name =] value, ...` (system procedures), or
+    /// `EXEC (sql)` with an empty name.
+    ExecProc {
+        name: String,
+        args: Vec<(Option<String>, Expr)>,
+    },
     /// Statements accepted and ignored because they have no effect here (the tag is reported back).
     NoOp(&'static str),
     Empty,
@@ -323,6 +340,19 @@ pub struct ColumnDef {
     pub auto_increment: bool,
     pub references: Option<ForeignKey>,
     pub check: Option<Expr>,
+    /// The type as written (T-SQL only: `datetime`, `varchar(50)`), for the catalogs.
+    pub declared: Option<String>,
+    /// Names given with `CONSTRAINT name` to the column's inline constraints.
+    pub names: ConstraintNames,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ConstraintNames {
+    pub primary_key: Option<String>,
+    pub unique: Option<String>,
+    pub default: Option<String>,
+    pub check: Option<String>,
+    pub foreign_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -371,7 +401,7 @@ pub enum TableConstraint {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterOp {
     AddColumn {
-        column: ColumnDef,
+        column: Box<ColumnDef>,
         if_not_exists: bool,
     },
     DropColumn {
@@ -403,6 +433,8 @@ pub enum AlterColumn {
     Type(DataType),
     /// MySQL `MODIFY` / `CHANGE`: the whole definition (type, nullability, default).
     Redefine(Box<ColumnDef>),
+    /// T-SQL `ADD [CONSTRAINT name] DEFAULT expr FOR column`.
+    SetNamedDefault(Option<String>, Expr),
 }
 
 #[derive(Debug, Clone, PartialEq)]

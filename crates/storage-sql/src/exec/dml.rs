@@ -918,6 +918,31 @@ fn build_row(
 }
 
 pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outcome> {
+    if ins.table.starts_with('@') {
+        // T-SQL table variable.
+        let rows: Vec<Vec<Datum>> = {
+            let ex = Exec::new(s, params);
+            match &ins.source {
+                InsertSource::Values(rows) => rows
+                    .iter()
+                    .map(|r| {
+                        r.iter()
+                            .map(|e| ex.eval_const(e))
+                            .collect::<SqlResult<Vec<_>>>()
+                    })
+                    .collect::<SqlResult<_>>()?,
+                InsertSource::Query(q) => ex.query(q, None)?.rows,
+                InsertSource::DefaultValues => Vec::new(),
+            }
+        };
+        let n = rows.len();
+        s.table_var_append(&ins.table, &ins.columns, rows)?;
+        return Ok(Outcome::Command {
+            tag: format!("INSERT 0 {n}"),
+            affected: n as u64,
+            last_insert_id: None,
+        });
+    }
     let table = s.engine.table(&ins.table)?;
     let target: Vec<usize> = if ins.columns.is_empty() {
         if matches!(ins.source, InsertSource::DefaultValues) {
@@ -1724,4 +1749,18 @@ pub fn setval(engine: &Engine, name: &str, v: i64) -> SqlResult<()> {
         .commit(std::slice::from_ref(&w))
         .map_err(|e| e.to_sql(std::slice::from_ref(&w)))?;
     Ok(())
+}
+
+/// The last value an IDENTITY / AUTO_INCREMENT column handed out (`None`: none yet).
+pub fn identity_current(engine: &Engine, t: &Table, column: usize) -> SqlResult<Option<i64>> {
+    let doc = engine.store.get(SEQUENCES, &auto_sequence(t, column))?;
+    Ok(doc.and_then(|d| {
+        let next = d.fields.get("next").and_then(Value::as_i64)?;
+        let step = d
+            .fields
+            .get("increment")
+            .and_then(Value::as_i64)
+            .unwrap_or(1);
+        Some(next - step)
+    }))
 }

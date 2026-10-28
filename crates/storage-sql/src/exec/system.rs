@@ -233,8 +233,11 @@ pub fn table(ex: &Exec<'_>, schema: Option<&str>, name: &str) -> SqlResult<Optio
     let tables = ex.s.engine.catalog.all();
     let mysql = ex.dialect() == Dialect::MySql;
     let db = ex.s.database.clone();
+    let mssql = ex.dialect() == Dialect::MsSql;
     let schema_name = if mysql {
         db.clone()
+    } else if mssql {
+        "dbo".to_owned()
     } else {
         "public".to_owned()
     };
@@ -265,6 +268,7 @@ pub fn table(ex: &Exec<'_>, schema: Option<&str>, name: &str) -> SqlResult<Optio
         (Some("information_schema"), _) => {
             information_schema(ex, &n, &tables, &schema_name, mysql)?
         }
+        (Some("sys"), _) if mssql => super::mssql::sys_catalog(ex, &n, &tables)?,
         (Some("mysql" | "performance_schema" | "sys"), _) => Rel::default(),
         _ => pg_catalog(ex, &n, &tables)?,
     };
@@ -1451,17 +1455,29 @@ fn information_schema(
     mysql: bool,
 ) -> SqlResult<Rel> {
     let db = ex.s.database.clone();
-    // MySQL's information_schema uses upper-case column names; lookups are case-insensitive.
+    let mssql = ex.dialect() == Dialect::MsSql;
+    // MySQL's and SQL Server's information_schema use upper-case column names; lookups are
+    // case-insensitive.
     let cased = |name: &str| {
-        if mysql {
+        if mysql || mssql {
             name.to_ascii_uppercase()
         } else {
             name.to_owned()
         }
     };
     let mk = |spec: &[(&str, DataType)]| -> Builder {
-        let owned: Vec<(String, DataType)> =
-            spec.iter().map(|(n, t)| (cased(n), t.clone())).collect();
+        // SQL Server's catalog numbers are `int` (drivers return `bigint` as strings).
+        let owned: Vec<(String, DataType)> = spec
+            .iter()
+            .map(|(n, t)| {
+                let t = if mssql && *t == DataType::BigInt {
+                    DataType::Int
+                } else {
+                    t.clone()
+                };
+                (cased(n), t)
+            })
+            .collect();
         Builder {
             cols: owned
                 .into_iter()
@@ -1597,7 +1613,37 @@ fn information_schema(
             for tb in tables {
                 for (k, c) in tb.columns.iter().enumerate() {
                     let (my_dt, my_ct) = mysql_column_type(c);
+                    let (ms_type, _, ms_len, ms_p, ms_s) = super::mssql::column_type(c);
+                    let ms_wide = matches!(ms_type.as_str(), "nvarchar" | "nchar" | "ntext");
+                    let ms_text =
+                        ms_wide || matches!(ms_type.as_str(), "varchar" | "char" | "text");
+                    let ms_numeric = matches!(
+                        ms_type.as_str(),
+                        "decimal"
+                            | "numeric"
+                            | "money"
+                            | "smallmoney"
+                            | "tinyint"
+                            | "smallint"
+                            | "int"
+                            | "bigint"
+                            | "float"
+                            | "real"
+                    );
                     let (char_len, num_prec, num_scale) = match &c.ty {
+                        _ if mssql && ms_text => (
+                            Some(if ms_len < 0 {
+                                -1
+                            } else if ms_wide {
+                                ms_len / 2
+                            } else {
+                                ms_len
+                            }),
+                            None,
+                            None,
+                        ),
+                        _ if mssql && ms_numeric => (None, Some(ms_p), Some(ms_s)),
+                        _ if mssql => (None, None, None),
                         DataType::Varchar(Some(n)) | DataType::Char(Some(n)) => {
                             (Some(i64::from(*n)), None, None)
                         }
@@ -1626,6 +1672,8 @@ fn information_schema(
                         ""
                     };
                     let default = match (&c.default, c.auto_increment) {
+                        (Some(d), _) if mssql => Some(super::mssql::default_sql(d)),
+                        (None, true) if mssql => None,
                         (Some(d), _) => Some(if mysql {
                             mysql_default(d)
                         } else {
@@ -1648,9 +1696,23 @@ fn information_schema(
                         i(k as i64 + 1),
                         default.map_or(N, t),
                         t(if c.not_null { "NO" } else { "YES" }),
-                        t(if mysql { my_dt } else { pg_data_type(&c.ty) }),
+                        t(if mysql {
+                            my_dt.to_owned()
+                        } else if mssql {
+                            ms_type.to_owned()
+                        } else {
+                            pg_data_type(&c.ty)
+                        }),
                         char_len.map_or(N, i),
-                        char_len.map_or(N, |n| i(n * 4)),
+                        char_len.map_or(N, |n| {
+                            i(if n < 0 {
+                                -1
+                            } else if mssql {
+                                ms_len
+                            } else {
+                                n * 4
+                            })
+                        }),
                         num_prec.map_or(N, i),
                         num_prec.map_or(N, |_| {
                             i(if matches!(c.ty, DataType::Numeric(_)) {
@@ -1663,7 +1725,9 @@ fn information_schema(
                         c.datetime_precision().map_or(N, i),
                         // Character set and collation: MySQL names them; PostgreSQL leaves
                         // the default collation NULL.
-                        if mysql
+                        if mssql && ms_text {
+                            t("UNICODE")
+                        } else if mysql
                             && matches!(
                                 c.ty,
                                 DataType::Text | DataType::Varchar(_) | DataType::Char(_)
@@ -1673,7 +1737,9 @@ fn information_schema(
                         } else {
                             N
                         },
-                        if mysql
+                        if mssql && ms_text {
+                            t(super::mssql::COLLATION)
+                        } else if mysql
                             && matches!(
                                 c.ty,
                                 DataType::Text | DataType::Varchar(_) | DataType::Char(_)
@@ -2718,7 +2784,7 @@ pub fn show(s: &mut Session, what: &Show) -> SqlResult<Outcome> {
 
 /// Databases to list: the default one, every created one, and the name this session
 /// connected with (names never created are served by the default database).
-fn database_list(s: &crate::exec::Session) -> SqlResult<Vec<String>> {
+pub(crate) fn database_list(s: &crate::exec::Session) -> SqlResult<Vec<String>> {
     let mut names = s.engine.database_names()?;
     if !names.iter().any(|n| n.eq_ignore_ascii_case(&s.database)) {
         names.push(s.database.clone());

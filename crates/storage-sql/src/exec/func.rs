@@ -100,6 +100,11 @@ pub fn call(
 }
 
 pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
+    if ex.dialect() == Dialect::MsSql {
+        if let Some(r) = super::mssql::function(ex, name, args) {
+            return r;
+        }
+    }
     let mysql = ex.dialect() == Dialect::MySql;
     let a0 = args.first().cloned().unwrap_or(Datum::Null);
     Ok(match name {
@@ -1592,6 +1597,14 @@ pub const RESERVED_WORDS: &[&str] = &[
 
 pub fn table_function(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Rel> {
     match name {
+        // T-SQL: extended properties (column comments) are not stored.
+        "fn_listextendedproperty" => Ok(Rel {
+            cols: ["objtype", "objname", "name", "value"]
+                .iter()
+                .map(|c| ColMeta::new(*c, Some(DataType::Text)))
+                .collect(),
+            rows: Vec::new(),
+        }),
         "generate_series" => {
             if args.len() < 2 || null_if_any(args) {
                 return Err(SqlError::new(
@@ -2091,6 +2104,11 @@ pub fn return_type(
 ) -> Option<DataType> {
     let mysql = ex.dialect() == Dialect::MySql;
     let arg_ty = |i: usize| args.get(i).and_then(|a| ex.static_type(a, cols).0);
+    if ex.dialect() == Dialect::MsSql {
+        if let Some(ty) = super::mssql::return_type(name) {
+            return Some(ty);
+        }
+    }
     Some(match name {
         "count" => DataType::BigInt,
         "sum" => match arg_ty(0) {

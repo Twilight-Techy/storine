@@ -78,7 +78,7 @@ func TestMSSQL(t *testing.T) {
 	}
 	// Unique violation surfaces as SQL Server error 2627.
 	_, err = db.Exec("INSERT INTO go_ms (name) VALUES (@p1)", "ann")
-	if err == nil || !strings.Contains(err.Error(), "unique") {
+	if err == nil || !strings.Contains(err.Error(), "Violation of UNIQUE KEY constraint") {
 		t.Fatalf("duplicate accepted: %v", err)
 	}
 	var n int64

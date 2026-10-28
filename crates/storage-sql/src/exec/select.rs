@@ -307,6 +307,12 @@ impl Exec<'_> {
             )? {
                 return Ok(row[i].clone());
             }
+            // `ORDER BY t.col` after a UNION names the output column (SQL Server, MySQL).
+            if p.len() > 1 {
+                if let Some(i) = find_column(cols, None, &p[p.len() - 1])? {
+                    return Ok(row[i].clone());
+                }
+            }
         }
         self.eval(&o.expr, env)
     }
@@ -559,6 +565,21 @@ impl Exec<'_> {
                     if let Some(rel) = self.cte(name) {
                         return (*rel).clone().requalify(alias, Some(name));
                     }
+                }
+                if let Some(tv) = name
+                    .starts_with('@')
+                    .then(|| self.s.table_vars.get(name))
+                    .flatten()
+                {
+                    let rel = Rel {
+                        cols: tv
+                            .columns
+                            .iter()
+                            .map(|(n, t)| ColMeta::new(n.clone(), Some(t.clone())))
+                            .collect(),
+                        rows: tv.rows.clone(),
+                    };
+                    return rel.requalify(alias, Some(name));
                 }
                 if let Some(rel) = system::table(self, schema.as_deref(), name)? {
                     return rel.requalify(alias, Some(name));

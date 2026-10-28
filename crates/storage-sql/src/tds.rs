@@ -173,6 +173,48 @@ fn error_number(code: &str) -> i32 {
     }
 }
 
+/// SQL Server's wording for the constraint errors ORMs recognise by message (Sequelize,
+/// EF Core, ActiveRecord); other messages pass through.
+fn tsql_message(e: &SqlError, db: &str) -> String {
+    let quoted: Vec<&str> = e.message.split('"').skip(1).step_by(2).collect();
+    let q = |i: usize| quoted.get(i).copied().unwrap_or("");
+    match e.code {
+        "23505" if e.message.starts_with("duplicate key") => {
+            let kind = if q(0).starts_with("PK_") || q(0).ends_with("_pkey") {
+                "PRIMARY"
+            } else {
+                "UNIQUE"
+            };
+            format!(
+                "Violation of {kind} KEY constraint '{}'. Cannot insert duplicate key in object 'dbo.{}'.",
+                q(0),
+                q(1)
+            )
+        }
+        "23503" if e.message.starts_with("insert or update") => format!(
+            "The INSERT statement conflicted with the FOREIGN KEY constraint \"{}\". The conflict occurred in database \"{db}\", table \"dbo.{}\".",
+            q(1),
+            if quoted.len() > 2 { q(2) } else { q(0) }
+        ),
+        "23503" if e.message.starts_with("update or delete") => format!(
+            "The DELETE statement conflicted with the REFERENCE constraint \"{}\". The conflict occurred in database \"{db}\", table \"dbo.{}\".",
+            q(1),
+            q(2)
+        ),
+        "23502" if e.message.starts_with("null value") => format!(
+            "Cannot insert the value NULL into column '{}', table '{db}.dbo.{}'; column does not allow nulls. INSERT fails.",
+            q(0),
+            q(1)
+        ),
+        "23514" if e.message.starts_with("new row") => format!(
+            "The INSERT statement conflicted with the CHECK constraint \"{}\". The conflict occurred in database \"{db}\", table \"dbo.{}\".",
+            q(1),
+            q(0)
+        ),
+        _ => e.message.clone(),
+    }
+}
+
 /// How a result column is sent (chosen from the column's type and, for widths and scales,
 /// from the values actually being sent).
 #[derive(Debug, Clone)]
@@ -1235,7 +1277,7 @@ impl Conn {
         b.u32(error_number(e.code) as u32)
             .u8(1)
             .u8(16)
-            .us_varchar(&e.message)
+            .us_varchar(&tsql_message(e, &self.session.database))
             .b_varchar("storine")
             .b_varchar("");
         if self.version >= TDS72 {
@@ -1395,7 +1437,7 @@ fn tm_isolation(level: u8) -> Option<String> {
 }
 
 /// Parameter names of an `sp_executesql` / `sp_prepare` declaration (`@P1 int, @P2 nvarchar(50)`).
-fn declared_names(decl: &str) -> Vec<String> {
+pub(crate) fn declared_names(decl: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0;
     let mut current = String::new();

@@ -42,6 +42,8 @@ fn column_from_def(ex: &Exec<'_>, d: &ColumnDef) -> SqlResult<Column> {
         default: d.default.clone(),
         auto_increment: d.auto_increment,
         missing: None,
+        declared: d.declared.clone(),
+        default_name: d.names.default.clone(),
     })
 }
 
@@ -61,7 +63,7 @@ fn positions(t: &Table, cols: &[String]) -> SqlResult<Vec<usize>> {
 
 fn add_constraint(t: &mut Table, c: &TableConstraint, s: &Session) -> SqlResult<()> {
     match c {
-        TableConstraint::PrimaryKey { columns, .. } => {
+        TableConstraint::PrimaryKey { name, columns } => {
             if !t.primary_key.is_empty() {
                 return Err(SqlError::new(
                     "42P16",
@@ -72,6 +74,7 @@ fn add_constraint(t: &mut Table, c: &TableConstraint, s: &Session) -> SqlResult<
                 ));
             }
             t.primary_key = positions(t, columns)?;
+            t.pk_name = name.clone();
             for i in t.primary_key.clone() {
                 t.columns[i].not_null = true;
             }
@@ -237,6 +240,8 @@ pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlR
                 auto_increment: false,
                 references: None,
                 check: None,
+                declared: None,
+                names: Default::default(),
             })
             .collect();
         let inner = CreateTable {
@@ -281,6 +286,7 @@ pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlR
         indexes: Vec::new(),
         foreign_keys: Vec::new(),
         checks: Vec::new(),
+        pk_name: None,
         version: 0,
     };
     {
@@ -304,25 +310,30 @@ pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlR
     for d in &ct.columns {
         if d.primary_key {
             constraints.push(TableConstraint::PrimaryKey {
-                name: None,
+                name: d.names.primary_key.clone(),
                 columns: vec![d.name.clone()],
             });
         }
         if d.unique {
             constraints.push(TableConstraint::Unique {
-                name: None,
+                name: d.names.unique.clone(),
                 columns: vec![d.name.clone()],
             });
         }
         if let Some(fk) = &d.references {
             constraints.push(TableConstraint::ForeignKey {
-                name: None,
+                name: d.names.foreign_key.clone(),
                 fk: fk.clone(),
             });
         }
         if let Some(c) = &d.check {
             constraints.push(TableConstraint::Check {
-                name: Some(format!("{}_{}_check", ct.name, d.name)),
+                name: Some(
+                    d.names
+                        .check
+                        .clone()
+                        .unwrap_or_else(|| format!("{}_{}_check", ct.name, d.name)),
+                ),
                 expr: c.clone(),
             });
         }
@@ -798,7 +809,18 @@ pub fn alter_table(s: &mut Session, table: &str, ops: &[AlterOp]) -> SqlResult<O
                 let steps = match change {
                     AlterColumn::Redefine(def) => {
                         let in_pk = t.primary_key.contains(&i);
-                        t.columns[i].auto_increment = def.auto_increment;
+                        // T-SQL ALTER COLUMN keeps the IDENTITY property and the default
+                        // constraint; MySQL MODIFY replaces both.
+                        let tsql = s.dialect == Dialect::MsSql;
+                        if !tsql {
+                            t.columns[i].auto_increment = def.auto_increment;
+                        }
+                        let default = match (&def.default, tsql) {
+                            (None, true) => t.columns[i].default.clone(),
+                            (d, _) => d.clone(),
+                        };
+                        let default_name = t.columns[i].default_name.clone();
+                        t.columns[i].declared = def.declared.clone();
                         t.columns[i].precision = def.precision;
                         vec![
                             AlterColumn::Type(def.ty.clone()),
@@ -807,9 +829,9 @@ pub fn alter_table(s: &mut Session, table: &str, ops: &[AlterOp]) -> SqlResult<O
                             } else {
                                 AlterColumn::DropNotNull
                             },
-                            def.default
-                                .clone()
-                                .map_or(AlterColumn::DropDefault, AlterColumn::SetDefault),
+                            default.map_or(AlterColumn::DropDefault, |d| {
+                                AlterColumn::SetNamedDefault(default_name.filter(|_| tsql), d)
+                            }),
                         ]
                     }
                     other => vec![other.clone()],
@@ -817,7 +839,14 @@ pub fn alter_table(s: &mut Session, table: &str, ops: &[AlterOp]) -> SqlResult<O
                 for change in &steps {
                     match change {
                         AlterColumn::SetDefault(e) => t.columns[i].default = Some(e.clone()),
-                        AlterColumn::DropDefault => t.columns[i].default = None,
+                        AlterColumn::SetNamedDefault(n, e) => {
+                            t.columns[i].default = Some(e.clone());
+                            t.columns[i].default_name = n.clone();
+                        }
+                        AlterColumn::DropDefault => {
+                            t.columns[i].default = None;
+                            t.columns[i].default_name = None;
+                        }
                         AlterColumn::DropNotNull => {
                             if t.primary_key.contains(&i) {
                                 return Err(SqlError::new(
@@ -898,7 +927,19 @@ pub fn alter_table(s: &mut Session, table: &str, ops: &[AlterOp]) -> SqlResult<O
                 t.foreign_keys.retain(|f| !f.name.eq_ignore_ascii_case(n));
                 t.checks.retain(|c| !c.name.eq_ignore_ascii_case(n));
                 t.indexes.retain(|i| !i.name.eq_ignore_ascii_case(n));
-                if t.uniques.len() + t.foreign_keys.len() + t.checks.len() + t.indexes.len()
+                // T-SQL default constraints have names too.
+                let default_of = t.columns.iter().position(|c| {
+                    c.default.is_some()
+                        && (c
+                            .default_name
+                            .as_deref()
+                            .is_some_and(|d| d.eq_ignore_ascii_case(n))
+                            || crate::exec::mssql::default_name(&t.name, c).eq_ignore_ascii_case(n))
+                });
+                if let Some(k) = default_of {
+                    t.columns[k].default = None;
+                    t.columns[k].default_name = None;
+                } else if t.uniques.len() + t.foreign_keys.len() + t.checks.len() + t.indexes.len()
                     == before
                 {
                     if *if_exists {
