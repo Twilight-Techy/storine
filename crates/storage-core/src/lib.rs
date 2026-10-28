@@ -15,6 +15,7 @@
 pub mod backup;
 pub mod catalog;
 mod decrypt_cache;
+pub mod document;
 pub mod engine;
 pub mod migration;
 pub mod model;
@@ -30,8 +31,12 @@ pub use backup::{
     archive_wal_for_pitr, create_online_backup, restore_point_in_time, BackupManifest,
 };
 pub use catalog::{CatalogTransaction, CollectionMeta, DatabaseCatalog, ErasedCollectionEngine};
+pub use document::{
+    CollectionInfo, CommitSink, DocOp, DocPage, DocQuery, DocWrite, Direction, Document,
+    DocumentRecord, DocumentStore, Filter, WriteSummary, MAX_DOCUMENT_INDEXES,
+};
 pub use engine::{
-    EncryptionConfig, IndexTier, PrimaryTier, ResealReport,
+    EncryptionConfig, IndexTier, PrimaryTier, ResealReport, Precondition, WriteKind, WriteOp, WriteResult,
     EngineConfig, EngineStats, RecordRef, StorageEngine, StorageLayoutMode, TransactionBatch,
 };
 pub use migration::SchemaRegistry;

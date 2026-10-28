@@ -250,6 +250,15 @@ pub trait Indexable: storage_codec::ZeroCopyRecord {
         IndexSnapshot::new()
     }
 
+    /// Applies atomic field operations (`FieldOp::Set` / `Unset` / `Add` / `Append`) to this
+    /// record, for server-side read-modify-write (`TASK-095`). Record types without dynamic
+    /// fields keep the default, which rejects every operation.
+    fn apply_field_ops(&mut self, _ops: &[storage_codec::field_ops::FieldOp]) -> storage_types::Result<()> {
+        Err(storage_types::StorageError::invalid_value(
+            "this record type does not support field operations",
+        ))
+    }
+
     /// Extracts an `IndexSnapshot` directly from the zero-copy archived representation (`mmap` / `hot_dirty`)
     /// without allocating an owned record or storing a persistent `IndexSnapshot` map in RAM.
     #[inline]

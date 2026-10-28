@@ -37,6 +37,25 @@ pub enum StorageError {
     ResourceExhausted { resource: &'static str },
     /// Multi-record transaction aborted due to conflict or user closure error.
     TransactionAborted { reason: &'static str },
+    /// A write precondition (`if absent`, `if exists`, `if version`) did not hold.
+    /// `actual` is the record's current version (`None` = the record does not exist).
+    ConditionFailed {
+        id: InlineId,
+        reason: &'static str,
+        actual: Option<Version>,
+    },
+    /// A value was rejected: arithmetic overflow, a bound violation, a type mismatch, or input
+    /// that does not parse (e.g. a malformed decimal).
+    InvalidValue { reason: &'static str },
+    /// This replica is not the Raft leader; writes (and linearizable reads) must go to
+    /// `leader` (a node id) when it is known.
+    NotLeader { leader: Option<u64> },
+    /// A replicated write was proposed but its outcome is unknown (no quorum acknowledged it in
+    /// time; it may still commit). Retry with the same request id: the retry is applied at most
+    /// once.
+    CommitUnknown { index: u64 },
+    /// The engine is a Raft replica: it is written only through consensus, never directly.
+    ReadOnlyReplica,
     /// Underlying OS I/O or virtual memory mapping error.
     Io {
         context: &'static str,
@@ -110,6 +129,18 @@ impl StorageError {
 
     #[cold]
     #[inline(never)]
+    pub fn condition_failed(id: InlineId, reason: &'static str, actual: Option<Version>) -> Self {
+        Self::ConditionFailed { id, reason, actual }
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub fn invalid_value(reason: &'static str) -> Self {
+        Self::InvalidValue { reason }
+    }
+
+    #[cold]
+    #[inline(never)]
     pub fn io(context: &'static str, err: std::io::Error) -> Self {
         Self::Io {
             context,
@@ -158,6 +189,25 @@ impl fmt::Display for StorageError {
                 write!(f, "engine resource limit exhausted: {resource}")
             }
             Self::TransactionAborted { reason } => write!(f, "transaction aborted: {reason}"),
+            Self::ConditionFailed { id, reason, actual } => match actual {
+                Some(v) => write!(f, "condition failed on '{id}': {reason} (current version v{})", v.0),
+                None => write!(f, "condition failed on '{id}': {reason} (record does not exist)"),
+            },
+            Self::InvalidValue { reason } => write!(f, "invalid value: {reason}"),
+            Self::NotLeader { leader: Some(l) } => {
+                write!(f, "this node is not the leader; send writes to node {l}")
+            }
+            Self::NotLeader { leader: None } => {
+                write!(f, "this node is not the leader and no leader is known yet; retry shortly")
+            }
+            Self::CommitUnknown { index } => write!(
+                f,
+                "write outcome unknown (raft index {index} not yet confirmed by a quorum); retry with the same request id"
+            ),
+            Self::ReadOnlyReplica => write!(
+                f,
+                "this engine is a raft replica: write through the leader, not directly"
+            ),
             Self::Io {
                 context,
                 raw_os_error,

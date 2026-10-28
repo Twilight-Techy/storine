@@ -303,6 +303,16 @@ impl<A: ArchivePod> ArchivedSlice<A> {
         _marker: PhantomData,
     };
 
+    /// A slice reference from raw parts (validated by [`Self::validate`] / [`Self::as_slice`]).
+    #[inline]
+    pub const fn from_parts(offset: u32, len: u32) -> Self {
+        Self {
+            offset,
+            len,
+            _marker: PhantomData,
+        }
+    }
+
     #[inline]
     pub const fn len(&self) -> usize {
         self.len as usize

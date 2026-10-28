@@ -205,7 +205,9 @@ fn test_full_system_end_to_end_all_features() {
     // § 6. CAS (Compare-And-Swap)
     // =========================================================================
     let cas_id = InlineId::from_static("cas_record");
-    engine
+    // A new record's first version is above every version ever deleted in the collection
+    // (no ABA), so it is not necessarily 1: use the version `put` returns.
+    let v1 = engine
         .put(cas_id, &AgentObjectRecord::new(cas_id, "CAS v1", 1, 10))
         .unwrap();
     assert!(matches!(
@@ -213,9 +215,9 @@ fn test_full_system_end_to_end_all_features() {
         Err(StorageError::VersionConflict { .. })
     ));
     let v2 = engine
-        .put_cas(cas_id, Version(1), &AgentObjectRecord::new(cas_id, "CAS v2", 1, 20))
+        .put_cas(cas_id, v1, &AgentObjectRecord::new(cas_id, "CAS v2", 1, 20))
         .unwrap();
-    assert_eq!(v2, Version(2));
+    assert_eq!(v2, v1.next());
 
     // =========================================================================
     // § 7. TTL Expiration

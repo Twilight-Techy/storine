@@ -45,6 +45,8 @@ pub trait ErasedCollectionEngine: Send + Sync {
     fn schema_version(&self) -> u16;
     fn as_any(&self) -> &dyn Any;
     fn current_version(&self, id: InlineId) -> Option<Version>;
+    /// Version the next upsert of `id` receives (monotonic across delete + re-create).
+    fn next_version(&self, id: InlineId) -> Version;
     fn lock_many<'a>(&'a self, ids: &[InlineId]) -> MultiRecordLockGuard<'a>;
     fn apply_delete_locked(&self, id: InlineId) -> Result<bool>;
     fn flush_collection(&self) -> Result<usize>;
@@ -78,6 +80,11 @@ impl<T: ZeroCopyRecord + Indexable + 'static> ErasedCollectionEngine for Storage
     #[inline]
     fn current_version(&self, id: InlineId) -> Option<Version> {
         StorageEngine::current_version(self, id)
+    }
+
+    #[inline]
+    fn next_version(&self, id: InlineId) -> Version {
+        self.next_write_version(id)
     }
 
     #[inline]
@@ -537,9 +544,7 @@ impl<'a> CatalogTransaction<'a> {
         let rec_clone = record.clone();
 
         let prepare_fn = Box::new(move |now_ns: u64| -> PreparedUpsert {
-            let next_ver = erased
-                .current_version(id)
-                .map_or(Version::INITIAL, |v| v.next());
+            let next_ver = erased.next_version(id);
             let frame = RecordCodec::encode_aligned(&rec_clone, next_ver, now_ns, RecordFlags::NONE, 0);
             let wal_bytes = erased
                 .as_any()

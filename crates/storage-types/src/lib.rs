@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
+pub mod decimal;
 pub mod error;
 pub mod header;
 pub mod id;
@@ -12,6 +13,7 @@ pub mod padded;
 pub mod testing;
 pub mod wire;
 
+pub use decimal::{Decimal, RoundingMode, MAX_DECIMAL_SCALE};
 pub use error::{Result, StorageError};
 pub use header::{
     RecordFlags, RecordHeader, HEADER_SIZE, MAX_PAYLOAD_SIZE, RECORD_MAGIC, WIRE_FORMAT_VERSION,

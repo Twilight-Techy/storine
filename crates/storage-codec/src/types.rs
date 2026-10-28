@@ -6,7 +6,7 @@
 //! allocations** and **zero Undefined Behavior** on untrusted disk bytes.
 
 use std::collections::BTreeMap;
-use storage_types::{InlineId, Result, StorageError};
+use storage_types::{Decimal, InlineId, Result, StorageError};
 
 use crate::archive::{ArchiveBuilder, ArchivePod, ArchivedBytes, ArchivedSlice, ArchivedString};
 
@@ -269,7 +269,11 @@ impl ArchivedStringSlice {
     }
 }
 
-/// Owned dynamic property value supporting all scalar, temporal, binary, and text types.
+/// Maximum nesting depth of `List` / `Map` values (bounds recursion on hostile input).
+pub const MAX_VALUE_DEPTH: usize = 32;
+
+/// Owned dynamic property value supporting all scalar, temporal, binary, text, exact decimal,
+/// list and map types (`F-TYPE-01`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum PropertyValue {
     Null,
@@ -283,6 +287,12 @@ pub enum PropertyValue {
     Id(InlineId),
     Text(String),
     Bytes(Vec<u8>),
+    /// Exact fixed-point decimal (money): never stored as a binary float.
+    Decimal(Decimal),
+    /// Ordered list of values (nesting depth at most `MAX_VALUE_DEPTH`).
+    List(Vec<PropertyValue>),
+    /// String-keyed map, sorted by key (nesting depth at most `MAX_VALUE_DEPTH`).
+    Map(BTreeMap<String, PropertyValue>),
 }
 
 /// Tag discriminant for `ArchivedPropertyValue`.
@@ -297,6 +307,9 @@ const TAG_UUID: u8 = 7;
 const TAG_INLINE_ID: u8 = 8;
 const TAG_TEXT: u8 = 9;
 const TAG_BYTES: u8 = 10;
+const TAG_DECIMAL: u8 = 11;
+const TAG_LIST: u8 = 12;
+const TAG_MAP: u8 = 13;
 
 /// Zero-copy `#[repr(C)]` archived representation of `PropertyValue` (32 bytes, 8-byte aligned).
 #[repr(C, align(8))]
@@ -305,6 +318,84 @@ pub struct ArchivedPropertyValue {
     pub tag: u8,
     pub _pad: [u8; 7],
     pub slots: [u64; 3],
+}
+
+/// Borrowed zero-copy view of an archived list value.
+#[derive(Clone, Copy, Debug)]
+pub struct ListRef<'a> {
+    items: &'a [ArchivedPropertyValue],
+    payload: &'a [u8],
+}
+
+impl<'a> ListRef<'a> {
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    #[inline]
+    pub fn get(&self, idx: usize) -> Option<PropertyValueRef<'a>> {
+        self.items.get(idx).map(|v| v.as_ref(self.payload))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = PropertyValueRef<'a>> + 'a {
+        let payload = self.payload;
+        self.items.iter().map(move |v| v.as_ref(payload))
+    }
+}
+
+impl PartialEq for ListRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().zip(other.iter()).all(|(a, b)| a == b)
+    }
+}
+
+/// Borrowed zero-copy view of an archived map value (sorted keys, `O(log N)` lookup).
+#[derive(Clone, Copy, Debug)]
+pub struct MapRef<'a> {
+    entries: &'a [ArchivedMapEntry],
+    payload: &'a [u8],
+}
+
+impl<'a> MapRef<'a> {
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Looks up `key` by binary search (`0` heap allocations).
+    #[inline]
+    pub fn get(&self, key: &str) -> Option<PropertyValueRef<'a>> {
+        let payload = self.payload;
+        let idx = self
+            .entries
+            .binary_search_by(|e| e.key.as_str(payload).cmp(key))
+            .ok()?;
+        Some(self.entries[idx].value.as_ref(payload))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&'a str, PropertyValueRef<'a>)> + 'a {
+        let payload = self.payload;
+        self.entries
+            .iter()
+            .map(move |e| (e.key.as_str(payload), e.value.as_ref(payload)))
+    }
+}
+
+impl PartialEq for MapRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len() && self.iter().zip(other.iter()).all(|(a, b)| a == b)
+    }
 }
 
 /// Borrowed zero-copy view of an `ArchivedPropertyValue` resolved against `payload`.
@@ -321,9 +412,55 @@ pub enum PropertyValueRef<'a> {
     Id(InlineId),
     Text(&'a str),
     Bytes(&'a [u8]),
+    Decimal(Decimal),
+    List(ListRef<'a>),
+    Map(MapRef<'a>),
+}
+
+impl<'a> PropertyValueRef<'a> {
+    /// Owned copy (recursion is depth-capped: deeper levels become `Null`, never a stack
+    /// overflow, even on unvalidated bytes).
+    pub fn to_owned_value(self) -> PropertyValue {
+        self.to_owned_depth(0)
+    }
+
+    fn to_owned_depth(self, depth: usize) -> PropertyValue {
+        match self {
+            Self::Null => PropertyValue::Null,
+            Self::Bool(b) => PropertyValue::Bool(b),
+            Self::Int64(v) => PropertyValue::Int64(v),
+            Self::UInt64(v) => PropertyValue::UInt64(v),
+            Self::Float64(v) => PropertyValue::Float64(v),
+            Self::Int128(v) => PropertyValue::Int128(v),
+            Self::TimestampNs(v) => PropertyValue::TimestampNs(v),
+            Self::Uuid(u) => PropertyValue::Uuid(u),
+            Self::Id(id) => PropertyValue::Id(id),
+            Self::Text(s) => PropertyValue::Text(s.to_owned()),
+            Self::Bytes(b) => PropertyValue::Bytes(b.to_vec()),
+            Self::Decimal(d) => PropertyValue::Decimal(d),
+            Self::List(l) => {
+                if depth >= MAX_VALUE_DEPTH {
+                    return PropertyValue::Null;
+                }
+                PropertyValue::List(l.iter().map(|v| v.to_owned_depth(depth + 1)).collect())
+            }
+            Self::Map(m) => {
+                if depth >= MAX_VALUE_DEPTH {
+                    return PropertyValue::Null;
+                }
+                PropertyValue::Map(
+                    m.iter()
+                        .map(|(k, v)| (k.to_owned(), v.to_owned_depth(depth + 1)))
+                        .collect(),
+                )
+            }
+        }
+    }
 }
 
 impl PropertyValue {
+    /// Archives this value; children (strings, bytes, nested lists and maps) are written into
+    /// `builder` first.
     pub fn archive(&self, builder: &mut ArchiveBuilder<'_>) -> ArchivedPropertyValue {
         let mut slots = [0u64; 3];
         let tag = match *self {
@@ -378,6 +515,27 @@ impl PropertyValue {
                 slots[1] = u64::from(arch.len);
                 TAG_BYTES
             }
+            Self::Decimal(d) => {
+                let u = d.mantissa() as u128;
+                slots[0] = u as u64;
+                slots[1] = (u >> 64) as u64;
+                slots[2] = u64::from(d.scale());
+                TAG_DECIMAL
+            }
+            Self::List(ref items) => {
+                let archived: Vec<ArchivedPropertyValue> =
+                    items.iter().map(|v| v.archive(builder)).collect();
+                let slice = builder.write_slice(&archived);
+                slots[0] = u64::from(slice.offset);
+                slots[1] = u64::from(slice.len);
+                TAG_LIST
+            }
+            Self::Map(ref map) => {
+                let arch = ArchivedMap::archive(builder, map);
+                slots[0] = u64::from(arch.entries.offset);
+                slots[1] = u64::from(arch.entries.len);
+                TAG_MAP
+            }
         };
         ArchivedPropertyValue {
             tag,
@@ -385,10 +543,49 @@ impl PropertyValue {
             slots,
         }
     }
+
+    /// Nesting depth of this value (`0` for scalars).
+    pub fn depth(&self) -> usize {
+        match self {
+            Self::List(items) => 1 + items.iter().map(Self::depth).max().unwrap_or(0),
+            Self::Map(map) => 1 + map.values().map(Self::depth).max().unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    /// Short type name used in error messages and schemas (`"int64"`, `"decimal"`, ...).
+    pub const fn type_name(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Bool(_) => "bool",
+            Self::Int64(_) => "int64",
+            Self::UInt64(_) => "uint64",
+            Self::Float64(_) => "float64",
+            Self::Int128(_) => "int128",
+            Self::TimestampNs(_) => "timestamp",
+            Self::Uuid(_) => "uuid",
+            Self::Id(_) => "id",
+            Self::Text(_) => "text",
+            Self::Bytes(_) => "bytes",
+            Self::Decimal(_) => "decimal",
+            Self::List(_) => "list",
+            Self::Map(_) => "map",
+        }
+    }
 }
 
 impl ArchivedPropertyValue {
+    #[inline]
+    fn slice_parts<A: ArchivePod>(&self) -> ArchivedSlice<A> {
+        ArchivedSlice::from_parts(self.slots[0] as u32, self.slots[1] as u32)
+    }
+
+    /// Validates this value (and, recursively, nested lists and maps up to `MAX_VALUE_DEPTH`).
     pub fn validate(&self, payload: &[u8]) -> Result<()> {
+        self.validate_depth(payload, 0)
+    }
+
+    fn validate_depth(&self, payload: &[u8], depth: usize) -> Result<()> {
         match self.tag {
             TAG_NULL | TAG_INT64 | TAG_UINT64 | TAG_FLOAT64 | TAG_INT128 | TAG_TIMESTAMP_NS
             | TAG_UUID => Ok(()),
@@ -408,19 +605,41 @@ impl ArchivedPropertyValue {
                 InlineId::from_raw_bytes(raw)?;
                 Ok(())
             }
-            TAG_TEXT => {
-                let s = ArchivedString {
-                    offset: self.slots[0] as u32,
-                    len: self.slots[1] as u32,
-                };
-                s.validate(payload)
+            TAG_TEXT => ArchivedString {
+                offset: self.slots[0] as u32,
+                len: self.slots[1] as u32,
             }
-            TAG_BYTES => {
-                let b = ArchivedBytes {
-                    offset: self.slots[0] as u32,
-                    len: self.slots[1] as u32,
-                };
-                b.validate(payload)
+            .validate(payload),
+            TAG_BYTES => ArchivedBytes {
+                offset: self.slots[0] as u32,
+                len: self.slots[1] as u32,
+            }
+            .validate(payload),
+            TAG_DECIMAL => {
+                if self.slots[2] > u64::from(storage_types::MAX_DECIMAL_SCALE) {
+                    return Err(StorageError::invalid_archive("decimal scale out of range"));
+                }
+                Ok(())
+            }
+            TAG_LIST => {
+                if depth >= MAX_VALUE_DEPTH {
+                    return Err(StorageError::invalid_archive("value nesting too deep"));
+                }
+                let slice = self.slice_parts::<ArchivedPropertyValue>();
+                slice.validate(payload)?;
+                for item in slice.as_slice(payload) {
+                    item.validate_depth(payload, depth + 1)?;
+                }
+                Ok(())
+            }
+            TAG_MAP => {
+                if depth >= MAX_VALUE_DEPTH {
+                    return Err(StorageError::invalid_archive("value nesting too deep"));
+                }
+                ArchivedMap {
+                    entries: self.slice_parts(),
+                }
+                .validate_depth(payload, depth + 1)
             }
             _ => Err(StorageError::invalid_archive(
                 "unknown ArchivedPropertyValue discriminant tag",
@@ -454,38 +673,42 @@ impl ArchivedPropertyValue {
                 raw[16..24].copy_from_slice(&self.slots[2].to_le_bytes());
                 PropertyValueRef::Id(InlineId::from_raw_bytes(raw).unwrap_or(InlineId::EMPTY))
             }
-            TAG_TEXT => {
-                let s = ArchivedString {
+            TAG_TEXT => PropertyValueRef::Text(
+                ArchivedString {
                     offset: self.slots[0] as u32,
                     len: self.slots[1] as u32,
-                };
-                PropertyValueRef::Text(s.as_str(payload))
-            }
-            TAG_BYTES => {
-                let b = ArchivedBytes {
+                }
+                .as_str(payload),
+            ),
+            TAG_BYTES => PropertyValueRef::Bytes(
+                ArchivedBytes {
                     offset: self.slots[0] as u32,
                     len: self.slots[1] as u32,
-                };
-                PropertyValueRef::Bytes(b.as_slice(payload))
+                }
+                .as_slice(payload),
+            ),
+            TAG_DECIMAL => {
+                let m = (u128::from(self.slots[0]) | (u128::from(self.slots[1]) << 64)) as i128;
+                // An out-of-range scale (unvalidated bytes) reads as zero, never panics.
+                PropertyValueRef::Decimal(
+                    Decimal::new(m, self.slots[2].min(255) as u8).unwrap_or(Decimal::ZERO),
+                )
             }
+            TAG_LIST => PropertyValueRef::List(ListRef {
+                items: self.slice_parts::<ArchivedPropertyValue>().as_slice(payload),
+                payload,
+            }),
+            TAG_MAP => PropertyValueRef::Map(MapRef {
+                entries: self.slice_parts::<ArchivedMapEntry>().as_slice(payload),
+                payload,
+            }),
             _ => PropertyValueRef::Null,
         }
     }
 
+    #[inline]
     pub fn to_owned_value(&self, payload: &[u8]) -> PropertyValue {
-        match self.as_ref(payload) {
-            PropertyValueRef::Null => PropertyValue::Null,
-            PropertyValueRef::Bool(b) => PropertyValue::Bool(b),
-            PropertyValueRef::Int64(v) => PropertyValue::Int64(v),
-            PropertyValueRef::UInt64(v) => PropertyValue::UInt64(v),
-            PropertyValueRef::Float64(v) => PropertyValue::Float64(v),
-            PropertyValueRef::Int128(v) => PropertyValue::Int128(v),
-            PropertyValueRef::TimestampNs(v) => PropertyValue::TimestampNs(v),
-            PropertyValueRef::Uuid(u) => PropertyValue::Uuid(u),
-            PropertyValueRef::Id(id) => PropertyValue::Id(id),
-            PropertyValueRef::Text(s) => PropertyValue::Text(s.to_owned()),
-            PropertyValueRef::Bytes(b) => PropertyValue::Bytes(b.to_vec()),
-        }
+        self.as_ref(payload).to_owned_value()
     }
 }
 
@@ -538,34 +761,48 @@ impl ArchivedMap {
         self.entries.is_empty()
     }
 
+    /// Validates bounds, UTF-8, strictly increasing (unique, sorted) keys and every value.
     pub fn validate(&self, payload: &[u8]) -> Result<()> {
+        self.validate_depth(payload, 0)
+    }
+
+    fn validate_depth(&self, payload: &[u8], depth: usize) -> Result<()> {
         self.entries.validate(payload)?;
+        let mut prev: Option<&str> = None;
         for entry in self.entries.as_slice(payload) {
             entry.key.validate(payload)?;
-            entry.value.validate(payload)?;
+            let key = entry.key.as_str(payload);
+            if prev.is_some_and(|p| p >= key) {
+                return Err(StorageError::invalid_archive(
+                    "ArchivedMap keys are not strictly increasing",
+                ));
+            }
+            prev = Some(key);
+            entry.value.validate_depth(payload, depth)?;
         }
         Ok(())
+    }
+
+    /// Zero-copy view of the map.
+    #[inline]
+    pub fn view<'a>(&self, payload: &'a [u8]) -> MapRef<'a> {
+        MapRef {
+            entries: self.entries.as_slice(payload),
+            payload,
+        }
     }
 
     /// Looks up `key` in $O(\log N)$ binary search directly inside `payload` (`0` heap allocations).
     #[inline]
     pub fn get<'a>(&self, payload: &'a [u8], key: &str) -> Option<PropertyValueRef<'a>> {
-        let slice = self.entries.as_slice(payload);
-        let idx = slice
-            .binary_search_by(|entry| entry.key.as_str(payload).cmp(key))
-            .ok()?;
-        Some(slice[idx].value.as_ref(payload))
+        self.view(payload).get(key)
     }
 
     pub fn unarchive(&self, payload: &[u8]) -> BTreeMap<String, PropertyValue> {
-        let mut map = BTreeMap::new();
-        for entry in self.entries.as_slice(payload) {
-            map.insert(
-                entry.key.as_str(payload).to_owned(),
-                entry.value.to_owned_value(payload),
-            );
-        }
-        map
+        self.view(payload)
+            .iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned_value()))
+            .collect()
     }
 }
 
@@ -615,6 +852,65 @@ mod tests {
             assert_eq!(arch_strs.len(), 3);
             assert_eq!(arch_strs.get(payload, 1), Some("beta"));
             assert_eq!(arch_strs.to_vec(payload), strings);
+        });
+    }
+
+    #[test]
+    fn test_nested_decimal_list_map_archive_roundtrip_and_hostile_cycles() {
+        let mut inner = BTreeMap::new();
+        inner.insert("price".to_string(), PropertyValue::Decimal("19.99".parse().unwrap()));
+        inner.insert("qty".to_string(), PropertyValue::Int64(3));
+        let mut props = BTreeMap::new();
+        props.insert("items".to_string(), PropertyValue::List(vec![
+            PropertyValue::Map(inner.clone()),
+            PropertyValue::Text("x".into()),
+        ]));
+        props.insert("total".to_string(), PropertyValue::Decimal("59.97".parse().unwrap()));
+        with_thread_scratch(|scratch| {
+            scratch.clear();
+            let mut builder = ArchiveBuilder::new(scratch, 0);
+            let arch = ArchivedMap::archive(&mut builder, &props);
+            let payload = scratch.as_slice().to_vec();
+            arch.validate(&payload).unwrap();
+            assert_eq!(arch.unarchive(&payload), props);
+            let Some(PropertyValueRef::List(items)) = arch.get(&payload, "items") else {
+                panic!("list expected");
+            };
+            let Some(PropertyValueRef::Map(first)) = items.get(0) else {
+                panic!("map expected");
+            };
+            assert_eq!(first.get("qty"), Some(PropertyValueRef::Int64(3)));
+
+            // A list whose slice points back at itself must be rejected by `validate` and must
+            // not overflow the stack when converted without validation.
+            let mut cyc = ArchivedPropertyValue { tag: TAG_LIST, _pad: [0; 7], slots: [0, 1, 0] };
+            let mut buf = vec![0u8; 64];
+            let bytes: [u8; 32] = {
+                let mut b = [0u8; 32];
+                b[0] = TAG_LIST;
+                b[8..16].copy_from_slice(&0u64.to_le_bytes());
+                b[16..24].copy_from_slice(&1u64.to_le_bytes());
+                b
+            };
+            buf[..32].copy_from_slice(&bytes);
+            cyc.slots = [0, 1, 0];
+            let aligned = crate::AlignedBytes::copy_from_slice(&buf);
+            assert!(cyc.validate(aligned.as_slice()).is_err());
+            let _ = cyc.to_owned_value(aligned.as_slice());
+            // Unsorted map keys are rejected.
+            let mut b2 = BTreeMap::new();
+            b2.insert("a".to_string(), PropertyValue::Null);
+            b2.insert("b".to_string(), PropertyValue::Null);
+            scratch.clear();
+            let mut builder = ArchiveBuilder::new(scratch, 0);
+            let arch = ArchivedMap::archive(&mut builder, &b2);
+            let mut payload = scratch.as_slice().to_vec();
+            // swap the two key bytes "a" and "b"
+            let pa = payload.iter().position(|&c| c == b'a').unwrap();
+            let pb = payload.iter().position(|&c| c == b'b').unwrap();
+            payload.swap(pa, pb);
+            let aligned = crate::AlignedBytes::copy_from_slice(&payload);
+            assert!(arch.validate(aligned.as_slice()).is_err());
         });
     }
 }

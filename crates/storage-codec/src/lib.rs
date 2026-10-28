@@ -9,9 +9,11 @@ pub mod checksum;
 pub mod relations;
 pub mod compress;
 pub mod crypto;
+pub mod field_ops;
 pub mod scratch;
 pub mod sealed_file;
 pub mod types;
+pub mod value_wire;
 
 pub use archive::{
     ArchiveBuilder, ArchivePod, ArchivedBytes, ArchivedSlice, ArchivedString, FrameProtection, RecordCodec, AUTH_TRAILER_LEN,
@@ -29,5 +31,6 @@ pub use scratch::{AlignedBytes, AlignedScratchBuf, with_thread_scratch};
 pub use sealed_file::{is_sealed, FileSeal, SEALED_FILE_HEADER_LEN, SEALED_FILE_MAGIC};
 pub use types::{
     ArchivedBool, ArchivedChar, ArchivedI128, ArchivedMap, ArchivedMapEntry, ArchivedPropertyValue,
-    ArchivedStringSlice, ArchivedU128, ArchivedUuid, PropertyValue, PropertyValueRef,
+    ArchivedStringSlice, ArchivedU128, ArchivedUuid, ListRef, MapRef, PropertyValue, PropertyValueRef,
+    MAX_VALUE_DEPTH,
 };

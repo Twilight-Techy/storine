@@ -408,6 +408,14 @@ struct SharedEngineInner<T: ZeroCopyRecord + Indexable> {
     wal_archive_dir: Option<PathBuf>,
     /// `(id, path)` of deleted record files whose removal failed (e.g. still mapped on Windows).
     pending_file_removals: Mutex<Vec<(InlineId, PathBuf)>>,
+    /// Highest version ever deleted in this collection. A re-created record starts above it, so
+    /// a version number is never reused for a key (no OCC/CAS ABA after delete + re-insert).
+    version_floor: CachePadded<AtomicU64>,
+    /// `<base>/<stem>.vfloor` (a single number, not secret), saved with every checkpoint.
+    floor_path: PathBuf,
+    /// Set while the engine is a Raft replica: direct writes are refused (`ReadOnlyReplica`);
+    /// only the consensus apply path writes.
+    replica: AtomicBool,
 }
 
 /// Percent-encodes `name` into a single safe path component (no separators, `..` or `:`).
@@ -579,6 +587,8 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         let cold_manifest = base_dir.join("indexes").join(format!("{stem}_primary.cold"));
         let open_seal = file_seal(config.encryption.as_ref());
         let primary_stamp = load_primary_state(&primary, &idx_path, &cold_manifest, config.primary_tier, &open_seal)?;
+        let floor_path = base_dir.join(format!("{stem}.vfloor"));
+        let version_floor = load_version_floor(&floor_path)?;
 
         // Secondary indexes. The paged tier may reuse its files only if they were written by the
         // same checkpoint as the primary index (equal stamps) and nothing happened afterwards (no
@@ -662,6 +672,9 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             hnsw_saved_generation: AtomicU64::new(hnsw_saved_generation),
             wal_archive_dir,
             pending_file_removals: Mutex::new(Vec::new()),
+            version_floor: CachePadded::new(AtomicU64::new(version_floor)),
+            floor_path,
+            replica: AtomicBool::new(false),
         });
 
         // Replay committed WAL frames of a dedicated WAL (`F-DURA-04`). Every replayed record is
@@ -979,6 +992,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
     /// Scans all live records and re-encodes any record with `hdr.schema_version != T::SCHEMA_VERSION`
     /// into the latest `T::SCHEMA_VERSION` frame on disk.
     pub fn upgrade_legacy_schemas(&self) -> Result<usize> {
+        self.inner.ensure_writable()?;
         let entries = self.inner.primary.entries_snapshot();
         let mut upgraded_count = 0usize;
         for entry in entries {
@@ -1128,11 +1142,29 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         self.inner.get_owned_internal(id)
     }
 
+    /// Marks the engine as a Raft replica (`true`): every direct write API then fails with
+    /// [`StorageError::ReadOnlyReplica`] and only the consensus apply path can change data.
+    pub fn set_replica_mode(&self, replica: bool) {
+        self.inner.replica.store(replica, Ordering::Release);
+    }
+
+    /// `true` while the engine only accepts writes from Raft consensus.
+    pub fn is_replica(&self) -> bool {
+        self.inner.replica.load(Ordering::Acquire)
+    }
+
+    /// Version the next upsert of `id` receives (monotonic across delete + re-create).
+    #[inline]
+    pub(crate) fn next_write_version(&self, id: InlineId) -> Version {
+        self.inner.next_version(self.inner.primary.version_of(id))
+    }
+
     /// Inserts a new record (`Err(RecordAlreadyExists)` if `id` already exists).
     pub fn insert(&self, id: InlineId, record: &T) -> Result<Version> {
+        self.inner.ensure_writable()?;
         let _lock = self.inner.locks.lock_one(id);
         let now_ns = current_time_ns();
-        let mut version = Version::INITIAL;
+        let mut version = self.inner.next_version(None);
         if let Some(existing) = self.inner.primary.get(id) {
             if existing.ttl_expires_at_ns == 0 || now_ns < existing.ttl_expires_at_ns {
                 return Err(StorageError::already_exists(id));
@@ -1151,13 +1183,10 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         parent_group: Option<InlineId>,
         record: &T,
     ) -> Result<Version> {
+        self.inner.ensure_writable()?;
         let _lock = self.inner.locks.lock_one(id);
         let now_ns = current_time_ns();
-        let next_ver = self
-            .inner
-            .primary
-            .get(id)
-            .map_or(Version::INITIAL, |e| e.version.next());
+        let next_ver = self.inner.next_version(self.inner.primary.version_of(id));
         self.inner
             .write_record_locked(id, parent_group, record, next_ver, now_ns, 0, RecordFlags::NONE)
     }
@@ -1170,14 +1199,11 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
 
     /// Inserts or overwrites a record with a Time-To-Live (`ttl`) duration (`TASK-027`, `F-OPS-02`).
     pub fn put_with_ttl(&self, id: InlineId, record: &T, ttl: Duration) -> Result<Version> {
+        self.inner.ensure_writable()?;
         let _lock = self.inner.locks.lock_one(id);
         let now_ns = current_time_ns();
         let expires_ns = now_ns.saturating_add(ttl.as_nanos() as u64);
-        let next_ver = self
-            .inner
-            .primary
-            .get(id)
-            .map_or(Version::INITIAL, |e| e.version.next());
+        let next_ver = self.inner.next_version(self.inner.primary.version_of(id));
         self.inner.write_record_locked(
             id,
             None,
@@ -1198,6 +1224,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
     where
         F: FnOnce(&mut T) -> Result<()>,
     {
+        self.inner.ensure_writable()?;
         let _lock = self.inner.locks.lock_one(id);
         let (cur_ver, mut draft, parent_group, ttl_ns, flags) =
             self.inner.load_mutable_draft_locked(id)?;
@@ -1216,6 +1243,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         expected_version: Version,
         record: &T,
     ) -> Result<Version> {
+        self.inner.ensure_writable()?;
         let _lock = self.inner.locks.lock_one(id);
         let now_ns = current_time_ns();
         let cur_ver = self
@@ -1226,11 +1254,9 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         if cur_ver != expected_version {
             return Err(StorageError::version_conflict(id, expected_version, cur_ver));
         }
-        let next_ver = if cur_ver.0 == 0 {
-            Version::INITIAL
-        } else {
-            cur_ver.next()
-        };
+        let next_ver = self
+            .inner
+            .next_version((cur_ver.0 != 0).then_some(cur_ver));
         self.inner.write_record_locked(
             id,
             None,
@@ -1253,6 +1279,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
     where
         F: FnOnce(&mut T) -> Result<()>,
     {
+        self.inner.ensure_writable()?;
         let _lock = self.inner.locks.lock_one(id);
         let (cur_ver, mut draft, parent_group, ttl_ns, flags) =
             self.inner.load_mutable_draft_locked(id)?;
@@ -1268,6 +1295,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
 
     /// Compresses a record using cold LZ4 block compression (`TASK-027`, `F-OPS-03`).
     pub fn compress_cold_record(&self, id: InlineId) -> Result<Version> {
+        self.inner.ensure_writable()?;
         let _lock = self.inner.locks.lock_one(id);
         let (cur_ver, draft, parent_group, ttl_ns, flags) =
             self.inner.load_mutable_draft_locked(id)?;
@@ -1288,6 +1316,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
 
     /// Deletes `id` from the storage engine and removes all secondary index postings.
     pub fn delete(&self, id: InlineId) -> Result<bool> {
+        self.inner.ensure_writable()?;
         let _lock = self.inner.locks.lock_one(id);
         self.inner.delete_record_locked(id)
     }
@@ -1307,6 +1336,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         FA: FnOnce(&mut T) -> Result<()>,
         FB: FnOnce(&mut T) -> Result<()>,
     {
+        self.inner.ensure_writable()?;
         if id_a == id_b {
             return Err(StorageError::invalid_key(
                 "cannot call update_pair_atomic with identical IDs",
@@ -1376,6 +1406,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         FRel: Fn(&T) -> Vec<InlineId>,
         FUnlink: FnMut(&mut T, InlineId),
     {
+        self.inner.ensure_writable()?;
         // The set of records to lock depends on record contents, which may change until locked:
         // compute it, lock it, recompute it under the locks, and retry if it grew.
         let compute_set = |policy: OnDelete| -> Result<Vec<InlineId>> {
@@ -1581,6 +1612,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
     /// is re-checked under each record's stripe lock, so a key rewritten without a TTL after the
     /// scan is never deleted.
     pub fn sweep_expired(&self) -> Result<usize> {
+        self.inner.ensure_writable()?;
         let Some(expired) = self.inner.expired_ordinals() else {
             return Ok(0);
         };
@@ -1640,6 +1672,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         }
         let idx_path = self.inner.idx_path.clone();
         let enc = self.inner.crypto();
+        self.inner.persist_version_floor()?;
         let written = append_primary_checkpoint_delta_sealed(
             &self.inner.primary,
             &idx_path,
@@ -2259,6 +2292,9 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                     }
                 }
                 WalOpKind::Delete => {
+                    // The record may already be gone (checkpointed deletion): still remember
+                    // its version so a re-created record never reuses it.
+                    self.raise_version_floor(entry.version);
                     let _mvcc_gate = self.mvcc.writer_guard();
                     let _ = self.remove_record_after_wal_locked(entry.record_id);
                 }
@@ -2738,6 +2774,40 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         }
     }
 
+    /// Version for the next write of a record whose current version is `current` (`None` when
+    /// the record does not exist). A created record starts above every version ever deleted in
+    /// this collection, so versions are never reused for a key (`RULE-SAFE-03`, no ABA).
+    #[inline]
+    pub(crate) fn next_version(&self, current: Option<Version>) -> Version {
+        match current {
+            Some(v) => v.next(),
+            None => {
+                let floor = self.version_floor.load(Ordering::Acquire);
+                Version(floor.saturating_add(1).max(Version::INITIAL.0))
+            }
+        }
+    }
+
+    /// Refuses direct writes while the engine is a Raft replica.
+    #[inline]
+    pub(crate) fn ensure_writable(&self) -> Result<()> {
+        if self.replica.load(Ordering::Acquire) {
+            return Err(StorageError::ReadOnlyReplica);
+        }
+        Ok(())
+    }
+
+    /// Raises the version floor to `version` (called for every deletion, including replay).
+    #[inline]
+    pub(crate) fn raise_version_floor(&self, version: Version) {
+        self.version_floor.fetch_max(version.0, Ordering::AcqRel);
+    }
+
+    /// Persists the version floor next to the primary checkpoint.
+    fn persist_version_floor(&self) -> Result<()> {
+        save_version_floor(&self.floor_path, self.version_floor.load(Ordering::Acquire))
+    }
+
     /// Current version of `id` if it exists and has not expired.
     #[inline]
     fn live_version(&self, id: InlineId) -> Option<Version> {
@@ -2858,6 +2928,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         let Some(removed) = self.primary.remove(id) else {
             return false;
         };
+        self.raise_version_floor(removed.version.next());
         self.remove_from_secondary_indexes(&removed);
         self.set_ttl_ordinal(removed.ordinal, false);
         self.primary.release_ordinal(removed.ordinal);
@@ -3215,6 +3286,9 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
     /// Persists `cut` in the configured primary tier's format (removing the other tier's files
     /// and any delta log it supersedes), sealed per the current encryption settings.
     fn save_primary_files(&self, cut: PrimaryCut, stamp: u64) -> Result<()> {
+        // The floor is written first: it only ever grows, so an older checkpoint paired with a
+        // newer floor is still safe, while the reverse could let a version be reused.
+        self.persist_version_floor()?;
         let enc = self.crypto();
         let seal = file_seal(enc.as_deref());
         match cut {
@@ -3383,6 +3457,272 @@ fn fresh_paged_bitmap(path: &Path, seal: &FileSeal<'_>) -> Result<PagedBitmapInd
     PagedBitmapIndex::open_sealed(path, seal)
 }
 
+/// Precondition checked atomically, under the record's lock, before a [`WriteOp`] is applied
+/// (`TASK-096`, `F-CONC-09`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Precondition {
+    /// Always apply.
+    #[default]
+    None,
+    /// The record must not exist (insert / create-only).
+    Absent,
+    /// The record must exist.
+    Exists,
+    /// The record must exist at exactly this version (compare-and-swap).
+    Version(Version),
+}
+
+/// What a [`WriteOp`] does to its record.
+#[derive(Clone, Debug)]
+pub enum WriteKind<T> {
+    /// Insert or replace the record (clears any TTL).
+    Put(T),
+    /// Insert or replace the record with a time-to-live.
+    PutWithTtl(T, Duration),
+    /// Delete the record (a no-op if it does not exist).
+    Delete,
+    /// Apply atomic field operations to the existing record (`Indexable::apply_field_ops`).
+    Patch(Vec<storage_codec::field_ops::FieldOp>),
+    /// Change nothing; only the precondition is checked (OCC read-set validation).
+    Check,
+}
+
+/// One operation of an atomic [`StorageEngine::commit`].
+#[derive(Clone, Debug)]
+pub struct WriteOp<T> {
+    pub id: InlineId,
+    pub kind: WriteKind<T>,
+    pub precondition: Precondition,
+}
+
+impl<T> WriteOp<T> {
+    #[inline]
+    pub fn put(id: InlineId, record: T) -> Self {
+        Self { id, kind: WriteKind::Put(record), precondition: Precondition::None }
+    }
+
+    #[inline]
+    pub fn delete(id: InlineId) -> Self {
+        Self { id, kind: WriteKind::Delete, precondition: Precondition::None }
+    }
+
+    #[inline]
+    pub fn patch(id: InlineId, ops: Vec<storage_codec::field_ops::FieldOp>) -> Self {
+        Self { id, kind: WriteKind::Patch(ops), precondition: Precondition::Exists }
+    }
+
+    #[inline]
+    pub fn check(id: InlineId, precondition: Precondition) -> Self {
+        Self { id, kind: WriteKind::Check, precondition }
+    }
+
+    /// Adds a precondition.
+    #[inline]
+    #[must_use]
+    pub fn when(mut self, precondition: Precondition) -> Self {
+        self.precondition = precondition;
+        self
+    }
+}
+
+/// Result of one [`WriteOp`] after a successful commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteResult {
+    pub id: InlineId,
+    /// Version of the record after the commit (`None` if it does not exist afterwards).
+    pub version: Option<Version>,
+    /// Whether the record existed before this operation.
+    pub existed: bool,
+}
+
+/// Staged state of one record inside a commit.
+struct StagedRecord<T> {
+    original: Option<Version>,
+    state: Option<(T, u64, RecordFlags)>,
+    loaded: bool,
+    changed: bool,
+}
+
+impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
+    /// Applies `ops` atomically (all or nothing) with every precondition checked under the
+    /// records' locks (`TASK-096`, `RULE-SAFE-03`, `RULE-CONC-01`):
+    ///
+    /// - keys are locked in canonical order (deadlock-free), preconditions are evaluated
+    ///   against the state left by the earlier operations of the same commit;
+    /// - the whole change is one WAL transaction, written before anything becomes visible;
+    /// - each touched record gets exactly one new version, monotonic across delete + re-create.
+    ///
+    /// A failed precondition returns [`StorageError::ConditionFailed`] (or `VersionConflict`
+    /// for [`Precondition::Version`]) and changes nothing.
+    pub fn commit(&self, ops: Vec<WriteOp<T>>) -> Result<Vec<WriteResult>> {
+        self.inner.ensure_writable()?;
+        self.commit_with_min_version(ops, None)
+    }
+
+    /// [`Self::commit`] where every new version is at least `min_version` (Raft replicas use
+    /// the log index, so all replicas assign identical versions). Bypasses the replica guard.
+    pub(crate) fn commit_with_min_version(
+        &self,
+        ops: Vec<WriteOp<T>>,
+        min_version: Option<Version>,
+    ) -> Result<Vec<WriteResult>> {
+        if ops.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut keys: Vec<InlineId> = ops.iter().map(|o| o.id).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let _guards = self.inner.locks.lock_many(&keys);
+        let now_ns = current_time_ns();
+
+        // Stage every operation in order against the current state.
+        let mut order: Vec<InlineId> = Vec::with_capacity(keys.len());
+        let mut staged: FastHashMap<InlineId, StagedRecord<T>> = FastHashMap::default();
+        let mut results: Vec<(InlineId, bool)> = Vec::with_capacity(ops.len());
+        for op in ops {
+            let rec = match staged.entry(op.id) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    order.push(op.id);
+                    let original = self.inner.live_version(op.id);
+                    v.insert(StagedRecord { original, state: None, loaded: false, changed: false })
+                }
+            };
+            // Lazily load the current record when an operation needs its contents.
+            let needs_body = matches!(op.kind, WriteKind::Patch(_));
+            if needs_body && !rec.loaded && !rec.changed && rec.original.is_some() {
+                let (_, draft, _pg, ttl, flags) = self.inner.load_mutable_draft_locked(op.id)?;
+                rec.state = Some((draft, ttl, flags));
+                rec.loaded = true;
+            }
+            let exists_now = if rec.changed || rec.loaded { rec.state.is_some() } else { rec.original.is_some() };
+            let current_version = if rec.changed { None } else { rec.original };
+            match op.precondition {
+                Precondition::None => {}
+                Precondition::Absent if exists_now => {
+                    return Err(StorageError::condition_failed(op.id, "record already exists", current_version.or(rec.original)));
+                }
+                Precondition::Exists if !exists_now => {
+                    return Err(StorageError::condition_failed(op.id, "record does not exist", None));
+                }
+                Precondition::Version(v) => {
+                    if rec.changed {
+                        return Err(StorageError::condition_failed(
+                            op.id,
+                            "version precondition after an earlier change in the same commit",
+                            None,
+                        ));
+                    }
+                    let actual = rec.original.unwrap_or(Version(0));
+                    if actual != v {
+                        return Err(StorageError::version_conflict(op.id, v, actual));
+                    }
+                }
+                Precondition::Absent | Precondition::Exists => {}
+            }
+            let existed = exists_now;
+            match op.kind {
+                WriteKind::Put(record) => {
+                    rec.state = Some((record, 0, RecordFlags::NONE));
+                    rec.changed = true;
+                }
+                WriteKind::PutWithTtl(record, ttl) => {
+                    let expires = now_ns.saturating_add(ttl.as_nanos().min(u128::from(u64::MAX)) as u64);
+                    rec.state = Some((record, expires, RecordFlags::HAS_TTL));
+                    rec.changed = true;
+                }
+                WriteKind::Delete => {
+                    if exists_now {
+                        rec.state = None;
+                        rec.changed = true;
+                        rec.loaded = true;
+                    }
+                }
+                WriteKind::Patch(field_ops) => {
+                    let Some((ref mut draft, _, _)) = rec.state else {
+                        return Err(StorageError::not_found(op.id));
+                    };
+                    // Patch a copy so a failing operation leaves the staged record untouched.
+                    let mut copy = draft.clone();
+                    copy.apply_field_ops(&field_ops)?;
+                    *draft = copy;
+                    rec.changed = true;
+                }
+                WriteKind::Check => {}
+            }
+            results.push((op.id, existed));
+        }
+
+        // Encode new frames and the WAL transaction.
+        let mut wal_ops = Vec::with_capacity(order.len());
+        let mut upserts: Vec<(InlineId, T, Version, u64, AlignedBytes)> = Vec::new();
+        let mut deletes: Vec<InlineId> = Vec::new();
+        let mut final_versions: FastHashMap<InlineId, Option<Version>> = FastHashMap::default();
+        for id in &order {
+            let Some(rec) = staged.remove(id) else { continue };
+            if !rec.changed {
+                final_versions.insert(*id, rec.original);
+                continue;
+            }
+            let mut version = self.inner.next_version(rec.original);
+            if let Some(min) = min_version {
+                version = version.max(min);
+            }
+            match rec.state {
+                Some((record, ttl, flags)) => {
+                    let frame = RecordCodec::encode_aligned(&record, version, now_ns, flags, ttl);
+                    wal_ops.push((
+                        T::COLLECTION_ID,
+                        WalOpKind::Upsert,
+                        *id,
+                        version,
+                        self.inner.wal_frame_bytes(*id, frame.as_slice())?,
+                    ));
+                    upserts.push((*id, record, version, ttl, frame));
+                    final_versions.insert(*id, Some(version));
+                }
+                None => {
+                    if rec.original.is_some() {
+                        wal_ops.push((
+                            T::COLLECTION_ID,
+                            WalOpKind::Delete,
+                            *id,
+                            version,
+                            now_ns.to_le_bytes().to_vec(),
+                        ));
+                        deletes.push(*id);
+                    }
+                    final_versions.insert(*id, None);
+                }
+            }
+        }
+
+        if !wal_ops.is_empty() {
+            if let Some(ref wal) = self.inner.wal {
+                let txn_id = wal.allocate_txn_id();
+                wal.append_transaction(txn_id, wal_ops)?;
+            }
+            let _mvcc_gate = self.inner.mvcc.writer_guard();
+            for (id, record, version, ttl, frame) in upserts {
+                self.inner
+                    .apply_encoded_upsert_locked(id, None, &record, version, now_ns, ttl, frame)?;
+            }
+            for id in deletes {
+                let _ = self.inner.remove_record_after_wal_locked(id);
+            }
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|(id, existed)| WriteResult {
+                id,
+                version: final_versions.get(&id).copied().flatten(),
+                existed,
+            })
+            .collect())
+    }
+}
+
 /// Multi-record Optimistic Concurrency Control (OCC) Transaction Batch (`TASK-024`, `F-CONC-07`).
 pub struct TransactionBatch<'a, T: ZeroCopyRecord + Indexable> {
     engine: &'a StorageEngine<T>,
@@ -3448,90 +3788,61 @@ impl<'a, T: ZeroCopyRecord + Indexable> TransactionBatch<'a, T> {
         if self.staged_upserts.is_empty() && self.staged_deletes.is_empty() {
             return Ok(());
         }
-
-        // Collect all touched keys (reads + writes + deletes) and lock in canonical ascending order (`RULE-CONC-02`)
-        let mut all_keys: Vec<InlineId> = self
-            .read_versions
-            .keys()
-            .chain(self.staged_upserts.keys())
-            .chain(self.staged_deletes.iter())
-            .copied()
-            .collect();
-        all_keys.sort_unstable();
-        all_keys.dedup();
-
-        let _guards = self.engine.inner.locks.lock_many(&all_keys);
-
-        // Verify OCC read-set versions have not changed since read (expired == absent)
-        for (&id, &expected_opt) in &self.read_versions {
-            let actual_opt = self.engine.inner.live_version(id);
-            if actual_opt != expected_opt {
-                return Err(StorageError::TransactionAborted {
-                    reason: "OCC read-set version conflict detected at commit",
-                });
-            }
-        }
-
-        let now_ns = current_time_ns();
-        let mut encoded_upserts: Vec<(InlineId, Option<InlineId>, T, Version, AlignedBytes)> =
-            Vec::with_capacity(self.staged_upserts.len());
-        let mut wal_ops = Vec::with_capacity(self.staged_upserts.len() + self.staged_deletes.len());
-
-        for (id, (pg, rec)) in self.staged_upserts {
-            let next_ver = self
-                .engine
-                .inner
-                .primary
-                .get(id)
-                .map_or(Version::INITIAL, |e| e.version.next());
-            let frame =
-                RecordCodec::encode_aligned(&rec, next_ver, now_ns, RecordFlags::NONE, 0);
-            wal_ops.push((
-                T::COLLECTION_ID,
-                WalOpKind::Upsert,
+        // Read-set validation and writes in one atomic commit (`RULE-CONC-02`).
+        let mut ops: Vec<WriteOp<T>> = Vec::with_capacity(
+            self.read_versions.len() + self.staged_upserts.len() + self.staged_deletes.len(),
+        );
+        for (&id, &expected) in &self.read_versions {
+            ops.push(WriteOp::check(
                 id,
-                next_ver,
-                self.engine.inner.wal_frame_bytes(id, frame.as_slice())?,
-            ));
-            encoded_upserts.push((id, pg, rec, next_ver, frame));
-        }
-
-        for &id in &self.staged_deletes {
-            let next_ver = self
-                .engine
-                .inner
-                .primary
-                .get(id)
-                .map_or(Version::INITIAL, |e| e.version.next());
-            wal_ops.push((
-                T::COLLECTION_ID,
-                WalOpKind::Delete,
-                id,
-                next_ver,
-                now_ns.to_le_bytes().to_vec(),
+                expected.map_or(Precondition::Absent, Precondition::Version),
             ));
         }
-
-        // Write atomic multi-record commit batch to WAL before mutating in-memory state
-        if let Some(ref wal) = self.engine.inner.wal {
-            let txn_id = wal.allocate_txn_id();
-            wal.append_transaction(txn_id, wal_ops)?;
-        }
-
-        // Apply all mutations atomically while still holding canonical stripe locks; the MVCC
-        // writer guard keeps the whole batch atomic with respect to snapshot registration.
-        let _mvcc_gate = self.engine.inner.mvcc.writer_guard();
-        for (id, pg, rec, next_ver, frame) in encoded_upserts {
-            self.engine
-                .inner
-                .apply_encoded_upsert_locked(id, pg, &rec, next_ver, now_ns, 0, frame)?;
+        for (id, (_pg, rec)) in self.staged_upserts {
+            ops.push(WriteOp::put(id, rec));
         }
         for id in self.staged_deletes {
-            let _ = self.engine.inner.remove_record_after_wal_locked(id);
+            ops.push(WriteOp::delete(id));
         }
-
-        Ok(())
+        match self.engine.commit(ops) {
+            Ok(_) => Ok(()),
+            Err(StorageError::ConditionFailed { .. } | StorageError::VersionConflict { .. }) => {
+                Err(StorageError::TransactionAborted {
+                    reason: "OCC read-set version conflict detected at commit",
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
+}
+
+const VERSION_FLOOR_MAGIC: u32 = 0x5346_4C52; // "SFLR"
+
+/// Reads the persisted version floor (`0` if the file does not exist yet).
+fn load_version_floor(path: &Path) -> Result<u64> {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(StorageError::io("read version floor", e)),
+    };
+    if bytes.len() != 20 || storage_types::wire::read_u32_le(&bytes, 0) != VERSION_FLOOR_MAGIC {
+        return Err(StorageError::corrupted_header("version floor file is malformed"));
+    }
+    let floor = storage_types::wire::read_u64_le(&bytes, 4);
+    if storage_types::wire::read_u64_le(&bytes, 12) != storage_codec::checksum_payload(&bytes[..12]) {
+        return Err(StorageError::corrupted_header("version floor checksum mismatch"));
+    }
+    Ok(floor)
+}
+
+/// Atomically persists the version floor (`[magic u32 | floor u64 | checksum u64]`).
+fn save_version_floor(path: &Path, floor: u64) -> Result<()> {
+    let mut bytes = [0u8; 20];
+    bytes[0..4].copy_from_slice(&VERSION_FLOOR_MAGIC.to_le_bytes());
+    bytes[4..12].copy_from_slice(&floor.to_le_bytes());
+    let check = storage_codec::checksum_payload(&bytes[..12]);
+    bytes[12..20].copy_from_slice(&check.to_le_bytes());
+    atomic_write_replace(path, &bytes, true)
 }
 
 #[inline]
