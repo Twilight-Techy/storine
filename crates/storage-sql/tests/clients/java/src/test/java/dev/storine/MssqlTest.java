@@ -18,6 +18,16 @@ class MssqlTest {
         return "jdbc:sqlserver://" + a + ";databaseName=shop;user=sa;password=x;" + encryption;
     }
 
+    /** Integrated (Windows) authentication is refused with a clear message, not a hang. */
+    @Test
+    void integratedAuthenticationIsRefusedClearly() {
+        String a = System.getenv().getOrDefault("STORINE_MSSQL", "127.0.0.1:51433");
+        String url = "jdbc:sqlserver://" + a + ";databaseName=shop;encrypt=false;loginTimeout=10;"
+            + "integratedSecurity=true;authenticationScheme=NTLM;domain=EXAMPLE;user=ann;password=x";
+        SQLException e = assertThrows(SQLException.class, () -> DriverManager.getConnection(url).close());
+        assertTrue(e.getMessage().contains("use SQL Server authentication"), e.getMessage());
+    }
+
     /** Full TLS inside TDS 7.4, and TDS 8 strict mode verifying the pinned certificate. */
     @Test
     void tls() throws Exception {

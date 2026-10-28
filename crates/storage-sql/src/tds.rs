@@ -715,6 +715,21 @@ impl Conn {
                 return c.send(PT_REPLY, &t.b);
             }
         };
+        if let Some(kind) = l.other_auth {
+            // Refuse clearly, in both modes: the client would otherwise wait for an
+            // authentication exchange that never comes.
+            let mut t = Tokens::default();
+            let e = SqlError::new(
+                "28000",
+                format!(
+                    "Login failed: {kind} authentication is not supported by Storine SQL; \
+                     use SQL Server authentication (User ID and Password in the connection string)."
+                ),
+            );
+            c.error_token(&mut t, &e, 1);
+            c.done(&mut t, TK_DONE, DONE_ERROR, 0, 0);
+            return c.send(PT_REPLY, &t.b);
+        }
         // TDS 8 (0x08000000) is TDS 7.4 inside TLS.
         c.version = if l.version == 0x0800_0000 {
             TDS74
@@ -1392,6 +1407,9 @@ struct Login {
     user: String,
     password: String,
     database: String,
+    /// The client asked for a login method other than SQL Server authentication:
+    /// integrated (SSPI: Kerberos / NTLM) or federated (access token).
+    other_auth: Option<&'static str>,
 }
 
 fn parse_login7(b: &[u8]) -> Result<Login, SqlError> {
@@ -1406,6 +1424,27 @@ fn parse_login7(b: &[u8]) -> Result<Login, SqlError> {
         b.get(off..off + chars * 2).ok_or_else(bad)
     };
     let version = u32::from_be_bytes(u32_at(4).to_le_bytes());
+    // OptionFlags2 bit 0x80: integrated security (an SSPI blob follows at ibSSPI / cbSSPI).
+    let integrated = b[25] & 0x80 != 0 || u16_at(80) > 0;
+    // OptionFlags3 bit 0x10: a FeatureExt block, which may request FEDAUTH (feature 0x02).
+    let fedauth = b[27] & 0x10 != 0
+        && b.get(u16_at(56)..u16_at(56) + 4)
+            .map(|o| u32::from_le_bytes([o[0], o[1], o[2], o[3]]) as usize)
+            .is_some_and(|mut at| {
+                while let Some(&id) = b.get(at) {
+                    if id == 0xff {
+                        return false;
+                    }
+                    if id == 0x02 {
+                        return true;
+                    }
+                    let Some(len) = b.get(at + 1..at + 5) else {
+                        return false;
+                    };
+                    at += 5 + u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize;
+                }
+                false
+            });
     let user = from_utf16(field(40)?);
     let password: Vec<u8> = field(44)?
         .iter()
@@ -1421,6 +1460,13 @@ fn parse_login7(b: &[u8]) -> Result<Login, SqlError> {
         user,
         password: from_utf16(&password),
         database: from_utf16(field(68)?),
+        other_auth: if integrated {
+            Some("integrated (Windows / Kerberos / NTLM)")
+        } else if fedauth {
+            Some("access-token (federated)")
+        } else {
+            None
+        },
     })
 }
 

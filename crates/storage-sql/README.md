@@ -168,7 +168,10 @@ what Django's and Rails' test databases and Prisma's shadow databases rely on.
 
 - **TLS**: TLS 1.3 and 1.2, ChaCha20-Poly1305 only, Ed25519 certificates only (see above). No
   client-certificate authentication.
-- **SQL Server**: SQL authentication only (no Windows / Entra ID authentication), one schema
+- **SQL Server**: SQL authentication only. Integrated (Windows / Kerberos / NTLM) and access-token
+  logins are refused with an error saying to use SQL authentication; Kerberos (any realm: MIT,
+  Heimdal, FreeIPA, Samba AD, Active Directory) and generic OpenID Connect tokens are the planned,
+  platform-neutral additions. One schema
   (`dbo`), no MARS (one active result per connection, as with `MultipleActiveResultSets=false`),
   no stored procedures of your own, cursors or temporary `#tables`; a statement error leaves the
   transaction open (`XACT_ABORT OFF`), as SQL Server does.

@@ -82,6 +82,20 @@ public class MssqlTests
         Assert.Equal(2627, dup.Number);
     }
 
+    // Token (federated) authentication is refused promptly, not left hanging. (SqlClient gives
+    // up before sending its login, so the server's explanatory message is not shown yet.)
+    [Fact]
+    public async Task AccessTokenIsRefusedPromptly()
+    {
+        await using var c = new SqlConnection($"Server=tcp:{Ms.Replace(':', ',')};Database=shop;Encrypt=Optional;Connect Timeout=10")
+        {
+            AccessToken = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0.",
+        };
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await Assert.ThrowsAsync<SqlException>(() => c.OpenAsync());
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(8), $"took {sw.Elapsed}");
+    }
+
     [Fact]
     public async Task SqlClientTls()
     {
