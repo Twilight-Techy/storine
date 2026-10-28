@@ -292,6 +292,8 @@ pub enum DataType {
     Real,
     Double,
     Text,
+    /// PostgreSQL `name` (catalog identifiers; text everywhere but the type OID).
+    Name,
     Varchar(Option<u32>),
     Char(Option<u32>),
     Bytes,

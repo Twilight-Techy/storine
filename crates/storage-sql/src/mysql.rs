@@ -592,7 +592,8 @@ impl Conn {
         match self.session.execute(&stmt, &params) {
             Ok(Outcome::Rows(rs)) => {
                 // Column types come from the actual result (they may refine the prepared ones).
-                let cols = if rs.columns.len() == described.len() { rs.columns.clone() } else { rs.columns.clone() };
+                let _ = described;
+                let cols = rs.columns.clone();
                 let mut p = Vec::new();
                 lenenc(&mut p, cols.len() as u64);
                 self.write_packet(&p)?;

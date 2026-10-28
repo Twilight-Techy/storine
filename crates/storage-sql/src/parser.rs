@@ -418,7 +418,18 @@ impl Parser {
         }
         let _ = self.eat_kw("session") || self.eat_kw("local") || self.eat_kw("global") || self.eat_kw("persist");
         if self.eat_kws(&["time", "zone"]) {
-            let value = if self.eat_kw("local") || self.eat_kw("default") { None } else { Some(self.expr()?) };
+            let value = if self.eat_kw("local") || self.eat_kw("default") {
+                None
+            } else if self.eat_kw("interval") {
+                // INTERVAL '+00:00' HOUR TO MINUTE: keep the offset text.
+                match self.next() {
+                    Some(Token::Str(s)) => Some(Expr::Str(s)),
+                    _ => return Err(self.unexpected("a time zone offset")),
+                }
+            } else {
+                Some(self.expr()?)
+            };
+            self.skip_to_end();
             return Ok(Statement::Set { name: "timezone".into(), value });
         }
         // SET a = 1, b = 2 (MySQL) — keep the first; SET x TO a, b (search_path).
@@ -970,7 +981,8 @@ impl Parser {
             }
             "float8" => DataType::Double,
             "oid" | "xid" | "cid" | "tid" | "regproc" | "regoper" | "regrole" => DataType::BigInt,
-            "text" | "tinytext" | "mediumtext" | "longtext" | "ntext" | "clob" | "citext" | "string" | "name" | "bpchar" | "unknown" => DataType::Text,
+            "text" | "tinytext" | "mediumtext" | "longtext" | "ntext" | "clob" | "citext" | "string" | "bpchar" | "unknown" => DataType::Text,
+            "name" => DataType::Name,
             "varchar" | "nvarchar" | "varchar2" | "nvarchar2" => {
                 let n = paren_numbers(self)?;
                 DataType::Varchar(n.first().copied().filter(|n| *n != u32::MAX))

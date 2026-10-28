@@ -23,6 +23,7 @@ pub fn type_oid(ty: &DataType) -> u32 {
         DataType::SmallInt => 21,
         DataType::Int => 23,
         DataType::Text | DataType::Enum(_) => 25,
+        DataType::Name => 19,
         DataType::Json => 114,
         DataType::Real => 700,
         DataType::Double => 701,
@@ -41,6 +42,7 @@ pub fn type_oid(ty: &DataType) -> u32 {
             DataType::SmallInt => 1005,
             DataType::Int => 1007,
             DataType::Text | DataType::Enum(_) => 1009,
+            DataType::Name => 1003,
             DataType::Varchar(_) => 1015,
             DataType::BigInt => 1016,
             DataType::Real => 1021,
@@ -92,6 +94,7 @@ const PG_TYPES: &[(u32, &str, i32, &str, u32, u32)] = &[
     (3802, "jsonb", -1, "U", 3807, 0),
     (2205, "regclass", 4, "N", 2210, 0),
     (2206, "regtype", 4, "N", 2211, 0),
+    (1003, "_name", -1, "A", 0, 19),
     (1000, "_bool", -1, "A", 0, 16),
     (1001, "_bytea", -1, "A", 0, 17),
     (1005, "_int2", -1, "A", 0, 21),
@@ -179,7 +182,7 @@ fn b(v: bool) -> Datum {
 
 const N: Datum = Datum::Null;
 
-use DataType::{BigInt as I8, Bool as B, Int as I4, SmallInt as I2, Text as T};
+use DataType::{BigInt as I8, Bool as B, Int as I4, Name as NM, SmallInt as I2, Text as T};
 
 fn int2vector(cols: &[usize]) -> Datum {
     t(cols.iter().map(|c| (c + 1).to_string()).collect::<Vec<_>>().join(" "))
@@ -221,7 +224,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
     let user = ex.s.user.clone();
     Ok(match n {
         "pg_namespace" => {
-            let mut bd = Builder::new(&[("oid", I8), ("nspname", T), ("nspowner", I8), ("nspacl", T)]);
+            let mut bd = Builder::new(&[("oid", I8), ("nspname", NM), ("nspowner", I8), ("nspacl", T)]);
             for (oid, name) in [(NS_PG_CATALOG, "pg_catalog"), (NS_PUBLIC, "public"), (NS_INFORMATION_SCHEMA, "information_schema")] {
                 bd.row(vec![i(oid), t(name), i(10), N]);
             }
@@ -230,7 +233,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
         "pg_class" => {
             let mut bd = Builder::new(&[
                 ("oid", I8),
-                ("relname", T),
+                ("relname", NM),
                 ("relnamespace", I8),
                 ("reltype", I8),
                 ("reloftype", I8),
@@ -282,7 +285,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
         "pg_attribute" => {
             let mut bd = Builder::new(&[
                 ("attrelid", I8),
-                ("attname", T),
+                ("attname", NM),
                 ("atttypid", I8),
                 ("attstattarget", I4),
                 ("attlen", I2),
@@ -352,7 +355,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
         "pg_type" => {
             let mut bd = Builder::new(&[
                 ("oid", I8),
-                ("typname", T),
+                ("typname", NM),
                 ("typnamespace", I8),
                 ("typowner", I8),
                 ("typlen", I2),
@@ -474,7 +477,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
         "pg_constraint" => {
             let mut bd = Builder::new(&[
                 ("oid", I8),
-                ("conname", T),
+                ("conname", NM),
                 ("connamespace", I8),
                 ("contype", T),
                 ("condeferrable", B),
@@ -702,7 +705,7 @@ pub fn mysql_type(ty: &DataType) -> (String, String) {
         DataType::Numeric(None) => ("decimal".into(), "decimal(65,30)".into()),
         DataType::Real => ("float".into(), "float".into()),
         DataType::Double => ("double".into(), "double".into()),
-        DataType::Text => ("text".into(), "text".into()),
+        DataType::Text | DataType::Name => ("text".into(), "text".into()),
         DataType::Varchar(n) => ("varchar".into(), format!("varchar({})", n.unwrap_or(255))),
         DataType::Char(n) => ("char".into(), format!("char({})", n.unwrap_or(1))),
         DataType::Bytes => ("blob".into(), "blob".into()),
