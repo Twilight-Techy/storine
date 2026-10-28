@@ -13,6 +13,7 @@ use crate::exec::{func, now_ns, OutCol, ResultSet, Session};
 use crate::lexer::Dialect;
 
 /// Read-side execution context of one statement.
+#[derive(Debug)]
 pub struct Exec<'a> {
     pub s: &'a Session,
     pub params: &'a [Datum],
@@ -27,7 +28,7 @@ pub struct Exec<'a> {
 }
 
 /// The row an expression is evaluated against, with its enclosing rows (correlated subqueries).
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct Env<'e> {
     pub cols: &'e [ColMeta],
     pub row: &'e [Datum],

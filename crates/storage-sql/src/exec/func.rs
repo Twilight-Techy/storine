@@ -59,6 +59,12 @@ pub fn call(ex: &Exec<'_>, name: &str, arg_exprs: &[Expr], star: bool, _distinct
                 return ex.column(&["excluded".to_owned(), p[p.len() - 1].clone()], env);
             }
         }
+        "array" => {
+            if let [Expr::Subquery(q)] = arg_exprs {
+                let rel = ex.subquery(q, env)?;
+                return Ok(Datum::Array(rel.rows.iter().map(|r| r.first().cloned().unwrap_or(Datum::Null)).collect()));
+            }
+        }
         "count" if star => return Err(SqlError::new("42803", "aggregate function count(*) is not allowed here")),
         _ => {}
     }
@@ -613,7 +619,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
         "has_table_privilege" | "has_schema_privilege" | "has_database_privilege" | "has_column_privilege" | "has_sequence_privilege"
         | "has_function_privilege" | "pg_has_role" => Datum::Bool(true),
         "obj_description" | "col_description" | "shobj_description" | "pg_get_viewdef" | "pg_get_triggerdef" => Datum::Null,
-        "pg_table_is_visible" | "pg_type_is_visible" | "pg_function_is_visible" => Datum::Bool(true),
+        n if n.starts_with("pg_") && n.ends_with("_is_visible") => Datum::Bool(true),
         "format_type" => crate::exec::system::format_type(&a0, args.get(1)),
         "pg_get_expr" => crate::exec::system::pg_get_expr(ex, &a0, args.get(1))?,
         "pg_get_constraintdef" => crate::exec::system::constraint_def(ex, &a0)?,
@@ -626,7 +632,33 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             }
             Datum::Text(format!("{}_{}_seq", text(&a0), text(&args[1])))
         }
-        "to_regclass" | "regclass" => Datum::Text(text(&a0)),
+        "to_regclass" | "regclass" => match &a0 {
+            Datum::Null => Datum::Null,
+            Datum::Int(i) => Datum::Int(*i),
+            d => {
+                let tname = text(d);
+                let bare = tname.rsplit('.').next().unwrap_or(&tname).trim_matches('"').to_owned();
+                match ex.s.engine.find_table(&bare)? {
+                    Some(t) => Datum::Int(crate::exec::system::table_oid(&t.name)),
+                    None if name == "to_regclass" || crate::exec::system::is_system(None, &bare) => Datum::Null,
+                    None => return Err(SqlError::undefined_table(&bare)),
+                }
+            }
+        },
+        "regtype" | "to_regtype" => match &a0 {
+            Datum::Null => Datum::Null,
+            Datum::Int(i) => Datum::Int(*i),
+            d => match crate::parser::parse_data_type(&text(d)) {
+                Ok(t) => Datum::Int(i64::from(crate::exec::system::type_oid(&t))),
+                Err(_) if name == "to_regtype" => Datum::Null,
+                Err(_) => Datum::Int(25),
+            },
+        },
+        "regnamespace" => match text(&a0).as_str() {
+            "pg_catalog" => Datum::Int(crate::exec::system::NS_PG_CATALOG),
+            "information_schema" => Datum::Int(crate::exec::system::NS_INFORMATION_SCHEMA),
+            _ => Datum::Int(crate::exec::system::NS_PUBLIC),
+        },
         "array_length" | "cardinality" | "array_upper" => match &a0 {
             Datum::Array(a) if !a.is_empty() || name == "cardinality" => Datum::Int(a.len() as i64),
             _ => Datum::Null,

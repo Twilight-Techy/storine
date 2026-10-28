@@ -659,7 +659,9 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
         | "pg_range" | "pg_tablespace" | "pg_seclabel" | "pg_statistic_ext" | "pg_opclass" | "pg_language" | "pg_aggregate" => {
             Builder::new(&[("oid", I8)]).done()
         }
-        other => return Err(SqlError::undefined_table(&format!("pg_catalog.{other}"))),
+        // Other catalogs (publications, policies, statistics...) describe features this
+        // gateway does not have: they are empty.
+        _ => Builder::new(&[("oid", I8)]).done(),
     })
 }
 

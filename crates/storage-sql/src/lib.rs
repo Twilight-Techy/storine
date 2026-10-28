@@ -10,7 +10,9 @@ pub mod exec;
 pub mod fmt;
 pub mod hash;
 pub mod lexer;
+pub mod mysql;
 pub mod parser;
+pub mod pg;
 pub mod store;
 
 pub use error::{SqlError, SqlResult};
@@ -27,4 +29,10 @@ pub const MYSQL_VERSION: &str = "8.0.36-storine";
 pub fn instance_id() -> &'static str {
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ID.get_or_init(|| hash::hex(&hash::random_bytes(8)))
+}
+
+/// Whether statements and errors are logged to stderr (`STORINE_SQL_LOG=1`).
+pub fn log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("STORINE_SQL_LOG").is_ok_and(|v| v != "0"))
 }

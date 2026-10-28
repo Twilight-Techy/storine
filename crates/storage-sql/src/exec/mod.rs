@@ -15,7 +15,7 @@ mod eval;
 mod func;
 mod regex;
 mod select;
-mod system;
+pub mod system;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,6 +31,7 @@ use crate::error::{SqlError, SqlResult};
 use crate::lexer::Dialect;
 use crate::store::{Op, Pre, Store, Tag, Write};
 
+pub use eval::walk as eval_walk;
 pub use select::Rel;
 
 /// Settings of a gateway.
@@ -628,4 +629,9 @@ fn explain_text(stmt: &Statement) -> String {
         Statement::Update(_) | Statement::Delete(_) => "read matching rows, write with version preconditions".into(),
         _ => "utility statement".into(),
     }
+}
+
+/// Result columns of `RETURNING items` on `table` (for protocol-level Describe).
+pub fn describe_returning(s: &Session, table: &str, items: &[crate::ast::SelectItem]) -> SqlResult<Vec<OutCol>> {
+    dml::describe_returning(s, table, items)
 }

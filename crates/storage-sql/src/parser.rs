@@ -834,7 +834,7 @@ impl Parser {
                 col.check = Some(self.expr()?);
                 self.expect_op(")")?;
             } else if self.eat_kw("collate") {
-                self.ident()?;
+                self.object_name()?;
             } else if self.eat_kw("comment") {
                 let _ = self.next();
             } else if self.eat_kws(&["character", "set"]) || self.eat_kw("charset") {
@@ -865,6 +865,9 @@ impl Parser {
 
     /// A column type; the flag is true for serial types (auto-increment).
     fn data_type(&mut self) -> SqlResult<(DataType, bool)> {
+        if matches!(self.peek(), Some(Token::Word { .. })) && self.is_op_at(1, ".") {
+            self.pos += 2; // pg_catalog.text
+        }
         let word = match self.next() {
             Some(Token::Word { text, .. }) => text.to_ascii_lowercase(),
             _ => {
@@ -966,7 +969,8 @@ impl Parser {
                 DataType::Double
             }
             "float8" => DataType::Double,
-            "text" | "tinytext" | "mediumtext" | "longtext" | "ntext" | "clob" | "citext" | "string" | "name" => DataType::Text,
+            "oid" | "xid" | "cid" | "tid" | "regproc" | "regoper" | "regrole" => DataType::BigInt,
+            "text" | "tinytext" | "mediumtext" | "longtext" | "ntext" | "clob" | "citext" | "string" | "name" | "bpchar" | "unknown" => DataType::Text,
             "varchar" | "nvarchar" | "varchar2" | "nvarchar2" => {
                 let n = paren_numbers(self)?;
                 DataType::Varchar(n.first().copied().filter(|n| *n != u32::MAX))
@@ -1916,6 +1920,37 @@ impl Parser {
             if negated {
                 return Err(self.unexpected("BETWEEN, IN or LIKE"));
             }
+            // PostgreSQL `a OPERATOR(pg_catalog.~) b`.
+            if self.is_kw("operator") && self.is_op_at(1, "(") {
+                self.pos += 2;
+                if matches!(self.peek(), Some(Token::Word { .. })) && self.is_op_at(1, ".") {
+                    self.pos += 2;
+                }
+                let op = match self.next() {
+                    Some(Token::Op(o)) => o,
+                    _ => return Err(self.unexpected("an operator")),
+                };
+                self.expect_op(")")?;
+                let bop = match op {
+                    "=" => BinaryOp::Eq,
+                    "<>" | "!=" => BinaryOp::NotEq,
+                    "<" => BinaryOp::Lt,
+                    "<=" => BinaryOp::LtEq,
+                    ">" => BinaryOp::Gt,
+                    ">=" => BinaryOp::GtEq,
+                    "~" => BinaryOp::Regex { case_insensitive: false, negated: false },
+                    "~*" => BinaryOp::Regex { case_insensitive: true, negated: false },
+                    "!~" => BinaryOp::Regex { case_insensitive: false, negated: true },
+                    "!~*" => BinaryOp::Regex { case_insensitive: true, negated: true },
+                    "||" => BinaryOp::Concat,
+                    "+" => BinaryOp::Add,
+                    "-" => BinaryOp::Sub,
+                    other => return Err(SqlError::unsupported(format!("OPERATOR({other})"))),
+                };
+                let right = self.bit_or()?;
+                left = Expr::binary(bop, left, right);
+                continue;
+            }
             let op = match self.peek() {
                 Some(Token::Op("=")) => BinaryOp::Eq,
                 Some(Token::Op("<>")) | Some(Token::Op("!=")) => BinaryOp::NotEq,
@@ -2076,6 +2111,10 @@ impl Parser {
         let mut e = self.primary()?;
         loop {
             if self.eat_op("::") {
+                if let Some(f) = self.reg_cast() {
+                    e = func(f, vec![e]);
+                    continue;
+                }
                 let (ty, _) = self.data_type()?;
                 e = Expr::Cast { expr: Box::new(e), ty };
             } else if self.is_op("[") {
@@ -2087,7 +2126,7 @@ impl Parser {
                 self.expect_op("]")?;
                 e = Expr::Index { expr: Box::new(e), index: Box::new(index) };
             } else if self.eat_kw("collate") {
-                self.ident()?;
+                self.object_name()?;
             } else if self.is_kw("at") && self.is_kw_at(1, "time") && self.is_kw_at(2, "zone") {
                 self.pos += 3;
                 let zone = self.primary()?;
@@ -2165,6 +2204,10 @@ impl Parser {
                     self.expect_op("(")?;
                     let e = self.expr()?;
                     self.expect_kw("as")?;
+                    if let Some(f) = self.reg_cast() {
+                        self.expect_op(")")?;
+                        return Ok(func(f, vec![e]));
+                    }
                     let ty = self.cast_type()?;
                     self.expect_op(")")?;
                     return Ok(Expr::Cast { expr: Box::new(e), ty });
@@ -2191,6 +2234,12 @@ impl Parser {
                     let ty = self.cast_type()?;
                     self.expect_op(")")?;
                     return Ok(Expr::Cast { expr: Box::new(e), ty });
+                }
+                "array" if self.is_op("(") && (self.is_kw_at(1, "select") || self.is_kw_at(1, "with")) => {
+                    self.pos += 1;
+                    let q = self.query()?;
+                    self.expect_op(")")?;
+                    return Ok(func("array", vec![Expr::Subquery(Box::new(q))]));
                 }
                 "array" if self.is_op("[") => {
                     self.pos += 1;
@@ -2381,6 +2430,19 @@ impl Parser {
             }
             Ok(Expr::Function { name, args, star, distinct, over })
         }
+    }
+
+    /// `::regclass` / `::regtype` / `::regnamespace`: name-to-OID casts, as functions.
+    fn reg_cast(&mut self) -> Option<&'static str> {
+        let off = if matches!(self.peek(), Some(Token::Word { .. })) && self.is_op_at(1, ".") { 2 } else { 0 };
+        let f = match self.peek_at(off).and_then(Token::keyword).as_deref() {
+            Some("regclass") => "regclass",
+            Some("regtype") => "regtype",
+            Some("regnamespace") => "regnamespace",
+            _ => return None,
+        };
+        self.pos += off + 1;
+        Some(f)
     }
 
     /// The type of a CAST: also accepts MySQL `SIGNED [INTEGER]`, `UNSIGNED`, `CHAR`.

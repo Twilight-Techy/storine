@@ -1045,3 +1045,10 @@ pub fn delete(s: &mut Session, del: &Delete, params: &[Datum]) -> SqlResult<Outc
     }
     Ok(Outcome::Command { tag: format!("DELETE {n}"), affected: n, last_insert_id: None })
 }
+
+pub fn describe_returning(s: &Session, table: &str, items: &[SelectItem]) -> SqlResult<Vec<crate::exec::OutCol>> {
+    let t = s.engine.table(table)?;
+    let ex = Exec::new(s, &[]);
+    let rel = project_returning(&ex, items, &returning_cols(&t, &t.name), &[])?;
+    Ok(ex.result_set(rel)?.columns)
+}
