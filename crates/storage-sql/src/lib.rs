@@ -3,6 +3,7 @@
 
 pub mod ast;
 pub mod catalog;
+pub mod copy;
 pub mod datum;
 pub mod embedded;
 pub mod error;

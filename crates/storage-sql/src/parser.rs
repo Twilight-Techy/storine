@@ -68,11 +68,54 @@ const RESERVED: &[&str] = &[
     "straight_join",
     "lateral",
     "only",
-    "top",
     "returning",
 ];
 
 /// Parses a string that may hold several `;`-separated statements.
+/// SQL text that re-tokenizes to `tokens` (stored view definitions).
+fn tokens_sql(tokens: &[Token], dialect: Dialect) -> SqlResult<String> {
+    let mut out = String::new();
+    for t in tokens {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        match t {
+            Token::Word {
+                text,
+                quoted: false,
+            } => out.push_str(text),
+            Token::Word { text, quoted: true } if dialect == Dialect::MySql => {
+                out.push_str(&format!("`{}`", text.replace('`', "``")))
+            }
+            Token::Word { text, quoted: true } => {
+                out.push_str(&format!("\"{}\"", text.replace('"', "\"\"")))
+            }
+            Token::Number(n) => out.push_str(n),
+            Token::Str(s) if dialect == Dialect::MySql => out.push_str(&format!(
+                "'{}'",
+                s.replace('\\', "\\\\").replace('\'', "''")
+            )),
+            Token::Str(s) => out.push_str(&format!("'{}'", s.replace('\'', "''"))),
+            Token::Blob(b) => {
+                out.push_str("X'");
+                for x in b {
+                    out.push_str(&format!("{x:02x}"));
+                }
+                out.push('\'');
+            }
+            Token::Param(_) => {
+                return Err(SqlError::syntax("a view cannot have parameters".into()))
+            }
+            Token::Variable { name, system } => {
+                out.push_str(if *system { "@@" } else { "@" });
+                out.push_str(name);
+            }
+            Token::Op(op) => out.push_str(op),
+        }
+    }
+    Ok(out)
+}
+
 pub fn parse(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Statement>, usize)> {
     let (tokens, params) = tokenize(sql, dialect)?;
     let mut p = Parser {
@@ -341,6 +384,7 @@ impl Parser {
             "update" => self.update(),
             "delete" => self.delete(),
             "create" => self.create(),
+            "copy" => self.copy(),
             "drop" => self.drop(),
             "alter" => self.alter(),
             "truncate" => {
@@ -741,11 +785,49 @@ impl Parser {
 
     fn create(&mut self) -> SqlResult<Statement> {
         self.pos += 1; // CREATE
-        let _ = self.eat_kws(&["or", "replace"]);
+        let or_replace = self.eat_kws(&["or", "replace"]);
         let _ = self.eat_kw("temporary") || self.eat_kw("temp") || self.eat_kw("unlogged");
         if self.eat_kw("table") {
             return self.create_table();
         }
+        // MySQL view options: ALGORITHM = x, DEFINER = user, SQL SECURITY x.
+        let start = self.pos;
+        loop {
+            if self.eat_kw("algorithm") || self.eat_kw("definer") {
+                self.eat_op("=");
+                self.pos += 1;
+                while self.eat_op("@") || matches!(self.peek(), Some(Token::Variable { .. })) {
+                    self.pos += 1;
+                }
+            } else if self.eat_kws(&["sql", "security"]) {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        if self.eat_kw("view") {
+            let if_not_exists = self.eat_kws(&["if", "not", "exists"]);
+            let name = self.table_name()?;
+            let columns = if self.is_op("(") {
+                self.ident_list()?
+            } else {
+                Vec::new()
+            };
+            self.expect_kw("as")?;
+            let from = self.pos;
+            self.query()?; // validates the syntax now
+            let sql = tokens_sql(&self.tokens[from..self.pos], self.dialect)?;
+            let _ = self.eat_kws(&["with", "check", "option"])
+                || self.eat_kws(&["with", "cascaded", "check", "option"]);
+            return Ok(Statement::CreateView {
+                name,
+                columns,
+                sql,
+                or_replace,
+                if_not_exists,
+            });
+        }
+        self.pos = start;
         let unique = self.eat_kw("unique");
         let _ = self.eat_kw("clustered") || self.eat_kw("nonclustered");
         if self.eat_kw("index") {
@@ -1388,9 +1470,132 @@ impl Parser {
         Ok((ty, serial))
     }
 
+    fn copy(&mut self) -> SqlResult<Statement> {
+        self.pos += 1; // COPY
+        let mut c = CopyStmt {
+            table: None,
+            columns: Vec::new(),
+            query: None,
+            from: false,
+            stdio: false,
+            csv: false,
+            binary: false,
+            header: false,
+            delimiter: None,
+            null: None,
+            quote: None,
+            escape: None,
+        };
+        if self.eat_op("(") {
+            c.query = Some(Box::new(self.query()?));
+            self.expect_op(")")?;
+        } else {
+            c.table = Some(self.table_name()?);
+            if self.is_op("(") {
+                c.columns = self.ident_list()?;
+            }
+        }
+        c.from = if self.eat_kw("from") {
+            true
+        } else {
+            self.expect_kw("to")?;
+            false
+        };
+        c.stdio = self.eat_kw("stdin") || self.eat_kw("stdout");
+        if !c.stdio {
+            self.pos += 1; // 'file' / PROGRAM
+        }
+        let _ = self.eat_kw("with");
+        let paren = self.eat_op("(");
+        let char_opt = |p: &mut Parser| -> SqlResult<char> {
+            match p.next() {
+                Some(Token::Str(s)) if s.chars().count() == 1 => {
+                    Ok(s.chars().next().unwrap_or(','))
+                }
+                _ => Err(SqlError::syntax(
+                    "COPY delimiter, quote and escape must be a single character".into(),
+                )),
+            }
+        };
+        loop {
+            if paren && self.eat_op(")") {
+                break;
+            }
+            let Some(word) = self.peek().and_then(Token::keyword) else {
+                break;
+            };
+            self.pos += 1;
+            match word.as_str() {
+                "format" => match self.next().and_then(|t| t.keyword()).as_deref() {
+                    Some("csv") => c.csv = true,
+                    Some("binary") => c.binary = true,
+                    _ => {}
+                },
+                "csv" => c.csv = true,
+                "binary" => c.binary = true,
+                "header" => {
+                    c.header = !(self.eat_kw("false") || self.eat_kw("off"));
+                    let _ = self.eat_kw("true") || self.eat_kw("on") || self.eat_kw("match");
+                }
+                "delimiter" => {
+                    let _ = self.eat_kw("as");
+                    c.delimiter = Some(char_opt(self)?);
+                }
+                "null" => {
+                    let _ = self.eat_kw("as");
+                    match self.next() {
+                        Some(Token::Str(s)) => c.null = Some(s),
+                        _ => return Err(SqlError::syntax("COPY NULL needs a string".into())),
+                    }
+                }
+                "quote" => {
+                    let _ = self.eat_kw("as");
+                    c.quote = Some(char_opt(self)?);
+                }
+                "escape" => {
+                    let _ = self.eat_kw("as");
+                    c.escape = Some(char_opt(self)?);
+                }
+                "encoding" => {
+                    self.pos += 1;
+                }
+                _ => {} // FREEZE, FORCE_QUOTE / FORCE_NOT_NULL (lists), ...
+            }
+            if paren {
+                // Skip the rest of this option (lists such as FORCE_QUOTE (a, b)).
+                let mut depth = 0;
+                while let Some(t) = self.peek() {
+                    match t {
+                        Token::Op("(") => depth += 1,
+                        Token::Op(")") if depth == 0 => break,
+                        Token::Op(")") => depth -= 1,
+                        Token::Op(",") if depth == 0 => {
+                            self.pos += 1;
+                            break;
+                        }
+                        Token::Op(";") => break,
+                        _ => {}
+                    }
+                    self.pos += 1;
+                }
+            }
+        }
+        self.skip_to_end();
+        Ok(Statement::Copy(Box::new(c)))
+    }
+
     fn drop(&mut self) -> SqlResult<Statement> {
         self.pos += 1;
         let _ = self.eat_kw("temporary");
+        if self.eat_kw("view") {
+            let if_exists = self.eat_kws(&["if", "exists"]);
+            let mut names = vec![self.table_name()?];
+            while self.eat_op(",") {
+                names.push(self.table_name()?);
+            }
+            self.skip_to_end(); // CASCADE / RESTRICT
+            return Ok(Statement::DropView { names, if_exists });
+        }
         if self.eat_kw("table") {
             let if_exists = self.eat_kws(&["if", "exists"]);
             let mut names = vec![self.table_name()?];
@@ -1829,10 +2034,9 @@ impl Parser {
 
     fn query(&mut self) -> SqlResult<Query> {
         let mut ctes = Vec::new();
+        let mut recursive = false;
         if self.eat_kw("with") {
-            if self.eat_kw("recursive") {
-                return Err(SqlError::unsupported("WITH RECURSIVE"));
-            }
+            recursive = self.eat_kw("recursive");
             loop {
                 let name = self.ident()?;
                 let columns = if self.is_op("(") {
@@ -1857,6 +2061,7 @@ impl Parser {
         }
         let (body, top) = self.set_expr()?;
         let mut q = Query {
+            recursive,
             ctes,
             body,
             order_by: Vec::new(),
@@ -2009,9 +2214,17 @@ impl Parser {
         let mut top = None;
         if self.eat_kw("distinct") {
             if self.eat_kw("on") {
-                return Err(SqlError::unsupported("SELECT DISTINCT ON"));
+                self.expect_op("(")?;
+                loop {
+                    sel.distinct_on.push(self.expr()?);
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+                self.expect_op(")")?;
+            } else {
+                sel.distinct = true;
             }
-            sel.distinct = true;
         } else {
             self.eat_kw("all");
         }

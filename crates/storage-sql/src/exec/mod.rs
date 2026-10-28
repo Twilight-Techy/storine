@@ -175,6 +175,54 @@ impl Engine {
         Ok(names)
     }
 
+    /// A view's definition: `(sql, dialect, column names)`.
+    pub fn view(&self, name: &str) -> SqlResult<Option<(String, Dialect, Vec<String>)>> {
+        let Some(d) = self
+            .store
+            .get(crate::catalog::VIEWS, &name.to_lowercase())?
+        else {
+            return Ok(None);
+        };
+        let text = |k: &str| {
+            d.fields
+                .get(k)
+                .and_then(storine::Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let dialect = if text("dialect") == "mysql" {
+            Dialect::MySql
+        } else {
+            Dialect::Postgres
+        };
+        let columns = d
+            .fields
+            .get("columns")
+            .and_then(storine::Value::as_list)
+            .map(|l| {
+                l.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some((text("sql"), dialect, columns)))
+    }
+
+    /// Every view name.
+    pub fn view_names(&self) -> SqlResult<Vec<String>> {
+        Ok(self
+            .store
+            .scan(crate::catalog::VIEWS, None)?
+            .into_iter()
+            .filter_map(|d| {
+                d.fields
+                    .get("name")
+                    .and_then(storine::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect())
+    }
+
     /// `CREATE DATABASE`; false when it already existed.
     pub fn create_database(&self, name: &str) -> SqlResult<bool> {
         if self.is_default_name(name) {
@@ -616,6 +664,7 @@ impl Session {
             crate::catalog::LOCKS,
             crate::catalog::UNIQUE,
             crate::catalog::REFS,
+            crate::catalog::VIEWS,
         ] {
             let _ = target.store.drop_collection(c);
         }
@@ -1006,6 +1055,86 @@ impl Session {
                 }
                 Ok(Outcome::command("CREATE DATABASE"))
             }
+            Statement::CreateView {
+                name,
+                columns,
+                sql,
+                or_replace,
+                if_not_exists,
+            } => {
+                if self.engine.find_table(name)?.is_some() {
+                    return Err(SqlError::new(
+                        "42P07",
+                        format!("relation \"{name}\" already exists"),
+                    ));
+                }
+                let mut doc = Doc::new();
+                doc.insert("name".into(), storine::Value::Text(name.clone()));
+                doc.insert("sql".into(), storine::Value::Text(sql.clone()));
+                doc.insert(
+                    "dialect".into(),
+                    storine::Value::Text(
+                        if self.dialect == Dialect::MySql {
+                            "mysql"
+                        } else {
+                            "postgres"
+                        }
+                        .into(),
+                    ),
+                );
+                doc.insert(
+                    "columns".into(),
+                    storine::Value::List(
+                        columns
+                            .iter()
+                            .map(|c| storine::Value::Text(c.clone()))
+                            .collect(),
+                    ),
+                );
+                let w = Write {
+                    collection: crate::catalog::VIEWS.into(),
+                    key: name.to_lowercase(),
+                    op: Op::Put(doc),
+                    pre: if *or_replace { Pre::None } else { Pre::Absent },
+                    tag: Tag::Internal,
+                };
+                match self.engine.store.commit(std::slice::from_ref(&w)) {
+                    Ok(_) => Ok(Outcome::command("CREATE VIEW")),
+                    Err(crate::store::CommitError::Condition { .. }) if *if_not_exists => {
+                        Ok(Outcome::command("CREATE VIEW"))
+                    }
+                    Err(crate::store::CommitError::Condition { .. }) => Err(SqlError::new(
+                        "42P07",
+                        format!("relation \"{name}\" already exists"),
+                    )),
+                    Err(e) => Err(e.to_sql(std::slice::from_ref(&w))),
+                }
+            }
+            Statement::DropView { names, if_exists } => {
+                for n in names {
+                    if self.engine.view(n)?.is_none() {
+                        if *if_exists {
+                            continue;
+                        }
+                        return Err(SqlError::new(
+                            "42P01",
+                            format!("view \"{n}\" does not exist"),
+                        ));
+                    }
+                    let w = Write {
+                        collection: crate::catalog::VIEWS.into(),
+                        key: n.to_lowercase(),
+                        op: Op::Delete,
+                        pre: Pre::None,
+                        tag: Tag::Internal,
+                    };
+                    self.engine
+                        .store
+                        .commit(std::slice::from_ref(&w))
+                        .map_err(|e| e.to_sql(std::slice::from_ref(&w)))?;
+                }
+                Ok(Outcome::command("DROP VIEW"))
+            }
             Statement::DropSchema {
                 database: false, ..
             } => Ok(Outcome::command("DROP SCHEMA")),
@@ -1047,6 +1176,9 @@ impl Session {
                 }
                 Ok(Outcome::command("DEALLOCATE"))
             }
+            Statement::Copy(_) => Err(SqlError::unsupported(
+                "COPY here: it streams through the PostgreSQL protocol's simple query (psql \\copy, COPY ... FROM STDIN / TO STDOUT)",
+            )),
             Statement::NoOp(tag) => Ok(Outcome::command(*tag)),
             Statement::Empty => Ok(Outcome::command("")),
             Statement::Begin { .. }

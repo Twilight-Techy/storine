@@ -395,6 +395,44 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                     ]);
                 }
             }
+            // Views (relkind 'v').
+            for v in ex.s.engine.view_names()? {
+                let oid = table_oid(&v);
+                let mut row = vec![
+                    i(oid),
+                    t(&v),
+                    i(NS_PUBLIC),
+                    i(oid + 1),
+                    i(0),
+                    i(10),
+                    i(0),
+                    i(0),
+                    i(0),
+                    i(0),
+                    Datum::Float(-1.0),
+                    i(0),
+                    i(0),
+                    b(false),
+                    b(false),
+                    t("p"),
+                    t("v"),
+                    i(0),
+                    i(0),
+                    b(true),
+                    b(false),
+                    b(false),
+                    b(false),
+                    b(false),
+                    b(true),
+                    t("n"),
+                    b(false),
+                    N,
+                    N,
+                    N,
+                ];
+                row.truncate(30);
+                bd.row(row);
+            }
             bd.done()
         }
         "pg_attribute" => {
@@ -1054,10 +1092,23 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
             ("tgisinternal", B),
         ])
         .done(),
-        "pg_views" | "pg_matviews" => Builder::new(&[
+        "pg_views" => {
+            let mut bd = Builder::new(&[
+                ("schemaname", T),
+                ("viewname", T),
+                ("viewowner", T),
+                ("definition", T),
+            ]);
+            for v in ex.s.engine.view_names()? {
+                let sql = ex.s.engine.view(&v)?.map(|d| d.0).unwrap_or_default();
+                bd.row(vec![t("public"), t(&v), t(&ex.s.user), t(sql)]);
+            }
+            bd.done()
+        }
+        "pg_matviews" => Builder::new(&[
             ("schemaname", T),
-            ("viewname", T),
-            ("viewowner", T),
+            ("matviewname", T),
+            ("matviewowner", T),
             ("definition", T),
         ])
         .done(),
@@ -1486,6 +1537,25 @@ fn information_schema(
                     t(""),
                     t("Dynamic"),
                     i(10),
+                    N,
+                ]);
+            }
+            for v in ex.s.engine.view_names()? {
+                bd.row(vec![
+                    t(if mysql { "def" } else { &db }),
+                    t(schema),
+                    t(&v),
+                    t("VIEW"),
+                    N,
+                    N,
+                    N,
+                    N,
+                    t(if mysql { "VIEW" } else { "" }),
+                    N,
+                    t("NO"),
+                    t(""),
+                    t(""),
+                    N,
                     N,
                 ]);
             }
@@ -2002,11 +2072,36 @@ fn information_schema(
             ]);
             bd.done()
         }
-        "views" | "routines" | "triggers" | "sequences" | "parameters" | "events"
-        | "partitions" | "table_privileges" | "column_privileges" | "user_privileges"
-        | "schema_privileges" | "processlist" | "innodb_trx" | "role_table_grants" | "domains"
-        | "element_types" | "attributes" | "user_defined_types" | "column_statistics"
-        | "plugins" => mk(&[("table_schema", T), ("table_name", T)]).done(),
+        "views" => {
+            let mut bd = mk(&[
+                ("table_catalog", T),
+                ("table_schema", T),
+                ("table_name", T),
+                ("view_definition", T),
+                ("check_option", T),
+                ("is_updatable", T),
+                ("is_insertable_into", T),
+            ]);
+            for v in ex.s.engine.view_names()? {
+                let sql = ex.s.engine.view(&v)?.map(|d| d.0).unwrap_or_default();
+                bd.row(vec![
+                    t(if mysql { "def" } else { &db }),
+                    t(schema),
+                    t(&v),
+                    t(sql),
+                    t("NONE"),
+                    t("NO"),
+                    t("NO"),
+                ]);
+            }
+            bd.done()
+        }
+        "routines" | "triggers" | "sequences" | "parameters" | "events" | "partitions"
+        | "table_privileges" | "column_privileges" | "user_privileges" | "schema_privileges"
+        | "processlist" | "innodb_trx" | "role_table_grants" | "domains" | "element_types"
+        | "attributes" | "user_defined_types" | "column_statistics" | "plugins" => {
+            mk(&[("table_schema", T), ("table_name", T)]).done()
+        }
         other => {
             return Err(SqlError::undefined_table(&format!(
                 "information_schema.{other}"
@@ -2330,6 +2425,19 @@ pub fn show(s: &mut Session, what: &Show) -> SqlResult<Outcome> {
                         vec![t(&tb.name)]
                     }
                 })
+                .chain(
+                    s.engine
+                        .view_names()?
+                        .into_iter()
+                        .filter(|v| like_filter(like, v))
+                        .map(|v| {
+                            if *full {
+                                vec![t(&v), t("VIEW")]
+                            } else {
+                                vec![t(&v)]
+                            }
+                        }),
+                )
                 .collect();
             if *full {
                 text_rs(&[&col, "Table_type"], rows)

@@ -139,7 +139,20 @@ impl Exec<'_> {
             let mut scope = HashMap::new();
             self.ctes.borrow_mut().push(HashMap::new());
             for cte in &q.ctes {
-                let rel = self.query(&cte.query, outer)?;
+                let rel = match &cte.query.body {
+                    SetExpr::SetOp {
+                        op: SetOp::Union,
+                        all,
+                        left,
+                        right,
+                    } if q.recursive
+                        && cte.query.ctes.is_empty()
+                        && refers_to(right, &cte.name) =>
+                    {
+                        self.recursive_cte(cte, left, right, *all, outer)?
+                    }
+                    _ => self.query(&cte.query, outer)?,
+                };
                 let rel = rel.requalify(
                     &Some(TableAlias {
                         name: cte.name.clone(),
@@ -160,6 +173,55 @@ impl Exec<'_> {
             self.ctes.borrow_mut().pop();
         }
         r
+    }
+
+    /// `WITH RECURSIVE name AS (anchor UNION [ALL] step)`: the step runs against the rows the
+    /// previous iteration produced until it produces none (UNION also drops rows seen before).
+    fn recursive_cte(
+        &self,
+        cte: &crate::ast::Cte,
+        anchor: &SetExpr,
+        step: &SetExpr,
+        all: bool,
+        outer: Option<&Env<'_>>,
+    ) -> SqlResult<Rel> {
+        let alias = Some(TableAlias {
+            name: cte.name.clone(),
+            columns: cte.columns.clone(),
+        });
+        let key = cte.name.to_ascii_lowercase();
+        let first = self.set_expr(anchor, outer)?.requalify(&alias, None)?;
+        let cols = first.cols.clone();
+        let mut seen = HashSet::new();
+        let fresh = |rows: Vec<Row>, seen: &mut HashSet<String>| -> Vec<Row> {
+            if all {
+                return rows;
+            }
+            rows.into_iter()
+                .filter(|r| seen.insert(r.iter().map(hash_key).collect::<Vec<_>>().join("\u{1}")))
+                .collect()
+        };
+        let mut working = fresh(first.rows, &mut seen);
+        let mut result = working.clone();
+        while !working.is_empty() {
+            if result.len() > MAX_RECURSIVE_ROWS {
+                return Err(SqlError::new(
+                    "54000",
+                    format!("WITH RECURSIVE \"{}\" produced more than {MAX_RECURSIVE_ROWS} rows; check its termination condition", cte.name),
+                ));
+            }
+            let table = Rc::new(Rel {
+                cols: cols.clone(),
+                rows: std::mem::take(&mut working),
+            });
+            if let Some(top) = self.ctes.borrow_mut().last_mut() {
+                top.insert(key.clone(), table);
+            }
+            let next = self.set_expr(step, outer)?;
+            working = fresh(next.rows, &mut seen);
+            result.extend(working.iter().cloned());
+        }
+        Ok(Rel { cols, rows: result })
     }
 
     fn limit_offset(&self, q: &Query) -> SqlResult<(Option<usize>, usize)> {
@@ -414,6 +476,30 @@ impl Exec<'_> {
     ) -> SqlResult<Rel> {
         let mut acc: Option<Rel> = None;
         for item in from {
+            // `FROM a, LATERAL (SELECT ... a.x ...)`: evaluated once per row of what precedes it.
+            if let (
+                TableRef::Derived {
+                    query,
+                    alias,
+                    lateral: true,
+                },
+                Some(l),
+            ) = (item, acc.as_ref())
+            {
+                let l = Rel {
+                    cols: l.cols.clone(),
+                    rows: l.rows.clone(),
+                };
+                acc = Some(self.lateral_join(
+                    l,
+                    query,
+                    alias,
+                    JoinKind::Cross,
+                    &JoinConstraint::None,
+                    outer,
+                )?);
+                continue;
+            }
             let rel = self.eval_from_entry(item, pushable, outer, acc.as_ref())?;
             acc = Some(match acc {
                 None => rel,
@@ -477,7 +563,13 @@ impl Exec<'_> {
                 if let Some(rel) = system::table(self, schema.as_deref(), name)? {
                     return rel.requalify(alias, Some(name));
                 }
-                let table = self.s.engine.table(name)?;
+                let table = match self.s.engine.find_table(name)? {
+                    Some(t) => t,
+                    None => match self.view_rel(name, alias)? {
+                        Some(rel) => return Ok(rel),
+                        None => return Err(SqlError::undefined_table(name)),
+                    },
+                };
                 let qual = alias.as_ref().map_or(name.as_str(), |a| a.name.as_str());
                 let rows = self.scan_rows(&table, Some(qual), pushable, Vec::new(), outer)?;
                 let rel = Rel {
@@ -535,6 +627,14 @@ impl Exec<'_> {
                         &[]
                     };
                 let l = self.eval_from_entry(left, lp, outer, lateral_left)?;
+                if let TableRef::Derived {
+                    query,
+                    alias,
+                    lateral: true,
+                } = &**right
+                {
+                    return self.lateral_join(l, query, alias, *kind, constraint, outer);
+                }
                 // Lookup join: fetch only the right rows whose join key appears on the left.
                 let r = match (&**right, constraint) {
                     (
@@ -546,6 +646,7 @@ impl Exec<'_> {
                         JoinConstraint::On(on),
                     ) if self.cte(name).is_none()
                         && !system::is_system(None, name)
+                        && self.s.engine.find_table(name).ok().flatten().is_some()
                         && l.rows.len() <= 2000
                         && matches!(kind, JoinKind::Inner | JoinKind::Left) =>
                     {
@@ -564,6 +665,100 @@ impl Exec<'_> {
                 self.join(l, r, *kind, constraint, outer)
             }
         }
+    }
+
+    /// The rows of view `name`, if there is one.
+    fn view_rel(&self, name: &str, alias: &Option<TableAlias>) -> SqlResult<Option<Rel>> {
+        let key = name.to_ascii_lowercase();
+        let cached = self.views.borrow().get(&key).cloned();
+        let def = match cached {
+            Some(d) => d,
+            None => {
+                let Some((sql, dialect, columns)) = self.s.engine.view(name)? else {
+                    return Ok(None);
+                };
+                let (stmts, _) = crate::parser::parse(&sql, dialect)?;
+                let Some(crate::ast::Statement::Query(q)) = stmts.into_iter().next() else {
+                    return Err(SqlError::internal(format!(
+                        "view \"{name}\" is not a query"
+                    )));
+                };
+                let d = Rc::new((*q, columns));
+                self.views.borrow_mut().insert(key, Rc::clone(&d));
+                d
+            }
+        };
+        let depth = self.view_depth.get();
+        if depth >= 32 {
+            return Err(SqlError::new(
+                "54001",
+                format!("view \"{name}\" is nested too deeply (does it refer to itself?)"),
+            ));
+        }
+        self.view_depth.set(depth + 1);
+        let rel = self.query(&def.0, None);
+        self.view_depth.set(depth);
+        let mut rel = rel?;
+        // Column names: the alias's, else the view's declared ones.
+        let names = match alias {
+            Some(a) if !a.columns.is_empty() => a.columns.clone(),
+            _ => def.1.clone(),
+        };
+        for (c, n) in rel.cols.iter_mut().zip(&names) {
+            c.name = n.clone();
+        }
+        let a = Some(TableAlias {
+            name: alias.as_ref().map_or(name, |a| a.name.as_str()).to_owned(),
+            columns: Vec::new(),
+        });
+        rel.requalify(&a, None).map(Some)
+    }
+
+    /// `left [kind] JOIN LATERAL (query) alias [ON ...]`: the subquery sees each left row.
+    fn lateral_join(
+        &self,
+        left: Rel,
+        query: &Query,
+        alias: &Option<TableAlias>,
+        kind: JoinKind,
+        constraint: &JoinConstraint,
+        outer: Option<&Env<'_>>,
+    ) -> SqlResult<Rel> {
+        if matches!(kind, JoinKind::Right | JoinKind::Full) {
+            return Err(SqlError::syntax(
+                "the combining JOIN type must be INNER or LEFT for a LATERAL reference".into(),
+            ));
+        }
+        let mut out: Option<Rel> = None;
+        let null_row = vec![Datum::Null; left.cols.len()];
+        let rows: Vec<&Row> = if left.rows.is_empty() {
+            vec![&null_row]
+        } else {
+            left.rows.iter().collect()
+        };
+        for lrow in rows {
+            let env = Env {
+                cols: &left.cols,
+                row: lrow,
+                outer,
+                aggs: None,
+            };
+            let sub = self.query(query, Some(&env))?.requalify(alias, None)?;
+            let one = Rel {
+                cols: left.cols.clone(),
+                rows: if left.rows.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![lrow.clone()]
+                },
+            };
+            let joined = self.join(one, sub, kind, constraint, outer)?;
+            match &mut out {
+                Some(acc) => acc.rows.extend(joined.rows),
+                None => out = Some(joined),
+            }
+        }
+        out.ok_or_else(|| SqlError::internal("lateral join without rows"))
     }
 
     /// For `ON right.col = <left expr>`: an IN filter on `right.col` with the left side's values.
@@ -1282,8 +1477,18 @@ impl Exec<'_> {
             .collect();
         // Each output row with its ORDER BY keys.
         let mut produced: Vec<(Row, Vec<Datum>)> = Vec::new();
+        // ORDER BY keys, then the DISTINCT ON keys (resolved the same way).
+        let key_specs: Vec<OrderBy> = order_by
+            .iter()
+            .cloned()
+            .chain(sel.distinct_on.iter().map(|e| OrderBy {
+                expr: e.clone(),
+                desc: false,
+                nulls_first: None,
+            }))
+            .collect();
         let order_key = |this: &Self, env: &Env<'_>, out: &Row| -> SqlResult<Vec<Datum>> {
-            order_by
+            key_specs
                 .iter()
                 .map(|o| {
                     if let Expr::Number(n) = &o.expr {
@@ -1513,6 +1718,19 @@ impl Exec<'_> {
         }
         if !order_by.is_empty() {
             produced.sort_by(|a, b| self.order_cmp(order_by, &a.1, &b.1));
+        }
+        if !sel.distinct_on.is_empty() {
+            let n = order_by.len();
+            let mut seen = HashSet::new();
+            produced.retain(|(_, k)| {
+                seen.insert(
+                    k[n..]
+                        .iter()
+                        .map(hash_key)
+                        .collect::<Vec<_>>()
+                        .join("\u{1}"),
+                )
+            });
         }
         let mut out_rows: Vec<Row> = produced.into_iter().map(|(r, _)| r).collect();
         apply_limit(&mut out_rows, limit, offset);
@@ -1898,6 +2116,27 @@ fn numeric_result(a: Option<DataType>, b: Option<DataType>) -> Option<DataType> 
             })
         }
         _ => None,
+    }
+}
+
+/// Upper bound on the rows a recursive CTE may produce.
+const MAX_RECURSIVE_ROWS: usize = 10_000_000;
+
+/// Whether `e` reads table `name` (directly, in a join, or in a derived table).
+fn refers_to(e: &SetExpr, name: &str) -> bool {
+    fn table(t: &TableRef, name: &str) -> bool {
+        match t {
+            TableRef::Named { name: n, .. } => n.eq_ignore_ascii_case(name),
+            TableRef::Join { left, right, .. } => table(left, name) || table(right, name),
+            TableRef::Derived { query, .. } => refers_to(&query.body, name),
+            _ => false,
+        }
+    }
+    match e {
+        SetExpr::Select(s) => s.from.iter().any(|t| table(t, name)),
+        SetExpr::SetOp { left, right, .. } => refers_to(left, name) || refers_to(right, name),
+        SetExpr::Nested(q) => refers_to(&q.body, name),
+        SetExpr::Values(_) => false,
     }
 }
 

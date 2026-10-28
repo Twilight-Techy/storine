@@ -210,6 +210,12 @@ pub fn tokenize(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Token>, Params)> 
             continue;
         }
         // Named placeholders (:name, @name in T-SQL) and MySQL variables.
+        // `user`@`host` / 'user'@'%' (MySQL account names, e.g. in DEFINER = ...).
+        if c == b'@' && matches!(b.get(i + 1), Some(b'`' | b'\'' | b'"' | b'%')) {
+            out.push(Token::Op("@"));
+            i += 1;
+            continue;
+        }
         if c == b'@' {
             let system = b.get(i + 1) == Some(&b'@');
             let start = if system { i + 2 } else { i + 1 };

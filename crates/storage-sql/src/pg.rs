@@ -320,8 +320,8 @@ impl Conn {
                     Ok(())
                 }
                 b'X' => return Ok(()),
-                b'p' => Ok(()), // stray password message
-                b'd' | b'c' | b'f' => Err(SqlError::unsupported("COPY")),
+                b'p' => Ok(()),               // stray password message
+                b'd' | b'c' | b'f' => Ok(()), // copy data after a failed COPY: ignored
                 b'F' => Err(SqlError::unsupported("the function-call protocol")),
                 other => Err(SqlError::new(
                     "08P01",
@@ -362,6 +362,19 @@ impl Conn {
             return Ok(());
         }
         for st in &stmts {
+            if let Statement::Copy(c) = st {
+                match self.copy(c) {
+                    Ok(n) => self
+                        .send(Msg::new(b'C').cstr(&format!("COPY {n}")))
+                        .map_err(io_err)?,
+                    Err(e) => {
+                        self.error(&e).map_err(io_err)?;
+                        self.ready().map_err(io_err)?;
+                        return Ok(());
+                    }
+                }
+                continue;
+            }
             let outcome = match self.session.execute(st, &[]) {
                 Ok(o) => o,
                 Err(e) => {
@@ -374,6 +387,417 @@ impl Conn {
         }
         self.ready().map_err(io_err)?;
         Ok(())
+    }
+
+    /// `COPY ... FROM STDIN` / `TO STDOUT` through the copy sub-protocol; the row count.
+    fn copy(&mut self, c: &crate::ast::CopyStmt) -> SqlResult<u64> {
+        if !c.stdio {
+            return Err(SqlError::unsupported(
+                "COPY to or from a server file or program (use STDIN / STDOUT, e.g. psql \\copy)",
+            ));
+        }
+        if c.binary {
+            return if c.from {
+                self.copy_in_binary(c)
+            } else {
+                self.copy_out_binary(c)
+            };
+        }
+        let fmt = crate::copy::Format::new(c)?;
+        if c.from {
+            self.copy_in(c, fmt)
+        } else {
+            self.copy_out(c, fmt)
+        }
+    }
+
+    /// The rows a `COPY ... TO` sends.
+    fn copy_rows(&mut self, c: &crate::ast::CopyStmt) -> SqlResult<crate::exec::ResultSet> {
+        let query = match (&c.query, &c.table) {
+            (Some(q), _) => Statement::Query(q.clone()),
+            (None, Some(t)) => {
+                let cols = if c.columns.is_empty() {
+                    "*".to_owned()
+                } else {
+                    c.columns
+                        .iter()
+                        .map(|n| crate::fmt::quote_ident(n))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let sql = format!("SELECT {cols} FROM {}", crate::fmt::quote_ident(t));
+                parse(&sql, Dialect::Postgres)?
+                    .0
+                    .into_iter()
+                    .next()
+                    .unwrap_or(Statement::Empty)
+            }
+            (None, None) => return Err(SqlError::syntax("COPY needs a table or a query".into())),
+        };
+        match self.session.execute(&query, &[])? {
+            Outcome::Rows(rs) => Ok(rs),
+            _ => Err(SqlError::syntax(
+                "COPY (...) TO needs a query that returns rows".into(),
+            )),
+        }
+    }
+
+    fn copy_out(&mut self, c: &crate::ast::CopyStmt, fmt: crate::copy::Format) -> SqlResult<u64> {
+        let rs = self.copy_rows(c)?;
+        let mut head = Msg::new(b'H').u8(0).i16(rs.columns.len() as i16);
+        for _ in &rs.columns {
+            head = head.i16(0);
+        }
+        self.send(head).map_err(io_err)?;
+        let mut line = String::new();
+        if fmt.header {
+            let names: Vec<Option<String>> =
+                rs.columns.iter().map(|c| Some(c.name.clone())).collect();
+            fmt.encode(&names, &mut line);
+            self.send(Msg::new(b'd').bytes(line.as_bytes()))
+                .map_err(io_err)?;
+        }
+        for row in &rs.rows {
+            line.clear();
+            let fields: Vec<Option<String>> = row
+                .iter()
+                .zip(&rs.columns)
+                .map(|(d, col)| (!d.is_null()).then(|| encode_text(d, &col.ty)))
+                .collect();
+            fmt.encode(&fields, &mut line);
+            self.send(Msg::new(b'd').bytes(line.as_bytes()))
+                .map_err(io_err)?;
+        }
+        self.send(Msg::new(b'c')).map_err(io_err)?;
+        Ok(rs.rows.len() as u64)
+    }
+
+    /// `COPY ... TO STDOUT (FORMAT binary)`.
+    fn copy_out_binary(&mut self, c: &crate::ast::CopyStmt) -> SqlResult<u64> {
+        let rs = self.copy_rows(c)?;
+        let mut head = Msg::new(b'H').u8(1).i16(rs.columns.len() as i16);
+        for _ in &rs.columns {
+            head = head.i16(1);
+        }
+        self.send(head).map_err(io_err)?;
+        // The file header travels with the first tuple (as PostgreSQL sends it).
+        let mut header = COPY_SIGNATURE.to_vec();
+        header.extend_from_slice(&[0; 8]); // flags, header extension length
+        for row in &rs.rows {
+            let mut t = std::mem::take(&mut header);
+            t.extend_from_slice(&(rs.columns.len() as i16).to_be_bytes());
+            for (d, col) in row.iter().zip(&rs.columns) {
+                if d.is_null() {
+                    t.extend_from_slice(&(-1i32).to_be_bytes());
+                } else {
+                    let v = encode_binary(d, &col.ty);
+                    t.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                    t.extend_from_slice(&v);
+                }
+            }
+            self.send(Msg::new(b'd').bytes(&t)).map_err(io_err)?;
+        }
+        header.extend_from_slice(&(-1i16).to_be_bytes());
+        self.send(Msg::new(b'd').bytes(&header)).map_err(io_err)?;
+        self.send(Msg::new(b'c')).map_err(io_err)?;
+        Ok(rs.rows.len() as u64)
+    }
+
+    /// `COPY ... FROM STDIN (FORMAT binary)` (asyncpg's `copy_records_to_table`, `pg_dump -Fc`
+    /// restores through `pg_restore`, ...): fields decoded by the target columns' types.
+    fn copy_in_binary(&mut self, c: &crate::ast::CopyStmt) -> SqlResult<u64> {
+        let Some(table_name) = &c.table else {
+            return Err(SqlError::syntax("COPY FROM needs a table".into()));
+        };
+        let table = self.session.engine.table(table_name)?;
+        let columns: Vec<String> = if c.columns.is_empty() {
+            table.columns.iter().map(|col| col.name.clone()).collect()
+        } else {
+            c.columns.clone()
+        };
+        let oids: Vec<u32> = columns
+            .iter()
+            .map(|n| {
+                table
+                    .column(n)
+                    .map(|i| system::type_oid(&table.columns[i].ty))
+            })
+            .collect::<SqlResult<_>>()?;
+        let mut head = Msg::new(b'G').u8(1).i16(columns.len() as i16);
+        for _ in &columns {
+            head = head.i16(1);
+        }
+        self.send(head).map_err(io_err)?;
+        self.w.flush().map_err(io_err)?;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut header_done = false;
+        let mut trailer = false;
+        let mut batch: Vec<Vec<Datum>> = Vec::new();
+        let mut count = 0u64;
+        let mut failure: Option<SqlError> = None;
+        loop {
+            let mut tag = [0u8; 1];
+            self.r.read_exact(&mut tag).map_err(io_err)?;
+            let len = read_i32(&mut self.r).map_err(io_err)? as usize;
+            if !(4..=MAX_MESSAGE).contains(&len) {
+                return Err(SqlError::new("08P01", "bad message length during COPY"));
+            }
+            let mut body = vec![0u8; len - 4];
+            self.r.read_exact(&mut body).map_err(io_err)?;
+            let eof = match tag[0] {
+                b'd' => {
+                    if failure.is_none() && !trailer {
+                        buf.extend_from_slice(&body);
+                    }
+                    false
+                }
+                b'c' => true,
+                b'f' => {
+                    let why = String::from_utf8_lossy(body.strip_suffix(&[0]).unwrap_or(&body))
+                        .into_owned();
+                    return Err(failure.unwrap_or_else(|| {
+                        SqlError::new("57014", format!("COPY from stdin failed: {why}"))
+                    }));
+                }
+                b'H' | b'S' => false,
+                other => {
+                    return Err(SqlError::new(
+                        "08P01",
+                        format!("unexpected message '{}' during COPY", other as char),
+                    ));
+                }
+            };
+            if failure.is_none() {
+                let r = (|| -> SqlResult<()> {
+                    if !header_done {
+                        if buf.len() < 19 {
+                            return if eof {
+                                Err(SqlError::new("22P04", "COPY binary header is missing"))
+                            } else {
+                                Ok(())
+                            };
+                        }
+                        if buf[..11] != COPY_SIGNATURE[..] {
+                            return Err(SqlError::new(
+                                "22P04",
+                                "COPY file signature not recognized",
+                            ));
+                        }
+                        let ext = u32::from_be_bytes([buf[15], buf[16], buf[17], buf[18]]) as usize;
+                        if buf.len() < 19 + ext {
+                            return Ok(());
+                        }
+                        buf.drain(..19 + ext);
+                        header_done = true;
+                    }
+                    let mut pos = 0;
+                    while !trailer {
+                        match binary_tuple(&buf[pos..], oids.len())? {
+                            None => break,
+                            Some((used, None)) => {
+                                pos += used;
+                                trailer = true;
+                            }
+                            Some((used, Some(fields))) => {
+                                let mut row = Vec::with_capacity(fields.len());
+                                for (f, oid) in fields.into_iter().zip(&oids) {
+                                    row.push(match f {
+                                        None => Datum::Null,
+                                        Some((s, e)) => {
+                                            decode_binary(*oid, &buf[pos + s..pos + e])?
+                                        }
+                                    });
+                                }
+                                pos += used;
+                                batch.push(row);
+                                if batch.len() >= COPY_BATCH {
+                                    count += self.copy_insert_values(
+                                        table_name,
+                                        &columns,
+                                        std::mem::take(&mut batch),
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                    buf.drain(..pos);
+                    if eof {
+                        if !buf.is_empty() && !trailer {
+                            return Err(SqlError::new(
+                                "22P04",
+                                "COPY binary data ends inside a row",
+                            ));
+                        }
+                        if !batch.is_empty() {
+                            count += self.copy_insert_values(
+                                table_name,
+                                &columns,
+                                std::mem::take(&mut batch),
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = r {
+                    failure = Some(e);
+                    buf.clear();
+                }
+            }
+            if eof {
+                return match failure {
+                    Some(e) => Err(e),
+                    None => Ok(count),
+                };
+            }
+        }
+    }
+
+    /// Inserts decoded rows as bound parameters.
+    fn copy_insert_values(
+        &mut self,
+        table: &str,
+        columns: &[String],
+        rows: Vec<Vec<Datum>>,
+    ) -> SqlResult<u64> {
+        let width = columns.len();
+        let exprs: Vec<Vec<Expr>> = (0..rows.len())
+            .map(|r| (0..width).map(|c| Expr::Param(r * width + c)).collect())
+            .collect();
+        let params: Vec<Datum> = rows.into_iter().flatten().collect();
+        let n = exprs.len() as u64;
+        let ins = crate::ast::Insert {
+            table: table.to_owned(),
+            alias: None,
+            columns: columns.to_vec(),
+            source: InsertSource::Values(exprs),
+            on_conflict: None,
+            returning: Vec::new(),
+            ignore: false,
+            replace: false,
+        };
+        self.session
+            .execute(&Statement::Insert(Box::new(ins)), &params)?;
+        Ok(n)
+    }
+
+    fn copy_in(&mut self, c: &crate::ast::CopyStmt, fmt: crate::copy::Format) -> SqlResult<u64> {
+        let Some(table_name) = &c.table else {
+            return Err(SqlError::syntax("COPY FROM needs a table".into()));
+        };
+        let table = self.session.engine.table(table_name)?;
+        let columns: Vec<String> = if c.columns.is_empty() {
+            table.columns.iter().map(|col| col.name.clone()).collect()
+        } else {
+            c.columns.clone()
+        };
+        for n in &columns {
+            table.column(n)?;
+        }
+        let mut head = Msg::new(b'G').u8(0).i16(columns.len() as i16);
+        for _ in &columns {
+            head = head.i16(0);
+        }
+        self.send(head).map_err(io_err)?;
+        self.w.flush().map_err(io_err)?;
+        let mut reader = crate::copy::Reader::new(fmt);
+        let mut batch: Vec<Vec<Expr>> = Vec::new();
+        let mut count = 0u64;
+        let mut failure: Option<SqlError> = None;
+        // Read until CopyDone / CopyFail; after an error keep draining the client's data.
+        loop {
+            let mut tag = [0u8; 1];
+            self.r.read_exact(&mut tag).map_err(io_err)?;
+            let len = read_i32(&mut self.r).map_err(io_err)? as usize;
+            if !(4..=MAX_MESSAGE).contains(&len) {
+                return Err(SqlError::new("08P01", "bad message length during COPY"));
+            }
+            let mut body = vec![0u8; len - 4];
+            self.r.read_exact(&mut body).map_err(io_err)?;
+            let eof = match tag[0] {
+                b'd' => {
+                    reader.feed(&body);
+                    false
+                }
+                b'c' => true,
+                b'f' => {
+                    let why = String::from_utf8_lossy(body.strip_suffix(&[0]).unwrap_or(&body))
+                        .into_owned();
+                    return Err(failure.unwrap_or_else(|| {
+                        SqlError::new("57014", format!("COPY from stdin failed: {why}"))
+                    }));
+                }
+                b'H' | b'S' => false,
+                other => {
+                    return Err(SqlError::new(
+                        "08P01",
+                        format!("unexpected message '{}' during COPY", other as char),
+                    ));
+                }
+            };
+            if failure.is_none() {
+                let r = (|| -> SqlResult<()> {
+                    while let Some(rec) = reader.next_record(eof)? {
+                        if rec.len() != columns.len() {
+                            return Err(SqlError::new(
+                                "22P04",
+                                format!(
+                                    "COPY row {} has {} columns, expected {}",
+                                    count + batch.len() as u64 + 1,
+                                    rec.len(),
+                                    columns.len()
+                                ),
+                            ));
+                        }
+                        batch.push(
+                            rec.into_iter()
+                                .map(|f| f.map_or(Expr::Null, Expr::Str))
+                                .collect(),
+                        );
+                        if batch.len() >= COPY_BATCH {
+                            count +=
+                                self.copy_insert(table_name, &columns, std::mem::take(&mut batch))?;
+                        }
+                    }
+                    if eof && !batch.is_empty() {
+                        count +=
+                            self.copy_insert(table_name, &columns, std::mem::take(&mut batch))?;
+                    }
+                    Ok(())
+                })();
+                if let Err(e) = r {
+                    failure = Some(e);
+                }
+            }
+            if eof {
+                return match failure {
+                    Some(e) => Err(e),
+                    None => Ok(count),
+                };
+            }
+        }
+    }
+
+    /// Inserts one batch of `COPY` rows (an implicit transaction each, outside BEGIN).
+    fn copy_insert(
+        &mut self,
+        table: &str,
+        columns: &[String],
+        rows: Vec<Vec<Expr>>,
+    ) -> SqlResult<u64> {
+        let n = rows.len() as u64;
+        let ins = crate::ast::Insert {
+            table: table.to_owned(),
+            alias: None,
+            columns: columns.to_vec(),
+            source: InsertSource::Values(rows),
+            on_conflict: None,
+            returning: Vec::new(),
+            ignore: false,
+            replace: false,
+        };
+        self.session
+            .execute(&Statement::Insert(Box::new(ins)), &[])?;
+        Ok(n)
     }
 
     fn parse_msg(&mut self, body: &[u8]) -> SqlResult<()> {
@@ -767,6 +1191,58 @@ fn row_description(cols: &[OutCol], formats: &[i16]) -> Msg {
     }
     m
 }
+
+/// Binary `COPY` signature.
+const COPY_SIGNATURE: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
+
+/// One binary `COPY` tuple at the start of `b`: `(bytes used, field ranges)`, `(used, None)` for
+/// the trailer, `None` when incomplete.
+#[allow(clippy::type_complexity)]
+fn binary_tuple(
+    b: &[u8],
+    width: usize,
+) -> SqlResult<Option<(usize, Option<Vec<Option<(usize, usize)>>>)>> {
+    if b.len() < 2 {
+        return Ok(None);
+    }
+    let n = i16::from_be_bytes([b[0], b[1]]);
+    if n == -1 {
+        return Ok(Some((2, None)));
+    }
+    if n < 0 || n as usize != width {
+        return Err(SqlError::new(
+            "22P04",
+            format!("COPY row has {n} fields, expected {width}"),
+        ));
+    }
+    let mut pos = 2;
+    let mut fields = Vec::with_capacity(width);
+    for _ in 0..width {
+        if b.len() < pos + 4 {
+            return Ok(None);
+        }
+        let len = i32::from_be_bytes([b[pos], b[pos + 1], b[pos + 2], b[pos + 3]]);
+        pos += 4;
+        if len == -1 {
+            fields.push(None);
+            continue;
+        }
+        let len = usize::try_from(len)
+            .map_err(|_| SqlError::new("22P04", "invalid COPY field length"))?;
+        if len > MAX_MESSAGE {
+            return Err(SqlError::new("22P04", "COPY field is too long"));
+        }
+        if b.len() < pos + len {
+            return Ok(None);
+        }
+        fields.push(Some((pos, pos + len)));
+        pos += len;
+    }
+    Ok(Some((pos, Some(fields))))
+}
+
+/// Rows per INSERT while loading `COPY` data.
+const COPY_BATCH: usize = 5000;
 
 fn data_row(cols: &[OutCol], row: &[Datum], formats: &[i16]) -> Msg {
     let mut m = Msg::new(b'D').i16(row.len() as i16);

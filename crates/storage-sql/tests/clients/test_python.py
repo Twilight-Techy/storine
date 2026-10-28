@@ -117,6 +117,20 @@ def run_all():
             assert len(rows) == 3
             row = c.execute("SELECT count(*) FROM p3_t WHERE note LIKE %s", ("n%",)).fetchone()
             assert row == (5,), row
+            # COPY in both directions (text format), including NULLs and escapes.
+            with c.cursor() as cur:
+                with cur.copy("COPY p3_t (id, amount, note) FROM STDIN") as cp:
+                    for i in range(100, 110):
+                        cp.write_row((i, D("0.0001") * i, None if i % 2 else f"tab\there {i}"))
+                with cur.copy("COPY (SELECT id, note FROM p3_t WHERE id >= 100 ORDER BY id) TO STDOUT") as cp:
+                    out = list(cp.rows())
+            c.commit()
+            assert out[0] == ("100", "tab\there 100") and out[1] == ("101", None), out[:2]
+            assert c.execute("SELECT sum(amount) FROM p3_t WHERE id >= 100").fetchone() == (D("0.1045"),)
+            with c.cursor() as cur:
+                with cur.copy("COPY (SELECT id, amount FROM p3_t WHERE id IN (100, 101) ORDER BY id) TO STDOUT (FORMAT BINARY)") as cp:
+                    cp.set_types(["int8", "numeric"])
+                    assert list(cp.rows()) == [(100, D("0.0100")), (101, D("0.0101"))]
 
     import asyncpg
 
@@ -140,6 +154,13 @@ def run_all():
             except RuntimeError:
                 pass
             assert await c.fetchval("SELECT score FROM ap_t WHERE id = 1") == D("1.75")
+            # Bulk load through binary COPY.
+            n = await c.copy_records_to_table(
+                "ap_t", records=[(10 + i, f"bulk{i}", D("0.10"), i % 2 == 0, dt.date(2001, 1, 1 + i)) for i in range(20)],
+                columns=["id", "name", "score", "active", "born"])
+            assert n == "COPY 20", n
+            assert await c.fetchval("SELECT sum(score) FROM ap_t WHERE name LIKE 'bulk%'") == D("2.00")
+            assert await c.fetchval("SELECT born FROM ap_t WHERE id = 12") == dt.date(2001, 1, 3)
             await c.close()
         asyncio.run(main())
 

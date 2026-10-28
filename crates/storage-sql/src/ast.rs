@@ -56,6 +56,20 @@ pub enum Statement {
     Explain(Box<Statement>),
     /// `CREATE SCHEMA` (accepted, there is one schema per database) or, with `database`,
     /// `CREATE DATABASE` (MySQL's `CREATE SCHEMA` is a database too).
+    /// `CREATE [OR REPLACE] VIEW name [(columns)] AS query`; `sql` is the query's text.
+    CreateView {
+        name: String,
+        columns: Vec<String>,
+        sql: String,
+        or_replace: bool,
+        if_not_exists: bool,
+    },
+    DropView {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    /// PostgreSQL `COPY` (served by the PostgreSQL protocol's copy sub-protocol).
+    Copy(Box<CopyStmt>),
     CreateSchema {
         name: String,
         if_not_exists: bool,
@@ -102,6 +116,8 @@ pub enum Show {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
+    /// `WITH RECURSIVE`: CTEs may reference themselves.
+    pub recursive: bool,
     pub ctes: Vec<Cte>,
     pub body: SetExpr,
     pub order_by: Vec<OrderBy>,
@@ -146,6 +162,8 @@ pub enum SetOp {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Select {
     pub distinct: bool,
+    /// PostgreSQL `DISTINCT ON (exprs)`: the first row (in ORDER BY order) of each key.
+    pub distinct_on: Vec<Expr>,
     pub items: Vec<SelectItem>,
     pub from: Vec<TableRef>,
     pub where_: Option<Expr>,
@@ -600,4 +618,23 @@ impl Expr {
             _ => None,
         }
     }
+}
+
+/// `COPY table [(columns)] FROM STDIN` / `COPY {table | (query)} TO STDOUT`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopyStmt {
+    pub table: Option<String>,
+    pub columns: Vec<String>,
+    pub query: Option<Box<Query>>,
+    /// `FROM` (load) or `TO` (unload).
+    pub from: bool,
+    /// `STDIN` / `STDOUT`; false for a server-side file or program (not supported).
+    pub stdio: bool,
+    pub csv: bool,
+    pub binary: bool,
+    pub header: bool,
+    pub delimiter: Option<char>,
+    pub null: Option<String>,
+    pub quote: Option<char>,
+    pub escape: Option<char>,
 }

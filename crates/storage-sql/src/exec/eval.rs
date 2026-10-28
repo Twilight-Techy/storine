@@ -13,6 +13,9 @@ use crate::exec::{func, now_ns, OutCol, ResultSet, Session};
 use crate::lexer::Dialect;
 
 /// Read-side execution context of one statement.
+/// A parsed view: its query and declared column names.
+pub(crate) type ViewDef = (crate::ast::Query, Vec<String>);
+
 #[derive(Debug)]
 pub struct Exec<'a> {
     pub s: &'a Session,
@@ -25,6 +28,10 @@ pub struct Exec<'a> {
     subquery_cache: RefCell<HashMap<usize, Rc<Rel>>>,
     /// Subqueries known to be correlated (re-run per row).
     correlated: RefCell<std::collections::HashSet<usize>>,
+    /// Parsed view definitions used by this statement (kept alive: the subquery cache is keyed
+    /// by node address) and the current view nesting depth.
+    pub(crate) views: RefCell<HashMap<String, Rc<ViewDef>>>,
+    pub(crate) view_depth: std::cell::Cell<u32>,
 }
 
 /// The row an expression is evaluated against, with its enclosing rows (correlated subqueries).
@@ -175,6 +182,8 @@ impl<'a> Exec<'a> {
             ctes: RefCell::new(Vec::new()),
             subquery_cache: RefCell::new(HashMap::new()),
             correlated: RefCell::new(Default::default()),
+            views: RefCell::new(HashMap::new()),
+            view_depth: std::cell::Cell::new(0),
         }
     }
 

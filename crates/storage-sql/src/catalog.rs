@@ -30,6 +30,8 @@ pub const LOCKS: &str = "_sql_locks";
 /// concurrent parent delete that scanned before the child committed fails instead of
 /// leaving an orphan.
 pub const REFS: &str = "_sql_refs";
+/// View definitions: `{name, sql, dialect, columns}` keyed by the lower-case name.
+pub const VIEWS: &str = "_sql_views";
 
 /// Collections the gateway keeps for itself (hidden from table listings).
 pub fn is_internal(collection: &str) -> bool {
