@@ -22,6 +22,12 @@
 >
 > Alright! Let's go.
 
+## Follow-Up Prompt 4: Remaining SDKs (Recorded Verbatim)
+
+> Build the SDKs for the languages you marked as to do accordig to the rulres we set when you're done with everything. I hope the SDKs all look similar. Please answer and then carry on.
+
+- **Decision**: PHP (`sdks/php`) and Ruby (`sdks/ruby`) are built after the SQL adapter work is finished, under the same `RULE-DX-*` rules as the other six: standard library only, the shared `protocol/vectors` conformance suite, the same end-to-end suite (including the 3-node failover test), and the same API surface (operation names, `storine://` connection strings, error kinds, exact decimals, transaction shape), adapted only to each language's casing and idioms.
+
 ### Agreed Decisions (from the answer to Follow-Up Prompt 2, approved in Follow-Up Prompt 3)
 
 - **Repository layout**: everything stays in this repository.
