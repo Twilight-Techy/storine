@@ -1,0 +1,25 @@
+[package]
+name = "storage-sql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "SQL gateway for Storine: PostgreSQL and MySQL wire protocols over the document API"
+
+[lib]
+name = "storage_sql"
+path = "src/lib.rs"
+
+[[bin]]
+name = "storine-sql"
+path = "src/main.rs"
+
+[dependencies]
+storine = { path = "../../sdks/rust" }
+storage-types = { path = "../storage-types" }
+storage-core = { path = "../storage-core" }
+storage-server = { path = "../storage-server" }
+
+[lints]
+workspace = true

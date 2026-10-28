@@ -10,8 +10,11 @@ members = [
     "crates/storage-core",
     "crates/storage-cli",
     "crates/storage-server",
+    "crates/storage-sql",
     "benches",
 ]
+# Client SDKs are standalone projects (the Rust one has its own workspace).
+exclude = ["sdks"]
 
 [workspace.package]
 version = "0.1.0"
