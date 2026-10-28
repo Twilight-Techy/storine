@@ -886,22 +886,24 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 ("datctype", T),
                 ("datacl", T),
             ]);
-            bd.row(vec![
-                i(16_384),
-                t(&ex.s.database),
-                i(10),
-                i(6),
-                t("c"),
-                b(false),
-                b(true),
-                i(-1),
-                i(0),
-                i(1),
-                i(1663),
-                t("C"),
-                t("C"),
-                N,
-            ]);
+            for (k, name) in database_list(ex.s)?.iter().enumerate() {
+                bd.row(vec![
+                    i(16_384 + k as i64),
+                    t(name),
+                    i(10),
+                    i(6),
+                    t("c"),
+                    b(false),
+                    b(true),
+                    i(-1),
+                    i(0),
+                    i(1),
+                    i(1663),
+                    t("C"),
+                    t("C"),
+                    N,
+                ]);
+            }
             bd.done()
         }
         "pg_roles" | "pg_user" | "pg_authid" | "pg_shadow" => {
@@ -1427,13 +1429,15 @@ fn information_schema(
                 ("default_collation_name", T),
             ]);
             if mysql {
-                bd.row(vec![
-                    t("def"),
-                    t(&db),
-                    N,
-                    t("utf8mb4"),
-                    t("utf8mb4_0900_ai_ci"),
-                ]);
+                for name in database_list(ex.s)? {
+                    bd.row(vec![
+                        t("def"),
+                        t(&name),
+                        N,
+                        t("utf8mb4"),
+                        t("utf8mb4_0900_ai_ci"),
+                    ]);
+                }
                 bd.row(vec![
                     t("def"),
                     t("information_schema"),
@@ -2449,10 +2453,11 @@ pub fn show(s: &mut Session, what: &Show) -> SqlResult<Outcome> {
                 rows,
             )
         }
-        Show::Databases => text_rs(
-            &["Database"],
-            vec![vec![t("information_schema")], vec![t(&db)]],
-        ),
+        Show::Databases => {
+            let mut rows = vec![vec![t("information_schema")]];
+            rows.extend(database_list(s)?.iter().map(|n| vec![t(n)]));
+            text_rs(&["Database"], rows)
+        }
         Show::CreateTable(name) => {
             let tb = s.engine.table(name)?;
             text_rs(
@@ -2601,4 +2606,14 @@ pub fn show(s: &mut Session, what: &Show) -> SqlResult<Outcome> {
             )
         }
     })
+}
+
+/// Databases to list: the default one, every created one, and the name this session
+/// connected with (names never created are served by the default database).
+fn database_list(s: &crate::exec::Session) -> SqlResult<Vec<String>> {
+    let mut names = s.engine.database_names()?;
+    if !names.iter().any(|n| n.eq_ignore_ascii_case(&s.database)) {
+        names.push(s.database.clone());
+    }
+    Ok(names)
 }

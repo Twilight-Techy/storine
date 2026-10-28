@@ -55,23 +55,145 @@ impl Default for EngineConfig {
     }
 }
 
-/// State shared by every session of a gateway.
+/// State shared by every session of one database of a gateway.
 #[derive(Debug)]
 pub struct Engine {
     pub store: Store,
     pub catalog: Catalog,
     pub config: EngineConfig,
-    next_session: AtomicU64,
+    next_session: Arc<AtomicU64>,
+    databases: Arc<Databases>,
+}
+
+/// The databases of a gateway: the default one (`EngineConfig::database`) and those made by
+/// `CREATE DATABASE`, each in its own collection namespace. Names never created share the
+/// default database, so clients that connect with any database name keep working.
+#[derive(Debug)]
+struct Databases {
+    root: Store,
+    default_name: String,
+    default: std::sync::Weak<Engine>,
+    open: std::sync::Mutex<HashMap<String, std::sync::Weak<Engine>>>,
+}
+
+/// Registry of created databases (in the default namespace).
+const DATABASES: &str = "_sql_databases";
+
+/// Collection namespace of a created database.
+fn database_prefix(key: &str) -> String {
+    let clean: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(32)
+        .collect();
+    if clean == key {
+        format!("{}{clean}.", crate::store::DATABASE_PREFIX)
+    } else {
+        let h = crate::hash::hex(&crate::hash::sha256(key.as_bytes()));
+        format!("{}{clean}_{}.", crate::store::DATABASE_PREFIX, &h[..8])
+    }
 }
 
 impl Engine {
+    /// The gateway's default database over `store`.
     pub fn new(store: Store, config: EngineConfig) -> Arc<Engine> {
-        Arc::new(Engine {
+        Arc::new_cyclic(|me| Engine {
+            databases: Arc::new(Databases {
+                root: store.namespaced(""),
+                default_name: config.database.clone(),
+                default: me.clone(),
+                open: std::sync::Mutex::new(HashMap::new()),
+            }),
             store,
             catalog: Catalog::default(),
             config,
-            next_session: AtomicU64::new(1),
+            next_session: Arc::new(AtomicU64::new(1)),
         })
+    }
+
+    fn default_engine(&self) -> SqlResult<Arc<Engine>> {
+        self.databases
+            .default
+            .upgrade()
+            .ok_or_else(|| SqlError::new("57P01", "the gateway is shutting down"))
+    }
+
+    fn is_default_name(&self, name: &str) -> bool {
+        name.is_empty() || name.eq_ignore_ascii_case(&self.databases.default_name)
+    }
+
+    fn is_created(&self, name: &str) -> SqlResult<bool> {
+        Ok(self
+            .databases
+            .root
+            .get(DATABASES, &name.to_lowercase())?
+            .is_some())
+    }
+
+    /// The engine serving database `name` (the default one for names never created).
+    pub fn database(&self, name: &str) -> SqlResult<Arc<Engine>> {
+        if self.is_default_name(name) || !self.is_created(name)? {
+            return self.default_engine();
+        }
+        let key = name.to_lowercase();
+        let mut open = self
+            .databases
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(e) = open.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Ok(e);
+        }
+        let e = Arc::new(Engine {
+            store: self.databases.root.namespaced(&database_prefix(&key)),
+            catalog: Catalog::default(),
+            config: EngineConfig {
+                database: name.to_owned(),
+                ..self.config.clone()
+            },
+            next_session: Arc::clone(&self.next_session),
+            databases: Arc::clone(&self.databases),
+        });
+        open.insert(key, Arc::downgrade(&e));
+        Ok(e)
+    }
+
+    /// The default database and every created one.
+    pub fn database_names(&self) -> SqlResult<Vec<String>> {
+        let mut names = vec![self.databases.default_name.clone()];
+        for d in self.databases.root.scan(DATABASES, None)? {
+            if let Some(n) = d.fields.get("name").and_then(storine::Value::as_str) {
+                names.push(n.to_owned());
+            }
+        }
+        Ok(names)
+    }
+
+    /// `CREATE DATABASE`; false when it already existed.
+    pub fn create_database(&self, name: &str) -> SqlResult<bool> {
+        if self.is_default_name(name) {
+            return Ok(false);
+        }
+        let mut doc = Doc::new();
+        doc.insert("name".into(), storine::Value::Text(name.to_owned()));
+        let w = Write {
+            collection: DATABASES.into(),
+            key: name.to_lowercase(),
+            op: Op::Put(doc),
+            pre: Pre::Absent,
+            tag: Tag::Internal,
+        };
+        match self.databases.root.commit(std::slice::from_ref(&w)) {
+            Ok(_) => Ok(true),
+            Err(crate::store::CommitError::Condition { .. }) => Ok(false),
+            Err(e) => Err(e.to_sql(std::slice::from_ref(&w))),
+        }
     }
 
     /// Re-reads every table schema when the cache is stale.
@@ -114,8 +236,12 @@ impl Engine {
         database: Option<&str>,
     ) -> Session {
         let id = self.next_session.fetch_add(1, Ordering::Relaxed);
+        let engine = match database.filter(|d| !d.is_empty()) {
+            Some(d) => self.database(d).unwrap_or_else(|_| Arc::clone(self)),
+            None => Arc::clone(self),
+        };
         Session {
-            engine: Arc::clone(self),
+            engine,
             dialect,
             user: user.to_owned(),
             database: database
@@ -433,6 +559,85 @@ impl Session {
         self.txn.as_ref().is_some_and(|t| t.explicit)
     }
 
+    /// `USE db` / MySQL `COM_INIT_DB`: later statements run in database `name`.
+    pub fn use_database(&mut self, name: &str) -> SqlResult<()> {
+        let engine = self.engine.database(name)?;
+        if !Arc::ptr_eq(&engine, &self.engine) && self.in_transaction() {
+            return Err(SqlError::new(
+                "25001",
+                "cannot switch databases inside a transaction",
+            ));
+        }
+        self.engine = engine;
+        self.database = name.to_owned();
+        Ok(())
+    }
+
+    /// `DROP DATABASE`: drops every table and sequence of the database. A created database
+    /// is also unregistered; the default one stays (empty).
+    fn drop_database(&mut self, name: &str, if_exists: bool) -> SqlResult<Outcome> {
+        let default = self.engine.is_default_name(name);
+        if !default && !self.engine.is_created(name)? {
+            if if_exists {
+                return Ok(Outcome::command("DROP DATABASE"));
+            }
+            return Err(SqlError::new(
+                "3D000",
+                format!("database \"{name}\" does not exist"),
+            ));
+        }
+        if self.in_transaction() {
+            return Err(SqlError::new(
+                "25001",
+                "DROP DATABASE cannot run inside a transaction block",
+            ));
+        }
+        let target = self.engine.database(name)?;
+        let mut s = target.new_session(self.dialect, &self.user, None);
+        target.refresh_catalog(true)?;
+        let names: Vec<String> = target
+            .catalog
+            .all()
+            .iter()
+            .map(|t| t.name.clone())
+            .collect();
+        if !names.is_empty() {
+            ddl::drop_tables(&mut s, &names, true, true)?;
+        }
+        for c in [
+            crate::catalog::SEQUENCES,
+            crate::catalog::LOCKS,
+            crate::catalog::UNIQUE,
+        ] {
+            let _ = target.store.drop_collection(c);
+        }
+        if !default {
+            let _ = target.store.drop_collection(TABLES);
+            let key = name.to_lowercase();
+            let w = Write {
+                collection: DATABASES.into(),
+                key: key.clone(),
+                op: Op::Delete,
+                pre: Pre::None,
+                tag: Tag::Internal,
+            };
+            let root = &self.engine.databases.root;
+            root.commit(std::slice::from_ref(&w))
+                .map_err(|e| e.to_sql(std::slice::from_ref(&w)))?;
+            self.engine
+                .databases
+                .open
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&key);
+            if Arc::ptr_eq(&self.engine, &target) {
+                self.engine = self.engine.default_engine()?;
+            }
+        }
+        target.catalog.invalidate();
+        Ok(Outcome::command("DROP DATABASE"))
+    }
+
     /// False after MySQL `SET autocommit = 0`.
     pub fn autocommit(&self) -> bool {
         !self.vars.get("autocommit").is_some_and(|v| {
@@ -725,7 +930,7 @@ impl Session {
             Statement::Set { name, value } => self.set_var(name, value.as_ref(), params),
             Statement::Show(s) => system::show(self, s),
             Statement::Use(db) => {
-                self.database = db.clone();
+                self.use_database(db)?;
                 Ok(Outcome::command("USE"))
             }
             Statement::Explain(inner) => {
@@ -739,14 +944,30 @@ impl Session {
                     rows: vec![vec![Datum::Text(text)]],
                 }))
             }
-            Statement::CreateSchema { .. } => {
-                Ok(Outcome::command(if self.dialect == Dialect::MySql {
-                    "CREATE DATABASE"
-                } else {
-                    "CREATE SCHEMA"
-                }))
+            Statement::CreateSchema {
+                database: false, ..
+            } => Ok(Outcome::command("CREATE SCHEMA")),
+            Statement::CreateSchema {
+                name,
+                if_not_exists,
+                database: true,
+            } => {
+                if !self.engine.create_database(name)? && !if_not_exists {
+                    return Err(SqlError::new(
+                        "42P04",
+                        format!("database \"{name}\" already exists"),
+                    ));
+                }
+                Ok(Outcome::command("CREATE DATABASE"))
             }
-            Statement::DropSchema { .. } => Ok(Outcome::command("DROP SCHEMA")),
+            Statement::DropSchema {
+                database: false, ..
+            } => Ok(Outcome::command("DROP SCHEMA")),
+            Statement::DropSchema {
+                name,
+                if_exists,
+                database: true,
+            } => self.drop_database(name, *if_exists),
             Statement::Prepare { name, statement } => {
                 self.prepared
                     .insert(name.to_ascii_lowercase(), ((**statement).clone(), 0));

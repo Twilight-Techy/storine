@@ -48,16 +48,20 @@ pub enum Statement {
         value: Option<Expr>,
     },
     Show(Show),
-    /// `USE db` / `\c` style database switch (accepted; there is one database).
+    /// `USE db`: switches the session to another database.
     Use(String),
     Explain(Box<Statement>),
+    /// `CREATE SCHEMA` (accepted, there is one schema per database) or, with `database`,
+    /// `CREATE DATABASE` (MySQL's `CREATE SCHEMA` is a database too).
     CreateSchema {
         name: String,
         if_not_exists: bool,
+        database: bool,
     },
     DropSchema {
         name: String,
         if_exists: bool,
+        database: bool,
     },
     /// SQL-level `PREPARE name AS stmt` / `EXECUTE name(args)` / `DEALLOCATE name`.
     Prepare {

@@ -127,4 +127,16 @@ assert Order.objects.count() == 3
 
 a.delete()
 assert Order.objects.count() == 1
+
+# Django's test runner: CREATE DATABASE test_shop, migrate into it, then drop it. The test
+# database is its own namespace, so the real tables are untouched.
+main_db = connection.settings_dict["NAME"]
+connection.creation.create_test_db(verbosity=0, autoclobber=True, keepdb=False)
+assert connection.settings_dict["NAME"] == "test_shop"
+assert Customer.objects.count() == 0
+Customer.objects.create(email="test@x")
+assert Customer.objects.count() == 1
+connection.creation.destroy_test_db(main_db, verbosity=0)
+assert Customer.objects.filter(email="test@x").count() == 0
+assert Customer.objects.filter(email="b@x").exists()
 print(f"django ({backend}) tests passed")

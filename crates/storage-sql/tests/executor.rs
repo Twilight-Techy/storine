@@ -450,3 +450,70 @@ fn window_functions_and_sequences() {
     );
     assert_eq!(one(&mut s, "SELECT nextval('tickets_id_seq')"), "43");
 }
+
+#[test]
+fn databases_are_separate_namespaces() {
+    let db = setup("databases");
+    let mut main = db
+        .engine
+        .new_session(Dialect::Postgres, "app", Some("shop"));
+    ok(
+        &mut main,
+        "CREATE TABLE notes (id SERIAL PRIMARY KEY, body TEXT)",
+    );
+    ok(&mut main, "INSERT INTO notes (body) VALUES ('main')");
+    ok(&mut main, "CREATE DATABASE test_shop");
+    assert_eq!(err(&mut main, "CREATE DATABASE test_shop"), "42P04");
+    ok(&mut main, "CREATE DATABASE IF NOT EXISTS test_shop");
+
+    // A session on the new database sees none of the default database's tables.
+    let mut t = db
+        .engine
+        .new_session(Dialect::Postgres, "app", Some("test_shop"));
+    assert_eq!(one(&mut t, "SELECT current_database()"), "test_shop");
+    assert_eq!(err(&mut t, "SELECT * FROM notes"), "42P01");
+    ok(
+        &mut t,
+        "CREATE TABLE notes (id SERIAL PRIMARY KEY, body TEXT UNIQUE)",
+    );
+    ok(
+        &mut t,
+        "INSERT INTO notes (body) VALUES ('test'), ('test2')",
+    );
+    assert_eq!(one(&mut t, "SELECT max(id) FROM notes"), "2");
+    assert_eq!(
+        rows(&mut main, "SELECT id, body FROM notes"),
+        vec![vec!["1", "main"]]
+    );
+    // Sequences are per database too.
+    ok(&mut main, "INSERT INTO notes (body) VALUES ('main2')");
+    assert_eq!(one(&mut main, "SELECT max(id) FROM notes"), "2");
+
+    // MySQL USE switches namespaces; listings show every database.
+    let mut m = db.engine.new_session(Dialect::MySql, "root", Some("shop"));
+    ok(&mut m, "USE test_shop");
+    assert_eq!(one(&mut m, "SELECT count(*) FROM notes"), "2");
+    ok(&mut m, "USE shop");
+    assert_eq!(one(&mut m, "SELECT count(*) FROM notes"), "2");
+    let dbs = rows(&mut m, "SHOW DATABASES");
+    assert!(
+        dbs.iter().any(|r| r[0] == "test_shop") && dbs.iter().any(|r| r[0] == "shop"),
+        "{dbs:?}"
+    );
+    let pg_dbs = rows(&mut main, "SELECT datname FROM pg_database ORDER BY 1");
+    assert!(pg_dbs.contains(&vec!["test_shop".to_owned()]), "{pg_dbs:?}");
+
+    // DROP DATABASE removes it and its tables; the name then falls back to the default.
+    ok(&mut main, "DROP DATABASE test_shop");
+    assert_eq!(err(&mut main, "DROP DATABASE test_shop"), "3D000");
+    ok(&mut main, "DROP DATABASE IF EXISTS test_shop");
+    let mut again = db
+        .engine
+        .new_session(Dialect::Postgres, "app", Some("test_shop"));
+    assert_eq!(one(&mut again, "SELECT count(*) FROM notes"), "2");
+    ok(&mut main, "CREATE DATABASE test_shop");
+    let mut fresh = db
+        .engine
+        .new_session(Dialect::Postgres, "app", Some("test_shop"));
+    assert_eq!(err(&mut fresh, "SELECT * FROM notes"), "42P01");
+}

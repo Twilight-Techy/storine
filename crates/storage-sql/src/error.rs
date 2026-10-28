@@ -137,6 +137,7 @@ impl SqlError {
             "0A000" => 1235, // ER_NOT_SUPPORTED_YET
             "25P02" => 1180,
             "3D000" => 1049, // ER_BAD_DB_ERROR
+            "42P04" => 1007, // ER_DB_CREATE_EXISTS
             _ => 1105,       // ER_UNKNOWN_ERROR
         }
     }

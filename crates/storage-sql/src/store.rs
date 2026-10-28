@@ -1,5 +1,6 @@
 //! Storage access through the Storine client: reads, scans and atomic tagged write batches.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use storine::{Client, Doc, Document, Error as StoreError, FieldOp, Filter, Query};
@@ -91,15 +92,36 @@ impl CommitError {
     }
 }
 
-/// The storage connection shared by every SQL session.
-#[derive(Debug)]
+/// The storage connection shared by every SQL session, scoped to one SQL database: every
+/// collection name is prefixed with the database's namespace (empty for the default database).
+#[derive(Debug, Clone)]
 pub struct Store {
-    client: Client,
+    client: Arc<Client>,
+    prefix: String,
 }
+
+/// Collection-name prefix of non-default databases; user tables never map to `_sql_...`.
+pub const DATABASE_PREFIX: &str = "_sql_db_";
 
 impl Store {
     pub fn new(client: Client) -> Store {
-        Store { client }
+        Store {
+            client: Arc::new(client),
+            prefix: String::new(),
+        }
+    }
+
+    /// The same connection scoped to another namespace (`""`: the default database).
+    pub fn namespaced(&self, prefix: &str) -> Store {
+        Store {
+            client: Arc::clone(&self.client),
+            prefix: prefix.to_owned(),
+        }
+    }
+
+    /// The physical collection behind `collection` in this namespace.
+    fn c(&self, collection: &str) -> String {
+        format!("{}{collection}", self.prefix)
     }
 
     /// Connects to `storine://...` (with the client's usual retries and failover).
@@ -111,7 +133,7 @@ impl Store {
                 ..storine::Options::default()
             },
         )?;
-        Ok(Store { client })
+        Ok(Store::new(client))
     }
 
     pub fn client(&self) -> &Client {
@@ -119,13 +141,13 @@ impl Store {
     }
 
     pub fn get(&self, collection: &str, key: &str) -> SqlResult<Option<Document>> {
-        Ok(self.client.collection(collection).get(key)?)
+        Ok(self.client.collection(&self.c(collection)).get(key)?)
     }
 
     /// Every document of `collection` matching `filter`, in key order.
     pub fn scan(&self, collection: &str, filter: Option<Filter>) -> SqlResult<Vec<Document>> {
         let mut out = Vec::new();
-        for d in self.client.collection(collection).scan(filter) {
+        for d in self.client.collection(&self.c(collection)).scan(filter) {
             out.push(d?);
         }
         Ok(out)
@@ -138,7 +160,7 @@ impl Store {
         filter: Option<Filter>,
         mut visit: impl FnMut(Document) -> SqlResult<bool>,
     ) -> SqlResult<()> {
-        for d in self.client.collection(collection).scan(filter) {
+        for d in self.client.collection(&self.c(collection)).scan(filter) {
             if !visit(d?)? {
                 break;
             }
@@ -147,33 +169,48 @@ impl Store {
     }
 
     pub fn find(&self, collection: &str, query: Query) -> SqlResult<Vec<Document>> {
-        Ok(self.client.collection(collection).find(query)?)
+        Ok(self.client.collection(&self.c(collection)).find(query)?)
     }
 
     pub fn count(&self, collection: &str, filter: Option<Filter>) -> SqlResult<u64> {
-        Ok(self.client.collection(collection).count(filter)?)
+        Ok(self.client.collection(&self.c(collection)).count(filter)?)
     }
 
     pub fn create_index(&self, collection: &str, field: &str) -> SqlResult<()> {
-        Ok(self.client.collection(collection).create_index(field)?)
+        Ok(self
+            .client
+            .collection(&self.c(collection))
+            .create_index(field)?)
     }
 
     pub fn drop_index(&self, collection: &str, field: &str) -> SqlResult<()> {
-        Ok(self.client.collection(collection).drop_index(field)?)
+        Ok(self
+            .client
+            .collection(&self.c(collection))
+            .drop_index(field)?)
     }
 
     /// Storage indexes of a collection (ready and building).
     pub fn indexed_fields(&self, collection: &str) -> SqlResult<Vec<String>> {
-        let info = self.client.collection(collection).info()?;
+        let info = self.client.collection(&self.c(collection)).info()?;
         Ok(info.indexes.into_iter().chain(info.building).collect())
     }
 
     pub fn drop_collection(&self, collection: &str) -> SqlResult<u64> {
-        Ok(self.client.collection(collection).drop()?)
+        Ok(self.client.collection(&self.c(collection)).drop()?)
     }
 
     pub fn collections(&self) -> SqlResult<Vec<String>> {
-        Ok(self.client.collections()?)
+        let all = self.client.collections()?;
+        Ok(if self.prefix.is_empty() {
+            all.into_iter()
+                .filter(|c| !c.starts_with(DATABASE_PREFIX))
+                .collect()
+        } else {
+            all.into_iter()
+                .filter_map(|c| c.strip_prefix(&self.prefix).map(str::to_owned))
+                .collect()
+        })
     }
 
     /// Applies `writes` atomically (all or none); returns the new versions.
@@ -183,7 +220,8 @@ impl Store {
         }
         let r = self.client.transaction(|tx| {
             for w in writes {
-                let (c, k) = (w.collection.as_str(), w.key.as_str());
+                let physical = self.c(&w.collection);
+                let (c, k) = (physical.as_str(), w.key.as_str());
                 match (&w.op, w.pre) {
                     (Op::Put(d), Pre::None) => tx.put(c, k, d.clone()),
                     (Op::Put(d), Pre::Absent) => tx.insert(c, k, d.clone()),

@@ -772,13 +772,16 @@ impl Parser {
                 if_not_exists,
             })));
         }
-        if self.eat_kw("schema") || self.eat_kw("database") {
+        if self.is_kw("schema") || self.is_kw("database") {
+            let database = self.eat_kw("database")
+                || (self.eat_kw("schema") && self.dialect == Dialect::MySql);
             let if_not_exists = self.eat_kws(&["if", "not", "exists"]);
             let name = self.ident()?;
             self.skip_to_end();
             return Ok(Statement::CreateSchema {
                 name,
                 if_not_exists,
+                database,
             });
         }
         if self.eat_kw("sequence") {
@@ -1384,11 +1387,17 @@ impl Parser {
                 if_exists,
             });
         }
-        if self.eat_kw("schema") || self.eat_kw("database") {
+        if self.is_kw("schema") || self.is_kw("database") {
+            let database = self.eat_kw("database")
+                || (self.eat_kw("schema") && self.dialect == Dialect::MySql);
             let if_exists = self.eat_kws(&["if", "exists"]);
             let name = self.ident()?;
             self.skip_to_end();
-            return Ok(Statement::DropSchema { name, if_exists });
+            return Ok(Statement::DropSchema {
+                name,
+                if_exists,
+                database,
+            });
         }
         if self.eat_kw("sequence") {
             let if_exists = self.eat_kws(&["if", "exists"]);

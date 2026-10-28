@@ -414,7 +414,10 @@ impl Conn {
         }
         c.session.user = if user.is_empty() { "root".into() } else { user };
         if let Some(db) = database.filter(|d| !d.is_empty()) {
-            c.session.database = db;
+            if let Err(e) = c.session.use_database(&db) {
+                c.err(&e)?;
+                return c.w.flush();
+            }
         }
         c.ok(0, 0, false, "")?;
         c.w.flush()?;
@@ -433,10 +436,10 @@ impl Conn {
             };
             let r = match cmd {
                 0x01 => return Ok(()),
-                0x02 => {
-                    self.session.database = String::from_utf8_lossy(body).into_owned();
-                    self.ok(0, 0, false, "")
-                }
+                0x02 => match self.session.use_database(&String::from_utf8_lossy(body)) {
+                    Ok(()) => self.ok(0, 0, false, ""),
+                    Err(e) => self.err(&e),
+                },
                 0x03 => self.query(body),
                 0x04 => self.eof(false),
                 0x09 => self.write_packet(b"Uptime: 1  Threads: 1  Questions: 0"),
