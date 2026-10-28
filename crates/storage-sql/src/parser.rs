@@ -361,8 +361,9 @@ impl Parser {
                     let _ =
                         self.eat_kw("transaction") || self.eat_kw("work") || self.eat_kw("tran");
                 }
-                self.skip_to_end(); // isolation level / read write / deferrable
-                Ok(Statement::Begin)
+                let isolation = self.isolation_clause();
+                self.skip_to_end(); // read write / deferrable
+                Ok(Statement::Begin { isolation })
             }
             "commit" | "end" => {
                 self.pos += 1;
@@ -485,15 +486,51 @@ impl Parser {
         }
     }
 
+    /// `ISOLATION LEVEL x [y]` anywhere in the rest of the statement, normalized.
+    fn isolation_clause(&self) -> Option<String> {
+        let words: Vec<String> = self.tokens[self.pos..]
+            .iter()
+            .take_while(|t| !matches!(t, Token::Op(";")))
+            .filter_map(|t| match t {
+                Token::Word { text, .. } => Some(text.to_ascii_lowercase()),
+                _ => None,
+            })
+            .collect();
+        let at = words
+            .windows(2)
+            .position(|w| w[0] == "isolation" && w[1] == "level")?;
+        let level = words.get(at + 2)?;
+        Some(match level.as_str() {
+            "repeatable" | "read" => {
+                format!("{level} {}", words.get(at + 3).map_or("", String::as_str))
+            }
+            other => other.to_owned(),
+        })
+    }
+
     fn set(&mut self) -> SqlResult<Statement> {
         self.pos += 1; // SET
-        if self.is_kw("transaction")
+                       // SET TRANSACTION ... (this / the next transaction) and the session-wide forms.
+        let next_only = self.is_kw("transaction");
+        if next_only
             || self.eat_kws(&["session", "characteristics"])
             || ((self.is_kw("session") || self.is_kw("global") || self.is_kw("local"))
                 && self.is_kw_at(1, "transaction"))
         {
+            let level = self.isolation_clause();
             self.skip_to_end();
-            return Ok(Statement::NoOp("SET"));
+            return Ok(match level {
+                Some(l) => Statement::Set {
+                    name: if next_only {
+                        "next_transaction_isolation"
+                    } else {
+                        "transaction_isolation"
+                    }
+                    .into(),
+                    value: Some(Expr::Str(l)),
+                },
+                None => Statement::NoOp("SET"),
+            });
         }
         if self.eat_kw("names") || self.eat_kws(&["character", "set"]) || self.eat_kw("charset") {
             let v = self.next();

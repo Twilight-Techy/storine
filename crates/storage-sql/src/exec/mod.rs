@@ -374,6 +374,10 @@ pub struct Txn {
     savepoints: Vec<(String, usize)>,
     /// Row locks held (lock-document keys), released at commit / rollback.
     pub(crate) locks: Vec<String>,
+    /// REPEATABLE READ / SERIALIZABLE: every row read is validated at commit.
+    pub(crate) validate_reads: bool,
+    /// Rows read (first version seen; `None`: looked up and absent), for `validate_reads`.
+    pub(crate) reads: std::cell::RefCell<HashMap<(String, String), Option<u64>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -427,9 +431,12 @@ impl Txn {
         let k = (collection.to_owned(), key.to_owned());
         let prev = self.overlay.get(&k).cloned();
         let new_in_order = prev.is_none();
-        let base = match &prev {
-            Some(e) => e.base,
-            None => observed.map_or(Pre::Absent, Pre::Version),
+        // A row read earlier in a validating transaction must still be the version first seen.
+        let first_read = self.reads.borrow().get(&k).copied();
+        let base = match (&prev, first_read) {
+            (Some(e), _) => e.base,
+            (None, Some(v)) => v.map_or(Pre::Absent, Pre::Version),
+            (None, None) => observed.map_or(Pre::Absent, Pre::Version),
         };
         self.overlay.insert(k.clone(), Entry { base, doc, tag });
         if new_in_order {
@@ -639,6 +646,26 @@ impl Session {
         Ok(Outcome::command("DROP DATABASE"))
     }
 
+    /// Whether a transaction at isolation `level` (else the session's) validates its reads:
+    /// PostgreSQL REPEATABLE READ and SERIALIZABLE, MySQL SERIALIZABLE (MySQL's REPEATABLE READ,
+    /// its default, reads without validation like InnoDB).
+    fn validates_reads(&self, level: Option<&str>) -> bool {
+        let session = self
+            .vars
+            .get("transaction_isolation")
+            .cloned()
+            .unwrap_or_default();
+        let l = level
+            .unwrap_or(&session)
+            .to_ascii_lowercase()
+            .replace(['-', '_'], " ");
+        match l.trim() {
+            "serializable" => true,
+            "repeatable read" => self.dialect != Dialect::MySql,
+            _ => false,
+        }
+    }
+
     /// False after MySQL `SET autocommit = 0`.
     pub fn autocommit(&self) -> bool {
         !self.vars.get("autocommit").is_some_and(|v| {
@@ -656,7 +683,7 @@ impl Session {
     pub fn execute(&mut self, stmt: &Statement, params: &[Datum]) -> SqlResult<Outcome> {
         // Transaction control first: it works even in a failed transaction.
         match stmt {
-            Statement::Begin => {
+            Statement::Begin { isolation } => {
                 if self.in_transaction() {
                     // PostgreSQL warns and continues; MySQL commits the open transaction.
                     if self.dialect == Dialect::MySql {
@@ -665,8 +692,12 @@ impl Session {
                         return Ok(Outcome::command("BEGIN"));
                     }
                 }
+                let level = isolation
+                    .clone()
+                    .or_else(|| self.vars.remove("next_transaction_isolation"));
                 self.txn = Some(Txn {
                     explicit: true,
+                    validate_reads: self.validates_reads(level.as_deref()),
                     ..Txn::default()
                 });
                 return Ok(Outcome::command("BEGIN"));
@@ -817,6 +848,20 @@ impl Session {
             return Ok(());
         };
         let mut batch = txn.batch();
+        // REPEATABLE READ / SERIALIZABLE: rows read but not written must be unchanged.
+        if txn.validate_reads {
+            for ((c, k), v) in txn.reads.borrow().iter() {
+                if txn.get(c, k).is_none() {
+                    batch.push(Write {
+                        collection: c.clone(),
+                        key: k.clone(),
+                        op: Op::Check,
+                        pre: v.map_or(Pre::Absent, Pre::Version),
+                        tag: Tag::Internal,
+                    });
+                }
+            }
+        }
         // Row locks are released in the same atomic batch.
         for k in &txn.locks {
             batch.push(Write {
@@ -1004,7 +1049,7 @@ impl Session {
             }
             Statement::NoOp(tag) => Ok(Outcome::command(*tag)),
             Statement::Empty => Ok(Outcome::command("")),
-            Statement::Begin
+            Statement::Begin { .. }
             | Statement::Commit
             | Statement::Rollback
             | Statement::Savepoint(_)
@@ -1057,6 +1102,14 @@ impl Session {
             }
         } else if key == "autocommit" && self.in_transaction() {
             self.commit()?;
+        }
+        if key == "next_transaction_isolation" && self.in_transaction() {
+            // PostgreSQL: SET TRANSACTION applies to the transaction already open.
+            let v = self.validates_reads(Some(&text));
+            if let Some(t) = self.txn.as_mut() {
+                t.validate_reads = v;
+            }
+            return Ok(Outcome::command("SET"));
         }
         self.vars.insert(key.to_owned(), text);
         Ok(Outcome::command("SET"))

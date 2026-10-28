@@ -36,7 +36,10 @@ pub enum Statement {
         if_exists: bool,
     },
     /// `BEGIN` / `START TRANSACTION`.
-    Begin,
+    /// `BEGIN [ISOLATION LEVEL ...]`: the level as written, lower-case (`serializable`, ...).
+    Begin {
+        isolation: Option<String>,
+    },
     Commit,
     Rollback,
     Savepoint(String),

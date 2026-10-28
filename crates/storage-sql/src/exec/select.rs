@@ -874,6 +874,22 @@ impl Exec<'_> {
     ) -> SqlResult<Vec<TableRow>> {
         let store = &self.s.engine.store;
         let txn = self.s.txn.as_ref();
+        // REPEATABLE READ / SERIALIZABLE: remember the first version of every row read.
+        let reads = txn.filter(|t| t.validate_reads).map(|t| &t.reads);
+        let note = |key: &str, version: Option<u64>| -> SqlResult<()> {
+            if let Some(r) = reads {
+                let mut r = r.borrow_mut();
+                if r.len() >= MAX_VALIDATED_READS {
+                    return Err(SqlError::new(
+                        "54000",
+                        format!("a REPEATABLE READ / SERIALIZABLE transaction may read at most {MAX_VALIDATED_READS} rows"),
+                    ));
+                }
+                r.entry((table.collection.clone(), key.to_owned()))
+                    .or_insert(version);
+            }
+            Ok(())
+        };
         // Primary-key point lookups.
         if let Some(keys) = self.pk_lookup(table, qual, conjs, outer)? {
             let mut out = Vec::new();
@@ -890,7 +906,9 @@ impl Exec<'_> {
                     }),
                     Some(None) => {}
                     None => {
-                        if let Some(d) = store.get(&table.collection, &k)? {
+                        let found = store.get(&table.collection, &k)?;
+                        note(&k, found.as_ref().map(|d| d.version))?;
+                        if let Some(d) = found {
                             out.push(TableRow {
                                 key: d.key,
                                 version: Some(d.version),
@@ -920,6 +938,7 @@ impl Exec<'_> {
             if overlay.contains_key(d.key.as_str()) {
                 continue;
             }
+            note(&d.key, Some(d.version))?;
             out.push(TableRow {
                 row: table.from_doc(&d.fields),
                 key: d.key,
@@ -1881,6 +1900,9 @@ fn numeric_result(a: Option<DataType>, b: Option<DataType>) -> Option<DataType> 
         _ => None,
     }
 }
+
+/// Rows a validating (REPEATABLE READ / SERIALIZABLE) transaction may read.
+const MAX_VALIDATED_READS: usize = 200_000;
 
 /// Set-returning functions allowed directly in a select list.
 const SELECT_LIST_SRFS: &[&str] = &[

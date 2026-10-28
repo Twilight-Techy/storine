@@ -568,3 +568,88 @@ fn parent_delete_racing_a_child_insert_never_leaves_an_orphan() {
     ok(&mut b, "INSERT INTO pets (owner) VALUES (1)");
     ok(&mut a, "COMMIT");
 }
+
+#[test]
+fn repeatable_read_and_serializable_validate_what_they_read() {
+    let db = setup("isolation");
+    let mut a = db.engine.new_session(Dialect::Postgres, "app", None);
+    let mut b = db.engine.new_session(Dialect::Postgres, "app", None);
+    ok(
+        &mut a,
+        "CREATE TABLE acct (id INT PRIMARY KEY, balance NUMERIC(12,2), on_call BOOLEAN)",
+    );
+    ok(
+        &mut a,
+        "INSERT INTO acct VALUES (1, 100, true), (2, 100, true)",
+    );
+
+    // The naive finance backend: read, compute in the app, write the result.
+    // REPEATABLE READ refuses the stale write instead of losing B's update.
+    ok(&mut a, "BEGIN ISOLATION LEVEL REPEATABLE READ");
+    assert_eq!(
+        one(&mut a, "SELECT balance FROM acct WHERE id = 1"),
+        "100.00"
+    );
+    ok(
+        &mut b,
+        "UPDATE acct SET balance = balance - 30 WHERE id = 1",
+    );
+    ok(&mut a, "UPDATE acct SET balance = 110 WHERE id = 1"); // 100 + 10, computed by the app
+    assert_eq!(err(&mut a, "COMMIT"), "40001");
+    assert_eq!(
+        one(&mut a, "SELECT balance FROM acct WHERE id = 1"),
+        "70.00"
+    );
+    // READ COMMITTED behaves like PostgreSQL's: the same pattern overwrites (use FOR UPDATE
+    // or an atomic `balance = balance + x` there).
+    ok(&mut a, "BEGIN");
+    one(&mut a, "SELECT balance FROM acct WHERE id = 1");
+    ok(
+        &mut b,
+        "UPDATE acct SET balance = balance - 30 WHERE id = 1",
+    );
+    ok(&mut a, "UPDATE acct SET balance = 80 WHERE id = 1");
+    ok(&mut a, "COMMIT");
+
+    // Write skew: each transaction checks that someone else stays on call, then leaves.
+    for s in [&mut a, &mut b] {
+        ok(s, "BEGIN TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+        assert_eq!(one(s, "SELECT count(*) FROM acct WHERE on_call"), "2");
+    }
+    ok(&mut a, "UPDATE acct SET on_call = false WHERE id = 1");
+    ok(&mut b, "UPDATE acct SET on_call = false WHERE id = 2");
+    ok(&mut a, "COMMIT");
+    assert_eq!(err(&mut b, "COMMIT"), "40001");
+    assert_eq!(one(&mut a, "SELECT count(*) FROM acct WHERE on_call"), "1");
+
+    // A key looked up and found absent must still be absent at commit.
+    ok(
+        &mut a,
+        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+    );
+    ok(&mut a, "BEGIN");
+    assert_eq!(rows(&mut a, "SELECT id FROM acct WHERE id = 5").len(), 0);
+    ok(&mut b, "INSERT INTO acct VALUES (5, 0, false)");
+    ok(&mut a, "INSERT INTO acct VALUES (6, 0, false)");
+    assert_eq!(err(&mut a, "COMMIT"), "40001");
+    ok(
+        &mut a,
+        "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED",
+    );
+
+    // SET TRANSACTION inside the transaction applies to it.
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    one(&mut a, "SELECT balance FROM acct WHERE id = 2");
+    ok(&mut b, "UPDATE acct SET balance = 1 WHERE id = 2");
+    ok(&mut a, "UPDATE acct SET balance = 2 WHERE id = 2");
+    assert_eq!(err(&mut a, "COMMIT"), "40001");
+
+    // MySQL's default REPEATABLE-READ keeps InnoDB's behavior (no read validation).
+    let mut m = db.engine.new_session(Dialect::MySql, "root", None);
+    ok(&mut m, "START TRANSACTION");
+    one(&mut m, "SELECT balance FROM acct WHERE id = 2");
+    ok(&mut b, "UPDATE acct SET balance = 3 WHERE id = 2");
+    ok(&mut m, "UPDATE acct SET balance = 4 WHERE id = 2");
+    ok(&mut m, "COMMIT");
+}
