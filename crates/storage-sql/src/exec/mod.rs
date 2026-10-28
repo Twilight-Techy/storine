@@ -608,6 +608,7 @@ impl Session {
             crate::catalog::SEQUENCES,
             crate::catalog::LOCKS,
             crate::catalog::UNIQUE,
+            crate::catalog::REFS,
         ] {
             let _ = target.store.drop_collection(c);
         }
