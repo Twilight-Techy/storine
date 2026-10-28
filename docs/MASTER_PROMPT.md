@@ -12,6 +12,26 @@
 
 ---
 
+## Follow-Up Prompt 2: Close Gaps, SDKs & SQL Adapter (Recorded Verbatim)
+
+> Alright! Go ahead and close all the gaps and implement everything we raised from your last 2 answers according to our rules and master prompt files in docs. Make sure to read them whole first. Take the best possible decisions where they arise and do not stop to ask me. Work until you're completely done. Then build sdks for popular backend languages to work with it accoriding to our master prompt and rules with simplicity and user intuitiveness/clarity included as rules. (I'm not sure if those should go in a new repo or the same one) Then build the SQL adapter separately (I'm not sure if that should go in a new repo or the same one) so that existing projects with SQL and/or ORMs can work with it with zero changes to their codebase or at least almost zero. It should support the different popular SQL formats. Answer the questions about repos first and stop for my response before you start working.
+
+## Follow-Up Prompt 3: Go-Ahead (Recorded Verbatim)
+
+> Yeah! Those are fine. You can add PHP and Ruby as to do. Do not stop until you're completely done with all the work. Record my last 2 prompts (this one included) as follow ups in the master prompt exactly as is so you  can reference them and do not lose them as context. This session resets at 8:20 a.m. so you need to wake yourself to continue working shortly after the reset in case you hit the limit before then and so on every 5 hours till the end of today. The goal is to maximize credits and minimize wasted time.
+>
+> Alright! Let's go.
+
+### Agreed Decisions (from the answer to Follow-Up Prompt 2, approved in Follow-Up Prompt 3)
+
+- **Repository layout**: everything stays in this repository.
+  - SDKs live in `sdks/<language>/` (outside the Cargo workspace), all generated against one wire-protocol spec and shared conformance vectors in `protocol/`.
+  - SDK languages: Python, TypeScript/Node, Go, Java, C#, Rust (`sdks/rust` / `storage-client`). PHP and Ruby are recorded as TODO.
+  - The SQL adapter is a separate crate, `crates/storage-sql`, with its own binary (`storine-sql`), speaking the PostgreSQL v3 and MySQL wire protocols (then SQL Server TDS) so existing drivers and ORMs work by changing only the connection string. SQLite is "near-zero change" (no network protocol to impersonate).
+- **Work order**: (1) close every engine gap raised in the two audit answers (lost updates over TCP, `put` blind overwrites, version ABA after delete/re-insert, `BATCH_PUT` without OCC, money-safe decimal type and checked arithmetic, `i128` indexing, Raft integrity gaps, read-only replicas, Windows IOCP-class readiness); (2) protocol spec + conformance vectors; (3) SDKs; (4) SQL adapter. Commit and push after each stage.
+
+---
+
 ## The 6 Canonical Project Documents
 
 Before commencing each task (`TASK-001` through `TASK-050`), consult and align with all 6 documents:
