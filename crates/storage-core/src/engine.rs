@@ -3485,6 +3485,9 @@ pub enum WriteKind<T> {
     Patch(Vec<storage_codec::field_ops::FieldOp>),
     /// Change nothing; only the precondition is checked (OCC read-set validation).
     Check,
+    /// Replace the stored representation of an existing record **without** a new version
+    /// (metadata-only changes such as index declarations; the logical content must be equal).
+    Rewrite(T),
 }
 
 /// One operation of an atomic [`StorageEngine::commit`].
@@ -3541,6 +3544,8 @@ struct StagedRecord<T> {
     state: Option<(T, u64, RecordFlags)>,
     loaded: bool,
     changed: bool,
+    /// Only `Rewrite` operations touched the record: keep its version.
+    same_version: bool,
 }
 
 impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
@@ -3585,11 +3590,11 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                 std::collections::hash_map::Entry::Vacant(v) => {
                     order.push(op.id);
                     let original = self.inner.live_version(op.id);
-                    v.insert(StagedRecord { original, state: None, loaded: false, changed: false })
+                    v.insert(StagedRecord { original, state: None, loaded: false, changed: false, same_version: false })
                 }
             };
             // Lazily load the current record when an operation needs its contents.
-            let needs_body = matches!(op.kind, WriteKind::Patch(_));
+            let needs_body = matches!(op.kind, WriteKind::Patch(_) | WriteKind::Rewrite(_));
             if needs_body && !rec.loaded && !rec.changed && rec.original.is_some() {
                 let (_, draft, _pg, ttl, flags) = self.inner.load_mutable_draft_locked(op.id)?;
                 rec.state = Some((draft, ttl, flags));
@@ -3625,16 +3630,19 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                 WriteKind::Put(record) => {
                     rec.state = Some((record, 0, RecordFlags::NONE));
                     rec.changed = true;
+                    rec.same_version = false;
                 }
                 WriteKind::PutWithTtl(record, ttl) => {
                     let expires = now_ns.saturating_add(ttl.as_nanos().min(u128::from(u64::MAX)) as u64);
                     rec.state = Some((record, expires, RecordFlags::HAS_TTL));
                     rec.changed = true;
+                    rec.same_version = false;
                 }
                 WriteKind::Delete => {
                     if exists_now {
                         rec.state = None;
                         rec.changed = true;
+                        rec.same_version = false;
                         rec.loaded = true;
                     }
                 }
@@ -3647,8 +3655,22 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                     copy.apply_field_ops(&field_ops)?;
                     *draft = copy;
                     rec.changed = true;
+                    rec.same_version = false;
                 }
                 WriteKind::Check => {}
+                WriteKind::Rewrite(record) => {
+                    let Some((_, ttl, flags)) = rec.state.take() else {
+                        return Err(StorageError::not_found(op.id));
+                    };
+                    if rec.changed {
+                        return Err(StorageError::invalid_value(
+                            "a rewrite cannot follow another change in the same commit",
+                        ));
+                    }
+                    rec.state = Some((record, ttl, flags));
+                    rec.changed = true;
+                    rec.same_version = true;
+                }
             }
             results.push((op.id, existed));
         }
@@ -3667,6 +3689,11 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             let mut version = self.inner.next_version(rec.original);
             if let Some(min) = min_version {
                 version = version.max(min);
+            }
+            if rec.same_version {
+                if let Some(orig) = rec.original {
+                    version = orig;
+                }
             }
             match rec.state {
                 Some((record, ttl, flags)) => {

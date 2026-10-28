@@ -23,7 +23,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use storage_codec::field_ops::{apply_field_ops, as_exact_decimal, get_path, FieldOp};
+use storage_codec::field_ops::{apply_field_ops, as_exact_decimal, FieldOp};
 use storage_codec::{
     impl_archive_pod, xxh3_64, ArchiveBuilder, ArchivedMap, ArchivedSlice, ArchivedString,
     MapRef, PropertyValue, PropertyValueRef, RecordView, ZeroCopyRecord,
@@ -476,16 +476,7 @@ impl Filter {
                 && ok(compare_values(&field, &probe))
         }
         match self {
-            Self::Eq(path, v) => {
-                let field = lookup_path(fields, path);
-                match v {
-                    PropertyValue::Null => matches!(field, PropertyValueRef::Null),
-                    PropertyValue::List(_) | PropertyValue::Map(_) => {
-                        field_to_owned(&field) == *v
-                    }
-                    _ => values_equal(&field, &value_ref_of(v)),
-                }
-            }
+            Self::Eq(path, v) => eq_value(&lookup_path(fields, path), v),
             Self::Ne(..) => {
                 let Self::Ne(path, v) = self else { return false };
                 !Self::Eq(path.clone(), v.clone()).matches_depth(key, fields, depth + 1)
@@ -499,10 +490,7 @@ impl Filter {
             }
             Self::In(path, values) => {
                 let field = lookup_path(fields, path);
-                values.iter().any(|v| match v {
-                    PropertyValue::Null => matches!(field, PropertyValueRef::Null),
-                    _ => values_equal(&field, &value_ref_of(v)),
-                })
+                values.iter().any(|v| eq_value(&field, v))
             }
             Self::Prefix(path, prefix) => {
                 matches!(lookup_path(fields, path), PropertyValueRef::Text(s) if s.starts_with(prefix.as_str()))
@@ -534,8 +522,17 @@ impl Filter {
     }
 }
 
-fn field_to_owned(v: &PropertyValueRef<'_>) -> PropertyValue {
-    v.to_owned_value()
+/// Equality of a stored value with a probe (`null` matches missing fields; lists and maps
+/// compare structurally).
+fn eq_value(field: &PropertyValueRef<'_>, probe: &PropertyValue) -> bool {
+    match probe {
+        PropertyValue::Null => matches!(field, PropertyValueRef::Null),
+        PropertyValue::List(_) | PropertyValue::Map(_) => {
+            matches!(field, PropertyValueRef::List(_) | PropertyValueRef::Map(_))
+                && field.to_owned_value() == *probe
+        }
+        _ => values_equal(field, &value_ref_of(probe)),
+    }
 }
 
 // ── Store ──────────────────────────────────────────────────────────────────────────────────
@@ -759,13 +756,18 @@ impl DocumentStore {
                 return Err(StorageError::invalid_value("filter nesting is too deep (max 32)"));
             }
         }
+        if q.order_by.len() > 16 {
+            return Err(StorageError::invalid_value("at most 16 sort keys"));
+        }
         let candidates = self.candidate_ordinals(&q.collection, q.filter.as_ref());
         let primary = self.engine.primary_index();
-        let mut matched: Vec<Document> = Vec::new();
         let coll = q.collection.as_str();
+        // Pass 1 (zero-copy): match and keep only the key, the id and the sort values, so a
+        // small page of a large result never materializes every matching document.
+        let mut hits: Vec<(String, InlineId, Vec<PropertyValue>)> = Vec::new();
         for ord in candidates.to_vec() {
             let Some(id) = primary.resolve_ordinal(ord) else { continue };
-            let doc = self.engine.with_ref(id, |view| {
+            let hit = self.engine.with_ref(id, |view| {
                 let arch = view.archived();
                 let payload = view.payload();
                 if arch.collection.as_str(payload) != coll {
@@ -783,27 +785,25 @@ impl DocumentStore {
                         return None;
                     }
                 }
-                Some(Document {
-                    key: key.to_owned(),
-                    version: view.header().version(),
-                    fields: arch.fields.unarchive(payload),
-                })
+                let sort_values = q
+                    .order_by
+                    .iter()
+                    .map(|(path, _)| lookup_path(fields, path).to_owned_value())
+                    .collect();
+                Some((key.to_owned(), sort_values))
             });
-            match doc {
-                Ok(Some(d)) => matched.push(d),
-                Ok(None) => {}
-                Err(StorageError::RecordNotFound { .. }) => {}
+            match hit {
+                Ok(Some((key, sv))) => hits.push((key, id, sv)),
+                Ok(None) | Err(StorageError::RecordNotFound { .. }) => {}
                 Err(e) => return Err(e),
             }
         }
         if q.order_by.is_empty() {
-            matched.sort_by(|a, b| a.key.cmp(&b.key));
+            hits.sort_by(|a, b| a.0.cmp(&b.0));
         } else {
-            matched.sort_by(|a, b| {
-                for (path, dir) in &q.order_by {
-                    let va = get_path(&a.fields, path).map_or(PropertyValueRef::Null, value_ref_of_any);
-                    let vb = get_path(&b.fields, path).map_or(PropertyValueRef::Null, value_ref_of_any);
-                    let mut c = compare_values(&va, &vb);
+            hits.sort_by(|a, b| {
+                for (i, (_, dir)) in q.order_by.iter().enumerate() {
+                    let mut c = compare_values(&value_ref_of(&a.2[i]), &value_ref_of(&b.2[i]));
                     if *dir == Direction::Desc {
                         c = c.reverse();
                     }
@@ -811,14 +811,28 @@ impl DocumentStore {
                         return c;
                     }
                 }
-                a.key.cmp(&b.key)
+                a.0.cmp(&b.0)
             });
         }
-        let total = matched.len();
+        let total = hits.len();
         let start = q.offset.min(total);
         let end = q.limit.map_or(total, |l| start.saturating_add(l).min(total));
         let more = end < total;
-        let documents: Vec<Document> = matched.drain(start..end).collect();
+        // Pass 2: materialize only the requested page.
+        let mut documents = Vec::with_capacity(end - start);
+        for (key, id, _) in hits.drain(start..end) {
+            let doc = self.engine.with_ref(id, |view| Document {
+                key: key.clone(),
+                version: view.header().version(),
+                fields: view.archived().fields.unarchive(view.payload()),
+            });
+            match doc {
+                Ok(d) => documents.push(d),
+                // Deleted between the passes: skip it.
+                Err(StorageError::RecordNotFound { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
         let next_after_key = (more && q.order_by.is_empty())
             .then(|| documents.last().map(|d| d.key.clone()))
             .flatten();
@@ -1101,7 +1115,7 @@ impl DocumentStore {
             // meanwhile (its new version already carries the current index ids).
             match self.sink().commit(vec![WriteOp {
                 id,
-                kind: WriteKind::Put(rec),
+                kind: WriteKind::Rewrite(rec),
                 precondition: Precondition::Version(doc.version),
             }]) {
                 Ok(_) | Err(StorageError::VersionConflict { .. }) => {}
@@ -1148,12 +1162,6 @@ fn v_of(f: &Filter) -> Option<&PropertyValue> {
         Filter::Eq(_, v) => Some(v),
         _ => None,
     }
-}
-
-/// Borrowed view of an owned value for comparisons (lists and maps compare structurally via
-/// their owned forms elsewhere; here they sort by type only).
-fn value_ref_of_any(v: &PropertyValue) -> PropertyValueRef<'_> {
-    value_ref_of(v)
 }
 
 fn hex16(bytes: &[u8; 16]) -> String {

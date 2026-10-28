@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use storage_core::{AgentObjectRecord, EngineConfig, StorageEngine};
+use storage_core::{AgentObjectRecord, DocumentStore, EngineConfig, StorageEngine};
 use storage_server::{RbacRole, SecurityConfig, StorageServer, DEFAULT_MAX_CONNECTIONS};
 use storage_types::{Result, StorageError};
 
@@ -66,7 +66,7 @@ fn run() -> Result<()> {
                 skip_next = false;
                 continue;
             }
-            if a == "--max-connections" {
+            if a == "--max-connections" || a == "--records" {
                 skip_next = true;
                 continue;
             }
@@ -92,26 +92,48 @@ fn run() -> Result<()> {
 
     let security = security_from_env()?;
     let auth_enabled = security.require_auth;
-    let engine = Arc::new(StorageEngine::<AgentObjectRecord>::open(
-        data_dir,
-        EngineConfig::default(),
-    )?);
-    let server = StorageServer::start_with_config(bind_addr, engine, max_connections, security)?;
-    println!(
-        "storage-server listening on {} (data_dir: {}, max_connections: {}, auth: {})",
-        server.local_addr(),
-        data_dir,
-        server.max_connections(),
-        if auth_enabled { "required" } else { "disabled (loopback only)" }
-    );
+    // `--records agent` serves the legacy typed `AgentObjectRecord` collection; the default is
+    // the document API used by every SDK and the SQL adapter.
+    let legacy_agent = args
+        .windows(2)
+        .any(|w| w[0] == "--records" && w[1] == "agent");
+    let once = args.iter().any(|s| s == "--once");
+    if legacy_agent {
+        let engine = Arc::new(StorageEngine::<AgentObjectRecord>::open(
+            data_dir,
+            EngineConfig::default(),
+        )?);
+        let server = StorageServer::start_with_config(bind_addr, engine, max_connections, security)?;
+        report((server.local_addr(), server.max_connections()), data_dir, auth_enabled, "agent records");
+        return park(server, once);
+    }
+    let store = Arc::new(DocumentStore::open(data_dir, EngineConfig::default())?);
+    let server = StorageServer::start_documents(bind_addr, store, max_connections, security, None)?;
+    report((server.local_addr(), server.max_connections()), data_dir, auth_enabled, "documents");
+    park(server, once)
+}
 
-    if args.iter().any(|s| s == "--once") {
+/// Keeps `server` running until the process is stopped (returns at once with `--once`).
+fn park<S>(server: S, once: bool) -> Result<()> {
+    if once {
         return Ok(());
     }
-
+    let _keep = server;
     loop {
         thread::sleep(Duration::from_secs(3600));
     }
+}
+
+fn report(
+    (addr, max_conns): (std::net::SocketAddr, usize),
+    data_dir: &str,
+    auth: bool,
+    mode: &str,
+) {
+    println!(
+        "storage-server listening on {addr} (data_dir: {data_dir}, mode: {mode}, max_connections: {max_conns}, auth: {})",
+        if auth { "required" } else { "disabled (loopback only)" }
+    );
 }
 
 fn main() -> ExitCode {

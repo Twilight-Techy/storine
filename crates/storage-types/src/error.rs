@@ -56,6 +56,9 @@ pub enum StorageError {
     CommitUnknown { index: u64 },
     /// The engine is a Raft replica: it is written only through consensus, never directly.
     ReadOnlyReplica,
+    /// A remote server rejected a request; `status` is the wire status code and `message` the
+    /// server's explanation.
+    Rejected { status: u8, message: String },
     /// Underlying OS I/O or virtual memory mapping error.
     Io {
         context: &'static str,
@@ -204,6 +207,9 @@ impl fmt::Display for StorageError {
                 f,
                 "write outcome unknown (raft index {index} not yet confirmed by a quorum); retry with the same request id"
             ),
+            Self::Rejected { status, message } => {
+                write!(f, "server rejected the request (status {status:#04x}): {message}")
+            }
             Self::ReadOnlyReplica => write!(
                 f,
                 "this engine is a raft replica: write through the leader, not directly"

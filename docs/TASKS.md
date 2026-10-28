@@ -706,3 +706,32 @@ This document defines the strict chronological execution order for building the 
   - Linker-map attribution (`.text` ≈ `692 KiB`): `storage_index` `134 KiB` (paged indexes, cold tier, HNSW), `storage_server` `107 KiB`, `core` `97 KiB` (sort monomorphizations, formatting), `storage_core` `97 KiB`, `std` `85 KiB` + `rustc_demangle` `17 KiB` (panic and backtrace machinery, removable only with nightly `build-std` + `panic_immediate_abort`).
   - Options were: (a) Cargo features for optional subsystems; (b) nightly `build-std`; (c) revise the budget. The user chose (c): `< 1 MiB`, treated as a ceiling, with code size still minimized wherever it costs no hot-path speed.
   - **Exit Criteria**: `storage-server` `903.0 KiB` and `storage-cli` `830.5 KiB` (after the cold primary tier), both `< 1 MiB`.
+
+## Stage 22: Write Safety for Money-Grade Workloads — No ABA, Exact Decimals, Atomic Operations, Conditional & Idempotent Writes, Documents (`TASK-093` – `TASK-098`)
+
+*(Follow-Up Prompt 2: close the gaps raised in the audit answers — lost updates, blind overwrites, version reuse, float money, `i128` indexing.)*
+
+- [x] **TASK-093: Monotonic Versions Across Delete + Re-Create (No OCC / CAS ABA) (`RULE-SAFE-08`)**
+  - A per-collection **version floor** (highest version ever deleted) is raised by every deletion, including WAL replay of deletions that are no longer in the primary index, and persisted at every checkpoint (`<stem>.vfloor`, checksummed, written before the primary checkpoint). A created record starts above it, so a stale CAS / transaction version can never match a re-created record.
+  - **Exit Criteria**: `test_versions_are_never_reused_after_delete_and_recreate` (in-process, after a clean restart, after a WAL-only deletion, and through transactions).
+- [x] **TASK-094: Exact `Decimal` Type, `i128` / Decimal Indexing (`F-TYPE-01`)**
+  - `storage_types::Decimal`: `i128` mantissa + scale `<= 38`; checked add / sub / mul, division and rescale with explicit `RoundingMode` (half-even default); numeric equality, total order and canonical hashing; strict parser (DoS-safe on hostile exponents). `sortable_key` maps every numeric type into one monotonic `i64` key space (`compress_i128_to_i64` beyond `2^62`); `IndexSnapshot::push_decimal` / `push_i128`.
+  - **Exit Criteria**: decimal unit tests (`0.1 + 0.2 == 0.3`, overflow errors, all rounding modes, key monotonicity over the full range).
+- [x] **TASK-095: Nested Values & Atomic Field Operations (`F-TYPE-02`, `F-CONC-09`)**
+  - `PropertyValue` gains `Decimal`, `List`, `Map` (depth `<= 32`, sorted unique keys validated, cyclic hostile layouts rejected). `FieldOp::{Set, Unset, Add { min, max }, Append}` with checked arithmetic; `Indexable::apply_field_ops`.
+  - **SVE** (Storine Value Encoding): the simple tag + little-endian value encoding every SDK implements (golden bytes pinned).
+  - **Exit Criteria**: SVE round-trip / truncation / bit-flip / huge-count / depth tests; field-op overdraft and overflow tests.
+- [x] **TASK-096: Unified Conditional Commit (`StorageEngine::commit`) & Replica Write Guard (`F-CONC-10`, `RULE-SAFE-03`)**
+  - `WriteOp { id, kind: Put | PutWithTtl | Delete | Patch | Check | Rewrite, precondition: None | Absent | Exists | Version }`: canonical lock order, staged evaluation, one WAL transaction, one version per touched record. `TransactionBatch` is built on it. `Rewrite` keeps the version (metadata-only changes).
+  - `set_replica_mode`: every direct write API returns `ReadOnlyReplica` (consensus applies through the internal path).
+  - New error variants: `ConditionFailed`, `InvalidValue`, `NotLeader`, `CommitUnknown`, `ReadOnlyReplica`, `Rejected`.
+- [x] **TASK-097: Document Store (`F-DOC-01` – `F-DOC-04`)**
+  - `DocumentRecord` (collection, key, typed fields, index ids) in one engine (cross-collection atomic transactions). Ids `from_any_str("<collection>/<key>")` with full-key verification (hash collisions are errors, never silent overwrites).
+  - Up to 4 secondary indexes per collection (numbers in one order-preserving key space, hashed equality tags for text); every index hit re-checked exactly; index builds rewrite at the same version.
+  - `DocumentStore::write`: atomic batches, preconditions, field patches, idempotent request ids (a `$idem/<id>` marker with an `Absent` precondition in the same transaction, 24 h window).
+  - Filters (`=`, `!=`, `<`, `<=`, `>`, `>=`, between, in, prefix, contains, exists, missing, key prefix, and / or / not), multi-key ordering, offset / limit and key-order cursors; two-pass execution (only the requested page is materialized).
+  - **Exit Criteria**: 800 concurrent `+0.01` deposits lose nothing; overdraft refused atomically; idempotent transfer retry applied once; indexed and unindexed queries return identical results before and after restart; hostile names / keys rejected.
+- [x] **TASK-098: Document & Transaction Wire Protocol (`OP_DOC_*`, `OP_TXN`) (`F-NET-03`)**
+  - `OP_DOC_GET 0x20`, `OP_DOC_WRITE 0x21`, `OP_DOC_QUERY 0x22`, `OP_DOC_ADMIN 0x23` (index builds and drops run on the admin job pool), `OP_TXN 0x24` (typed-frame batch with per-item preconditions: closes the blind `OP_BATCH_PUT` gap), `OP_DOC_INFO 0x25`. New statuses `NotLeader 0x07`, `Invalid 0x08`, `CommitUnknown 0x09`; conflicts report the failing write index and current version.
+  - `storage-server` binary serves documents by default (`--records agent` for the legacy typed collection). `StorageClient::doc_get` / `doc_write` / `doc_query` / `doc_command`.
+  - **Exit Criteria**: `test_document_api_over_tcp` (concurrent clients, conflicts, idempotency, index job, typed txn, hostile bodies on every new opcode).

@@ -74,6 +74,20 @@ impl IndexSnapshot {
         self.push_numeric(field_id, crate::btree::sortable_u64_to_i64(value));
     }
 
+    /// Indexes an exact decimal (money) field with an order-preserving key shared with
+    /// [`Self::push_i128`] (`TASK-094`). The key is monotonic but may be shared by close values
+    /// beyond 6 fractional digits: re-check exact values when filtering.
+    #[inline]
+    pub fn push_decimal(&mut self, field_id: u16, value: storage_types::Decimal) {
+        self.push_numeric(field_id, value.sortable_key());
+    }
+
+    /// Indexes a 128-bit integer field (same key space as [`Self::push_decimal`]).
+    #[inline]
+    pub fn push_i128(&mut self, field_id: u16, value: i128) {
+        self.push_numeric(field_id, storage_types::Decimal::from_i128(value).sortable_key());
+    }
+
     /// Indexes a boolean field (`false -> 0`, `true -> 1`).
     #[inline]
     pub fn push_bool(&mut self, field_id: u16, value: bool) {

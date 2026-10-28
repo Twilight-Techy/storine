@@ -408,3 +408,23 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Safety audit**: three `unsafe` FFI calls, each with a `SAFETY` note. The epoll descriptor is owned and closed once. Sockets are unregistered before they are closed, so a reused fd number can never inherit a stale registration. Tokens are mapped back through a map that is updated on `swap_remove`.
 - **Verification**: Linux type-check and clippy clean for the whole workspace (the Linux target was installed for this; there is no Linux linker or WSL here, so nothing Linux-specific has executed). The first Linux build also surfaced three latent clippy warnings in Unix-only mmap code, now fixed. **Not yet run on Linux**: the epoll unit test and the server tests must pass there before this task is closed.
 
+
+### Stage 22: Write Safety for Money-Grade Workloads (`TASK-093` – `TASK-098`) — 2026-10-28
+
+*(Follow-Up Prompt 2: close every gap raised in the audit answers.)*
+
+- **Gaps closed**:
+  - *Lost updates*: in-process `update` was already safe; over TCP only CAS was. Added server-side atomic field operations (`OP_DOC_WRITE` patches with checked `add` and bounds) and conditional batches (`OP_TXN`, `OP_DOC_WRITE`). `OP_BATCH_PUT` keeps its blind-upsert semantics (documented); `OP_TXN` is the conditional replacement.
+  - *ABA after delete + re-create*: fixed with the persisted version floor (`TASK-093`).
+  - *Float money*: `Decimal` + checked arithmetic; decimals and `i128` indexable (`TASK-094`).
+  - *Ambiguous retries*: idempotent request ids (`TASK-097`), groundwork for Raft `CommitUnknown` (Stage 23).
+- **Bugs found and fixed during the stage**:
+  - Building an index bumped every document's version (OCC clients would have seen spurious conflicts): index metadata now uses a same-version `Rewrite` (safe: the background flusher holds the record lock for its whole read-write-publish sequence, and the decrypted-frame cache is keyed by `(id, version)` and refreshed on flush).
+  - `Decimal` parsing of `0e999999999` would have looped ~10^9 times (DoS): zero short-circuits and exponents are bounded.
+  - Queries materialized every match before applying `limit` (memory bloat): now two passes, only the page is materialized.
+  - `IN` with list / map probes compared against `null`: fixed with structural equality.
+  - The version-floor file initially lived under `indexes/`, where encrypted databases require every file to be sealed: moved to `<stem>.vfloor` (it holds a single non-secret number).
+- **Behavior change**: a newly created record's first version is no longer always `1` (it starts above the collection's floor). `full_system_e2e` was updated to use the version returned by `put`.
+- **Security audit**: every new decoder (SVE values, field ops, document writes, filters, queries, `OP_TXN`) bounds counts by the bytes present before allocating, caps nesting at 32, rejects trailing bytes, duplicate map keys, invalid UTF-8 and unknown tags; new opcodes are role- and size-checked at the header stage; system collections (`$meta`, `$idem`) are not writable by clients; long-key hash collisions are reported, never silently overwritten.
+- **Complexity / footprint**: atomic patch = one locked read-modify-write (`O(document)`); document query = index-narrowed candidate scan with exact re-check, `O(candidates)` zero-copy pass + `O(page)` materialization; per-document index overhead 2 B per declared index.
+- **Verification**: `129` workspace tests passing, `0` clippy warnings (new code).

@@ -123,6 +123,12 @@
 - With `EngineConfig::encryption` set, every record frame written to disk or the WAL is protected: encrypted, or (only where the record type's `Indexable::protection` policy says so) authenticated with a MAC. Both bind the record id, key id and header metadata. Any unprotected record frame read back is rejected, never trusted (the only exception is the explicit migration state `accept_unencrypted`). Plaintext of encrypted records lives only in RAM (`hot_dirty`, MVCC history, the bounded decrypted-frame cache). Key material is never logged and is zeroed on drop.
 - Index files follow the same settings: sealed with the active key, plaintext index files refused (no downgrade), and a tampered paged generation is rebuilt, never served.
 
+### RULE-SAFE-08: Money-Grade Writes (No Lost Updates, No ABA, No Float Money)
+- **Versions are never reused**: a record created after a deletion starts above the collection's persisted version floor. Any code path that creates records MUST take its version from `next_version`.
+- **No client read-modify-write over the network**: every remote mutation of an existing value is either an atomic field operation (`FieldOp`) or a conditional write (`Precondition::Version`). Blind overwrites stay available but are never the documented way to update a value derived from its previous value.
+- **Exact numbers**: monetary values are `Decimal` (or integer minor units); arithmetic is checked and fails instead of wrapping, saturating or rounding silently; rounding happens only where the caller names a `RoundingMode`.
+- **Retries are safe**: mutating requests that a client may retry (timeouts, `CommitUnknown`) carry a request id and are applied at most once.
+
 ### RULE-CONC-01: Canonical Lock Ordering & Lock-Free I/O
 - Never hold primary index shard locks across disk I/O (`WriteFile`/`fsync`).
 - Multi-record mutations (`update_pair_atomic`, `transaction`, `delete_with_policy`) MUST lock keys in strictly ascending canonical `(CollectionId, InlineId)` order (`StripedLockTable::lock_many`) so AB-BA deadlocks are mathematically impossible.

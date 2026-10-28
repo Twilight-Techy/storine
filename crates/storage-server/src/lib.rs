@@ -21,6 +21,9 @@
 //!     - `0x13 = Health` (no body)
 //!     - `0x14 = AdminCheckpoint` (no body)
 //!     - `0x15 = RaftInstallSnapshot` (`[InstallSnapshotReq wire bytes]` -> `InstallSnapshotResp`)
+//!     - `0x20 = DocGet`, `0x21 = DocWrite`, `0x22 = DocQuery`, `0x23 = DocAdmin`, `0x25 = DocInfo`
+//!       (document API, `protocol/PROTOCOL.md`)
+//!     - `0x24 = Txn` (atomic typed-frame batch with per-item preconditions)
 //!   - `id: [u8; 24]` (`InlineId` raw bytes)
 //!   - `body_len: u32`
 //!   - `body: [u8; body_len]`
@@ -33,6 +36,9 @@
 //!     - `0x04 = Conflict` (CAS version mismatch)
 //!     - `0x05 = Unauthorized` (RBAC / Auth failure)
 //!     - `0x06 = RateLimited` (Token-bucket rate limit exceeded)
+//!     - `0x07 = NotLeader` (Raft follower; `version` = leader node id, `0` if unknown)
+//!     - `0x08 = Invalid` (malformed request, bad value, type mismatch, bound violated)
+//!     - `0x09 = CommitUnknown` (replicated write not confirmed; retry with the same request id)
 //!   - `version: u64`
 //!   - `body_len: u32`
 //!   - `body: [u8; body_len]`
@@ -49,6 +55,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
+pub mod documents;
 pub mod security;
 
 use std::io::{self, BufReader, BufWriter, IoSlice, Read, Write};
@@ -66,7 +73,8 @@ use storage_core::{
         AppendEntriesReq, AppendEntriesResp, InstallSnapshotReq, RaftNode, RequestVoteReq,
         RequestVoteResp, RAFT_SNAPSHOT_CHUNK,
     },
-    AgentObjectRecord, LatencyHistogram, RecordRef, SlowOpEntry, SlowOperationLog, StorageEngine,
+    AgentObjectRecord, DocumentRecord, DocumentStore, LatencyHistogram, Precondition, RecordRef,
+    SlowOpEntry, SlowOperationLog, StorageEngine, WriteKind, WriteOp,
 };
 use storage_index::Indexable;
 use storage_mmap::SocketPoller;
@@ -96,6 +104,12 @@ pub const OP_ADMIN_COMPACT: u8 = 0x12;
 pub const OP_HEALTH: u8 = 0x13;
 pub const OP_ADMIN_CHECKPOINT: u8 = 0x14;
 pub const OP_RAFT_SNAPSHOT: u8 = 0x15;
+pub const OP_DOC_GET: u8 = 0x20;
+pub const OP_DOC_WRITE: u8 = 0x21;
+pub const OP_DOC_QUERY: u8 = 0x22;
+pub const OP_DOC_ADMIN: u8 = 0x23;
+pub const OP_TXN: u8 = 0x24;
+pub const OP_DOC_INFO: u8 = 0x25;
 
 pub const STATUS_OK: u8 = 0x00;
 pub const STATUS_NOT_FOUND: u8 = 0x01;
@@ -104,6 +118,9 @@ pub const STATUS_OVERLOADED: u8 = 0x03;
 pub const STATUS_CONFLICT: u8 = 0x04;
 pub const STATUS_UNAUTHORIZED: u8 = 0x05;
 pub const STATUS_RATE_LIMITED: u8 = 0x06;
+pub const STATUS_NOT_LEADER: u8 = 0x07;
+pub const STATUS_INVALID: u8 = 0x08;
+pub const STATUS_COMMIT_UNKNOWN: u8 = 0x09;
 
 /// Default hard ceiling on simultaneous active TCP connections before load-shedding kicks in.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 100_000;
@@ -120,10 +137,10 @@ const BATCH_ITEM_HEADER: usize = 28;
 const fn required_role(op: u8) -> Option<RbacRole> {
     match op {
         OP_AUTH => Some(RbacRole::Unauthenticated),
-        OP_GET_RAW_FRAME | OP_STATS | OP_BATCH_GET | OP_QUERY_HYBRID | OP_METRICS | OP_HEALTH => {
-            Some(RbacRole::ReadOnly)
-        }
-        OP_PUT_RAW_FRAME | OP_DELETE | OP_CAS_PUT | OP_BATCH_PUT => Some(RbacRole::ReadWrite),
+        OP_GET_RAW_FRAME | OP_STATS | OP_BATCH_GET | OP_QUERY_HYBRID | OP_METRICS | OP_HEALTH
+        | OP_DOC_GET | OP_DOC_QUERY | OP_DOC_INFO => Some(RbacRole::ReadOnly),
+        OP_PUT_RAW_FRAME | OP_DELETE | OP_CAS_PUT | OP_BATCH_PUT | OP_TXN | OP_DOC_WRITE
+        | OP_DOC_ADMIN => Some(RbacRole::ReadWrite),
         OP_RAFT_VOTE | OP_RAFT_APPEND | OP_RAFT_SNAPSHOT | OP_MIGRATE_VSHARD | OP_ADMIN_BACKUP
         | OP_ADMIN_COMPACT | OP_ADMIN_CHECKPOINT => Some(RbacRole::Admin),
         _ => None,
@@ -139,7 +156,10 @@ const fn max_body_len(op: u8) -> usize {
         OP_QUERY_HYBRID => 64,
         OP_RAFT_VOTE => 64,
         OP_PUT_RAW_FRAME | OP_CAS_PUT | OP_BATCH_GET | OP_BATCH_PUT | OP_RAFT_APPEND
-        | OP_MIGRATE_VSHARD => MAX_PAYLOAD_SIZE as usize,
+        | OP_MIGRATE_VSHARD | OP_TXN | OP_DOC_WRITE => MAX_PAYLOAD_SIZE as usize,
+        // Collection + key, or a query / collection command (filters are small).
+        OP_DOC_GET => 2 * 1024 + 16,
+        OP_DOC_QUERY | OP_DOC_ADMIN | OP_DOC_INFO => 1024 * 1024,
         // One snapshot chunk plus its fixed header.
         OP_RAFT_SNAPSHOT => RAFT_SNAPSHOT_CHUNK + 64,
         _ => 0,
@@ -343,11 +363,28 @@ impl NonBlockingConn {
     }
 }
 
+impl StorageServer<DocumentRecord> {
+    /// Starts a server hosting the document API (`OP_DOC_*`, used by every SDK and the SQL
+    /// adapter) over `store`, plus the typed-frame opcodes over its engine.
+    pub fn start_documents(
+        bind_addr: &str,
+        store: Arc<DocumentStore>,
+        max_connections: usize,
+        security: SecurityConfig,
+        raft: Option<Arc<RaftNode<DocumentRecord>>>,
+    ) -> Result<Self> {
+        let engine = Arc::clone(store.engine());
+        Self::start_inner(bind_addr, engine, max_connections, security, raft, Some(store))
+    }
+}
+
 /// State shared by every reactor worker.
 struct ServerShared<T: ZeroCopyRecord + Indexable> {
     engine: Arc<StorageEngine<T>>,
     security: SecurityConfig,
     raft: Option<Arc<RaftNode<T>>>,
+    /// Document API (`OP_DOC_*`); `None` when the server hosts only typed records.
+    documents: Option<Arc<DocumentStore>>,
     admin_jobs: AtomicUsize,
     /// Every reactor shard, so `OP_METRICS` can merge their latency histograms.
     shards: Vec<Arc<ReactorShard>>,
@@ -439,6 +476,17 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
         security: SecurityConfig,
         raft: Option<Arc<RaftNode<T>>>,
     ) -> Result<Self> {
+        Self::start_inner(bind_addr, engine, max_connections, security, raft, None)
+    }
+
+    fn start_inner(
+        bind_addr: &str,
+        engine: Arc<StorageEngine<T>>,
+        max_connections: usize,
+        security: SecurityConfig,
+        raft: Option<Arc<RaftNode<T>>>,
+        documents: Option<Arc<DocumentStore>>,
+    ) -> Result<Self> {
         if security.require_auth && security.token_count() == 0 {
             return Err(StorageError::invalid_key(
                 "require_auth is set but no authentication token is registered",
@@ -473,6 +521,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
             engine,
             security,
             raft,
+            documents,
             admin_jobs: AtomicUsize::new(0),
             shards: shards.clone(),
             slow_log: SlowOperationLog::new(DEFAULT_SLOW_RPC_NS, SLOW_LOG_CAPACITY),
@@ -1008,10 +1057,11 @@ enum OpClass {
 #[inline]
 const fn op_class(op: u8) -> OpClass {
     match op {
-        OP_GET_RAW_FRAME | OP_BATCH_GET | OP_QUERY_HYBRID | OP_STATS | OP_METRICS | OP_HEALTH => {
-            OpClass::Read
+        OP_GET_RAW_FRAME | OP_BATCH_GET | OP_QUERY_HYBRID | OP_STATS | OP_METRICS | OP_HEALTH
+        | OP_DOC_GET | OP_DOC_QUERY | OP_DOC_INFO => OpClass::Read,
+        OP_PUT_RAW_FRAME | OP_CAS_PUT | OP_BATCH_PUT | OP_DELETE | OP_TXN | OP_DOC_WRITE => {
+            OpClass::Write
         }
-        OP_PUT_RAW_FRAME | OP_CAS_PUT | OP_BATCH_PUT | OP_DELETE => OpClass::Write,
         _ => OpClass::Other,
     }
 }
@@ -1036,6 +1086,12 @@ const fn op_name(op: u8) -> &'static str {
         OP_ADMIN_COMPACT => "admin_compact",
         OP_HEALTH => "health",
         OP_ADMIN_CHECKPOINT => "admin_checkpoint",
+        OP_DOC_GET => "doc_get",
+        OP_DOC_WRITE => "doc_write",
+        OP_DOC_QUERY => "doc_query",
+        OP_DOC_ADMIN => "doc_admin",
+        OP_DOC_INFO => "doc_info",
+        OP_TXN => "txn",
         _ => "unknown",
     }
 }
@@ -1298,6 +1354,39 @@ fn execute_request<T: ZeroCopyRecord + Indexable>(
                 Err((status, msg)) => conn.send_or_queue_response(status, 0, msg),
             }
         }
+        // ── Document API (`TASK-098`) ───────────────────────────────────────────────
+        OP_DOC_GET | OP_DOC_WRITE | OP_DOC_QUERY | OP_DOC_INFO | OP_DOC_ADMIN => {
+            let Some(ref store) = shared.documents else {
+                let _ = conn.send_or_queue_response(
+                    STATUS_INVALID,
+                    0,
+                    b"this server does not host the document API",
+                );
+                return ConnStep::Progress;
+            };
+            if op == OP_DOC_ADMIN && documents::admin_is_slow(&body) {
+                match spawn_admin_job(op, body, shared, shard) {
+                    Ok(rx) => {
+                        conn.pending_job = Some(rx);
+                        return ConnStep::Progress;
+                    }
+                    Err((status, msg)) => conn.send_or_queue_response(status, 0, msg),
+                }
+            } else {
+                let (status, version, out) = match op {
+                    OP_DOC_GET => documents::doc_get(store, &body),
+                    OP_DOC_WRITE => documents::doc_write(store, &body),
+                    OP_DOC_QUERY => documents::doc_query(store, &body),
+                    OP_DOC_INFO => documents::doc_admin(store, &body, false),
+                    _ => documents::doc_admin(store, &body, true),
+                };
+                conn.send_or_queue_response(status, version, &out)
+            }
+        }
+        OP_TXN => {
+            let (status, version, out) = execute_txn(engine, &body);
+            conn.send_or_queue_response(status, version, &out)
+        }
         OP_HEALTH => {
             let st = engine.stats();
             let health = format!(
@@ -1313,6 +1402,89 @@ fn execute_request<T: ZeroCopyRecord + Indexable>(
         ConnStep::Closed
     } else {
         ConnStep::Progress
+    }
+}
+
+/// `OP_TXN` precondition / kind codes (`protocol/PROTOCOL.md` §9).
+const TXN_PUT: u8 = 1;
+const TXN_DELETE: u8 = 2;
+const TXN_CHECK: u8 = 3;
+
+/// Executes an atomic typed-frame batch: `u32 count | (24B id | u8 precondition | u64 version |
+/// u8 kind | u32 frame_len | frame)*`, where precondition is `0` none, `1` absent, `2` exists,
+/// `3` version. Replies `u32 count | (u8 exists | u64 version)*`, or `Conflict` with
+/// `u32 index | u8 exists | u64 actual | message`.
+fn execute_txn<T: ZeroCopyRecord + Indexable>(engine: &StorageEngine<T>, body: &[u8]) -> (u8, u64, Vec<u8>) {
+    use storage_codec::value_wire::SveReader;
+    let parse = || -> Result<Vec<WriteOp<T>>> {
+        let mut r = SveReader::new(body);
+        let n = r.count(41)?;
+        let mut ops = Vec::with_capacity(n);
+        for _ in 0..n {
+            let id = InlineId::from_raw_bytes(read_array_24(r.take(24)?, 0))?;
+            let pre_kind = r.u8()?;
+            let ver = Version(r.u64()?);
+            let precondition = match pre_kind {
+                0 => Precondition::None,
+                1 => Precondition::Absent,
+                2 => Precondition::Exists,
+                3 => Precondition::Version(ver),
+                _ => return Err(StorageError::invalid_value("unknown precondition")),
+            };
+            let kind = r.u8()?;
+            let frame_len = r.u32()? as usize;
+            let frame = r.take(frame_len)?;
+            let kind = match kind {
+                TXN_PUT => {
+                    let aligned = AlignedBytes::try_copy_from_slice(frame)?;
+                    let (_, rec) = RecordCodec::decode_owned::<T>(aligned.as_slice())?;
+                    WriteKind::Put(rec)
+                }
+                TXN_DELETE => WriteKind::Delete,
+                TXN_CHECK => WriteKind::Check,
+                _ => return Err(StorageError::invalid_value("unknown txn item kind")),
+            };
+            ops.push(WriteOp { id, kind, precondition });
+        }
+        if r.remaining() != 0 {
+            return Err(StorageError::invalid_value("trailing bytes after txn"));
+        }
+        Ok(ops)
+    };
+    let ops = match parse() {
+        Ok(o) => o,
+        Err(e) => return documents::error_reply(&e),
+    };
+    let ids: Vec<InlineId> = ops.iter().map(|o| o.id).collect();
+    match engine.commit(ops) {
+        Ok(results) => {
+            let mut out = Vec::with_capacity(4 + results.len() * 9);
+            out.extend_from_slice(&(results.len() as u32).to_le_bytes());
+            for r in &results {
+                out.push(u8::from(r.version.is_some()));
+                out.extend_from_slice(&r.version.map_or(0, |v| v.0).to_le_bytes());
+            }
+            (STATUS_OK, results.len() as u64, out)
+        }
+        Err(e) => {
+            let (id, actual) = match e {
+                StorageError::VersionConflict { id, actual, .. } => (Some(id), (actual.0 != 0).then_some(actual)),
+                StorageError::ConditionFailed { id, actual, .. } => (Some(id), actual),
+                _ => (None, None),
+            };
+            match id {
+                Some(id) => {
+                    let idx = ids.iter().position(|&x| x == id).unwrap_or(u32::MAX as usize);
+                    let mut out = Vec::new();
+                    out.extend_from_slice(&(idx as u32).to_le_bytes());
+                    out.push(u8::from(actual.is_some()));
+                    out.extend_from_slice(&actual.map_or(0, |v| v.0).to_le_bytes());
+                    out.extend_from_slice(e.to_string().as_bytes());
+                    (STATUS_CONFLICT, 0, out)
+                }
+                None => documents::error_reply(&e),
+            }
+        }
     }
 }
 
@@ -1473,6 +1645,10 @@ fn run_admin_job<T: ZeroCopyRecord + Indexable>(
     let engine = &shared.engine;
     let err = |e: StorageError| (STATUS_ERROR, 0u64, e.to_string().into_bytes());
     match op {
+        OP_DOC_ADMIN => match shared.documents {
+            Some(ref store) => documents::doc_admin(store, body, true),
+            None => (STATUS_INVALID, 0, b"this server does not host the document API".to_vec()),
+        },
         OP_ADMIN_BACKUP => {
             let Some(path) = backup_path else {
                 return (STATUS_ERROR, 0, b"missing backup path".to_vec());
@@ -1864,6 +2040,62 @@ impl StorageClient {
         }
     }
 
+    // ── Document API (`TASK-098`) ──────────────────────────────────────────
+
+    /// Reads one document (`None` if it does not exist).
+    pub fn doc_get(&mut self, collection: &str, key: &str) -> Result<Option<storage_core::Document>> {
+        let mut body = Vec::with_capacity(8 + collection.len() + key.len());
+        storage_core::document_wire::put_str(&mut body, collection);
+        storage_core::document_wire::put_str(&mut body, key);
+        let (status, version, resp) = self.rpc(OP_DOC_GET, NO_KEY, &body)?;
+        match status {
+            STATUS_OK => {
+                let fields = storage_codec::value_wire::SveReader::new(&resp).map_body()?;
+                Ok(Some(storage_core::Document { key: key.to_owned(), version: Version(version), fields }))
+            }
+            STATUS_NOT_FOUND => Ok(None),
+            s => Err(remote_error(s, version, &resp)),
+        }
+    }
+
+    /// Applies document writes atomically (optionally idempotent with `request_id`).
+    pub fn doc_write(
+        &mut self,
+        writes: &[storage_core::DocWrite],
+        request_id: Option<[u8; 16]>,
+    ) -> Result<storage_core::WriteSummary> {
+        let mut body = Vec::new();
+        storage_core::document_wire::encode_write_request(writes, request_id, &mut body);
+        let (status, version, resp) = self.rpc(OP_DOC_WRITE, NO_KEY, &body)?;
+        match status {
+            STATUS_OK => {
+                let (versions, duplicate) = storage_core::document_wire::decode_write_response(&resp)?;
+                Ok(storage_core::WriteSummary { versions, duplicate })
+            }
+            s => Err(remote_error(s, version, &resp)),
+        }
+    }
+
+    /// Runs a document query and returns one page.
+    pub fn doc_query(&mut self, query: &storage_core::DocQuery) -> Result<storage_core::DocPage> {
+        let mut body = Vec::new();
+        storage_core::document_wire::encode_query(query, &mut body);
+        let (status, version, resp) = self.rpc(OP_DOC_QUERY, NO_KEY, &body)?;
+        match status {
+            STATUS_OK => storage_core::document_wire::decode_page(&resp),
+            s => Err(remote_error(s, version, &resp)),
+        }
+    }
+
+    /// Sends a raw collection command (`OP_DOC_ADMIN` or `OP_DOC_INFO`, see `documents`).
+    pub fn doc_command(&mut self, op: u8, body: &[u8]) -> Result<(u64, Vec<u8>)> {
+        let (status, version, resp) = self.rpc(op, NO_KEY, body)?;
+        match status {
+            STATUS_OK => Ok((version, resp)),
+            s => Err(remote_error(s, version, &resp)),
+        }
+    }
+
     fn rpc(&mut self, op: u8, id: InlineId, body: &[u8]) -> Result<(u8, u64, Vec<u8>)> {
         let mut req_hdr = [0u8; 29];
         req_hdr[0] = op;
@@ -1902,6 +2134,19 @@ impl StorageClient {
                 .map_err(|e| StorageError::io("read RPC response body", e))?;
         }
         Ok((status, version, resp_body))
+    }
+}
+
+/// Converts a non-OK response into a typed error.
+fn remote_error(status: u8, version: u64, body: &[u8]) -> StorageError {
+    match status {
+        STATUS_NOT_LEADER => StorageError::NotLeader { leader: (version != 0).then_some(version) },
+        STATUS_COMMIT_UNKNOWN => StorageError::CommitUnknown { index: version },
+        _ => {
+            // Conflict bodies start with `u32 index | u8 exists | u64 version` before the text.
+            let text = if status == STATUS_CONFLICT && body.len() >= 13 { &body[13..] } else { body };
+            StorageError::Rejected { status, message: String::from_utf8_lossy(text).into_owned() }
+        }
     }
 }
 

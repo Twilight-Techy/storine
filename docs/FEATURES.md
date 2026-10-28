@@ -154,6 +154,21 @@
 | **F-SEC-03** | **Per-Connection Token-Bucket Rate Limiting** | Zero-allocation `TokenBucket` applied at the request-header stage, before the body is read. | v1.0 |
 | **F-SEC-04** | **Constant-Time Auth & Confined Admin Paths** | Constant-time token comparison and `backup_root` confinement of client-supplied backup names. | v1.0 |
 
+### 6.10 Money-Grade Write Safety & Documents (`F-TYPE-*`, `F-DOC-*`, Stage 22)
+
+| Feature ID | Feature Name | Description | Target Tier |
+| :--- | :--- | :--- | :--- |
+| **F-TYPE-01** | **Exact Decimal & 128-bit Numbers** | `Decimal` (`i128` mantissa, scale `<= 38`) with checked arithmetic and explicit rounding; decimals and `i128` are indexable through one order-preserving numeric key space. Money is never a binary float. | v1.1 |
+| **F-TYPE-02** | **Nested Lists & Maps** | `PropertyValue::List` / `Map` archived zero-copy (depth `<= 32`). | v1.1 |
+| **F-CONC-09** | **Atomic Field Operations** | Server-side `set`, `unset`, checked `add` with `min` / `max` bounds (no overdraft), `append` — no client read-modify-write, no lost updates. | v1.1 |
+| **F-CONC-10** | **Conditional Atomic Commits** | Any mix of puts, deletes, patches and checks with `absent` / `exists` / `version` preconditions committed atomically (`StorageEngine::commit`, `OP_TXN`, `OP_DOC_WRITE`). Versions are monotonic across delete + re-create (no ABA). | v1.1 |
+| **F-CONC-11** | **Idempotent Requests** | A client request id makes a retried write apply at most once (crash-safe marker committed in the same transaction; 24 h window). | v1.1 |
+| **F-DOC-01** | **Schema-Flexible Document Collections** | Named collections of keyed documents with typed fields in one engine; cross-collection transactions. | v1.1 |
+| **F-DOC-02** | **Document Secondary Indexes** | Up to 4 per collection; equality, range and `IN` predicates use them; results always exact. | v1.1 |
+| **F-DOC-03** | **Document Queries** | Filters (comparison, between, in, prefix, contains, exists / missing, key prefix, and / or / not), ordering, offset / limit, cursors. | v1.1 |
+| **F-DOC-04** | **Document Wire Protocol** | `OP_DOC_*` opcodes with the SVE value encoding (`protocol/PROTOCOL.md`), used by every SDK and the SQL adapter. | v1.1 |
+| **F-NET-03** | **Rich Status Codes** | `NotLeader`, `Invalid`, `CommitUnknown`, conflict details (write index + current version). | v1.1 |
+
 ---
 
 ## 7. Verified Implementation Status (full-project audits, 2026-10-20/21, `TASK-067` – `TASK-081`)

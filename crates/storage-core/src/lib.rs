@@ -16,6 +16,7 @@ pub mod backup;
 pub mod catalog;
 mod decrypt_cache;
 pub mod document;
+pub mod document_wire;
 pub mod engine;
 pub mod migration;
 pub mod model;
