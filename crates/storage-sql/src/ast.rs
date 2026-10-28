@@ -119,11 +119,17 @@ pub enum Statement {
         args: Vec<Expr>,
     },
     Deallocate(Option<String>),
+    /// PostgreSQL `DISCARD ALL | PLANS | SEQUENCES | TEMP` (lowercase kind).
+    Discard(String),
+    /// PostgreSQL `RESET ALL`: every setting back to its session default.
+    ResetAll,
     /// T-SQL `EXEC [schema.]procedure [@name =] value, ...` (system procedures), or
     /// `EXEC (sql)` with an empty name.
     ExecProc {
         name: String,
         args: Vec<(Option<String>, Expr)>,
+        /// `EXEC @status = proc ...`: the variable receiving the return status.
+        status: Option<String>,
     },
     /// Statements accepted and ignored because they have no effect here (the tag is reported back).
     NoOp(&'static str),

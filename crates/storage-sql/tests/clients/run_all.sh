@@ -14,6 +14,7 @@
 #   STORINE_DATA    the server's --data directory (its TLS certificate is then verified)
 #   ELOQUENT_AUTOLOAD  vendor/autoload.php of `composer require illuminate/database:^11`
 #   GEM_HOME/GEM_PATH  with activerecord, pg, trilogy (GEM_PATH also listing the default gems)
+# The PgBouncer suite runs when `pgbouncer` is installed (it starts its own instance).
 set -u
 cd "$(dirname "$0")"
 PG=${STORINE_PG_PORT:-55432}
@@ -69,6 +70,7 @@ run() {
 }
 
 run python "$PYTHON" test_python.py "$PG" "$MY"
+have pgbouncer && run pgbouncer pgbouncer/run.sh "$PYTHON" "$PG"
 run django-postgres "$PYTHON" django/test_django.py postgres "$PG"
 run django-mysql "$PYTHON" django/test_django.py mysql "$MY"
 have node && run node node test_node.js "$PG" "$MY"

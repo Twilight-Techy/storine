@@ -9,6 +9,7 @@
 //! `40001` (serialization failure), which clients and ORMs retry. Unique constraints, primary
 //! keys and foreign-key parents are verified by preconditions in the same batch.
 
+pub(crate) mod advisory;
 mod ddl;
 mod dml;
 mod eval;
@@ -299,8 +300,11 @@ impl Engine {
                 .unwrap_or(&self.config.database)
                 .to_owned(),
             vars: default_vars(dialect),
+            base_vars: default_vars(dialect),
             user_vars: HashMap::new(),
             table_vars: HashMap::new(),
+            advisory: std::sync::Mutex::new(advisory::Held::default()),
+            return_status: 0,
             txn: None,
             last_insert_id: 0,
             prepared: HashMap::new(),
@@ -507,6 +511,7 @@ impl Drop for Session {
         if self.txn.is_some() {
             self.rollback();
         }
+        advisory::release_all(self, None, "");
     }
 }
 
@@ -647,9 +652,16 @@ pub struct Session {
     pub user: String,
     pub database: String,
     pub vars: HashMap<String, String>,
+    /// Session defaults (`RESET ALL` / `DISCARD ALL` return to them): the dialect's defaults
+    /// plus what the client set at connection time (`application_name`).
+    pub base_vars: HashMap<String, String>,
     pub user_vars: HashMap<String, Datum>,
     /// T-SQL table variables by name (with the `@`).
     pub table_vars: HashMap<String, TableVar>,
+    /// Return status of the last T-SQL procedure (`EXEC @status = ...`).
+    pub return_status: i32,
+    /// Advisory / named / application locks this session holds (`exec/advisory.rs`).
+    pub advisory: std::sync::Mutex<advisory::Held>,
     pub txn: Option<Txn>,
     pub last_insert_id: i64,
     pub prepared: HashMap<String, (Statement, usize)>,
@@ -796,6 +808,16 @@ impl Session {
 
     /// Runs one statement with bound parameters.
     pub fn execute(&mut self, stmt: &Statement, params: &[Datum]) -> SqlResult<Outcome> {
+        let out = self.execute_one(stmt, params);
+        // Transaction-scoped advisory locks end with the transaction (an autocommit statement
+        // is a transaction of its own).
+        if !self.in_transaction() {
+            advisory::release_all(self, Some(advisory::Scope::Xact), "");
+        }
+        out
+    }
+
+    fn execute_one(&mut self, stmt: &Statement, params: &[Datum]) -> SqlResult<Outcome> {
         if let Statement::If {
             cond,
             then,
@@ -1320,7 +1342,14 @@ impl Session {
                     .insert(name.to_ascii_lowercase(), ((**statement).clone(), 0));
                 Ok(Outcome::command("PREPARE"))
             }
-            Statement::ExecProc { name, args } => mssql::exec_proc(self, name, args, params),
+            Statement::ExecProc { name, args, status } => {
+                self.return_status = 0;
+                let out = mssql::exec_proc(self, name, args, params)?;
+                if let Some(var) = status {
+                    self.user_vars.insert(var.clone(), Datum::Int(i64::from(self.return_status)));
+                }
+                Ok(out)
+            }
             Statement::Execute { name, args } => {
                 let (stmt, _) = self
                     .prepared
@@ -1352,6 +1381,26 @@ impl Session {
             Statement::Copy(_) => Err(SqlError::unsupported(
                 "COPY here: it streams through the PostgreSQL protocol's simple query (psql \\copy, COPY ... FROM STDIN / TO STDOUT)",
             )),
+            Statement::Discard(kind) => {
+                if kind == "all" {
+                    if self.in_transaction() {
+                        return Err(SqlError::new(
+                            "25001",
+                            "DISCARD ALL cannot run inside a transaction block",
+                        ));
+                    }
+                    self.prepared.clear();
+                    advisory::release_all(self, None, "");
+                    self.vars = self.base_vars.clone();
+                    self.user_vars.clear();
+                    self.table_vars.clear();
+                }
+                Ok(Outcome::command(format!("DISCARD {}", kind.to_ascii_uppercase())))
+            }
+            Statement::ResetAll => {
+                self.vars = self.base_vars.clone();
+                Ok(Outcome::command("RESET"))
+            }
             Statement::NoOp(tag) => Ok(Outcome::command(*tag)),
             Statement::Empty => Ok(Outcome::command("")),
             Statement::Begin { .. }

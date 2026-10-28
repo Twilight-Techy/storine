@@ -167,6 +167,7 @@
 | **F-DOC-02** | **Document Secondary Indexes** | Up to 16 per collection; equality, range and `IN` predicates use them; results always exact. | v1.1 |
 | **F-DOC-03** | **Document Queries** | Filters (comparison, between, in, prefix, contains, exists / missing, key prefix, and / or / not), ordering, offset / limit, cursors. | v1.1 |
 | **F-DOC-04** | **Document Wire Protocol** | `OP_DOC_*` opcodes with the SVE value encoding (`protocol/PROTOCOL.md`), used by every SDK and the SQL adapter. | v1.1 |
+| **F-DOC-06** | **Ranged Reads & Projections** | Byte ranges of large `bytes` / `text` values (16 MiB per read, streamed in chunks by every SDK) and gets of selected fields only, so files and media stored in documents are never transferred whole. | v1.2 |
 | **F-DOC-05** | **Document Vector Search** | Named HNSW vector indexes on embedding fields (up to 4 per collection, 4,096 dimensions); `nearest` queries combined with any filter, exact re-ranking, `$score`; in every SDK. | v1.2 |
 | **F-DIST-05** | **Networked Raft Runtime & Clustered Serving** | Election timers, pre-vote, per-peer replication, leader lease; servers route writes through consensus, redirect from followers (`NotLeader` + leader address) and serve opt-in follower reads (`--node-id`, `--peers`). | v1.1 |
 | **F-NET-04** | **Session Options & Cluster Info** | `OP_SET_OPTIONS` (follower reads) and `OP_CLUSTER_INFO` (leader discovery for SDKs). | v1.1 |
@@ -190,7 +191,8 @@
 | **F-SQL-05** | **Zero-Dependency TLS** | TLS 1.3 and 1.2 (ChaCha20-Poly1305, x25519, Ed25519) on all three endpoints, including every SQL Server encryption mode and TDS 8 strict. | v1.2 |
 | **F-SQL-07** | **Platform-Neutral SQL Server Logins** | SQL Server authentication plus OpenID Connect access tokens from any issuer (JWKS, RS256/384/512, EdDSA) and Kerberos from any realm (keytab), without tying deployments to a cloud or to Windows. | v1.2 |
 | **F-SQL-08** | **pgvector Compatibility** | `vector(n)`, `<->` / `<=>` / `<#>` / `<+>`, pgvector's functions and wire formats, `CREATE INDEX ... USING hnsw / ivfflat` backed by the store's vector indexes; works with the pgvector adapters for psycopg, psycopg2 and SQLAlchemy. | v1.2 |
-| **F-SQL-06** | **Real-Client Compatibility Matrix** | `tests/clients/run_all.sh`: 14 suites over Python, Node, Go, Java, .NET, PHP and Ruby drivers and ORMs. | v1.2 |
+| **F-SQL-09** | **Poolers & Application Locks** | PgBouncer in session and transaction pooling; real `DISCARD ALL` / `RESET`; PostgreSQL advisory locks, MySQL `GET_LOCK` and SQL Server `sp_getapplock` stored in the database and shared by every gateway. | v1.2 |
+| **F-SQL-06** | **Real-Client Compatibility Matrix** | `tests/clients/run_all.sh`: 15 suites over Python, Node, Go, Java, .NET, PHP and Ruby drivers and ORMs, and PgBouncer. | v1.2 |
 
 ---
 

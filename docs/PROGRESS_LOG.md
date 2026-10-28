@@ -568,3 +568,13 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Also**: the secondary-index limit per collection (and per SQL table) went from 4 to 16.
 - **Verification**: engine, replica and SDK suites; the pgvector section of the Python client suite against numpy; the full client matrix (14 suites) green.
 
+### Stage 27 (continued): large values and connection poolers (`TASK-123`, `TASK-124`) — 2026-10-28
+
+- **Large values**: a document holds up to 256 MiB, but every read returned all of it, so a 200 MB video in a document meant a 200 MB transfer to read its title. Gets can now name the fields they want, and large `bytes` / `text` values are read in ranges of up to 16 MiB. The server copies only the requested slice out of the memory-mapped record. The SDKs stream a value chunk by chunk and stop with a conflict if the document changes in between, so a reader never mixes two versions.
+- **PgBouncer**: the first run through PgBouncer passed the money and transaction tests but exposed three gaps in session handling:
+  - `DISCARD ALL` and `RESET` were accepted as no-ops. PgBouncer's session mode sends `DISCARD ALL` between clients to clean the connection, so the next client would have inherited the previous one's prepared statements and settings. The test that two consecutive clients on one server connection share nothing now passes.
+  - asyncpg's pool reset (`CLOSE ALL`, `pg_advisory_unlock_all()`) failed: `CLOSE` was rejected and advisory locks did not exist.
+  - SQL Server's `sp_getapplock` was a stub that granted every lock, which defeats EF Core's migration lock.
+- **Application locks**: added for all three dialects. They are documents in the store, changed only by version-conditioned writes, so several gateways in front of one store exclude each other. Leases are renewed in the background, and the locks of a crashed gateway lapse within a minute instead of blocking forever.
+- **Verification**: engine, TCP and conformance tests; a large-values end-to-end test in all 8 SDKs; executor tests for every lock function and reset; the PgBouncer suite; the full client matrix.
+

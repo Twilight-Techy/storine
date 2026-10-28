@@ -142,6 +142,7 @@ Every suite below runs against a real `storine-sql` (`tests/clients/run_all.sh`)
 | PHP | PDO (pgsql, mysql; native and emulated prepares), pgsql, mysqli | Laravel Eloquent and schema builder |
 | Ruby | pg, trilogy | ActiveRecord 8 (migrations, locking, `update_counters`) |
 | CLI | `psql`, `mysql` | |
+| Poolers | PgBouncer 1.22 (session and transaction pooling, SCRAM on both legs, `max_prepared_statements`) with psycopg2, psycopg 3, asyncpg and SQLAlchemy | |
 
 SQL Server (TDS 7.1 - 7.4 and 8.0):
 
@@ -230,6 +231,28 @@ FROM items WHERE body <> '' ORDER BY distance LIMIT 10;
 - **Clients**: the `pgvector` adapters for psycopg 3, psycopg2 and SQLAlchemy are tested
   (`tests/clients/test_python.py`). On the MySQL and SQL Server endpoints, store embeddings in
   JSON columns or use the document API's `nearest` queries.
+
+## Connection pools and application locks
+
+- **PgBouncer** works in session and transaction pooling modes (`tests/clients/pgbouncer`).
+  `DISCARD ALL` (PgBouncer's `server_reset_query`), `RESET ALL` / `RESET name` and `CLOSE ALL`
+  really reset the session: prepared statements (SQL and protocol level), settings and
+  advisory locks of one client never reach the next. As with PostgreSQL itself, transaction
+  pooling does not keep session state (`SET`, session advisory locks) between transactions.
+- **Advisory and named locks** for migration tools and job schedulers:
+  - PostgreSQL: `pg_advisory_lock`, `pg_try_advisory_lock`, `pg_advisory_unlock`,
+    `pg_advisory_unlock_all`, the `_shared` and `_xact_` variants, with one `bigint` key or
+    two `int` keys. Blocking calls honour `SET lock_timeout`.
+  - MySQL: `GET_LOCK(name, seconds)`, `RELEASE_LOCK`, `RELEASE_ALL_LOCKS`, `IS_FREE_LOCK`,
+    `IS_USED_LOCK`.
+  - SQL Server: `sp_getapplock` / `sp_releaseapplock` (session or transaction owner, shared or
+    exclusive, `@LockTimeout`), with the return status in `EXEC @r = ...`.
+
+  Locks are stored in the database, so every gateway in front of the same store sees them.
+  They are released by unlock calls, at the end of the transaction or session, or by
+  `DISCARD ALL`; a gateway that stops without releasing them loses them after 60 seconds.
+  There is no deadlock detection between advisory locks: use timeouts or try-locks if two
+  tasks take several of them in different orders.
 
 ## Transactions and money safety
 

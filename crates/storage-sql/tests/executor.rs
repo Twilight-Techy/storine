@@ -668,3 +668,150 @@ fn a_disconnected_session_releases_its_row_locks() {
     ok(&mut b, "SELECT n FROM acct WHERE id = 1 FOR UPDATE NOWAIT");
     ok(&mut b, "COMMIT");
 }
+
+#[test]
+fn advisory_named_and_application_locks_exclude_other_sessions() {
+    let db = setup("advisory");
+    let mut a = db.engine.new_session(Dialect::Postgres, "a", None);
+    let mut b = db.engine.new_session(Dialect::Postgres, "b", None);
+    let t = |s: &mut Session, sql: &str| one(s, sql);
+
+    // Session locks: exclusive against other sessions, re-entrant within one.
+    ok(&mut a, "SELECT pg_advisory_lock(42)");
+    assert_eq!(
+        t(&mut a, "SELECT pg_try_advisory_lock(42)"),
+        t(&mut a, "SELECT true")
+    );
+    assert_eq!(
+        t(&mut b, "SELECT pg_try_advisory_lock(42)"),
+        t(&mut b, "SELECT false")
+    );
+    // The two-int key space is separate from the bigint one.
+    assert_eq!(
+        t(&mut b, "SELECT pg_try_advisory_lock(0, 42)"),
+        t(&mut b, "SELECT true")
+    );
+    ok(&mut b, "SET lock_timeout = '50ms'");
+    assert_eq!(err(&mut b, "SELECT pg_advisory_lock(42)"), "55P03");
+    // Held twice by a: still held after one unlock, free after the second.
+    assert_eq!(
+        t(&mut a, "SELECT pg_advisory_unlock(42)"),
+        t(&mut a, "SELECT true")
+    );
+    assert_eq!(
+        t(&mut b, "SELECT pg_try_advisory_lock(42)"),
+        t(&mut b, "SELECT false")
+    );
+    assert_eq!(
+        t(&mut a, "SELECT pg_advisory_unlock(42)"),
+        t(&mut a, "SELECT true")
+    );
+    assert_eq!(
+        t(&mut a, "SELECT pg_advisory_unlock(42)"),
+        t(&mut a, "SELECT false")
+    );
+    assert_eq!(
+        t(&mut b, "SELECT pg_try_advisory_lock(42)"),
+        t(&mut b, "SELECT true")
+    );
+    ok(&mut b, "SELECT pg_advisory_unlock_all()");
+
+    // Shared locks coexist; exclusive waits for them.
+    ok(&mut a, "SELECT pg_advisory_lock_shared(7)");
+    assert_eq!(
+        t(&mut b, "SELECT pg_try_advisory_lock_shared(7)"),
+        t(&mut b, "SELECT true")
+    );
+    assert_eq!(
+        t(&mut b, "SELECT pg_try_advisory_lock(7)"),
+        t(&mut b, "SELECT false")
+    );
+    ok(&mut a, "SELECT pg_advisory_unlock_shared(7)");
+    ok(&mut b, "SELECT pg_advisory_unlock_shared(7)");
+
+    // Transaction locks end with the transaction (an autocommit statement is one).
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "SELECT pg_advisory_xact_lock(9)");
+    assert_eq!(
+        t(&mut b, "SELECT pg_try_advisory_lock(9)"),
+        t(&mut b, "SELECT false")
+    );
+    ok(&mut a, "COMMIT");
+    assert_eq!(
+        t(&mut b, "SELECT pg_try_advisory_xact_lock(9)"),
+        t(&mut b, "SELECT true")
+    );
+    assert_eq!(
+        t(&mut a, "SELECT pg_try_advisory_lock(9)"),
+        t(&mut a, "SELECT true")
+    );
+
+    // A blocked lock is granted when the holder's session ends.
+    let e = Arc::clone(&db.engine);
+    let waiter = std::thread::spawn(move || {
+        let mut c = e.new_session(Dialect::Postgres, "c", None);
+        let start = std::time::Instant::now();
+        ok(&mut c, "SELECT pg_advisory_lock(9)");
+        start.elapsed()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    drop(a);
+    assert!(waiter.join().unwrap() >= std::time::Duration::from_millis(150));
+    // DISCARD ALL releases session locks too (connection pools rely on it).
+    ok(&mut b, "SELECT pg_advisory_lock(11)");
+    ok(&mut b, "DISCARD ALL");
+    let mut d = db.engine.new_session(Dialect::Postgres, "d", None);
+    assert_eq!(
+        t(&mut d, "SELECT pg_try_advisory_lock(11)"),
+        t(&mut d, "SELECT true")
+    );
+
+    // MySQL named locks.
+    let mut m1 = db.engine.new_session(Dialect::MySql, "m1", None);
+    let mut m2 = db.engine.new_session(Dialect::MySql, "m2", None);
+    assert_eq!(one(&mut m1, "SELECT GET_LOCK('Migrations', 0)"), "1");
+    assert_eq!(one(&mut m2, "SELECT GET_LOCK('migrations', 0.05)"), "0");
+    assert_eq!(one(&mut m2, "SELECT IS_FREE_LOCK('migrations')"), "0");
+    assert_eq!(
+        one(&mut m2, "SELECT IS_USED_LOCK('migrations')"),
+        one(&mut m1, "SELECT CONNECTION_ID()")
+    );
+    assert_eq!(one(&mut m2, "SELECT RELEASE_LOCK('migrations')"), "0");
+    assert_eq!(one(&mut m2, "SELECT RELEASE_LOCK('never')"), "NULL");
+    assert_eq!(one(&mut m1, "SELECT GET_LOCK('other', 0)"), "1");
+    assert_eq!(one(&mut m1, "SELECT RELEASE_ALL_LOCKS()"), "2");
+    assert_eq!(one(&mut m2, "SELECT GET_LOCK('migrations', 0)"), "1");
+
+    // SQL Server application locks: return status through EXEC @r = ...
+    let mut s1 = db.engine.new_session(Dialect::MsSql, "s1", None);
+    let mut s2 = db.engine.new_session(Dialect::MsSql, "s2", None);
+    let get = "DECLARE @r int; EXEC @r = sp_getapplock @Resource = 'job', @LockMode = 'Exclusive', @LockOwner = 'Session', @LockTimeout = 0; SELECT @r";
+    assert_eq!(one(&mut s1, get), "0");
+    assert_eq!(one(&mut s2, get), "-1");
+    // Transaction-owned locks need a transaction.
+    assert_eq!(one(&mut s2, "DECLARE @r int; EXEC @r = sp_getapplock @Resource = 't', @LockMode = 'Shared'; SELECT @r"), "-999");
+    assert_eq!(one(&mut s1, "DECLARE @r int; EXEC @r = sp_releaseapplock @Resource = 'job', @LockOwner = 'Session'; SELECT @r"), "0");
+    assert_eq!(one(&mut s2, get), "0");
+}
+
+#[test]
+fn discard_reset_and_close_really_reset_the_session() {
+    let db = setup("discard");
+    let mut s = db.engine.new_session(Dialect::Postgres, "app", None);
+    ok(&mut s, "PREPARE q AS SELECT 1");
+    ok(&mut s, "SET search_path TO elsewhere");
+    ok(&mut s, "RESET search_path");
+    assert!(!one(&mut s, "SHOW search_path").contains("elsewhere"));
+    ok(&mut s, "SET search_path TO elsewhere");
+    ok(&mut s, "RESET ALL");
+    assert!(!one(&mut s, "SHOW search_path").contains("elsewhere"));
+    ok(&mut s, "BEGIN");
+    assert_eq!(err(&mut s, "DISCARD ALL"), "25001");
+    ok(&mut s, "ROLLBACK");
+    ok(&mut s, "DISCARD ALL");
+    ok(&mut s, "PREPARE q AS SELECT 2"); // the first `q` is gone
+    assert_eq!(one(&mut s, "EXECUTE q"), "2");
+    ok(&mut s, "CLOSE ALL");
+    assert_eq!(err(&mut s, "CLOSE c1"), "34000");
+    ok(&mut s, "DISCARD PLANS");
+}

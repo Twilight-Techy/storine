@@ -640,11 +640,16 @@ impl Parser {
                     return Ok(Statement::ExecProc {
                         name: String::new(),
                         args: vec![(None, sql)],
+                        status: None,
                     });
                 }
                 // EXEC @status = proc ...
-                if matches!(self.peek(), Some(Token::Variable { .. })) && self.is_op_at(1, "=") {
-                    self.pos += 2;
+                let mut status = None;
+                if let Some(Token::Variable { name, .. }) = self.peek() {
+                    if self.is_op_at(1, "=") {
+                        status = Some(name.to_ascii_lowercase());
+                        self.pos += 2;
+                    }
                 }
                 let (_, name) = self.object_name()?;
                 let mut args = Vec::new();
@@ -672,6 +677,7 @@ impl Parser {
                 Ok(Statement::ExecProc {
                     name: name.to_ascii_lowercase(),
                     args,
+                    status,
                 })
             }
             "execute" | "exec" => {
@@ -703,6 +709,48 @@ impl Parser {
                     return Ok(Statement::Deallocate(None));
                 }
                 Ok(Statement::Deallocate(Some(self.ident()?)))
+            }
+            // PostgreSQL session resets, sent by connection pools (PgBouncer's
+            // `server_reset_query`, asyncpg) between clients: they must really reset.
+            "discard" if self.dialect == Dialect::Postgres => {
+                self.pos += 1;
+                let kind = self.ident()?.to_ascii_lowercase();
+                let kind = if kind == "temporary" {
+                    "temp".to_owned()
+                } else {
+                    kind
+                };
+                if !matches!(kind.as_str(), "all" | "plans" | "sequences" | "temp") {
+                    return Err(SqlError::syntax(format!(
+                        "unrecognized DISCARD target {kind}"
+                    )));
+                }
+                Ok(Statement::Discard(kind))
+            }
+            "reset" if self.dialect == Dialect::Postgres => {
+                self.pos += 1;
+                if self.eat_kw("all") {
+                    return Ok(Statement::ResetAll);
+                }
+                let mut name = self.ident()?.to_ascii_lowercase();
+                while self.eat_op(".") {
+                    name.push('.');
+                    name.push_str(&self.ident()?.to_ascii_lowercase());
+                }
+                Ok(Statement::Set { name, value: None })
+            }
+            // No cursors exist (DECLARE ... CURSOR is not supported), so `CLOSE ALL` has nothing to
+            // close and any named cursor does not exist.
+            "close" if self.dialect == Dialect::Postgres => {
+                self.pos += 1;
+                if self.eat_kw("all") {
+                    return Ok(Statement::NoOp("CLOSE CURSOR ALL"));
+                }
+                let name = self.ident()?;
+                Err(SqlError::new(
+                    "34000",
+                    format!("cursor \"{name}\" does not exist"),
+                ))
             }
             "discard" | "listen" | "unlisten" | "notify" | "reset" | "lock" | "unlock"
             | "analyze" | "vacuum" | "checkpoint" | "flush" | "pragma" | "comment" | "grant"

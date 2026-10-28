@@ -65,6 +65,33 @@ def run_all():
         assert cur.fetchone() == (1, D("19.99"))
         c.close()
 
+    @section("psycopg2: advisory locks exclude other connections and wait for release")
+    def _():
+        a = psycopg2.connect(host="127.0.0.1", port=PG_PORT, user="app", dbname="shop")
+        b = psycopg2.connect(host="127.0.0.1", port=PG_PORT, user="app", dbname="shop")
+        a.autocommit = b.autocommit = True
+        ka, kb = a.cursor(), b.cursor()
+        ka.execute("SELECT pg_advisory_lock(%s)", (72707369,))  # what migration tools do
+        kb.execute("SELECT pg_try_advisory_lock(72707369)")
+        assert kb.fetchone()[0] is False
+        got = []
+
+        def wait():
+            kb.execute("SELECT pg_advisory_lock(72707369)")
+            got.append(True)
+
+        t = threading.Thread(target=wait)
+        t.start()
+        t.join(0.3)
+        assert not got, "lock granted while held"
+        ka.execute("SELECT pg_advisory_unlock(72707369)")
+        assert ka.fetchone()[0] is True
+        t.join(5)
+        assert got
+        kb.execute("SELECT pg_advisory_unlock_all()")
+        a.close()
+        b.close()
+
     @section("psycopg2: no lost updates under concurrency")
     def _():
         c = psycopg2.connect(host="127.0.0.1", port=PG_PORT, user="app", dbname="shop")

@@ -2078,11 +2078,71 @@ pub fn exec_proc(
         | "sp_updateextendedproperty"
         | "sp_dropextendedproperty"
         | "sp_tableoption"
-        | "sp_releaseapplock"
         | "sp_refreshview"
         | "sp_updatestats"
         | "sp_recompile" => ok(),
-        "sp_getapplock" => Ok(rows(&[("", I4)], vec![vec![i(0)]])),
+        // Application locks (`exec/advisory.rs`): return status 0 granted at once, 1 granted
+        // after waiting, -1 timed out, -999 parameter or ownership error; sp_releaseapplock 0
+        // released, -999 not held.
+        "sp_getapplock" | "sp_releaseapplock" => {
+            use super::advisory::{self as adv, Mode, Scope};
+            let resource = text(&arg("resource", 0));
+            let owner = text(&arg(
+                "lockowner",
+                if name == "sp_getapplock" { 2 } else { 1 },
+            ))
+            .to_ascii_lowercase();
+            let scope = match owner.as_str() {
+                "" | "transaction" => Scope::Xact,
+                "session" => Scope::Session,
+                _ => {
+                    s.return_status = -999;
+                    return ok();
+                }
+            };
+            if resource.is_empty()
+                || resource.chars().count() > 255
+                || (scope == Scope::Xact && !s.in_transaction())
+            {
+                // A transaction-owned lock needs an open transaction.
+                s.return_status = -999;
+                return ok();
+            }
+            let key = format!("a/{resource}");
+            if name == "sp_releaseapplock" {
+                let released = adv::release(s, &key, Mode::Exclusive, Some(scope))?
+                    || adv::release(s, &key, Mode::Shared, Some(scope))?;
+                s.return_status = if released { 0 } else { -999 };
+                return ok();
+            }
+            let mode = match text(&arg("lockmode", 1)).to_ascii_lowercase().as_str() {
+                "shared" | "intentshared" => Mode::Shared,
+                "exclusive" | "update" | "intentexclusive" => Mode::Exclusive,
+                _ => {
+                    s.return_status = -999;
+                    return ok();
+                }
+            };
+            // @LockTimeout in milliseconds; -1 (the default) waits forever.
+            let timeout = match arg("locktimeout", 3) {
+                Datum::Null => None,
+                d => d
+                    .as_i64()
+                    .ok()
+                    .filter(|ms| *ms >= 0)
+                    .map(|ms| std::time::Duration::from_millis(ms as u64)),
+            };
+            if adv::acquire(s, &key, mode, scope, Some(std::time::Duration::ZERO))? {
+                s.return_status = 0;
+            } else if timeout != Some(std::time::Duration::ZERO)
+                && adv::acquire(s, &key, mode, scope, timeout)?
+            {
+                s.return_status = 1;
+            } else {
+                s.return_status = -1;
+            }
+            ok()
+        }
         "sp_server_info" => Ok(rows(
             &[
                 ("attribute_id", I4),

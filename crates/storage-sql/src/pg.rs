@@ -274,6 +274,9 @@ impl Conn {
         let mut session = engine.new_session(Dialect::Postgres, &user, database.as_deref());
         if let Some(app) = params.get("application_name") {
             session.vars.insert("application_name".into(), app.clone());
+            session
+                .base_vars
+                .insert("application_name".into(), app.clone());
         }
         for (k, v) in [
             ("server_version", crate::PG_VERSION.to_owned()),
@@ -425,6 +428,7 @@ impl Conn {
                     return Ok(());
                 }
             };
+            self.after_discard(&outcome, None);
             self.send_outcome(&outcome, &[], true, 0).map_err(io_err)?;
         }
         self.ready().map_err(io_err)?;
@@ -966,6 +970,7 @@ impl Conn {
         if portal.result.is_none() {
             let (stmt, params) = (portal.stmt.clone(), portal.params.clone());
             let o = self.session.execute(&stmt, &params)?;
+            self.after_discard(&o, Some(&name));
             if let Some(p) = self.portals.get_mut(&name) {
                 p.result = Some((o, 0));
             }
@@ -981,6 +986,17 @@ impl Conn {
         self.send(msg).map_err(io_err)
     }
 
+    /// `DISCARD ALL` also deallocates protocol-level prepared statements and closes portals
+    /// (except the one running it), as in PostgreSQL, so a pooled connection handed to the next
+    /// client carries nothing over.
+    fn after_discard(&mut self, o: &Outcome, running_portal: Option<&str>) {
+        if matches!(o, Outcome::Command { tag, .. } if tag == "DISCARD ALL") {
+            self.prepared.clear();
+            self.portals
+                .retain(|n, _| Some(n.as_str()) == running_portal);
+        }
+    }
+
     fn execute(&mut self, body: &[u8]) -> SqlResult<()> {
         let mut b = Body { b: body, pos: 0 };
         let name = b.cstr().map_err(io_sql)?;
@@ -992,6 +1008,7 @@ impl Conn {
         if portal.result.is_none() {
             let (stmt, params) = (portal.stmt.clone(), portal.params.clone());
             let o = self.session.execute(&stmt, &params)?;
+            self.after_discard(&o, Some(&name));
             if let Some(p) = self.portals.get_mut(&name) {
                 p.result = Some((o, 0));
             }

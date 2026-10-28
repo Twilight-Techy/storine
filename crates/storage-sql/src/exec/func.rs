@@ -105,6 +105,9 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             return r;
         }
     }
+    if let Some(r) = lock_function(ex, name, args) {
+        return r;
+    }
     let mysql = ex.dialect() == Dialect::MySql;
     let a0 = args.first().cloned().unwrap_or(Datum::Null);
     Ok(match name {
@@ -2262,6 +2265,15 @@ pub fn return_type(
         "l2_distance" | "cosine_distance" | "inner_product" | "l1_distance" | "vector_norm" => {
             DataType::Double
         }
+        "pg_try_advisory_lock"
+        | "pg_try_advisory_lock_shared"
+        | "pg_try_advisory_xact_lock"
+        | "pg_try_advisory_xact_lock_shared"
+        | "pg_advisory_unlock"
+        | "pg_advisory_unlock_shared" => DataType::Bool,
+        "get_lock" | "release_lock" | "release_all_locks" | "is_free_lock" | "is_used_lock" => {
+            DataType::BigInt
+        }
         "l2_normalize" | "subvector" => DataType::Vector(None),
         "now"
         | "current_timestamp"
@@ -2303,6 +2315,141 @@ pub fn return_type(
             return None;
         }
     })
+}
+
+/// PostgreSQL advisory locks and MySQL named locks (`exec/advisory.rs`); `None` for other names.
+fn lock_function(ex: &Exec<'_>, name: &str, args: &[Datum]) -> Option<SqlResult<Datum>> {
+    use super::advisory::{self as adv, Mode, Scope};
+    let pg = |mode: Mode, scope: Scope, wait: bool| -> SqlResult<Datum> {
+        let Some(key) = advisory_key(args)? else {
+            return Ok(Datum::Null);
+        };
+        let timeout = if wait {
+            adv::pg_lock_timeout(ex.s)
+        } else {
+            Some(std::time::Duration::ZERO)
+        };
+        let got = adv::acquire(ex.s, &key, mode, scope, timeout)?;
+        if wait {
+            if !got {
+                return Err(SqlError::lock_timeout("advisory lock"));
+            }
+            return Ok(Datum::Null);
+        }
+        Ok(Datum::Bool(got))
+    };
+    let unlock = |mode: Mode| -> SqlResult<Datum> {
+        let Some(key) = advisory_key(args)? else {
+            return Ok(Datum::Null);
+        };
+        Ok(Datum::Bool(adv::release(
+            ex.s,
+            &key,
+            mode,
+            Some(Scope::Session),
+        )?))
+    };
+    // MySQL lock names are case-insensitive and at most 64 characters.
+    let named = || -> SqlResult<Option<String>> {
+        match args.first() {
+            None | Some(Datum::Null) => Ok(None),
+            Some(d) => {
+                let n = d.as_text();
+                if n.is_empty() || n.chars().count() > 64 {
+                    return Err(SqlError::new(
+                        "42000",
+                        format!("Incorrect user-level lock name '{n}'."),
+                    ));
+                }
+                Ok(Some(format!("n/{}", n.to_lowercase())))
+            }
+        }
+    };
+    Some(match name {
+        "pg_advisory_lock" => pg(Mode::Exclusive, Scope::Session, true),
+        "pg_advisory_lock_shared" => pg(Mode::Shared, Scope::Session, true),
+        "pg_advisory_xact_lock" => pg(Mode::Exclusive, Scope::Xact, true),
+        "pg_advisory_xact_lock_shared" => pg(Mode::Shared, Scope::Xact, true),
+        "pg_try_advisory_lock" => pg(Mode::Exclusive, Scope::Session, false),
+        "pg_try_advisory_lock_shared" => pg(Mode::Shared, Scope::Session, false),
+        "pg_try_advisory_xact_lock" => pg(Mode::Exclusive, Scope::Xact, false),
+        "pg_try_advisory_xact_lock_shared" => pg(Mode::Shared, Scope::Xact, false),
+        "pg_advisory_unlock" => unlock(Mode::Exclusive),
+        "pg_advisory_unlock_shared" => unlock(Mode::Shared),
+        "pg_advisory_unlock_all" => {
+            adv::release_all(ex.s, Some(Scope::Session), "k");
+            Ok(Datum::Null)
+        }
+        "get_lock" => (|| {
+            let Some(key) = named()? else {
+                return Ok(Datum::Null);
+            };
+            // Seconds; negative waits forever.
+            let secs: f64 = args.get(1).and_then(datum::to_f64).unwrap_or(0.0);
+            let timeout = (secs >= 0.0).then(|| std::time::Duration::from_secs_f64(secs.min(1e9)));
+            let got = adv::acquire(ex.s, &key, Mode::Exclusive, Scope::Session, timeout)?;
+            Ok(Datum::Int(i64::from(got)))
+        })(),
+        "release_lock" => (|| {
+            let Some(key) = named()? else {
+                return Ok(Datum::Null);
+            };
+            if adv::release(ex.s, &key, Mode::Exclusive, Some(Scope::Session))? {
+                return Ok(Datum::Int(1));
+            }
+            Ok(match adv::holder(ex.s, &key)? {
+                None => Datum::Null,
+                Some(_) => Datum::Int(0),
+            })
+        })(),
+        "release_all_locks" => Ok(Datum::Int(
+            adv::release_all(ex.s, Some(Scope::Session), "n/") as i64,
+        )),
+        "is_free_lock" => (|| {
+            let Some(key) = named()? else {
+                return Ok(Datum::Null);
+            };
+            Ok(Datum::Int(i64::from(adv::holder(ex.s, &key)?.is_none())))
+        })(),
+        "is_used_lock" => (|| {
+            let Some(key) = named()? else {
+                return Ok(Datum::Null);
+            };
+            Ok(match adv::holder(ex.s, &key)? {
+                Some(Some(id)) => Datum::Int(id as i64),
+                _ => Datum::Null,
+            })
+        })(),
+        _ => return None,
+    })
+}
+
+/// PostgreSQL advisory lock key: one `bigint`, or two `int`s (a separate key space).
+fn advisory_key(args: &[Datum]) -> SqlResult<Option<String>> {
+    if args.iter().any(|a| matches!(a, Datum::Null)) {
+        return Ok(None);
+    }
+    let int = |d: &Datum| -> SqlResult<i64> {
+        match d {
+            Datum::Int(i) => Some(*i),
+            other => other.as_text().trim().parse().ok(),
+        }
+        .ok_or_else(|| SqlError::datatype_mismatch("advisory lock keys are integers"))
+    };
+    match args {
+        [k] => Ok(Some(format!("k/{}", int(k)?))),
+        [a, b] => {
+            let (a, b) = (int(a)?, int(b)?);
+            if i32::try_from(a).is_err() || i32::try_from(b).is_err() {
+                return Err(SqlError::numeric_out_of_range("integer out of range"));
+            }
+            Ok(Some(format!("k2/{a}/{b}")))
+        }
+        _ => Err(SqlError::new(
+            "42883",
+            "advisory lock functions take one bigint or two integer keys",
+        )),
+    }
 }
 
 #[cfg(test)]
