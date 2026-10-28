@@ -6,6 +6,7 @@ members = [
     "crates/storage-mmap",
     "crates/storage-wal",
     "crates/storage-index",
+    "crates/storage-columnar",
     "crates/storage-graph",
     "crates/storage-core",
     "crates/storage-cli",

@@ -578,3 +578,14 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Application locks**: added for all three dialects. They are documents in the store, changed only by version-conditioned writes, so several gateways in front of one store exclude each other. Leases are renewed in the background, and the locks of a crashed gateway lapse within a minute instead of blocking forever.
 - **Verification**: engine, TCP and conformance tests; a large-values end-to-end test in all 8 SDKs; executor tests for every lock function and reset; the PgBouncer suite; the full client matrix.
 
+### Stage 28: Columnar HTAP analytics — `TASK-125` column segments — 2026-10-28
+
+- **Plan**: Follow-Up Prompt 5 is recorded in `MASTER_PROMPT.md`, with Stages 28–31 in `IMPLEMENTATION_PLAN.md` §4, rules `RULE-TEST-03` / `RULE-OLAP-*` / `RULE-DIST-*`, and tasks `TASK-125` – `TASK-152`. The starting point, measured before planning:
+  - The served cluster is one Raft group replicating everything, so adding nodes adds copies, not capacity.
+  - The SQL gateway aggregates row by row after pulling every row over TCP.
+  - `GRANT` / `REVOKE` are accepted and ignored (closed in `TASK-145`).
+- **Segment format**: a new crate, `storage-columnar`, with no `unsafe` code. Documents are schema-flexible, so a column chunk may hold several value kinds; such a chunk becomes a variant chunk with per-row kind tags and dense children, and values are never coerced. Decimals stay exact `i128` mantissas with their scales.
+- **Deletes without RAM per row**: a sorted id-hash index inside the segment locates the rows of a changed document, so marking them deleted needs no in-RAM map (`RULE-MEM-02`).
+- **Integrity**: checksums are per unit (chunk, id index, footer) and verified on first read (`RULE-SAFE-04`). A test flips bytes across the whole file and requires every flip inside a checksummed unit to be detected; only alignment padding may change unnoticed.
+- **Measured**: on 1M `lineitem`-shaped rows the segment is 9.9x smaller than the row-store encoding of the same fields (45.9 versus 452.8 B/row). Integer decoding runs at 2.07 ns/value on the generic unpack path, too slow for the analytics target; per-width kernels are scheduled in `TASK-127`.
+

@@ -1,0 +1,16 @@
+[package]
+name = "storage-columnar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Immutable memory-mapped column segments for analytic queries over documents (TASK-125)"
+
+[dependencies]
+storage-types = { path = "../storage-types" }
+storage-codec = { path = "../storage-codec" }
+storage-mmap = { path = "../storage-mmap" }
+
+[lints]
+workspace = true

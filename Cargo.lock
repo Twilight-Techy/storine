@@ -38,6 +38,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "storage-columnar"
+version = "0.1.0"
+dependencies = [
+ "storage-codec",
+ "storage-mmap",
+ "storage-types",
+]
+
+[[package]]
 name = "storage-core"
 version = "0.1.0"
 dependencies = [
