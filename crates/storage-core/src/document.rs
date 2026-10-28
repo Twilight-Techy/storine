@@ -37,7 +37,18 @@ use crate::engine::{EngineConfig, Precondition, StorageEngine, WriteKind, WriteO
 pub const DOCUMENT_COLLECTION_ID: u16 = 2;
 /// Maximum number of secondary indexes per collection (bounded by the per-record index
 /// snapshot, `RULE-MEM-02`).
-pub const MAX_DOCUMENT_INDEXES: usize = 4;
+pub const MAX_DOCUMENT_INDEXES: usize = 16;
+/// Vector indexes per collection (`TASK-122`).
+pub const MAX_VECTOR_INDEXES: usize = 4;
+/// Largest vector dimension accepted by a vector index.
+pub const MAX_VECTOR_DIMS: usize = 4096;
+/// Largest `k` of a nearest-neighbour query.
+pub const MAX_NEAREST_K: usize = 10_000;
+/// Below this many candidate documents a nearest-neighbour query scores every candidate
+/// exactly instead of using the HNSW graph.
+const EXACT_VECTOR_SCAN: usize = 2048;
+/// Pseudo-field carrying the similarity of each nearest-neighbour result.
+pub const SCORE_FIELD: &str = "$score";
 /// Index field id reserved for the collection-membership tag.
 const COLLECTION_FIELD_ID: u16 = u16::MAX;
 /// Reserved collection holding collection metadata (index declarations, SQL schemas).
@@ -117,6 +128,100 @@ pub fn document_id(collection: &str, key: &str) -> Result<InlineId> {
 
 /// Index field id of `field` in `collection` (`1..=65533`; collisions only widen index hits,
 /// which are re-checked exactly).
+/// A document's vector-indexed fields must hold `dims` finite numbers (or be absent / null).
+fn check_vectors(info: &CollectionInfo, fields: &BTreeMap<String, PropertyValue>) -> Result<()> {
+    for v in &info.vectors {
+        match fields.get(&v.field) {
+            None | Some(PropertyValue::Null) => {}
+            Some(value) => {
+                if owned_vector_of(value).is_none_or(|x| x.len() != v.dims) {
+                    return Err(StorageError::invalid_value(
+                        "a vector-indexed field must be a list of the index's number of finite numbers",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every index id a document of `collection` carries: scalar indexes (ready or building) and
+/// vector indexes.
+fn all_index_ids(collection: &str, info: &CollectionInfo) -> Vec<u16> {
+    info.indexes
+        .iter()
+        .chain(info.building.iter())
+        .map(|f| index_field_id(collection, f))
+        .chain(info.vectors.iter().map(|v| vector_field_id(collection, &v.field)))
+        .collect()
+}
+
+/// Id of the vector index on `field` (a separate id space from scalar indexes in practice: the
+/// name is prefixed with a byte no field name contains).
+pub fn vector_field_id(collection: &str, field: &str) -> u16 {
+    index_field_id(collection, &format!("\u{1}vector\u{1}{field}"))
+}
+
+/// A list of finite numbers as an `f32` vector (`None` for anything else, or an empty list).
+fn vector_of(value: &PropertyValueRef<'_>) -> Option<Vec<f32>> {
+    let PropertyValueRef::List(list) = value else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(list.len());
+    for v in list.iter() {
+        let x = match v {
+            PropertyValueRef::Float64(x) => x,
+            PropertyValueRef::Int64(x) => x as f64,
+            PropertyValueRef::UInt64(x) => x as f64,
+            PropertyValueRef::Int128(x) => x as f64,
+            PropertyValueRef::Decimal(d) => d.to_string().parse().ok()?,
+            _ => return None,
+        };
+        if !x.is_finite() {
+            return None;
+        }
+        out.push(x as f32);
+    }
+    (!out.is_empty() && out.len() <= MAX_VECTOR_DIMS).then_some(out)
+}
+
+fn owned_vector_of(value: &PropertyValue) -> Option<Vec<f32>> {
+    let PropertyValue::List(items) = value else {
+        return None;
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for v in items {
+        let x = match v {
+            PropertyValue::Float64(x) => *x,
+            PropertyValue::Int64(x) => *x as f64,
+            PropertyValue::UInt64(x) => *x as f64,
+            PropertyValue::Int128(x) => *x as f64,
+            PropertyValue::Decimal(d) => d.to_string().parse().ok()?,
+            _ => return None,
+        };
+        if !x.is_finite() {
+            return None;
+        }
+        out.push(x as f32);
+    }
+    (!out.is_empty() && out.len() <= MAX_VECTOR_DIMS).then_some(out)
+}
+
+/// Cosine similarity in `f64` (`None` for a zero vector or mismatched lengths).
+fn cosine(a: &[f32], b: &[f32]) -> Option<f64> {
+    if a.len() != b.len() {
+        return None;
+    }
+    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+    for (x, y) in a.iter().zip(b) {
+        let (x, y) = (f64::from(*x), f64::from(*y));
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    (na > 0.0 && nb > 0.0).then(|| dot / (na.sqrt() * nb.sqrt()))
+}
+
 pub fn index_field_id(collection: &str, field: &str) -> u16 {
     let mut buf = Vec::with_capacity(collection.len() + 1 + field.len());
     buf.extend_from_slice(collection.as_bytes());
@@ -241,7 +346,7 @@ impl ZeroCopyRecord for DocumentRecord {
         root.key.validate(payload)?;
         root.fields.validate(payload)?;
         root.index_ids.validate(payload)?;
-        if root.index_ids.len() > MAX_DOCUMENT_INDEXES {
+        if root.index_ids.len() > MAX_DOCUMENT_INDEXES + MAX_VECTOR_INDEXES {
             return Err(StorageError::invalid_archive("too many document index ids"));
         }
         Ok(())
@@ -290,6 +395,43 @@ impl Indexable for DocumentRecord {
 
     fn apply_field_ops(&mut self, ops: &[FieldOp]) -> Result<()> {
         apply_field_ops(&mut self.fields, ops)
+    }
+
+    const NAMED_EMBEDDINGS: bool = true;
+
+    fn named_embeddings(&self) -> Vec<(u16, Vec<f32>)> {
+        if self.index_ids.is_empty() {
+            return Vec::new();
+        }
+        self.fields
+            .iter()
+            .filter_map(|(name, value)| {
+                let id = vector_field_id(&self.collection, name);
+                if !self.index_ids.contains(&id) {
+                    return None;
+                }
+                owned_vector_of(value).map(|v| (id, v))
+            })
+            .collect()
+    }
+
+    fn archived_named_embeddings(root: &Self::Archived, payload: &[u8]) -> Vec<(u16, Vec<f32>)> {
+        let ids = root.index_ids.as_slice(payload);
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let collection = root.collection.as_str(payload);
+        root.fields
+            .view(payload)
+            .iter()
+            .filter_map(|(name, value)| {
+                let id = vector_field_id(collection, name);
+                if !ids.contains(&id) {
+                    return None;
+                }
+                vector_of(&value).map(|v| (id, v))
+            })
+            .collect()
     }
 }
 
@@ -601,6 +743,20 @@ pub struct DocQuery {
     pub offset: usize,
     /// Resume after this document key (only with key order, i.e. empty `order_by`).
     pub after_key: Option<String>,
+    /// Nearest-neighbour search (`TASK-122`): results are the documents matching `filter` most
+    /// similar to a vector, best first, each with its similarity in [`SCORE_FIELD`].
+    pub nearest: Option<Nearest>,
+}
+
+/// A nearest-neighbour search: the `k` documents whose `field` (a list of numbers) has the
+/// highest cosine similarity to `vector`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Nearest {
+    pub field: String,
+    pub vector: Vec<f32>,
+    pub k: usize,
+    /// Score every candidate exactly instead of using the (approximate) HNSW graph.
+    pub exact: bool,
 }
 
 /// One page of query results.
@@ -624,6 +780,17 @@ pub struct CollectionInfo {
     pub building: Vec<String>,
     /// Free-form metadata (e.g. the SQL adapter's table schema).
     pub extra: BTreeMap<String, PropertyValue>,
+    /// Vector indexes (`TASK-122`).
+    pub vectors: Vec<VectorIndexInfo>,
+}
+
+/// A vector index on a top-level field holding a list of `dims` numbers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VectorIndexInfo {
+    pub field: String,
+    pub dims: usize,
+    /// `false` while existing documents are being indexed (writes maintain it already).
+    pub ready: bool,
 }
 
 /// Where writes go: directly to the local engine, or through Raft consensus.
@@ -753,19 +920,6 @@ impl DocumentStore {
         v
     }
 
-    /// The index ids every write to `collection` must carry, and the `$meta` version they come
-    /// from.
-    fn index_ids_for(&self, collection: &str) -> (Option<Version>, Vec<u16>) {
-        let (version, info) = self.collection_info_versioned(collection);
-        let ids = info
-            .indexes
-            .iter()
-            .chain(info.building.iter())
-            .map(|f| index_field_id(collection, f))
-            .collect();
-        (version, ids)
-    }
-
     // ── Reads ──
 
     /// Reads one document (`None` if absent).
@@ -799,6 +953,9 @@ impl DocumentStore {
         }
         if q.order_by.len() > 16 {
             return Err(StorageError::invalid_value("at most 16 sort keys"));
+        }
+        if let Some(ref n) = q.nearest {
+            return self.query_nearest(q, n);
         }
         let candidates = self.candidate_ordinals(&q.collection, q.filter.as_ref());
         let primary = self.engine.primary_index();
@@ -1002,7 +1159,11 @@ impl DocumentStore {
             let id = document_id(&w.collection, &w.key)?;
             self.check_no_collision(id, &w.collection, &w.key)?;
             targets.push((w.collection.clone(), w.key.clone()));
-            let (meta_version, index_ids) = self.index_ids_for(&w.collection);
+            let (meta_version, info) = self.collection_info_versioned(&w.collection);
+            let index_ids = all_index_ids(&w.collection, &info);
+            if let DocOp::Put(f) | DocOp::PutWithTtl(f, _) = &w.op {
+                check_vectors(&info, f)?;
+            }
             if !w.collection.starts_with('$') && !meta_checks.iter().any(|(c, _)| *c == w.collection) {
                 meta_checks.push((w.collection.clone(), meta_version));
             }
@@ -1134,6 +1295,23 @@ impl DocumentStore {
             PropertyValue::List(info.building.iter().map(|s| PropertyValue::Text(s.clone())).collect()),
         );
         fields.insert("extra".to_owned(), PropertyValue::Map(info.extra.clone()));
+        if !info.vectors.is_empty() {
+            fields.insert(
+                "vectors".to_owned(),
+                PropertyValue::List(
+                    info.vectors
+                        .iter()
+                        .map(|v| {
+                            let mut m = BTreeMap::new();
+                            m.insert("field".to_owned(), PropertyValue::Text(v.field.clone()));
+                            m.insert("dims".to_owned(), PropertyValue::Int64(v.dims as i64));
+                            m.insert("ready".to_owned(), PropertyValue::Bool(v.ready));
+                            PropertyValue::Map(m)
+                        })
+                        .collect(),
+                ),
+            );
+        }
         self.write_internal(
             vec![DocWrite {
                 collection: META_COLLECTION.to_owned(),
@@ -1167,17 +1345,12 @@ impl DocumentStore {
         }
         if !info.building.iter().any(|f| f == field) {
             if info.indexes.len() + info.building.len() >= MAX_DOCUMENT_INDEXES {
-                return Err(StorageError::invalid_value("a collection has at most 4 secondary indexes"));
+                return Err(StorageError::invalid_value("a collection has at most 16 secondary indexes"));
             }
             info.building.push(field.to_owned());
             self.save_info(&info)?;
         }
-        let ids: Vec<u16> = info
-            .indexes
-            .iter()
-            .chain(info.building.iter())
-            .map(|f| index_field_id(collection, f))
-            .collect();
+        let ids = all_index_ids(collection, &info);
         self.reindex(collection, &ids)?;
         let mut info = self.collection_info(collection);
         info.name = collection.to_owned();
@@ -1198,8 +1371,159 @@ impl DocumentStore {
         }
         info.name = collection.to_owned();
         self.save_info(&info)?;
-        let ids: Vec<u16> = info.indexes.iter().map(|f| index_field_id(collection, f)).collect();
+        let ids = all_index_ids(collection, &info);
         self.reindex(collection, &ids)
+    }
+
+    /// Adds a vector index on the top-level `field` (a list of `dims` numbers) and indexes the
+    /// existing documents (`TASK-122`). Like [`Self::create_index`], the index is first
+    /// published as building, so every concurrent write maintains it, then made ready. Documents
+    /// whose field is not a `dims`-long list of numbers are simply not indexed; new writes of
+    /// such values are refused.
+    pub fn create_vector_index(&self, collection: &str, field: &str, dims: usize) -> Result<()> {
+        validate_collection_name(collection, false)?;
+        if field.is_empty() || field.contains('.') {
+            return Err(StorageError::invalid_value("vector indexes cover one top-level field"));
+        }
+        if dims == 0 || dims > MAX_VECTOR_DIMS {
+            return Err(StorageError::invalid_value("vector dimensions must be between 1 and 4096"));
+        }
+        let mut info = self.collection_info(collection);
+        info.name = collection.to_owned();
+        match info.vectors.iter().find(|v| v.field == field) {
+            Some(v) if v.dims != dims => {
+                return Err(StorageError::invalid_value(
+                    "the field already has a vector index with other dimensions; drop it first",
+                ))
+            }
+            Some(v) if v.ready => return Ok(()),
+            Some(_) => {}
+            None => {
+                if info.vectors.len() >= MAX_VECTOR_INDEXES {
+                    return Err(StorageError::invalid_value("a collection has at most 4 vector indexes"));
+                }
+                info.vectors.push(VectorIndexInfo { field: field.to_owned(), dims, ready: false });
+                self.save_info(&info)?;
+            }
+        }
+        let ids = all_index_ids(collection, &info);
+        self.reindex(collection, &ids)?;
+        let mut info = self.collection_info(collection);
+        info.name = collection.to_owned();
+        for v in &mut info.vectors {
+            if v.field == field {
+                v.ready = true;
+            }
+        }
+        self.save_info(&info)
+    }
+
+    /// Removes the vector index on `field` (no-op if absent).
+    pub fn drop_vector_index(&self, collection: &str, field: &str) -> Result<()> {
+        let mut info = self.collection_info(collection);
+        let before = info.vectors.len();
+        info.vectors.retain(|v| v.field != field);
+        if info.vectors.len() == before {
+            return Ok(());
+        }
+        info.name = collection.to_owned();
+        self.save_info(&info)?;
+        let ids = all_index_ids(collection, &info);
+        self.reindex(collection, &ids)
+    }
+
+    /// Nearest-neighbour query: exact scoring of every candidate for small candidate sets (or on
+    /// request), else HNSW candidates re-ranked exactly; falls back to exact scoring when a
+    /// selective filter leaves the graph search short of `k` results.
+    fn query_nearest(&self, q: &DocQuery, n: &Nearest) -> Result<DocPage> {
+        if n.k == 0 || n.k > MAX_NEAREST_K {
+            return Err(StorageError::invalid_value("nearest k must be between 1 and 10000"));
+        }
+        if n.vector.is_empty() || n.vector.len() > MAX_VECTOR_DIMS || n.vector.iter().any(|x| !x.is_finite()) {
+            return Err(StorageError::invalid_value("the query vector must hold 1 to 4096 finite numbers"));
+        }
+        if !q.order_by.is_empty() || q.after_key.is_some() {
+            return Err(StorageError::invalid_value(
+                "a nearest-neighbour query is ordered by similarity: no sort keys or cursor",
+            ));
+        }
+        let coll = q.collection.as_str();
+        let info = self.collection_info(coll);
+        let spec = info.vectors.iter().find(|v| v.field == n.field);
+        if spec.is_some_and(|v| v.dims != n.vector.len()) {
+            return Err(StorageError::invalid_value("the query vector does not have the index's dimensions"));
+        }
+        let candidates = self.candidate_ordinals(coll, q.filter.as_ref());
+        let primary = self.engine.primary_index();
+        let score = |ord: storage_types::RecordOrdinal| -> Result<Option<(f64, String, InlineId)>> {
+            let Some(id) = primary.resolve_ordinal(ord) else { return Ok(None) };
+            let hit = self.engine.with_ref(id, |view| {
+                let arch = view.archived();
+                let payload = view.payload();
+                if arch.collection.as_str(payload) != coll {
+                    return None;
+                }
+                let key = arch.key.as_str(payload);
+                let fields = arch.fields.view(payload);
+                if let Some(ref f) = q.filter {
+                    if !f.matches(key, fields) {
+                        return None;
+                    }
+                }
+                let v = vector_of(&fields.get(&n.field)?)?;
+                cosine(&n.vector, &v).map(|s| (s, key.to_owned(), id))
+            });
+            match hit {
+                Ok(h) => Ok(h),
+                Err(StorageError::RecordNotFound { .. }) => Ok(None),
+                Err(e) => Err(e),
+            }
+        };
+        let want = n.k.min(q.limit.unwrap_or(n.k));
+        let fid = vector_field_id(coll, &n.field);
+        let mut hits: Vec<(f64, String, InlineId)> = Vec::new();
+        let use_graph = spec.is_some_and(|v| v.ready)
+            && !n.exact
+            && candidates.len() > EXACT_VECTOR_SCAN
+            && self.engine.named_vector_count(fid) > 0;
+        let mut exact = !use_graph;
+        if use_graph {
+            let oversample = (want + q.offset).saturating_mul(4).max(64);
+            for c in self.engine.named_vector_candidates(fid, &n.vector, oversample, Some(&candidates)) {
+                if let Some(h) = score(c.ordinal)? {
+                    hits.push(h);
+                }
+            }
+            if hits.len() < want + q.offset {
+                hits.clear();
+                exact = true;
+            }
+        }
+        if exact {
+            for ord in candidates.to_vec() {
+                if let Some(h) = score(ord)? {
+                    hits.push(h);
+                }
+            }
+        }
+        hits.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let total = hits.len();
+        let start = q.offset.min(total);
+        let end = start.saturating_add(want).min(total);
+        let mut documents = Vec::with_capacity(end - start);
+        for (similarity, key, id) in hits.drain(start..end) {
+            let doc = self.engine.with_ref(id, |view| {
+                let mut fields = view.archived().fields.unarchive(view.payload());
+                fields.insert(SCORE_FIELD.to_owned(), PropertyValue::Float64(similarity));
+                Document { key: key.clone(), version: view.header().version(), fields }
+            });
+            match doc {
+                Ok(d) => documents.push(d),
+                Err(StorageError::RecordNotFound { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(DocPage { documents, total, next_after_key: None })
     }
 
     fn reindex(&self, collection: &str, ids: &[u16]) -> Result<()> {
@@ -1335,7 +1659,27 @@ fn info_from_fields(name: &str, fields: &BTreeMap<String, PropertyValue>) -> Col
         Some(PropertyValue::Map(m)) => m.clone(),
         _ => BTreeMap::new(),
     };
-    CollectionInfo { name: name.to_owned(), indexes, building, extra }
+    let vectors = match fields.get("vectors") {
+        Some(PropertyValue::List(items)) => items
+            .iter()
+            .filter_map(|v| {
+                let PropertyValue::Map(m) = v else { return None };
+                let field = match m.get("field") {
+                    Some(PropertyValue::Text(f)) => f.clone(),
+                    _ => return None,
+                };
+                let dims = match m.get("dims") {
+                    Some(PropertyValue::Int64(d)) if *d > 0 => *d as usize,
+                    _ => return None,
+                };
+                let ready = matches!(m.get("ready"), Some(PropertyValue::Bool(true)));
+                Some(VectorIndexInfo { field, dims, ready })
+            })
+            .take(MAX_VECTOR_INDEXES)
+            .collect(),
+        _ => Vec::new(),
+    };
+    CollectionInfo { name: name.to_owned(), indexes, building, extra, vectors }
 }
 
 fn document_from_view(view: &RecordView<'_, DocumentRecord>, collection: &str, key: &str) -> Result<Option<Document>> {
@@ -1529,8 +1873,10 @@ mod tests {
         s.create_index("items", "kind").unwrap();
         let indexed: Vec<_> = queries.iter().map(run).collect();
         assert_eq!(indexed, unindexed);
-        assert!(s.create_index("items", "a").is_ok());
-        assert!(s.create_index("items", "b").is_err(), "max 4 indexes");
+        for i in 0..13 {
+            assert!(s.create_index("items", &format!("f{i}")).is_ok(), "index {}", i + 4);
+        }
+        assert!(s.create_index("items", "one_too_many").is_err(), "max 16 indexes");
         // Survives a restart (metadata and index ids are persisted).
         drop(s);
         let s = DocumentStore::open(&dir, EngineConfig::default()).unwrap();
@@ -1623,6 +1969,145 @@ mod tests {
             };
             assert_eq!(q(true), q(false), "value {v}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn vec_value(v: &[f32]) -> PropertyValue {
+        PropertyValue::List(v.iter().map(|x| PropertyValue::Float64(f64::from(*x))).collect())
+    }
+
+    /// Deterministic pseudo-random unit-ish vector for document `i`.
+    fn emb(i: u64, dims: usize) -> Vec<f32> {
+        let mut x = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..dims)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ((x % 2001) as f32 / 1000.0) - 1.0
+            })
+            .collect()
+    }
+
+    fn nearest(s: &DocumentStore, coll: &str, filter: Option<Filter>, v: Vec<f32>, k: usize, exact: bool) -> Vec<(String, f64)> {
+        s.query(&DocQuery {
+            collection: coll.into(),
+            filter,
+            nearest: Some(Nearest { field: "emb".into(), vector: v, k, exact }),
+            ..Default::default()
+        })
+        .unwrap()
+        .documents
+        .into_iter()
+        .map(|d| {
+            let PropertyValue::Float64(score) = d.fields[SCORE_FIELD] else { panic!("no score") };
+            (d.key, score)
+        })
+        .collect()
+    }
+
+    #[test]
+    fn test_vector_index_nearest_matches_exact_and_respects_filters() {
+        let (s, dir) = store("vectors");
+        let dims = 16;
+        // Small collection: exact scoring, validation.
+        s.create_vector_index("small", "emb", 3).unwrap();
+        for (k, v) in [("a", [1.0, 0.0, 0.0]), ("b", [0.0, 1.0, 0.0]), ("c", [0.7, 0.7, 0.0])] {
+            s.put("small", k, fields(&[("emb", vec_value(&v)), ("kind", PropertyValue::Text(k.into()))])).unwrap();
+        }
+        s.put("small", "none", fields(&[("kind", PropertyValue::Text("x".into()))])).unwrap();
+        let got = nearest(&s, "small", None, vec![1.0, 0.1, 0.0], 2, false);
+        assert_eq!(got.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["a", "c"]);
+        assert!(got[0].1 > got[1].1 && got[0].1 <= 1.0);
+        let filtered = nearest(&s, "small", Some(Filter::Ne("kind".into(), PropertyValue::Text("a".into()))), vec![1.0, 0.1, 0.0], 5, false);
+        assert_eq!(filtered.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["c", "b"]);
+        // Wrong dimensions are refused on write and on query; non-numbers too.
+        assert!(s.put("small", "bad", fields(&[("emb", vec_value(&[1.0, 2.0]))])).is_err());
+        assert!(s.put("small", "bad", fields(&[("emb", PropertyValue::Text("x".into()))])).is_err());
+        assert!(s.query(&DocQuery {
+            collection: "small".into(),
+            nearest: Some(Nearest { field: "emb".into(), vector: vec![1.0], k: 1, exact: false }),
+            ..Default::default()
+        })
+        .is_err());
+        assert!(s.create_vector_index("small", "emb", 4).is_err(), "other dimensions");
+        // Large collection: the HNSW graph is used and agrees with exact search.
+        let n = 3000u64;
+        let writes: Vec<DocWrite> = (0..n)
+            .map(|i| DocWrite {
+                collection: "big".into(),
+                key: format!("d{i:05}"),
+                op: DocOp::Put(fields(&[("emb", vec_value(&emb(i, dims))), ("even", PropertyValue::Bool(i % 2 == 0))])),
+                precondition: Precondition::None,
+            })
+            .collect();
+        for chunk in writes.chunks(500) {
+            s.write(chunk.to_vec(), None).unwrap();
+        }
+        s.create_vector_index("big", "emb", dims).unwrap();
+        assert_eq!(s.engine.named_vector_count(vector_field_id("big", "emb")), n as usize);
+        let mut recall = 0usize;
+        for probe in 0..20u64 {
+            let q = emb(10_000 + probe, dims);
+            let approx = nearest(&s, "big", None, q.clone(), 10, false);
+            let exact = nearest(&s, "big", None, q, 10, true);
+            assert_eq!(approx.len(), 10);
+            // Scores are exact either way (the graph only proposes candidates).
+            for (k, sc) in &approx {
+                assert!(exact.iter().any(|(ek, es)| ek == k && (es - sc).abs() < 1e-12) || *sc <= exact[9].1 + 1e-12);
+            }
+            recall += approx.iter().filter(|h| exact.iter().any(|e| e.0 == h.0)).count();
+        }
+        assert!(recall >= 180, "recall@10 {recall}/200");
+        // A filter is honoured (graph search restricted to candidates, exact fallback if short).
+        let evens = nearest(&s, "big", Some(Filter::Eq("even".into(), PropertyValue::Bool(true))), emb(7, dims), 10, false);
+        assert_eq!(evens.len(), 10);
+        assert!(evens.iter().all(|(k, _)| k[1..].parse::<u64>().unwrap() % 2 == 0));
+        // Updates and deletes are reflected.
+        let top = nearest(&s, "big", None, emb(42, dims), 1, false);
+        assert_eq!(top[0].0, "d00042");
+        s.delete("big", "d00042").unwrap();
+        assert_ne!(nearest(&s, "big", None, emb(42, dims), 1, false)[0].0, "d00042");
+        s.put("big", "d00043", fields(&[("emb", vec_value(&emb(42, dims)))])).unwrap();
+        assert_eq!(nearest(&s, "big", None, emb(42, dims), 1, false)[0].0, "d00043");
+        // A scalar index build keeps vector indexing; reopening rebuilds the graph.
+        s.create_index("big", "even").unwrap();
+        assert_eq!(s.engine.named_vector_count(vector_field_id("big", "emb")), n as usize - 1);
+        drop(s);
+        let s = DocumentStore::open(&dir, EngineConfig::default()).unwrap();
+        assert_eq!(s.engine.named_vector_count(vector_field_id("big", "emb")), n as usize - 1);
+        assert_eq!(nearest(&s, "big", None, emb(42, dims), 1, false)[0].0, "d00043");
+        s.drop_vector_index("big", "emb").unwrap();
+        assert_eq!(s.engine.named_vector_count(vector_field_id("big", "emb")), 0);
+        // Without an index, nearest still works (exact scan).
+        assert_eq!(nearest(&s, "big", None, emb(42, dims), 1, false)[0].0, "d00043");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_vector_index_build_is_exact_under_concurrent_writes() {
+        let (s, dir) = store("vector_build");
+        let s = Arc::new(s);
+        for i in 0..400u64 {
+            s.put("c", &format!("k{i:04}"), fields(&[("emb", vec_value(&emb(i, 8)))])).unwrap();
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (s, stop) = (Arc::clone(&s), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let key = format!("k{:04}", (i * 7919) % 600);
+                    s.put("c", &key, fields(&[("emb", vec_value(&emb(i + 1_000, 8)))])).unwrap();
+                    i += 1;
+                }
+            })
+        };
+        s.create_vector_index("c", "emb", 8).unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        let docs = s.scan_collection("c").unwrap().len();
+        assert_eq!(s.engine.named_vector_count(vector_field_id("c", "emb")), docs, "every document indexed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

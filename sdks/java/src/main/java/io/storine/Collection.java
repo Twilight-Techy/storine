@@ -154,7 +154,43 @@ public final class Collection {
         return scan(null);
     }
 
-    /** Indexes a top-level field (at most 4 per collection); existing documents included. */
+    /**
+     * The {@code k} documents whose {@code field} (a list of numbers) is most similar to {@code vector} (cosine), best
+     * first. Each document's similarity is {@link Document#score()}.
+     */
+    public List<Document> nearest(String field, float[] vector, int k) {
+        return nearest(field, vector, k, null, false);
+    }
+
+    /**
+     * {@link #nearest(String, float[], int)} among the documents matching {@code where} ({@code null}: all). Uses the
+     * field's vector index when it has one (approximate candidates, exact scores); {@code exact} scores every candidate.
+     */
+    public List<Document> nearest(String field, float[] vector, int k, Filter where, boolean exact) {
+        if (k < 0) throw new InvalidException("k must not be negative");
+        Wire.Nearest n = new Wire.Nearest(field, vector.clone(), k, exact);
+        return Wire.page(client.call(Wire.OP_DOC_QUERY, Wire.query(name, new Query().where(where).limit(k), null, n)).body()).docs();
+    }
+
+    /**
+     * Indexes a top-level field holding {@code dims} numbers for {@link #nearest} (at most 4 per collection); existing
+     * documents included. Writes of other values to that field are then refused.
+     */
+    public void createVectorIndex(String field, int dims) {
+        if (dims <= 0) throw new InvalidException("dims must be positive");
+        client.call(Wire.OP_DOC_ADMIN, Wire.createVectorIndex(name, field, dims));
+    }
+
+    public void dropVectorIndex(String field) {
+        client.call(Wire.OP_DOC_ADMIN, Wire.admin(8, name, field));
+    }
+
+    /** The collection's vector indexes. */
+    public List<VectorIndex> vectorIndexes() {
+        return Wire.vectorIndexes(client.call(Wire.OP_DOC_INFO, Wire.admin(9, name, null)).body());
+    }
+
+    /** Indexes a top-level field (at most 16 per collection); existing documents included. */
     public void createIndex(String field) {
         client.call(Wire.OP_DOC_ADMIN, Wire.admin(1, name, field));
     }

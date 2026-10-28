@@ -190,6 +190,27 @@ function testQueriesIndexesAndPagination(): void
     });
 }
 
+function testVectorSearch(): void
+{
+    with_server(function (Storine $db) {
+        $c = $db->collection('php_docs');
+        $c->createVectorIndex('emb', dims: 3);
+        same([['field' => 'emb', 'dims' => 3, 'ready' => true]], $c->vectorIndexes());
+        foreach ([['a', [1, 0, 0], 'x'], ['b', [0, 1, 0], 'y'], ['c', [0.7, 0.7, 0], 'x']] as [$key, $vec, $kind]) {
+            $c->put($key, ['emb' => $vec, 'kind' => $kind]);
+        }
+        $keys = fn (array $docs) => array_map(fn ($d) => $d->key, $docs);
+        $hits = $c->nearest('emb', [1, 0.1, 0], k: 2);
+        same(['a', 'c'], $keys($hits));
+        check($hits[0]->score() > $hits[1]->score(), 'scores descending');
+        same(['a', 'c'], $keys($c->nearest('emb', [1, 0.1, 0], k: 5, where: ['kind' => 'x'], exact: true)));
+        throws(InvalidException::class, fn () => $c->put('bad', ['emb' => [1, 2]]), 'wrong dimensions on write');
+        throws(InvalidException::class, fn () => $c->nearest('emb', [1, 2], k: 1), 'wrong dimensions on query');
+        $c->dropVectorIndex('emb');
+        same([], $c->vectorIndexes());
+    });
+}
+
 function testTtlAndErrors(): void
 {
     with_server(function (Storine $db) {

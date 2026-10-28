@@ -222,7 +222,15 @@ export function parseOrderBy(order: OrderBy): Array<[string, boolean]> {
   return items.map((it) => (it.startsWith("-") ? [it.slice(1), true] : [it, false]));
 }
 
-export function encodeQuery(collection: string, filter: Filter | undefined, order: Array<[string, boolean]>, limit: number, offset: number, afterKey?: string): Uint8Array {
+/** The nearest-neighbour part of a query: the `k` documents whose `field` is most similar to `vector`. */
+export interface NearestQuery {
+  field: string;
+  vector: ArrayLike<number>;
+  k: number;
+  exact: boolean;
+}
+
+export function encodeQuery(collection: string, filter: Filter | undefined, order: Array<[string, boolean]>, limit: number, offset: number, afterKey?: string, nearest?: NearestQuery): Uint8Array {
   const w = new Writer();
   w.str(collection);
   if (filter) {
@@ -243,6 +251,15 @@ export function encodeQuery(collection: string, filter: Filter | undefined, orde
   } else {
     w.u8(1);
     w.str(afterKey);
+  }
+  if (nearest) {
+    // Optional trailing block: u8 1 | str field | u32 k | u8 exact | u32 dims | dims x f32.
+    w.u8(1);
+    w.str(nearest.field);
+    w.u32(nearest.k);
+    w.u8(nearest.exact ? 1 : 0);
+    w.u32(nearest.vector.length);
+    for (let i = 0; i < nearest.vector.length; i++) w.f32(nearest.vector[i]);
   }
   return w.finish();
 }
@@ -315,6 +332,23 @@ export function decodeInfo(r: Reader): CollectionInfo {
   const building: string[] = [];
   for (let i = r.count(4); i > 0; i--) building.push(r.str());
   return { name, indexes, building, metadata: r.fields() };
+}
+
+export interface VectorIndexInfo {
+  field: string;
+  dims: number;
+  ready: boolean;
+}
+
+export function decodeVectorIndexes(body: Uint8Array): VectorIndexInfo[] {
+  const r = new Reader(body);
+  const out: VectorIndexInfo[] = [];
+  for (let i = r.count(9); i > 0; i--) {
+    const field = r.str();
+    const dims = r.u32();
+    out.push({ field, dims, ready: r.u8() === 1 });
+  }
+  return out;
 }
 
 export interface ClusterInfo {

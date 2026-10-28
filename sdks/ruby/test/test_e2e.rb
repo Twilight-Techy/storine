@@ -150,6 +150,23 @@ class SingleNodeTest < Minitest::Test
     assert_includes @db.collections, "items"
   end
 
+  def test_vector_search
+    c = @db.collection("rb_docs")
+    c.create_vector_index("emb", 3)
+    assert_equal [{ field: "emb", dims: 3, ready: true }], c.vector_indexes
+    [["a", [1, 0, 0], "x"], ["b", [0, 1, 0], "y"], ["c", [0.7, 0.7, 0], "x"]].each do |key, vec, kind|
+      c.put(key, { "emb" => vec, "kind" => kind })
+    end
+    hits = c.nearest("emb", [1, 0.1, 0], k: 2)
+    assert_equal %w[a c], hits.map(&:key)
+    assert_operator hits[0].score, :>, hits[1].score
+    assert_equal %w[a c], c.nearest("emb", [1, 0.1, 0], k: 5, where: { "kind" => "x" }, exact: true).map(&:key)
+    assert_raises(Storine::InvalidError) { c.put("bad", { "emb" => [1, 2] }) } # wrong dimensions
+    assert_raises(Storine::InvalidError) { c.nearest("emb", [1, 2], k: 1) }
+    c.drop_vector_index("emb")
+    assert_equal [], c.vector_indexes
+  end
+
   def test_ttl_and_errors
     s = @db.collection("sessions")
     s.put("short", { "u" => 1 }, ttl: 0.2)

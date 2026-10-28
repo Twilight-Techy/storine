@@ -101,6 +101,9 @@ function testRequests(): void
             Filter::not(Filter::ne('a', 1)), Filter::le('b', 2.5), Filter::gt('c', 0), Filter::keyPrefix('user:')), [], 0, 0, null),
         'query: after key cursor' => Wire::encodeQuery('items', null, [], 100, 0, 'k0099'),
         'query: multi-key sort' => Wire::encodeQuery('items', null, Wire::parseOrderBy(['a', '-b']), 5, 0, null),
+        'query: nearest neighbours with a filter' => Wire::encodeQuery('items', Filter::eq('kind', 'book'), [], 5, 0, null,
+            ['embedding', [0.25, -1.5, 3.0], 5, false]),
+        'query: nearest neighbours, exact' => Wire::encodeQuery('items', null, [], 0, 0, null, ['v', [1.0, 0.0], 1, true]),
     ];
     $seen = 0;
     foreach (vectors()['requests'] as $vec) {

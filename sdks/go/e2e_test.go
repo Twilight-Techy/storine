@@ -274,6 +274,52 @@ func TestE2ESingleNode(t *testing.T) {
 		}
 	})
 
+	t.Run("vector search", func(t *testing.T) {
+		c := db.Collection("go_docs")
+		if err := c.CreateVectorIndex(ctx, "emb", 3); err != nil {
+			t.Fatal(err)
+		}
+		if vi, err := c.VectorIndexes(ctx); err != nil || !reflect.DeepEqual(vi, []VectorIndex{{Field: "emb", Dims: 3, Ready: true}}) {
+			t.Fatal(vi, err)
+		}
+		for _, x := range []struct {
+			key  string
+			emb  []any
+			kind string
+		}{{"a", []any{1.0, 0.0, 0.0}, "x"}, {"b", []any{0.0, 1.0, 0.0}, "y"}, {"c", []any{0.7, 0.7, 0.0}, "x"}} {
+			if _, err := c.Put(ctx, x.key, Doc{"emb": x.emb, "kind": x.kind}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		keys := func(docs []*Document) []string {
+			out := []string{}
+			for _, d := range docs {
+				out = append(out, d.Key)
+			}
+			return out
+		}
+		hits, err := c.Nearest(ctx, "emb", []float32{1, 0.1, 0}, NearestOptions{K: 2})
+		if err != nil || !reflect.DeepEqual(keys(hits), []string{"a", "c"}) || !(hits[0].Score() > hits[1].Score()) {
+			t.Fatal(keys(hits), err)
+		}
+		hits, err = c.Nearest(ctx, "emb", []float32{1, 0.1, 0}, NearestOptions{K: 5, Where: Eq("kind", "x"), Exact: true})
+		if err != nil || !reflect.DeepEqual(keys(hits), []string{"a", "c"}) {
+			t.Fatal(keys(hits), err)
+		}
+		if _, err := c.Put(ctx, "bad", Doc{"emb": []any{1, 2}}); !errors.Is(err, ErrInvalid) { // wrong dimensions
+			t.Fatalf("wrong-dims put: %v", err)
+		}
+		if _, err := c.Nearest(ctx, "emb", []float32{1, 2}, NearestOptions{K: 1}); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("wrong-dims query: %v", err)
+		}
+		if err := c.DropVectorIndex(ctx, "emb"); err != nil {
+			t.Fatal(err)
+		}
+		if vi, err := c.VectorIndexes(ctx); err != nil || len(vi) != 0 {
+			t.Fatal(vi, err)
+		}
+	})
+
 	t.Run("ttl and errors", func(t *testing.T) {
 		s := db.Collection("sessions")
 		if _, err := s.PutWithTTL(ctx, "short", Doc{"u": 1}, 200*time.Millisecond); err != nil {

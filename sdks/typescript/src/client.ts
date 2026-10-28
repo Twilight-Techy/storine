@@ -18,6 +18,8 @@ export interface Document<T extends Fields = Fields> {
   key: string;
   version: bigint;
   fields: T;
+  /** Similarity of a `nearest` result (also `fields["$score"]`); undefined for other queries. */
+  score?: number;
 }
 
 /** Options of `connect`. */
@@ -362,6 +364,15 @@ export interface FindOptions {
   offset?: number;
 }
 
+/** Options of `nearest`. */
+export interface NearestOptions {
+  /** Number of documents to return (default 10). */
+  k?: number;
+  where?: w.Where;
+  /** Score every candidate instead of using the vector index (default false). */
+  exact?: boolean;
+}
+
 /** A named set of documents. Every method is one atomic, exactly-once operation. */
 export class Collection<T extends Fields = Fields> {
   constructor(readonly client: Client, readonly name: string) {}
@@ -443,15 +454,47 @@ export class Collection<T extends Fields = Fields> {
     }
   }
 
-  private async query(where: w.Where, o: FindOptions, after: string | undefined) {
-    const body = w.encodeQuery(this.name, w.toFilter(where), w.parseOrderBy(o.orderBy), o.limit ?? 0, o.offset ?? 0, after);
+  /**
+   * The `k` documents whose `field` (a list of numbers) is most similar to `vector` (cosine), best
+   * first, among those matching `where`. Each document's similarity is in `doc.score` (also
+   * `doc.fields["$score"]`). Uses the field's vector index when it has one (approximate candidates,
+   * exact scores); `exact: true` scores every candidate.
+   */
+  async nearest(field: string, vector: ArrayLike<number>, options: NearestOptions = {}): Promise<Array<Document<T>>> {
+    const k = options.k ?? 10;
+    const docs = (await this.query(options.where, { limit: k }, undefined, { field, vector, k, exact: options.exact ?? false })).docs;
+    return docs.map((d) => ({ ...d, score: d.fields["$score"] as number }));
+  }
+
+  private async query(where: w.Where, o: FindOptions, after: string | undefined, nearest?: w.NearestQuery) {
+    const body = w.encodeQuery(this.name, w.toFilter(where), w.parseOrderBy(o.orderBy), o.limit ?? 0, o.offset ?? 0, after, nearest);
     const r = await this.client.request(w.OP.DOC_QUERY, body);
     if (r.status !== w.ST.OK) throw Client.error(r);
     const page = w.decodePage(r.body);
     return { total: page.total, next: page.next, docs: page.docs.map((d) => ({ key: d.key, version: d.version, fields: d.fields as T })) };
   }
 
-  /** Indexes a top-level field (at most 4 per collection); existing documents included. */
+  /**
+   * Indexes a top-level field holding `dims` numbers for `nearest` (at most 4 per collection);
+   * existing documents included. Writes of other values to that field are then refused.
+   */
+  async createVectorIndex(field: string, dims: number): Promise<void> {
+    const n = new Uint8Array(4);
+    new DataView(n.buffer).setUint32(0, dims, true);
+    await this.admin(w.OP.DOC_ADMIN, concat(Uint8Array.of(7), w.str(this.name), w.str(field), n));
+  }
+
+  async dropVectorIndex(field: string): Promise<void> {
+    await this.admin(w.OP.DOC_ADMIN, concat(Uint8Array.of(8), w.str(this.name), w.str(field)));
+  }
+
+  /** `[{ field, dims, ready }]` for the collection's vector indexes. */
+  async vectorIndexes(): Promise<w.VectorIndexInfo[]> {
+    const r = await this.admin(w.OP.DOC_INFO, concat(Uint8Array.of(9), w.str(this.name)));
+    return w.decodeVectorIndexes(r.body);
+  }
+
+  /** Indexes a top-level field (at most 16 per collection); existing documents included. */
   async createIndex(field: string): Promise<void> {
     await this.admin(w.OP.DOC_ADMIN, concat(Uint8Array.of(1), w.str(this.name), w.str(field)));
   }

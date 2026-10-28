@@ -48,8 +48,11 @@ final class Wire
         return $out;
     }
 
-    /** @param list<array{0: string, 1: bool}> $orderBy */
-    public static function encodeQuery(string $collection, ?Filter $filter, array $orderBy, int $limit, int $offset, ?string $afterKey): string
+    /**
+     * @param list<array{0: string, 1: bool}> $orderBy
+     * @param ?array{0: string, 1: list<float>, 2: int, 3: bool} $nearest field, vector, k, exact
+     */
+    public static function encodeQuery(string $collection, ?Filter $filter, array $orderBy, int $limit, int $offset, ?string $afterKey, ?array $nearest = null): string
     {
         $out = '';
         Sve::putStr($out, $collection);
@@ -70,6 +73,16 @@ final class Wire
         } else {
             $out .= "\x01";
             Sve::putStr($out, $afterKey);
+        }
+        if ($nearest !== null) {
+            // Optional trailing block: u8 1 | str field | u32 k | u8 exact | u32 dims | dims x f32 LE.
+            [$field, $vector, $k, $exact] = $nearest;
+            $out .= "\x01";
+            Sve::putStr($out, $field);
+            $out .= pack('VCV', $k, $exact ? 1 : 0, count($vector));
+            foreach ($vector as $x) {
+                $out .= pack('g', (float) $x);
+            }
         }
         return $out;
     }

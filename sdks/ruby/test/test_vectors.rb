@@ -104,7 +104,11 @@ class VectorTest < Minitest::Test
         ~Storine.ne("a", 1), Storine.le("b", 2.5), Storine.gt("c", 0), Storine.key_prefix("user:")
       ), [], 0, 0, nil),
       "query: after key cursor" => wire.encode_query("items", nil, [], 100, 0, "k0099"),
-      "query: multi-key sort" => wire.encode_query("items", nil, wire.parse_order_by(["a", "-b"]), 5, 0, nil)
+      "query: multi-key sort" => wire.encode_query("items", nil, wire.parse_order_by(["a", "-b"]), 5, 0, nil),
+      "query: nearest neighbours with a filter" => wire.encode_query(
+        "items", Storine.eq("kind", "book"), [], 5, 0, nil, ["embedding", [0.25, -1.5, 3.0], 5, false]
+      ),
+      "query: nearest neighbours, exact" => wire.encode_query("items", nil, [], 0, 0, nil, ["v", [1.0, 0.0], 1, true])
     }
     seen = 0
     VECTORS["requests"].each do |vec|

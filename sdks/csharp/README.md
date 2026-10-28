@@ -49,7 +49,9 @@ await foreach (var d in accounts.ScanAsync()) { /* every document, any collectio
 | `c.UpdateAsync(key, changes...)` / `c.UpdateAsync(key, changes[], ifVersion)` | Atomic server-side changes: `Set`, `Unset`, `Add(path, amount).Min(x).Max(y)`, `Append`. |
 | `c.DeleteAsync(key, ifVersion: null)` | `true` if it existed. |
 | `c.FindAsync(where, orderBy, limit, offset)` / `c.FirstAsync` / `c.CountAsync(where)` / `c.ScanAsync(where)` | Queries. Filters: `Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`, `Between`, `In`, `Prefix`, `Contains`, `Exists`, `Missing`, `KeyPrefix`, `And`, `Or`, `Not`, `Match(doc)`, combined with `&`, `|`, `!`. `orderBy: "-price"` (or `new[] {"a", "-b"}`) sorts descending. |
-| `c.CreateIndexAsync` / `c.DropIndexAsync` / `c.InfoAsync` / `c.DropAsync` | Indexes (up to 4 per collection) and collection management. |
+| `c.CreateIndexAsync` / `c.DropIndexAsync` / `c.InfoAsync` / `c.DropAsync` | Indexes (up to 16 per collection) and collection management. |
+| `c.NearestAsync(field, vector, k: 10, where: null, exact: false)` | The `k` documents whose `field` is most similar to `vector` (cosine), best first; `doc.Score` is the similarity. |
+| `c.CreateVectorIndexAsync(field, dims)` / `c.DropVectorIndexAsync(field)` / `c.VectorIndexesAsync()` | Vector indexes for `NearestAsync` (`VectorIndex(Field, Dims, Ready)`). |
 | `db.TransactionAsync(tx => ...)` | Writes committed atomically when the lambda returns; `tx.RequireVersion` / `tx.RequireExists` add checks. |
 | `db.CollectionsAsync()` / `db.ClusterInfoAsync()` | Introspection. |
 

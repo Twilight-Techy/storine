@@ -122,7 +122,47 @@ final class Collection
         } while ($next !== null);
     }
 
-    /** Indexes a top-level field (at most 4 per collection); existing documents included. */
+    /**
+     * The `$k` documents whose `$field` (a list of numbers) is most similar to `$vector` (cosine),
+     * best first, among those matching `$where`. Each document's similarity is in `$doc->score()`
+     * (also `$doc['$score']`). Uses the field's vector index when it has one (approximate
+     * candidates, exact scores); `exact: true` scores every candidate.
+     * @param list<int|float> $vector
+     * @return list<Document>
+     */
+    public function nearest(string $field, array $vector, int $k = 10, Filter|array|null $where = null, bool $exact = false): array
+    {
+        return $this->query($where, null, $k, 0, null, [$field, array_map('floatval', array_values($vector)), $k, $exact])[2];
+    }
+
+    /**
+     * Indexes a top-level field holding `$dims` numbers for `nearest` (at most 4 per collection);
+     * existing documents included. Writes of other values to that field are then refused.
+     */
+    public function createVectorIndex(string $field, int $dims): void
+    {
+        $this->admin(Wire::OP_DOC_ADMIN, "\x07", $field, pack('V', $dims));
+    }
+
+    public function dropVectorIndex(string $field): void
+    {
+        $this->admin(Wire::OP_DOC_ADMIN, "\x08", $field);
+    }
+
+    /** @return list<array{field: string, dims: int, ready: bool}> */
+    public function vectorIndexes(): array
+    {
+        $r = new Reader($this->admin(Wire::OP_DOC_INFO, "\x09")[1]);
+        $result = [];
+        for ($i = 0, $n = $r->count(9); $i < $n; $i++) {
+            $field = $r->str();
+            $dims = $r->u32();
+            $result[] = ['field' => $field, 'dims' => $dims, 'ready' => $r->u8() === 1];
+        }
+        return $result;
+    }
+
+    /** Indexes a top-level field (at most 16 per collection); existing documents included. */
     public function createIndex(string $field): void
     {
         $this->admin(Wire::OP_DOC_ADMIN, "\x01", $field);
@@ -146,9 +186,9 @@ final class Collection
     }
 
     /** @return array{0: int, 1: ?string, 2: list<Document>} */
-    private function query(Filter|array|null $where, string|array|null $orderBy, int $limit, int $offset, ?string $after): array
+    private function query(Filter|array|null $where, string|array|null $orderBy, int $limit, int $offset, ?string $after, ?array $nearest = null): array
     {
-        $body = Wire::encodeQuery($this->name, Filter::from($where), Wire::parseOrderBy($orderBy), $limit, $offset, $after);
+        $body = Wire::encodeQuery($this->name, Filter::from($where), Wire::parseOrderBy($orderBy), $limit, $offset, $after, $nearest);
         [$status, , $rbody] = $this->client->request(Wire::OP_DOC_QUERY, $body, true);
         if ($status !== Wire::ST_OK) {
             $this->client->fail($status, $rbody);
@@ -158,13 +198,14 @@ final class Collection
     }
 
     /** @return array{0: int, 1: string} */
-    private function admin(int $op, string $code, ?string $field = null): array
+    private function admin(int $op, string $code, ?string $field = null, string $tail = ''): array
     {
         $out = $code;
         Sve::putStr($out, $this->name);
         if ($field !== null) {
             Sve::putStr($out, $field);
         }
+        $out .= $tail;
         [$status, $version, $rbody] = $this->client->request($op, $out, true);
         if ($status !== Wire::ST_OK) {
             $this->client->fail($status, $rbody);

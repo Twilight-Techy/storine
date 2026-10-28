@@ -56,7 +56,9 @@ try (Storine db = Storine.connect("storine://127.0.0.1:7878")) {   // or "storin
 | `c.update(key, changes...)` / `c.updateIfVersion(key, version, changes...)` | Atomic server-side changes: `FieldOp.set`, `unset`, `add(path, amount).min(x).max(y)`, `append`. |
 | `c.delete(key)` / `c.deleteIfVersion(key, version)` | `true` if it existed. |
 | `c.find(Filter or Query)` / `c.first(query)` / `c.count(where)` / `c.scan(where)` | Queries. Filters: `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `between`, `in`, `prefix`, `contains`, `exists`, `missing`, `keyPrefix`, `and`, `or`, `not`, `match(Map)`. `orderBy("-price")` sorts descending. `scan` is a lazy `Stream`. |
-| `c.createIndex` / `c.dropIndex` / `c.info` / `c.drop` | Indexes (up to 4 per collection) and collection management. |
+| `c.createIndex` / `c.dropIndex` / `c.info` / `c.drop` | Indexes (up to 16 per collection) and collection management. |
+| `c.nearest(field, vector, k[, where, exact])` | The `k` documents whose `field` is most similar to `vector` (cosine), best first; `doc.score()` is the similarity. |
+| `c.createVectorIndex(field, dims)` / `c.dropVectorIndex(field)` / `c.vectorIndexes()` | Vector indexes for `nearest` (`VectorIndex(field, dims, ready)`). |
 | `db.transaction(tx -> ...)` | Writes committed atomically when the lambda returns; `tx.requireVersion` / `tx.requireExists` add checks. |
 | `db.collections()` / `db.clusterInfo()` | Introspection. |
 

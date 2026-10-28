@@ -49,7 +49,9 @@ for d in accounts.scan(None) { let d = d?; /* every document, any collection siz
 | `c.update(key, [changes])` / `c.update_if_version(key, version, [changes])` | Atomic server-side changes: `set`, `unset`, `add(path, amount).min(x).max(y)`, `append`. |
 | `c.delete(key)` / `c.delete_if_version(key, version)` | `true` if it existed. |
 | `c.find(filter or Query)` / `c.first(..)` / `c.count(filter)` / `c.scan(filter)` | Queries. Filters: `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `between`, `is_in`, `prefix`, `contains`, `exists`, `missing`, `key_prefix`, `and`, `or`, `matches(&doc)`, combined with `&`, `|`, `!`. `order_by("-price")` sorts descending. `scan` is a lazy iterator. |
-| `c.create_index` / `c.drop_index` / `c.info` / `c.drop` | Indexes (up to 4 per collection) and collection management. |
+| `c.nearest(field, &vector, k, filter)` / `c.nearest_exact(..)` | The `k` documents whose `field` (a list of numbers) is most similar to `vector` (cosine), best first; `doc.score()` holds the similarity. `nearest_exact` scores every candidate instead of using the vector index. |
+| `c.create_vector_index(field, dims)` / `c.drop_vector_index(field)` / `c.vector_indexes()` | Vector indexes for `nearest`; writes of other values to an indexed field are refused. |
+| `c.create_index` / `c.drop_index` / `c.info` / `c.drop` | Indexes (up to 16 per collection) and collection management. |
 | `db.transaction(\|tx\| ...)` | Writes committed atomically when the closure returns `Ok`; `tx.require_version` / `tx.require_exists` add checks. |
 | `db.collections()` / `db.cluster_info()` | Introspection. |
 

@@ -31,6 +31,11 @@ class Document(dict):
     def __repr__(self) -> str:
         return f"Document(key={self.key!r}, version={self.version}, fields={dict.__repr__(self)})"
 
+    @property
+    def score(self) -> Optional[float]:
+        """Similarity of a `nearest` result (None for other queries)."""
+        return self.get("$score")
+
 
 class _Connection:
     def __init__(self, address: Tuple[str, int], timeout: float, token: Optional[str], follower_reads: bool) -> None:
@@ -407,8 +412,47 @@ class Collection(_Writer):
                 return
             after = nxt
 
-    def _query(self, where: Any, order_by: Any, limit: int, offset: int, after: Optional[str]) -> Tuple[int, Optional[str], List[Document]]:
-        body = w.encode_query(self.name, w.where_to_filter(where), w.parse_order_by(order_by), limit, offset, after)
+    def nearest(self, field: str, vector: Sequence[float], k: int = 10, *, where: Any = None,
+                exact: bool = False) -> List[Document]:
+        """The `k` documents whose `field` (a list of numbers) is most similar to `vector` (cosine),
+        best first, among those matching `where`. Each document's similarity is in `doc.score`
+        (also `doc["$score"]`). Uses the field's vector index when it has one (approximate
+        candidates, exact scores); `exact=True` scores every candidate."""
+        _total, _next, docs = self._query(where, None, k, 0, None,
+                                          nearest=(field, [float(x) for x in vector], k, exact))
+        return docs
+
+    def create_vector_index(self, field: str, dims: int) -> None:
+        """Indexes a top-level field holding `dims` numbers for `nearest` (at most 4 per collection);
+        existing documents included. Writes of other values to that field are then refused."""
+        out = bytearray(b"\x07")
+        put_str(out, self.name)
+        put_str(out, field)
+        out += struct.pack("<I", dims)
+        self._admin(w.OP_DOC_ADMIN, bytes(out))
+
+    def drop_vector_index(self, field: str) -> None:
+        out = bytearray(b"\x08")
+        put_str(out, self.name)
+        put_str(out, field)
+        self._admin(w.OP_DOC_ADMIN, bytes(out))
+
+    def vector_indexes(self) -> List[Dict[str, Any]]:
+        """`[{"field", "dims", "ready"}]` for the collection's vector indexes."""
+        out = bytearray(b"\x09")
+        put_str(out, self.name)
+        _v, body = self._admin(w.OP_DOC_INFO, bytes(out))
+        r = Reader(body)
+        result = []
+        for _ in range(r.count(9)):
+            field = r.str()
+            dims = r.u32()
+            result.append({"field": field, "dims": dims, "ready": r.u8() == 1})
+        return result
+
+    def _query(self, where: Any, order_by: Any, limit: int, offset: int, after: Optional[str],
+               nearest: Optional[Tuple[str, Sequence[float], int, bool]] = None) -> Tuple[int, Optional[str], List[Document]]:
+        body = w.encode_query(self.name, w.where_to_filter(where), w.parse_order_by(order_by), limit, offset, after, nearest)
         status, _v, rbody = self.client._request(w.OP_DOC_QUERY, body, idempotent=True)
         if status != w.ST_OK:
             self.client._raise(status, rbody)
@@ -416,7 +460,7 @@ class Collection(_Writer):
         return total, nxt, [Document(k, v, f) for k, v, f in docs]
 
     def create_index(self, field: str) -> None:
-        """Indexes a top-level field (at most 4 per collection); existing documents included."""
+        """Indexes a top-level field (at most 16 per collection); existing documents included."""
         out = bytearray(b"\x01")
         put_str(out, self.name)
         put_str(out, field)

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use storine::{
     add, append, between, dec, doc, eq, gt, list, matches, set, unset, Client, Error, Options, Query, Value,
+    VectorIndex,
 };
 
 fn server_binary() -> Option<PathBuf> {
@@ -174,6 +175,23 @@ fn single_node_end_to_end() {
     assert_eq!(items.scan(None).map(Result::unwrap).count(), 120);
     assert_eq!(items.first(Query::new().order_by("-price")).unwrap().unwrap().key, "i119");
     assert!(db.collections().unwrap().iter().any(|n| n == "items"));
+
+    // Vector search.
+    let c = db.collection("rs_docs");
+    c.create_vector_index("emb", 3).unwrap();
+    assert_eq!(c.vector_indexes().unwrap(), vec![VectorIndex { field: "emb".into(), dims: 3, ready: true }]);
+    for (key, vec, kind) in [("a", [1.0, 0.0, 0.0], "x"), ("b", [0.0, 1.0, 0.0], "y"), ("c", [0.7, 0.7, 0.0], "x")] {
+        c.put(key, doc! {"emb" => list![vec[0], vec[1], vec[2]], "kind" => kind}).unwrap();
+    }
+    let hits = c.nearest("emb", &[1.0, 0.1, 0.0], 2, None).unwrap();
+    assert_eq!(hits.iter().map(|d| d.key.as_str()).collect::<Vec<_>>(), ["a", "c"]);
+    assert!(hits[0].score().unwrap() > hits[1].score().unwrap());
+    let hits = c.nearest_exact("emb", &[1.0, 0.1, 0.0], 5, eq("kind", "x")).unwrap();
+    assert_eq!(hits.iter().map(|d| d.key.as_str()).collect::<Vec<_>>(), ["a", "c"]);
+    assert!(matches!(c.put("bad", doc! {"emb" => list![1.0, 2.0]}), Err(Error::Invalid(_)))); // wrong dimensions
+    assert!(matches!(c.nearest("emb", &[1.0, 2.0], 1, None), Err(Error::Invalid(_))));
+    c.drop_vector_index("emb").unwrap();
+    assert_eq!(c.vector_indexes().unwrap(), vec![]);
 
     // TTL and errors.
     let s = db.collection("sessions");

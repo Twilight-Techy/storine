@@ -1,3 +1,4 @@
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Text;
@@ -9,7 +10,13 @@ public sealed record Document(string Key, ulong Version, Doc Fields)
 {
     /// <summary>The field <paramref name="name"/>, or null.</summary>
     public object? this[string name] => Fields.TryGetValue(name, out object? v) ? v : null;
+
+    /// <summary>Similarity of a <c>NearestAsync</c> result (the <c>$score</c> field), or null for other queries.</summary>
+    public double? Score => this["$score"] as double?;
 }
+
+/// <summary>A vector index of a collection (<c>Ready</c>: built from the existing documents).</summary>
+public sealed record VectorIndex(string Field, int Dims, bool Ready);
 
 /// <summary>A collection's indexes (<c>Building</c>: being built from existing documents) and metadata.</summary>
 public sealed record CollectionInfo(string Name, IReadOnlyList<string> Indexes, IReadOnlyList<string> Building, Doc Metadata);
@@ -84,7 +91,11 @@ internal static class Wire
         return w.ToArray();
     }
 
-    internal static byte[] Query(string collection, Filter? where, OrderBy? orderBy, uint limit, uint offset, string? afterKey)
+    /// <summary>The optional nearest-neighbour block of a query: the <c>K</c> documents whose <c>Field</c> is most similar to <c>Vector</c>.</summary>
+    internal sealed record Nearest(string Field, float[] Vector, int K, bool Exact);
+
+    internal static byte[] Query(string collection, Filter? where, OrderBy? orderBy, uint limit, uint offset, string? afterKey,
+        Nearest? nearest = null)
     {
         var w = new Values.Writer();
         w.Str(collection);
@@ -115,7 +126,41 @@ internal static class Wire
             w.U8(1);
             w.Str(afterKey);
         }
+        if (nearest is not null)
+        {
+            // Optional trailing block: u8 1 | str field | u32 k | u8 exact | u32 dims | dims x f32.
+            w.U8(1);
+            w.Str(nearest.Field);
+            w.U32(nearest.K);
+            w.U8(nearest.Exact ? 1 : 0);
+            w.U32(nearest.Vector.Length);
+            foreach (float f in nearest.Vector) w.U32(BitConverter.SingleToUInt32Bits(f));
+        }
         return w.ToArray();
+    }
+
+    internal static byte[] CreateVectorIndex(string collection, string field, int dims)
+    {
+        var w = new Values.Writer();
+        w.U8(7);
+        w.Str(collection);
+        w.Str(field);
+        w.U32(dims);
+        return w.ToArray();
+    }
+
+    internal static List<VectorIndex> VectorIndexes(byte[] body)
+    {
+        var r = new Values.Reader(body);
+        int n = r.Count(9);
+        var list = new List<VectorIndex>(n);
+        for (int i = 0; i < n; i++)
+        {
+            string field = r.Str();
+            int dims = (int)r.U32();
+            list.Add(new VectorIndex(field, dims, r.U8() == 1));
+        }
+        return list;
     }
 
     internal static byte[] Admin(int sub, string collection, string? field = null)

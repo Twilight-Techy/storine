@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::{invalid, Error, Result};
 use crate::value::{Doc, Reader};
-use crate::wire::{self, ClusterInfo, CollectionInfo, Document, FieldOp, Filter, Query, Write};
+use crate::wire::{self, ClusterInfo, CollectionInfo, Document, FieldOp, Filter, Nearest, Query, VectorIndex, Write};
 
 const MAX_BODY: u32 = 256 * 1024 * 1024;
 
@@ -533,7 +533,7 @@ impl Collection<'_> {
     }
 
     fn query(&self, q: &Query, after: Option<&str>) -> Result<wire::Page> {
-        wire::decode_page(&self.client.call(wire::OP_DOC_QUERY, &wire::encode_query(&self.name, q, after)?)?.body)
+        wire::decode_page(&self.client.call(wire::OP_DOC_QUERY, &wire::encode_query(&self.name, q, after, None)?)?.body)
     }
 
     /// Documents matching `query` (a [`Query`] or a [`Filter`]).
@@ -563,7 +563,57 @@ impl Collection<'_> {
         }
     }
 
-    /// Indexes a top-level field (at most 4 per collection); existing documents included.
+    /// The `k` documents whose `field` (a list of numbers) is most similar to `vector` (cosine), best
+    /// first, among those matching `filter` (`None`: all). Each document's similarity is in
+    /// [`Document::score`] (also the `$score` field). Uses the field's vector index when it has one
+    /// (approximate candidates, exact scores).
+    pub fn nearest(
+        &self,
+        field: &str,
+        vector: &[f32],
+        k: u32,
+        filter: impl Into<Option<Filter>>,
+    ) -> Result<Vec<Document>> {
+        self.nearest_query(Nearest { field, vector, k, exact: false }, filter.into())
+    }
+
+    /// [`Collection::nearest`] scoring every candidate instead of using the vector index.
+    pub fn nearest_exact(
+        &self,
+        field: &str,
+        vector: &[f32],
+        k: u32,
+        filter: impl Into<Option<Filter>>,
+    ) -> Result<Vec<Document>> {
+        self.nearest_query(Nearest { field, vector, k, exact: true }, filter.into())
+    }
+
+    fn nearest_query(&self, n: Nearest<'_>, filter: Option<Filter>) -> Result<Vec<Document>> {
+        let q = Query { filter, limit: n.k, ..Query::default() };
+        let body = wire::encode_query(&self.name, &q, None, Some(n))?;
+        Ok(wire::decode_page(&self.client.call(wire::OP_DOC_QUERY, &body)?.body)?.docs)
+    }
+
+    /// Indexes a top-level field holding `dims` numbers for `nearest` (at most 4 per collection);
+    /// existing documents included. Writes of other values to that field are then refused.
+    pub fn create_vector_index(&self, field: &str, dims: u32) -> Result<()> {
+        let mut body = wire::encode_admin(7, &self.name, Some(field))?;
+        body.extend_from_slice(&dims.to_le_bytes());
+        self.client.call(wire::OP_DOC_ADMIN, &body).map(|_| ())
+    }
+
+    /// Removes the vector index on `field`.
+    pub fn drop_vector_index(&self, field: &str) -> Result<()> {
+        self.client.call(wire::OP_DOC_ADMIN, &wire::encode_admin(8, &self.name, Some(field))?).map(|_| ())
+    }
+
+    /// The collection's vector indexes.
+    pub fn vector_indexes(&self) -> Result<Vec<VectorIndex>> {
+        let r = self.client.call(wire::OP_DOC_INFO, &wire::encode_admin(9, &self.name, None)?)?;
+        wire::decode_vector_indexes(&r.body)
+    }
+
+    /// Indexes a top-level field (at most 16 per collection); existing documents included.
     pub fn create_index(&self, field: &str) -> Result<()> {
         self.client.call(wire::OP_DOC_ADMIN, &wire::encode_admin(1, &self.name, Some(field))?).map(|_| ())
     }

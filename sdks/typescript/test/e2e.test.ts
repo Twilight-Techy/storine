@@ -131,6 +131,23 @@ test("queries, indexes and pagination", { skip }, async () => {
   assert.ok((await db.collections()).includes("items"));
 });
 
+test("vector search", { skip }, async () => {
+  const c = db.collection("ts_docs");
+  await c.createVectorIndex("emb", 3);
+  assert.deepEqual(await c.vectorIndexes(), [{ field: "emb", dims: 3, ready: true }]);
+  for (const [key, emb, kind] of [["a", [1, 0, 0], "x"], ["b", [0, 1, 0], "y"], ["c", [0.7, 0.7, 0], "x"]] as const) {
+    await c.put(key, { emb: [...emb], kind });
+  }
+  const hits = await c.nearest("emb", [1, 0.1, 0], { k: 2 });
+  assert.deepEqual(hits.map((d) => d.key), ["a", "c"]);
+  assert.ok(hits[0].score! > hits[1].score!);
+  assert.deepEqual((await c.nearest("emb", [1, 0.1, 0], { k: 5, where: { kind: "x" }, exact: true })).map((d) => d.key), ["a", "c"]);
+  await assert.rejects(c.put("bad", { emb: [1, 2] }), s.InvalidError); // wrong dimensions
+  await assert.rejects(c.nearest("emb", [1, 2], { k: 1 }), s.InvalidError);
+  await c.dropVectorIndex("emb");
+  assert.deepEqual(await c.vectorIndexes(), []);
+});
+
 test("three-node cluster: redirects and failover", { skip, timeout: 60000 }, async () => {
   const base = mkdtempSync(join(tmpdir(), "storine_ts_cluster_"));
   const ports = [await freePort(), await freePort(), await freePort()];

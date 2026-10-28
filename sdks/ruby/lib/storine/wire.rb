@@ -186,7 +186,8 @@ module Storine
       out
     end
 
-    def encode_query(collection, filter, order_by, limit, offset, after_key)
+    # `nearest`: nil or [field, vector, k, exact].
+    def encode_query(collection, filter, order_by, limit, offset, after_key, nearest = nil)
       out = buf
       SVE.put_str(out, collection)
       if filter.nil?
@@ -206,6 +207,14 @@ module Storine
       else
         out << "\x01"
         SVE.put_str(out, after_key)
+      end
+      if nearest
+        # Optional trailing block: u8 1 | str field | u32 k | u8 exact | u32 dims | dims x f32 LE.
+        field, vector, k, exact = nearest
+        out << "\x01"
+        SVE.put_str(out, field)
+        out << [k, exact ? 1 : 0, vector.length].pack("VCV")
+        out << vector.map { |x| Float(x) }.pack("e*")
       end
       out
     end

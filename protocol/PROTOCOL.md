@@ -143,7 +143,16 @@ u32 sort_count (<= 16) | sort_count × (str path | u8 descending)
 u32 limit      (0 = default 1,000; capped at 10,000)
 u32 offset
 u8 has_after | str after_key (if 1)   (resume after this key; only without sort keys)
+[u8 1 | str field | u32 k | u8 exact | u32 dims | dims × f32]   (optional: nearest neighbours)
 ```
+
+The optional trailing block (absent for ordinary queries) asks for the `k` documents whose
+`field` (a list of numbers) is most similar to the vector by cosine similarity, best first,
+among those matching the filter. Clients send `limit = k`, `offset = 0`, no sort keys and no
+cursor. Each result carries its similarity in the extra field `$score` (`f64`). With a vector
+index on the field (below) the server proposes candidates from an HNSW graph and scores them
+exactly; `exact = 1`, or a small candidate set, scores every candidate. Wrong dimensions are
+`Invalid`.
 
 `filter`:
 
@@ -181,10 +190,13 @@ Body: `u8 command | arguments`.
 | `4` drop collection | `0x23` | `str collection` | `Ok`, `version` = documents deleted |
 | `5` set metadata | `0x23` | `str collection | map body` | `Ok` |
 | `6` collection info | `0x25` | `str collection` | `info` |
+| `7` create vector index | `0x23` | `str collection | str field | u32 dims` | `Ok` once existing documents are indexed; later writes of anything but `dims` numbers to the field are `Invalid` |
+| `8` drop vector index | `0x23` | `str collection | str field` | `Ok` |
+| `9` vector indexes | `0x25` | `str collection` | `u32 n | (str field | u32 dims | u8 ready)*` |
 
 `info := str name | u32 n | str index* | u32 m | str building_index* | map body (metadata)`.
-At most 4 secondary indexes per collection; indexes cover one top-level field; queries are always
-exact (index hits are re-checked).
+At most 16 secondary indexes and 4 vector indexes (up to 4,096 dimensions) per collection; indexes
+cover one top-level field; filters are always exact (index hits are re-checked).
 
 ## 6. Session and cluster
 

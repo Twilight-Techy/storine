@@ -206,6 +206,11 @@ impl HnswVectorIndex {
         self.len() == 0
     }
 
+    /// Dimension of the stored vectors (`0` before the first insert).
+    pub fn dim(&self) -> usize {
+        self.graph.read().unwrap_or_else(|poisoned| poisoned.into_inner()).dim
+    }
+
     /// Mutation counter: equal values mean the graph did not change in between.
     #[inline]
     pub fn generation(&self) -> u64 {

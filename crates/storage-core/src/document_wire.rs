@@ -316,6 +316,17 @@ pub fn encode_query(q: &DocQuery, out: &mut Vec<u8>) {
         }
         None => out.push(0),
     }
+    // Optional trailing block (`TASK-122`); absent for ordinary queries.
+    if let Some(n) = &q.nearest {
+        out.push(1);
+        put_str(out, &n.field);
+        out.extend_from_slice(&u32::try_from(n.k).unwrap_or(u32::MAX).to_le_bytes());
+        out.push(u8::from(n.exact));
+        out.extend_from_slice(&(n.vector.len() as u32).to_le_bytes());
+        for x in &n.vector {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    }
 }
 
 /// Decodes a query; the limit is clamped to [`MAX_PAGE_SIZE`] (default [`DEFAULT_PAGE_SIZE`]).
@@ -344,11 +355,31 @@ pub fn decode_query(body: &[u8]) -> Result<DocQuery> {
         1 => Some(r.str()?.to_owned()),
         _ => return Err(StorageError::invalid_value("bad cursor flag")),
     };
+    // `u8 1 | str field | u32 k | u8 exact | u32 dims | dims × f32` (nearest-neighbour search).
+    let nearest = if r.remaining() == 0 {
+        None
+    } else {
+        if r.u8()? != 1 {
+            return Err(StorageError::invalid_value("bad nearest flag"));
+        }
+        let field = r.str()?.to_owned();
+        let k = r.u32()? as usize;
+        let exact = r.u8()? != 0;
+        let dims = r.count(4)?;
+        if dims > crate::document::MAX_VECTOR_DIMS {
+            return Err(StorageError::invalid_value("query vector too long"));
+        }
+        let mut vector = Vec::with_capacity(dims);
+        for _ in 0..dims {
+            vector.push(f32::from_bits(r.u32()?));
+        }
+        Some(crate::document::Nearest { field, vector, k, exact })
+    };
     if r.remaining() != 0 {
         return Err(StorageError::invalid_value("trailing bytes after query"));
     }
     let limit = if limit == 0 { DEFAULT_PAGE_SIZE } else { limit.min(MAX_PAGE_SIZE) };
-    Ok(DocQuery { collection, filter, order_by, limit: Some(limit), offset, after_key })
+    Ok(DocQuery { collection, filter, order_by, limit: Some(limit), offset, after_key, nearest })
 }
 
 /// `u32 total | u8 has_next | str next? | u32 count | (str key, u64 version, map)*`
@@ -437,12 +468,20 @@ mod tests {
             limit: Some(10),
             offset: 2,
             after_key: Some("k1".into()),
+            nearest: Some(crate::document::Nearest { field: "v".into(), vector: vec![0.5, -2.0], k: 3, exact: true }),
         };
         let mut buf = Vec::new();
         encode_query(&q, &mut buf);
         assert_eq!(decode_query(&buf).unwrap(), q);
+        // The nearest block is optional: cutting exactly before it leaves a valid plain query;
+        // every other truncation is an error, and none decodes back to the original.
+        let plain = DocQuery { nearest: None, ..q.clone() };
+        let mut plain_buf = Vec::new();
+        encode_query(&plain, &mut plain_buf);
         for cut in 0..buf.len() {
-            assert!(decode_query(&buf[..cut]).is_err());
+            if let Ok(d) = decode_query(&buf[..cut]) {
+                assert!(cut == plain_buf.len() && d == plain, "cut {cut}");
+            }
         }
 
         let page = DocPage {

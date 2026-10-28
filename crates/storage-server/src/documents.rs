@@ -25,6 +25,12 @@ pub const INFO_LIST_COLLECTIONS: u8 = 3;
 pub const ADMIN_DROP_COLLECTION: u8 = 4;
 pub const ADMIN_SET_EXTRA: u8 = 5;
 pub const INFO_COLLECTION: u8 = 6;
+/// Vector indexes (`TASK-122`): create (`str collection | str field | u32 dims`), drop
+/// (`str collection | str field`), list (`str collection` -> `u32 n | (str field | u32 dims |
+/// u8 ready)*`).
+pub const ADMIN_CREATE_VECTOR_INDEX: u8 = 7;
+pub const ADMIN_DROP_VECTOR_INDEX: u8 = 8;
+pub const INFO_VECTOR_INDEXES: u8 = 9;
 
 pub(crate) type Reply = (u8, u64, Vec<u8>);
 
@@ -170,7 +176,10 @@ fn encode_info(info: &CollectionInfo, out: &mut Vec<u8>) {
 
 /// `true` if this `OP_DOC_ADMIN` request may take long (runs as an admin job).
 pub(crate) fn admin_is_slow(body: &[u8]) -> bool {
-    matches!(body.first(), Some(&(ADMIN_CREATE_INDEX | ADMIN_DROP_INDEX | ADMIN_DROP_COLLECTION)))
+    matches!(
+        body.first(),
+        Some(&(ADMIN_CREATE_INDEX | ADMIN_DROP_INDEX | ADMIN_DROP_COLLECTION | ADMIN_CREATE_VECTOR_INDEX | ADMIN_DROP_VECTOR_INDEX))
+    )
 }
 
 /// `OP_DOC_ADMIN` / `OP_DOC_INFO`: `u8 sub-command | args`.
@@ -178,7 +187,15 @@ pub(crate) fn doc_admin(store: &DocumentStore, body: &[u8], allow_writes: bool) 
     let mut r = SveReader::new(body);
     let mut run = || -> storage_types::Result<Reply> {
         let sub = r.u8()?;
-        let is_write = matches!(sub, ADMIN_CREATE_INDEX | ADMIN_DROP_INDEX | ADMIN_DROP_COLLECTION | ADMIN_SET_EXTRA);
+        let is_write = matches!(
+            sub,
+            ADMIN_CREATE_INDEX
+                | ADMIN_DROP_INDEX
+                | ADMIN_DROP_COLLECTION
+                | ADMIN_SET_EXTRA
+                | ADMIN_CREATE_VECTOR_INDEX
+                | ADMIN_DROP_VECTOR_INDEX
+        );
         if is_write && !allow_writes {
             return Err(StorageError::invalid_value("use OP_DOC_ADMIN for schema changes"));
         }
@@ -212,6 +229,30 @@ pub(crate) fn doc_admin(store: &DocumentStore, body: &[u8], allow_writes: bool) 
                 let extra: BTreeMap<_, _> = r.map_body()?;
                 store.set_collection_extra(&c, extra)?;
                 (STATUS_OK, 0, Vec::new())
+            }
+            ADMIN_CREATE_VECTOR_INDEX => {
+                let c = r.str()?.to_owned();
+                let f = r.str()?.to_owned();
+                let dims = r.u32()? as usize;
+                store.create_vector_index(&c, &f, dims)?;
+                (STATUS_OK, 0, Vec::new())
+            }
+            ADMIN_DROP_VECTOR_INDEX => {
+                let c = r.str()?.to_owned();
+                let f = r.str()?.to_owned();
+                store.drop_vector_index(&c, &f)?;
+                (STATUS_OK, 0, Vec::new())
+            }
+            INFO_VECTOR_INDEXES => {
+                let c = r.str()?.to_owned();
+                let info = store.collection_info(&c);
+                let mut out = (info.vectors.len() as u32).to_le_bytes().to_vec();
+                for v in &info.vectors {
+                    put_str(&mut out, &v.field);
+                    out.extend_from_slice(&(v.dims as u32).to_le_bytes());
+                    out.push(u8::from(v.ready));
+                }
+                (STATUS_OK, info.vectors.len() as u64, out)
             }
             INFO_COLLECTION => {
                 let c = r.str()?.to_owned();

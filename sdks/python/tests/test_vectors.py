@@ -115,6 +115,9 @@ class VectorTests(unittest.TestCase):
                 ~storine.ne("a", 1), storine.le("b", 2.5), storine.gt("c", 0), storine.key_prefix("user:")), [], 0, 0, None),
             "query: after key cursor": w.encode_query("items", None, [], 100, 0, "k0099"),
             "query: multi-key sort": w.encode_query("items", None, w.parse_order_by(["a", "-b"]), 5, 0, None),
+            "query: nearest neighbours with a filter": w.encode_query(
+                "items", storine.eq("kind", "book"), [], 5, 0, None, ("embedding", [0.25, -1.5, 3.0], 5, False)),
+            "query: nearest neighbours, exact": w.encode_query("items", None, [], 0, 0, None, ("v", [1.0, 0.0], 1, True)),
         }
         seen = 0
         for vec in VECTORS["requests"]:

@@ -267,7 +267,8 @@ def encode_writes(writes: Sequence[Write], request_id: Optional[bytes]) -> bytes
 
 
 def encode_query(collection: str, flt: Optional[Filter], order_by: Sequence[Tuple[str, bool]],
-                 limit: int, offset: int, after_key: Optional[str]) -> bytes:
+                 limit: int, offset: int, after_key: Optional[str],
+                 nearest: Optional[Tuple[str, Sequence[float], int, bool]] = None) -> bytes:
     out = bytearray()
     put_str(out, collection)
     if flt is None:
@@ -285,6 +286,13 @@ def encode_query(collection: str, flt: Optional[Filter], order_by: Sequence[Tupl
     else:
         out.append(1)
         put_str(out, after_key)
+    if nearest is not None:
+        # Optional trailing block: u8 1 | str field | u32 k | u8 exact | u32 dims | dims x f32.
+        field, vector, k, exact = nearest
+        out.append(1)
+        put_str(out, field)
+        out += struct.pack("<IBI", k, 1 if exact else 0, len(vector))
+        out += struct.pack(f"<{len(vector)}f", *vector)
     return bytes(out)
 
 

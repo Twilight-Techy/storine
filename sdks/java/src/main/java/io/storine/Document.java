@@ -12,4 +12,9 @@ public record Document(String key, long version, Map<String, Object> fields) {
     public Object get(String name) {
         return fields.get(name);
     }
+
+    /** Similarity of a {@link Collection#nearest} result (the {@code $score} field), or {@code null} for other queries. */
+    public Double score() {
+        return fields.get("$score") instanceof Double d ? d : null;
+    }
 }

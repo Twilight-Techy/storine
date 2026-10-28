@@ -46,7 +46,9 @@ foreach ($accounts->scan() as $d) {       // every document, any collection size
 | `$c->update($key, ...$changes)` / `$c->updateIfVersion($key, $version, ...$changes)` | Atomic server-side changes: `FieldOp::set`, `unset`, `add($path, $amount)->min(...)->max(...)`, `append`, or `['field' => value]` arrays. |
 | `$c->delete($key)` / `$c->deleteIfVersion($key, $version)` | `delete` returns `true` if it existed. |
 | `$c->find($where, orderBy:, limit:, offset:)` / `$c->first(...)` / `$c->count($where)` / `$c->scan($where)` | Queries. `$where` is a filter (`Filter::eq`, `ne`, `lt`, `le`, `gt`, `ge`, `between`, `in`, `prefix`, `contains`, `exists`, `missing`, `keyPrefix`, `and`, `or`, `not`) or `['field' => value]`. `orderBy: '-price'` sorts descending. `scan` is a generator. |
-| `$c->createIndex($field)` / `$c->dropIndex($field)` / `$c->info()` / `$c->drop()` | Indexes (up to 4 per collection) and collection management. |
+| `$c->nearest($field, $vector, k: 10, where: null, exact: false)` | The `k` documents whose `$field` (a list of numbers) is most similar to `$vector` (cosine), best first; `$doc->score()` holds the similarity. `exact: true` scores every candidate instead of using the vector index. |
+| `$c->createVectorIndex($field, $dims)` / `$c->dropVectorIndex($field)` / `$c->vectorIndexes()` | Vector indexes for `nearest`; writes of other values to an indexed field are refused. |
+| `$c->createIndex($field)` / `$c->dropIndex($field)` / `$c->info()` / `$c->drop()` | Indexes (up to 16 per collection) and collection management. |
 | `$db->transaction(fn (Transaction $tx) => ...)` | Buffered writes committed atomically when the callable returns (or `$db->transaction()` then `->commit()`); `requireVersion` / `requireExists` add checks. |
 
 **Values**: `null`, `bool`, `int`, `float`, `Decimal` (exact, up to 38 digits, keeps its scale — use it for money,

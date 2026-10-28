@@ -205,6 +205,11 @@ export class Writer {
     this.view.setBigInt64(this.length, v, true);
     this.length += 8;
   }
+  f32(v: number): void {
+    this.reserve(4);
+    this.view.setFloat32(this.length, v, true);
+    this.length += 4;
+  }
   f64(v: number): void {
     this.reserve(8);
     this.view.setFloat64(this.length, v, true);

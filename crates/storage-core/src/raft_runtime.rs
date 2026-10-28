@@ -1232,4 +1232,40 @@ mod tests {
             assert_eq!(voters(&again.membership()), vec![1, 2, 3, 4, 5]);
         }
     }
+
+    #[test]
+    fn test_vector_search_is_identical_on_every_replica() {
+        use crate::document::{DocQuery, Nearest};
+        let c = Cluster::new("vectors", 3);
+        let l = c.leader(Duration::from_secs(5));
+        let store = |i: usize| {
+            let st = DocumentStore::from_engine(Arc::clone(&c.engines[i])).unwrap();
+            st.set_commit_sink(Arc::clone(&c.runtimes[i]) as Arc<dyn crate::document::CommitSink>);
+            st
+        };
+        let leader = store(l);
+        leader.create_vector_index("v", "emb", 4).unwrap();
+        for i in 0..50i64 {
+            let mut f = BTreeMap::new();
+            let x = i as f64;
+            f.insert(
+                "emb".to_string(),
+                PropertyValue::List(vec![x, 50.0 - x, (x * 0.3).sin(), 1.0].into_iter().map(PropertyValue::Float64).collect()),
+            );
+            leader.put("v", &format!("k{i:02}"), f).unwrap();
+        }
+        c.wait_converged(&[0, 1, 2]);
+        let q = DocQuery {
+            collection: "v".into(),
+            nearest: Some(Nearest { field: "emb".into(), vector: vec![10.0, 40.0, 0.0, 1.0], k: 5, exact: false }),
+            ..Default::default()
+        };
+        let expected = leader.query(&q).unwrap().documents;
+        assert_eq!(expected.len(), 5);
+        for i in 0..3 {
+            let st = DocumentStore::from_engine(Arc::clone(&c.engines[i])).unwrap();
+            assert_eq!(st.query(&q).unwrap().documents, expected, "replica {i}");
+            assert_eq!(c.engines[i].named_vector_count(crate::document::vector_field_id("v", "emb")), 50);
+        }
+    }
 }

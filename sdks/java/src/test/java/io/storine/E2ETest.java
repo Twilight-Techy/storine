@@ -195,6 +195,25 @@ class E2ETest {
     }
 
     @Test
+    void vectorSearch() {
+        Collection c = db.collection("java_docs");
+        c.createVectorIndex("emb", 3);
+        assertEquals(List.of(new VectorIndex("emb", 3, true)), c.vectorIndexes());
+        c.put("a", Map.of("emb", List.of(1, 0, 0), "kind", "x"));
+        c.put("b", Map.of("emb", List.of(0, 1, 0), "kind", "y"));
+        c.put("c", Map.of("emb", List.of(0.7, 0.7, 0), "kind", "x"));
+        List<Document> hits = c.nearest("emb", new float[] {1, 0.1f, 0}, 2);
+        assertEquals(List.of("a", "c"), hits.stream().map(Document::key).toList());
+        assertTrue(hits.get(0).score() > hits.get(1).score());
+        assertEquals(List.of("a", "c"), c.nearest("emb", new float[] {1, 0.1f, 0}, 5, eq("kind", "x"), true).stream()
+                .map(Document::key).toList());
+        assertThrows(InvalidException.class, () -> c.put("bad", Map.of("emb", List.of(1, 2)))); // wrong dimensions
+        assertThrows(InvalidException.class, () -> c.nearest("emb", new float[] {1, 2}, 1));
+        c.dropVectorIndex("emb");
+        assertEquals(List.of(), c.vectorIndexes());
+    }
+
+    @Test
     void ttlAndErrors() throws Exception {
         Collection s = db.collection("sessions");
         s.put("short", Map.of("u", 1), Duration.ofMillis(200));

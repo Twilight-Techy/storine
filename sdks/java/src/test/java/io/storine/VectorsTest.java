@@ -162,6 +162,9 @@ class VectorsTest {
                 gt("c", 0), keyPrefix("user:"))), null));
         built.put("query: after key cursor", Wire.query("items", all.limit(100), "k0099"));
         built.put("query: multi-key sort", Wire.query("items", all.orderBy("a", "-b").limit(5), null));
+        built.put("query: nearest neighbours with a filter", Wire.query("items", all.where(eq("kind", "book")).limit(5), null,
+                new Wire.Nearest("embedding", new float[] {0.25f, -1.5f, 3.0f}, 5, false)));
+        built.put("query: nearest neighbours, exact", Wire.query("items", all, null, new Wire.Nearest("v", new float[] {1.0f, 0.0f}, 1, true)));
         built.put("admin: create index items.price", Wire.admin(1, "items", "price"));
         built.put("info: collection items", Wire.admin(6, "items", null));
         built.put("info: list collections", new byte[] {3});

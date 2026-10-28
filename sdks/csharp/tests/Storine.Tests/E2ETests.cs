@@ -215,6 +215,27 @@ public class E2ETests : IClassFixture<SingleNodeFixture>
     }
 
     [Fact]
+    public async Task VectorSearch()
+    {
+        if (!Server.Built) return;
+        var c = Db.Collection("cs_docs");
+        await c.CreateVectorIndexAsync("emb", 3);
+        Assert.Equal(new[] { new VectorIndex("emb", 3, true) }, await c.VectorIndexesAsync());
+        await c.PutAsync("a", new Doc { ["emb"] = new[] { 1, 0, 0 }, ["kind"] = "x" });
+        await c.PutAsync("b", new Doc { ["emb"] = new[] { 0, 1, 0 }, ["kind"] = "y" });
+        await c.PutAsync("c", new Doc { ["emb"] = new[] { 0.7, 0.7, 0 }, ["kind"] = "x" });
+        var hits = await c.NearestAsync("emb", new[] { 1f, 0.1f, 0f }, k: 2);
+        Assert.Equal(new[] { "a", "c" }, hits.Select(d => d.Key));
+        Assert.True(hits[0].Score > hits[1].Score);
+        var filtered = await c.NearestAsync("emb", new[] { 1f, 0.1f, 0f }, k: 5, where: Eq("kind", "x"), exact: true);
+        Assert.Equal(new[] { "a", "c" }, filtered.Select(d => d.Key));
+        await Assert.ThrowsAsync<InvalidException>(() => c.PutAsync("bad", new Doc { ["emb"] = new[] { 1, 2 } })); // wrong dimensions
+        await Assert.ThrowsAsync<InvalidException>(() => c.NearestAsync("emb", new[] { 1f, 2f }, k: 1));
+        await c.DropVectorIndexAsync("emb");
+        Assert.Empty(await c.VectorIndexesAsync());
+    }
+
+    [Fact]
     public async Task TtlAndErrors()
     {
         if (!Server.Built) return;

@@ -287,6 +287,25 @@ pub trait Indexable: storage_codec::ZeroCopyRecord {
         None
     }
 
+    /// `true` if records carry *named* vector embeddings (`TASK-122`): the engine then keeps one
+    /// HNSW graph per name, maintained on every write path (local writes, WAL replay, Raft
+    /// apply, snapshot install) and rebuilt at open.
+    const NAMED_EMBEDDINGS: bool = false;
+
+    /// Named embeddings of this record: `(vector index id, vector)` pairs.
+    #[inline]
+    fn named_embeddings(&self) -> Vec<(u16, Vec<f32>)> {
+        Vec::new()
+    }
+
+    /// [`Self::named_embeddings`] read from the zero-copy archived representation.
+    #[inline]
+    fn archived_named_embeddings(root: &Self::Archived, payload: &[u8]) -> Vec<(u16, Vec<f32>)> {
+        Self::unarchive(root, payload)
+            .map(|owned| owned.named_embeddings())
+            .unwrap_or_default()
+    }
+
     /// Borrows the `f32` vector embedding slice directly from the zero-copy archived payload (`mmap` / `hot_dirty`)
     /// without duplicating `Vec<f32>` in heap RAM.
     #[inline]

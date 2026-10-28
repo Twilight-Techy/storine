@@ -214,7 +214,7 @@ fn requests() {
     let rid: [u8; 16] = unhex("0102030405060708090a0b0c0d0e0f10").try_into().unwrap();
     let ab = [0xabu8; 16];
     let ws = |id: Option<&[u8; 16]>, w: Vec<Write>| encode_writes(&w, id).unwrap();
-    let q = |q: Query, after: Option<&str>| encode_query("items", &q, after).unwrap();
+    let q = |q: Query, after: Option<&str>| encode_query("items", &q, after, None).unwrap();
     let ttl = u64::try_from(Duration::from_millis(1500).as_millis()).unwrap();
     let mut built: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
     built.insert("get accounts/alice", encode_get("accounts", "alice").unwrap());
@@ -279,6 +279,26 @@ fn requests() {
     );
     built.insert("query: after key cursor", q(Query::new().limit(100), Some("k0099")));
     built.insert("query: multi-key sort", q(Query::new().order_by("a").order_by("-b").limit(5), None));
+    built.insert(
+        "query: nearest neighbours with a filter",
+        encode_query(
+            "items",
+            &Query::new().filter(eq("kind", "book")).limit(5),
+            None,
+            Some(Nearest { field: "embedding", vector: &[0.25, -1.5, 3.0], k: 5, exact: false }),
+        )
+        .unwrap(),
+    );
+    built.insert(
+        "query: nearest neighbours, exact",
+        encode_query(
+            "items",
+            &Query::new(),
+            None,
+            Some(Nearest { field: "v", vector: &[1.0, 0.0], k: 1, exact: true }),
+        )
+        .unwrap(),
+    );
     built.insert("admin: create index items.price", encode_admin(1, "items", Some("price")).unwrap());
     built.insert("info: collection items", encode_admin(6, "items", None).unwrap());
     built.insert("info: list collections", vec![3]);

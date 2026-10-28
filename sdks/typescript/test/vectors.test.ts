@@ -108,6 +108,8 @@ test("requests", () => {
     "query: not / ne / le / gt / key prefix": w.encodeQuery("items", s.and(s.not(s.ne("a", 1)), s.le("b", 2.5), s.gt("c", 0), s.keyPrefix("user:")), [], 0, 0),
     "query: after key cursor": w.encodeQuery("items", undefined, [], 100, 0, "k0099"),
     "query: multi-key sort": w.encodeQuery("items", undefined, w.parseOrderBy(["a", "-b"]), 5, 0),
+    "query: nearest neighbours with a filter": w.encodeQuery("items", s.eq("kind", "book"), [], 5, 0, undefined, { field: "embedding", vector: [0.25, -1.5, 3.0], k: 5, exact: false }),
+    "query: nearest neighbours, exact": w.encodeQuery("items", undefined, [], 0, 0, undefined, { field: "v", vector: [1.0, 0.0], k: 1, exact: true }),
   };
   let seen = 0;
   for (const vec of VECTORS.requests) {

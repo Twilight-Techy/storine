@@ -200,7 +200,10 @@ func TestRequestVectors(t *testing.T) {
 	}
 	ws := func(rid []byte, w ...write) []byte { return must(encodeWrites(w, rid)) }
 	q := func(c string, f *Filter, order []string, limit, offset uint32, after *string) []byte {
-		return must(encodeQuery(c, f, parseOrderBy(order), limit, offset, after))
+		return must(encodeQuery(c, f, parseOrderBy(order), limit, offset, after, nil))
+	}
+	nq := func(c string, f *Filter, limit uint32, n nearestQuery) []byte {
+		return must(encodeQuery(c, f, nil, limit, 0, nil, &n))
 	}
 	after := "k0099"
 	admin := func(sub byte, name string, field *string) []byte {
@@ -236,9 +239,12 @@ func TestRequestVectors(t *testing.T) {
 		"query: not / ne / le / gt / key prefix":      q("items", And(Not(Ne("a", 1)), Le("b", 2.5), Gt("c", 0), KeyPrefix("user:")), nil, 0, 0, nil),
 		"query: after key cursor":                     q("items", nil, nil, 100, 0, &after),
 		"query: multi-key sort":                       q("items", nil, []string{"a", "-b"}, 5, 0, nil),
-		"admin: create index items.price":             admin(1, "items", &price),
-		"info: collection items":                      admin(6, "items", nil),
-		"info: list collections":                      {3},
+		"query: nearest neighbours with a filter": nq("items", Eq("kind", "book"), 5,
+			nearestQuery{field: "embedding", vector: []float32{0.25, -1.5, 3.0}, k: 5, exact: false}),
+		"query: nearest neighbours, exact": nq("items", nil, 0, nearestQuery{field: "v", vector: []float32{1.0, 0.0}, k: 1, exact: true}),
+		"admin: create index items.price":  admin(1, "items", &price),
+		"info: collection items":           admin(6, "items", nil),
+		"info: list collections":           {3},
 	}
 	seen := 0
 	for _, vec := range loadVectors(t).Requests {

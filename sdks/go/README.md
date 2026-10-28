@@ -53,7 +53,9 @@ err = accounts.Scan(ctx, nil, func(d *storine.Document) error { ...; return nil 
 | `c.Update(ctx, key, changes...)` / `c.UpdateIfVersion(ctx, key, version, changes...)` | Atomic server-side changes: `Set`, `Unset`, `Add(path, amount).Min(x).Max(y)`, `Append`. |
 | `c.Delete(ctx, key)` / `c.DeleteIfVersion(ctx, key, version)` | `true` if it existed. |
 | `c.Find(ctx, Query{Where, OrderBy, Limit, Offset})` / `c.First` / `c.Count(ctx, where)` / `c.Scan(ctx, where, fn)` | Queries. `Where` is a filter: `Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`, `Between`, `In`, `Prefix`, `Contains`, `Exists`, `Missing`, `KeyPrefix`, `And`, `Or`, `Not`, or `Match(Doc{...})`; `nil` matches all. `"-price"` sorts descending. |
-| `c.CreateIndex` / `c.DropIndex` / `c.Info` / `c.Drop` | Indexes (up to 4 per collection) and collection management. |
+| `c.Nearest(ctx, field, vector, NearestOptions{K, Where, Exact})` | The `K` (default 10) documents whose `field` (a list of numbers) is most similar to `vector` (`[]float32`, cosine), best first; similarity in `doc.Score()`. |
+| `c.CreateVectorIndex(ctx, field, dims)` / `c.DropVectorIndex(ctx, field)` / `c.VectorIndexes(ctx)` | Vector indexes for `Nearest` (`[]VectorIndex{Field, Dims, Ready}`). |
+| `c.CreateIndex` / `c.DropIndex` / `c.Info` / `c.Drop` | Indexes (up to 16 per collection) and collection management. |
 | `db.Transaction(ctx, func(tx *Tx) error)` | Writes committed atomically when `fn` returns nil; `tx.RequireVersion` / `tx.RequireExists` add checks. |
 | `db.Collections(ctx)` / `db.ClusterInfo(ctx)` | Introspection. |
 

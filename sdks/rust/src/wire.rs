@@ -382,7 +382,21 @@ pub(crate) fn encode_writes(writes: &[Write], request_id: Option<&[u8; 16]>) -> 
     Ok(out)
 }
 
-pub(crate) fn encode_query(collection: &str, q: &Query, after_key: Option<&str>) -> Result<Vec<u8>> {
+/// The optional trailing block of a nearest-neighbour query.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Nearest<'a> {
+    pub field: &'a str,
+    pub vector: &'a [f32],
+    pub k: u32,
+    pub exact: bool,
+}
+
+pub(crate) fn encode_query(
+    collection: &str,
+    q: &Query,
+    after_key: Option<&str>,
+    nearest: Option<Nearest<'_>>,
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     put_str(&mut out, collection)?;
     match &q.filter {
@@ -404,6 +418,17 @@ pub(crate) fn encode_query(collection: &str, q: &Query, after_key: Option<&str>)
         Some(k) => {
             out.push(1);
             put_str(&mut out, k)?;
+        }
+    }
+    if let Some(n) = nearest {
+        // u8 1 | str field | u32 k | u8 exact | u32 dims | dims x f32 LE.
+        out.push(1);
+        put_str(&mut out, n.field)?;
+        out.extend_from_slice(&n.k.to_le_bytes());
+        out.push(u8::from(n.exact));
+        put_u32(&mut out, n.vector.len())?;
+        for x in n.vector {
+            out.extend_from_slice(&x.to_le_bytes());
         }
     }
     Ok(out)
@@ -444,6 +469,11 @@ impl Document {
     /// The field `name`, if present.
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.fields.get(name)
+    }
+
+    /// Similarity of a `nearest` result (`None` for other queries).
+    pub fn score(&self) -> Option<f64> {
+        self.fields.get("$score").and_then(Value::as_f64)
     }
 }
 
@@ -486,6 +516,27 @@ pub(crate) fn decode_info(r: &mut Reader<'_>) -> Result<CollectionInfo> {
     let indexes = strings(r)?;
     let building = strings(r)?;
     Ok(CollectionInfo { name, indexes, building, metadata: r.fields(1)? })
+}
+
+/// A vector index of a collection (see `Collection::create_vector_index`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorIndex {
+    pub field: String,
+    pub dims: u32,
+    /// False while existing documents are still being indexed.
+    pub ready: bool,
+}
+
+pub(crate) fn decode_vector_indexes(body: &[u8]) -> Result<Vec<VectorIndex>> {
+    let mut r = Reader::new(body);
+    let n = r.count(9)?;
+    (0..n)
+        .map(|_| {
+            let field = r.str()?;
+            let dims = r.u32()?;
+            Ok(VectorIndex { field, dims, ready: r.u8()? == 1 })
+        })
+        .collect()
 }
 
 /// The server currently used and its view of the cluster.

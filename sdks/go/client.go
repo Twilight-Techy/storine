@@ -25,6 +25,12 @@ type Document struct {
 	Fields  Doc
 }
 
+// Score is the similarity of a Nearest result (also Fields["$score"]); 0 for other queries.
+func (d *Document) Score() float64 {
+	f, _ := d.Fields["$score"].(float64)
+	return f
+}
+
 // Options configure Connect. Every field is optional.
 type Options struct {
 	// Token authenticates (also accepted in the URL: storine://token@host:port).
@@ -607,10 +613,14 @@ type Query struct {
 }
 
 func (c *Collection) query(ctx context.Context, q Query, after *string) (*page, error) {
+	return c.queryNearest(ctx, q, after, nil)
+}
+
+func (c *Collection) queryNearest(ctx context.Context, q Query, after *string, nearest *nearestQuery) (*page, error) {
 	if q.Limit < 0 || q.Offset < 0 {
 		return nil, invalidf("Limit and Offset must not be negative")
 	}
-	body, err := encodeQuery(c.name, q.Where, parseOrderBy(q.OrderBy), uint32(q.Limit), uint32(q.Offset), after)
+	body, err := encodeQuery(c.name, q.Where, parseOrderBy(q.OrderBy), uint32(q.Limit), uint32(q.Offset), after, nearest)
 	if err != nil {
 		return nil, err
 	}
@@ -670,6 +680,32 @@ func (c *Collection) Scan(ctx context.Context, where *Filter, fn func(*Document)
 	}
 }
 
+// NearestOptions configure Nearest. Every field is optional.
+type NearestOptions struct {
+	K     int     // number of documents to return; 0: 10
+	Where *Filter // nil: every document
+	Exact bool    // score every candidate instead of using the vector index
+}
+
+// Nearest returns the K documents whose field (a list of numbers) is most similar to vector
+// (cosine), best first, among those matching Where. Each document's similarity is in
+// doc.Score() (also Fields["$score"]). Uses the field's vector index when it has one (approximate
+// candidates, exact scores); Exact scores every candidate. ErrInvalid if the dimensions differ.
+func (c *Collection) Nearest(ctx context.Context, field string, vector []float32, o NearestOptions) ([]*Document, error) {
+	if o.K < 0 {
+		return nil, invalidf("K must not be negative")
+	}
+	if o.K == 0 {
+		o.K = 10
+	}
+	n := &nearestQuery{field: field, vector: vector, k: uint32(o.K), exact: o.Exact}
+	p, err := c.queryNearest(ctx, Query{Where: o.Where, Limit: o.K}, nil, n)
+	if err != nil {
+		return nil, err
+	}
+	return p.docs, nil
+}
+
 func (c *Collection) admin(ctx context.Context, op byte, sub byte, field *string) (uint64, []byte, error) {
 	w := &writer{}
 	w.u8(sub)
@@ -680,7 +716,37 @@ func (c *Collection) admin(ctx context.Context, op byte, sub byte, field *string
 	return c.client.call(ctx, op, w.b)
 }
 
-// CreateIndex indexes a top-level field (at most 4 per collection); existing documents included.
+// CreateVectorIndex indexes a top-level field holding dims numbers for Nearest (at most 4 per
+// collection); existing documents included. Writes of other values to that field are then refused.
+func (c *Collection) CreateVectorIndex(ctx context.Context, field string, dims int) error {
+	if dims <= 0 {
+		return invalidf("dims must be positive")
+	}
+	w := &writer{}
+	w.u8(7)
+	w.str(c.name)
+	w.str(field)
+	w.u32(uint32(dims))
+	_, _, err := c.client.call(ctx, opDocAdmin, w.b)
+	return err
+}
+
+// DropVectorIndex removes the vector index on field.
+func (c *Collection) DropVectorIndex(ctx context.Context, field string) error {
+	_, _, err := c.admin(ctx, opDocAdmin, 8, &field)
+	return err
+}
+
+// VectorIndexes returns the collection's vector indexes.
+func (c *Collection) VectorIndexes(ctx context.Context) ([]VectorIndex, error) {
+	_, body, err := c.admin(ctx, opDocInfo, 9, nil)
+	if err != nil {
+		return nil, err
+	}
+	return decodeVectorIndexes(body)
+}
+
+// CreateIndex indexes a top-level field (at most 16 per collection); existing documents included.
 func (c *Collection) CreateIndex(ctx context.Context, field string) error {
 	_, _, err := c.admin(ctx, opDocAdmin, 1, &field)
 	return err

@@ -44,7 +44,9 @@ accounts.scan { |d| ... }                # every document, any collection size (
 | `c.update(key, *changes, if_version: nil)` | Atomic server-side changes: `Storine.set`, `unset`, `add(path, amount, min:, max:)`, `append`, or a `{ field => value }` Hash. |
 | `c.delete(key, if_version: nil)` | `true` if it existed. |
 | `c.find(where, order_by:, limit:, offset:)` / `c.first(...)` / `c.count(where)` / `c.scan(where)` | Queries. `where` is a filter (`Storine.eq`, `ne`, `lt`, `le`, `gt`, `ge`, `between`, `in`, `prefix`, `contains`, `exists`, `missing`, `key_prefix`, `and`, `or`, `not`; or combine with `&`, `\|`, `~`) or `{ field => value }`. `order_by: "-price"` sorts descending. |
-| `c.create_index(field)` / `c.drop_index(field)` / `c.info` / `c.drop` | Indexes (up to 4 per collection) and collection management. |
+| `c.nearest(field, vector, k: 10, where: nil, exact: false)` | The `k` documents whose `field` (a list of numbers) is most similar to `vector` (cosine), best first; `doc.score` holds the similarity. `exact: true` scores every candidate instead of using the vector index. |
+| `c.create_vector_index(field, dims)` / `c.drop_vector_index(field)` / `c.vector_indexes` | Vector indexes for `nearest`; writes of other values to an indexed field are refused. |
+| `c.create_index(field)` / `c.drop_index(field)` / `c.info` / `c.drop` | Indexes (up to 16 per collection) and collection management. |
 | `db.transaction { \|tx\| ... }` | Buffered writes committed atomically when the block returns (or `tx.commit`); `tx.require(...)` adds a version check. |
 
 **Values**: `nil`, `true` / `false`, `Integer` (64- or 128-bit), `Float`, `Storine::Decimal` (exact, up to 38

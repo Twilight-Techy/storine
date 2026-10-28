@@ -17,6 +17,9 @@ module Storine
     end
 
     def inspect = "#<Storine::Document key=#{key.inspect} version=#{version} #{super}>"
+
+    # Similarity of a #nearest result (nil for other queries).
+    def score = self["$score"]
   end
 
   # One TCP connection speaking the binary protocol.
@@ -413,7 +416,30 @@ module Storine
       end
     end
 
-    # Indexes a top-level field (at most 4 per collection); existing documents included.
+    # The `k` documents whose `field` (a list of numbers) is most similar to `vector` (cosine),
+    # best first, among those matching `where`. Each document's similarity is in #score (also
+    # doc["$score"]). Uses the field's vector index when it has one (approximate candidates,
+    # exact scores); `exact: true` scores every candidate.
+    def nearest(field, vector, k: 10, where: nil, exact: false)
+      query(where, nil, k, 0, nil, [field, vector.map { |x| Float(x) }, k, exact])[2]
+    end
+
+    # Indexes a top-level field holding `dims` numbers for #nearest (at most 4 per collection);
+    # existing documents included. Writes of other values to that field are then refused.
+    def create_vector_index(field, dims) = admin(Wire::OP_DOC_ADMIN, "\x07", field, [dims].pack("V"))
+    def drop_vector_index(field) = admin(Wire::OP_DOC_ADMIN, "\x08", field)
+
+    # [{ field:, dims:, ready: }] for the collection's vector indexes.
+    def vector_indexes
+      r = Reader.new(admin(Wire::OP_DOC_INFO, "\x09")[1])
+      Array.new(r.count(9)) do
+        field = r.str
+        dims = r.u32
+        { field: field, dims: dims, ready: r.u8 == 1 }
+      end
+    end
+
+    # Indexes a top-level field (at most 16 per collection); existing documents included.
     def create_index(field) = admin(Wire::OP_DOC_ADMIN, "\x01", field)
     def drop_index(field) = admin(Wire::OP_DOC_ADMIN, "\x02", field)
 
@@ -425,18 +451,20 @@ module Storine
 
     private
 
-    def query(where, order_by, limit, offset, after)
-      body = Wire.encode_query(name, Wire.where_to_filter(where), Wire.parse_order_by(order_by), limit, offset, after)
+    def query(where, order_by, limit, offset, after, nearest = nil)
+      body = Wire.encode_query(name, Wire.where_to_filter(where), Wire.parse_order_by(order_by), limit, offset, after,
+                               nearest)
       status, _v, rbody = client.request(Wire::OP_DOC_QUERY, body, idempotent: true)
       client.raise_for(status, rbody) unless status == Wire::ST_OK
       total, nxt, docs = Wire.decode_page(rbody)
       [total, nxt, docs.map { |k, v, f| Document.new(k, v, f) }]
     end
 
-    def admin(op, code, field = nil)
+    def admin(op, code, field = nil, tail = "")
       out = code.b
       SVE.put_str(out, name)
       SVE.put_str(out, field) if field
+      out << tail
       status, version, rbody = client.request(op, out, idempotent: true)
       client.raise_for(status, rbody) unless status == Wire::ST_OK
       [version, rbody]

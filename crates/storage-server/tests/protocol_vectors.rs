@@ -172,6 +172,7 @@ fn build() -> String {
         limit,
         offset,
         after_key: after.map(str::to_owned),
+        nearest: None,
     };
     let query_cases: Vec<(&str, DocQuery)> = vec![
         ("all (default limit)", q(None, vec![], None, 0, None)),
@@ -196,6 +197,30 @@ fn build() -> String {
         ])), vec![], None, 0, None)),
         ("after key cursor", q(None, vec![], Some(100), 0, Some("k0099"))),
         ("multi-key sort", q(None, vec![("a", Direction::Asc), ("b", Direction::Desc)], Some(5), 0, None)),
+        (
+            "nearest neighbours with a filter",
+            DocQuery {
+                nearest: Some(storage_core::document::Nearest {
+                    field: "embedding".into(),
+                    vector: vec![0.25, -1.5, 3.0],
+                    k: 5,
+                    exact: false,
+                }),
+                ..q(Some(Filter::Eq("kind".into(), PropertyValue::Text("book".into()))), vec![], Some(5), 0, None)
+            },
+        ),
+        (
+            "nearest neighbours, exact",
+            DocQuery {
+                nearest: Some(storage_core::document::Nearest {
+                    field: "v".into(),
+                    vector: vec![1.0, 0.0],
+                    k: 1,
+                    exact: true,
+                }),
+                ..q(None, vec![], None, 0, None)
+            },
+        ),
     ];
     for (name, query) in query_cases {
         let mut b = Vec::new();

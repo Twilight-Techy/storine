@@ -285,7 +285,16 @@ func parseOrderBy(fields []string) []orderKey {
 	return out
 }
 
-func encodeQuery(collection string, f *Filter, order []orderKey, limit, offset uint32, afterKey *string) ([]byte, error) {
+// nearestQuery is the nearest-neighbour part of a query: the k documents whose field is most
+// similar to vector.
+type nearestQuery struct {
+	field  string
+	vector []float32
+	k      uint32
+	exact  bool
+}
+
+func encodeQuery(collection string, f *Filter, order []orderKey, limit, offset uint32, afterKey *string, nearest *nearestQuery) ([]byte, error) {
 	w := &writer{}
 	w.str(collection)
 	if f == nil {
@@ -312,6 +321,21 @@ func encodeQuery(collection string, f *Filter, order []orderKey, limit, offset u
 	} else {
 		w.u8(1)
 		w.str(*afterKey)
+	}
+	if nearest != nil {
+		// Optional trailing block: u8 1 | str field | u32 k | u8 exact | u32 dims | dims x f32.
+		w.u8(1)
+		w.str(nearest.field)
+		w.u32(nearest.k)
+		if nearest.exact {
+			w.u8(1)
+		} else {
+			w.u8(0)
+		}
+		w.u32(uint32(len(nearest.vector)))
+		for _, x := range nearest.vector {
+			w.f32(x)
+		}
 	}
 	return w.b, nil
 }
@@ -443,6 +467,38 @@ func decodeInfo(r *reader) (*CollectionInfo, error) {
 		return nil, err
 	}
 	return info, nil
+}
+
+// VectorIndex describes one vector index of a collection.
+type VectorIndex struct {
+	Field string
+	Dims  int
+	Ready bool // false while being built from existing documents
+}
+
+func decodeVectorIndexes(body []byte) ([]VectorIndex, error) {
+	r := &reader{b: body}
+	n, err := r.count(9)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]VectorIndex, 0, n)
+	for i := 0; i < n; i++ {
+		field, err := r.str()
+		if err != nil {
+			return nil, err
+		}
+		dims, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		ready, err := r.u8()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, VectorIndex{Field: field, Dims: int(dims), Ready: ready == 1})
+	}
+	return out, nil
 }
 
 // ClusterInfo describes the server currently used and its view of the cluster.

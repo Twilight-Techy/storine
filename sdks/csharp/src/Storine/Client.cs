@@ -539,7 +539,41 @@ public sealed class Collection
         } while (after is not null);
     }
 
-    /// <summary>Indexes a top-level field (at most 4 per collection); existing documents included.</summary>
+    /// <summary>
+    /// The <paramref name="k"/> documents whose <paramref name="field"/> (a list of numbers) is most similar to
+    /// <paramref name="vector"/> (cosine), best first, among those matching <paramref name="where"/> (null: all). Each
+    /// document's similarity is <see cref="Document.Score"/>. Uses the field's vector index when it has one (approximate
+    /// candidates, exact scores); <paramref name="exact"/> scores every candidate.
+    /// </summary>
+    public async Task<IReadOnlyList<Document>> NearestAsync(string field, float[] vector, int k = 10, Filter? where = null,
+        bool exact = false, CancellationToken ct = default)
+    {
+        if (k < 0) throw new InvalidException("k must not be negative");
+        var nearest = new Wire.Nearest(field, (float[])vector.Clone(), k, exact);
+        var r = await client.CallAsync(Wire.OpDocQuery, Wire.Query(Name, where, null, (uint)k, 0, null, nearest), ct)
+            .ConfigureAwait(false);
+        return Wire.ReadPage(r.Body).Docs;
+    }
+
+    /// <summary>
+    /// Indexes a top-level field holding <paramref name="dims"/> numbers for <see cref="NearestAsync"/> (at most 4 per
+    /// collection); existing documents included. Writes of other values to that field are then refused.
+    /// </summary>
+    public Task CreateVectorIndexAsync(string field, int dims, CancellationToken ct = default)
+    {
+        if (dims <= 0) throw new InvalidException("dims must be positive");
+        return client.CallAsync(Wire.OpDocAdmin, Wire.CreateVectorIndex(Name, field, dims), ct);
+    }
+
+    /// <summary>Removes the vector index on <paramref name="field"/>.</summary>
+    public Task DropVectorIndexAsync(string field, CancellationToken ct = default) =>
+        client.CallAsync(Wire.OpDocAdmin, Wire.Admin(8, Name, field), ct);
+
+    /// <summary>The collection's vector indexes.</summary>
+    public async Task<IReadOnlyList<VectorIndex>> VectorIndexesAsync(CancellationToken ct = default) =>
+        Wire.VectorIndexes((await client.CallAsync(Wire.OpDocInfo, Wire.Admin(9, Name), ct).ConfigureAwait(false)).Body);
+
+    /// <summary>Indexes a top-level field (at most 16 per collection); existing documents included.</summary>
     public Task CreateIndexAsync(string field, CancellationToken ct = default) =>
         client.CallAsync(Wire.OpDocAdmin, Wire.Admin(1, Name, field), ct);
 

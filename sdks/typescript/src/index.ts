@@ -11,11 +11,11 @@
  */
 
 export { connect, Client, Collection, Transaction } from "./client";
-export type { ConnectOptions, Document, FindOptions, IfVersion } from "./client";
+export type { ConnectOptions, Document, FindOptions, IfVersion, NearestOptions } from "./client";
 export {
   add, and, append, between, contains, eq, exists, ge, gt, isIn, keyPrefix, le, lt, missing, ne, not, or, prefix, set, unset,
 } from "./wire";
-export type { CollectionInfo, ClusterInfo, FieldOp, Filter, OrderBy, Where } from "./wire";
+export type { CollectionInfo, ClusterInfo, FieldOp, Filter, NearestQuery, OrderBy, VectorIndexInfo, Where } from "./wire";
 export { Decimal, Float, float, Id, Timestamp, UInt64, Uuid } from "./values";
 export type { Fields, Value } from "./values";
 export {

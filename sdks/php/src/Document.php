@@ -16,6 +16,12 @@ final class Document implements \ArrayAccess, \IteratorAggregate, \Countable, \J
     {
     }
 
+    /** Similarity of a `nearest` result (null for other queries). */
+    public function score(): ?float
+    {
+        return $this->fields['$score'] ?? null;
+    }
+
     /** @return array<string, mixed> */
     public function toArray(): array
     {

@@ -68,7 +68,14 @@ final class Wire {
         return out.toByteArray();
     }
 
+    /** The optional nearest-neighbour block of a query: the {@code k} documents whose {@code field} is most similar to {@code vector}. */
+    record Nearest(String field, float[] vector, int k, boolean exact) {}
+
     static byte[] query(String collection, Query q, String afterKey) {
+        return query(collection, q, afterKey, null);
+    }
+
+    static byte[] query(String collection, Query q, String afterKey, Nearest nearest) {
         Values.Out out = new Values.Out();
         out.str(collection);
         if (q.where == null) {
@@ -91,6 +98,15 @@ final class Wire {
             out.u8(1);
             out.str(afterKey);
         }
+        if (nearest != null) {
+            // Optional trailing block: u8 1 | str field | u32 k | u8 exact | u32 dims | dims x f32.
+            out.u8(1);
+            out.str(nearest.field());
+            out.u32(nearest.k());
+            out.u8(nearest.exact() ? 1 : 0);
+            out.u32(nearest.vector().length);
+            for (float f : nearest.vector()) out.u32(Float.floatToRawIntBits(f) & 0xFFFFFFFFL);
+        }
         return out.toByteArray();
     }
 
@@ -100,6 +116,27 @@ final class Wire {
         out.str(collection);
         if (field != null) out.str(field);
         return out.toByteArray();
+    }
+
+    static byte[] createVectorIndex(String collection, String field, int dims) {
+        Values.Out out = new Values.Out();
+        out.u8(7);
+        out.str(collection);
+        out.str(field);
+        out.u32(dims);
+        return out.toByteArray();
+    }
+
+    static List<VectorIndex> vectorIndexes(byte[] body) {
+        Values.Reader r = new Values.Reader(body);
+        int n = r.count(9);
+        List<VectorIndex> out = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) {
+            String field = r.str();
+            int dims = (int) r.u32();
+            out.add(new VectorIndex(field, dims, r.u8() == 1));
+        }
+        return out;
     }
 
     /** New version of each write; {@code null} for a deleted / absent document. */

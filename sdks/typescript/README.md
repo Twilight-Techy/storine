@@ -43,7 +43,9 @@ db.close();
 | `c.update(key, ...changes)` / `c.updateIfVersion(key, version, ...changes)` | Atomic server-side changes: `set`, `unset`, `add(path, amount, { min, max })`, `append`, or `{ field: value }`. |
 | `c.delete(key, { ifVersion })` | `true` if it existed. |
 | `c.find(where, { orderBy, limit, offset })`, `c.first`, `c.count`, `c.scan` | Queries. `where` is a filter (`eq`, `ne`, `lt`, `le`, `gt`, `ge`, `between`, `isIn`, `prefix`, `contains`, `exists`, `missing`, `keyPrefix`, `and`, `or`, `not`) or `{ field: value }`. `orderBy: "-price"` sorts descending. |
-| `c.createIndex(field)`, `c.dropIndex(field)`, `c.info()`, `c.drop()` | Indexes (up to 4 per collection) and collection management. |
+| `c.nearest(field, vector, { k = 10, where, exact = false })` | The `k` documents whose `field` (a list of numbers) is most similar to `vector` (cosine), best first; similarity in `doc.score`. |
+| `c.createVectorIndex(field, dims)`, `c.dropVectorIndex(field)`, `c.vectorIndexes()` | Vector indexes for `nearest` (`[{ field, dims, ready }]`). |
+| `c.createIndex(field)`, `c.dropIndex(field)`, `c.info()`, `c.drop()` | Indexes (up to 16 per collection) and collection management. |
 | `db.transaction(tx => ...)` | Buffered writes committed atomically; `tx.require(...)` adds a version check. |
 
 **Values**: `null`, `boolean`, integers (`number` up to 2^53, `bigint` up to 128 bits), floats (`number`;

@@ -185,9 +185,10 @@ type ID [24]byte
 
 type writer struct{ b []byte }
 
-func (w *writer) u8(v byte)    { w.b = append(w.b, v) }
-func (w *writer) u32(v uint32) { w.b = binary.LittleEndian.AppendUint32(w.b, v) }
-func (w *writer) u64(v uint64) { w.b = binary.LittleEndian.AppendUint64(w.b, v) }
+func (w *writer) u8(v byte)     { w.b = append(w.b, v) }
+func (w *writer) u32(v uint32)  { w.b = binary.LittleEndian.AppendUint32(w.b, v) }
+func (w *writer) u64(v uint64)  { w.b = binary.LittleEndian.AppendUint64(w.b, v) }
+func (w *writer) f32(v float32) { w.u32(math.Float32bits(v)) }
 func (w *writer) str(s string) {
 	w.u32(uint32(len(s)))
 	w.b = append(w.b, s...)

@@ -386,6 +386,9 @@ struct SharedEngineInner<T: ZeroCopyRecord + Indexable> {
     /// Fast-path flag: `true` while any encryption configuration is installed.
     crypto_on: AtomicBool,
     vector_index: HnswVectorIndex,
+    /// One HNSW graph per named embedding (`Indexable::NAMED_EMBEDDINGS`, `TASK-122`), rebuilt
+    /// from the records at open and maintained wherever `vector_index` is.
+    named_vectors: RwLock<FastHashMap<u16, Arc<HnswVectorIndex>>>,
     mvcc: MvccManager,
     migrations: RwLock<SchemaRegistry<T>>,
     flush_queue: Mutex<CoalescingQueue>,
@@ -657,6 +660,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             crypto: RwLock::new(config.encryption.clone().map(Arc::new)),
             crypto_on: AtomicBool::new(config.encryption.is_some()),
             vector_index,
+            named_vectors: RwLock::new(FastHashMap::default()),
             mvcc: MvccManager::new(),
             migrations: RwLock::new(SchemaRegistry::new()),
             flush_queue: Mutex::new(CoalescingQueue::default()),
@@ -904,6 +908,36 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
     #[inline]
     pub fn vector_index(&self) -> &HnswVectorIndex {
         &self.inner.vector_index
+    }
+
+    /// Approximate nearest neighbours of `query` (cosine, SQ8-quantized HNSW) in the named vector
+    /// graph `id`, at most `k`, restricted to `filter` when given (`TASK-122`). Callers re-rank
+    /// the candidates against the exact stored vectors.
+    pub fn named_vector_candidates(
+        &self,
+        id: u16,
+        query: &[f32],
+        k: usize,
+        filter: Option<&CompressedBitmap>,
+    ) -> Vec<VectorTopKHit> {
+        let graph = self
+            .inner
+            .named_vectors
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&id)
+            .cloned();
+        graph.map_or_else(Vec::new, |g| g.search_sq8_candidates(query, k, filter))
+    }
+
+    /// Vectors in the named graph `id` (`0` if none).
+    pub fn named_vector_count(&self, id: u16) -> usize {
+        self.inner
+            .named_vectors
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&id)
+            .map_or(0, |g| g.len())
     }
 
     #[inline]
@@ -2328,6 +2362,13 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                             .extract_snapshot_from_frame(aligned.as_slice(), false)
                             .unwrap_or_default();
                         self.apply_index_snapshot_diff(ord, &old_snap, &new_snap);
+                        if T::NAMED_EMBEDDINGS {
+                            let named = self
+                                .decode_or_migrate_frame(aligned.as_slice())
+                                .map(|(_, owned)| owned.named_embeddings())
+                                .unwrap_or_default();
+                            self.sync_named_vectors(ord, named);
+                        }
                         if old_snap.embedding_hash != new_snap.embedding_hash
                             || old_snap.has_embedding != new_snap.has_embedding
                         {
@@ -2735,6 +2776,9 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         // Differential secondary index update without any global IndexSnapshot map (`TASK-016`, `F-INDX-05`, `RULE-MEM-02`)
         let new_snap = record.extract_index_snapshot();
         self.apply_index_snapshot_diff(ordinal, &old_snap, &new_snap);
+        if T::NAMED_EMBEDDINGS {
+            self.sync_named_vectors(ordinal, record.named_embeddings());
+        }
         if old_snap.has_embedding != new_snap.has_embedding
             || old_snap.embedding_hash != new_snap.embedding_hash
         {
@@ -2946,6 +2990,9 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
 
     #[inline]
     fn remove_from_secondary_indexes(&self, removed: &PrimaryEntry) {
+        if T::NAMED_EMBEDDINGS {
+            self.remove_named_vectors(removed.ordinal);
+        }
         if let Some(snap) = self.extract_snapshot_for_entry(removed) {
             for (field_id, val) in snap.numerics() {
                 self.range_index.remove(field_id, val, removed.ordinal);
@@ -3410,6 +3457,19 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                 if snap.has_embedding && self.reconcile_vector(&entry) {
                     with_vectors.insert(entry.ordinal);
                 }
+                if T::NAMED_EMBEDDINGS {
+                    let named = match self.get_ref_internal(entry.id) {
+                        Ok(rec) => {
+                            let view = rec.view();
+                            T::archived_named_embeddings(view.archived(), view.payload())
+                        }
+                        Err(_) => self
+                            .get_owned_internal(entry.id)
+                            .map(|(_, owned)| owned.named_embeddings())
+                            .unwrap_or_default(),
+                    };
+                    self.sync_named_vectors(entry.ordinal, named);
+                }
             }
             if rebuild_postings && i > 0 && i % SPILL_EVERY == 0 {
                 if let Some(range) = self.range_index.as_paged() {
@@ -3426,6 +3486,48 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             }
         }
         Ok(())
+    }
+
+    /// Makes every named vector graph hold exactly `embeddings` for `ord`: graphs it is absent
+    /// from drop it, unchanged vectors are kept, and a vector whose dimension differs from its
+    /// graph's is not indexed (the document layer validates dimensions before writing).
+    fn sync_named_vectors(&self, ord: RecordOrdinal, embeddings: Vec<(u16, Vec<f32>)>) {
+        let graphs: Vec<(u16, Arc<HnswVectorIndex>)> = {
+            let map = self.named_vectors.read().unwrap_or_else(|p| p.into_inner());
+            map.iter().map(|(k, v)| (*k, Arc::clone(v))).collect()
+        };
+        for (id, graph) in &graphs {
+            if !embeddings.iter().any(|(e, _)| e == id) {
+                graph.remove(ord);
+            }
+        }
+        for (id, vector) in embeddings {
+            if vector.is_empty() {
+                continue;
+            }
+            let graph = match graphs.iter().find(|(g, _)| *g == id) {
+                Some((_, g)) => Arc::clone(g),
+                None => Arc::clone(
+                    self.named_vectors
+                        .write()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .entry(id)
+                        .or_insert_with(|| Arc::new(HnswVectorIndex::new(HnswConfig::default()))),
+                ),
+            };
+            let dim = graph.dim();
+            if dim != 0 && dim != vector.len() {
+                graph.remove(ord);
+            } else if !graph.vector_matches(ord, &vector) {
+                graph.insert(ord, &vector);
+            }
+        }
+    }
+
+    fn remove_named_vectors(&self, ord: RecordOrdinal) {
+        for graph in self.named_vectors.read().unwrap_or_else(|p| p.into_inner()).values() {
+            graph.remove(ord);
+        }
     }
 
     /// Makes the vector index hold `entry`'s current embedding (zero-copy read; owned decode only

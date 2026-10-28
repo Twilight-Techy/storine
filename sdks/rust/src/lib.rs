@@ -31,7 +31,7 @@ pub use error::{Error, Result};
 pub use value::{dec, decode, encode, Decimal, Doc, Value};
 pub use wire::{
     add, and, append, between, contains, eq, exists, ge, gt, is_in, key_prefix, le, lt, matches, missing, ne, or,
-    prefix, set, unset, ClusterInfo, CollectionInfo, Document, FieldOp, Filter, Query,
+    prefix, set, unset, ClusterInfo, CollectionInfo, Document, FieldOp, Filter, Query, VectorIndex,
 };
 
 #[cfg(test)]

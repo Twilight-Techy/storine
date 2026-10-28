@@ -150,6 +150,23 @@ class SingleNode(unittest.TestCase):
         self.assertEqual(items.first(order_by="-price").key, "i119")
         self.assertIn("items", self.db.collections())
 
+    def test_vector_search(self):
+        c = self.db.collection("py_docs")
+        c.create_vector_index("emb", dims=3)
+        self.assertEqual(c.vector_indexes(), [{"field": "emb", "dims": 3, "ready": True}])
+        for key, vec, kind in [("a", [1, 0, 0], "x"), ("b", [0, 1, 0], "y"), ("c", [0.7, 0.7, 0], "x")]:
+            c.put(key, {"emb": vec, "kind": kind})
+        hits = c.nearest("emb", [1, 0.1, 0], k=2)
+        self.assertEqual([d.key for d in hits], ["a", "c"])
+        self.assertGreater(hits[0].score, hits[1].score)
+        self.assertEqual([d.key for d in c.nearest("emb", [1, 0.1, 0], k=5, where={"kind": "x"}, exact=True)], ["a", "c"])
+        with self.assertRaises(storine.InvalidError):
+            c.put("bad", {"emb": [1, 2]})  # wrong dimensions
+        with self.assertRaises(storine.InvalidError):
+            c.nearest("emb", [1, 2], k=1)
+        c.drop_vector_index("emb")
+        self.assertEqual(c.vector_indexes(), [])
+
     def test_ttl_and_errors(self):
         s = self.db.collection("sessions")
         s.put("short", {"u": 1}, ttl=0.2)
