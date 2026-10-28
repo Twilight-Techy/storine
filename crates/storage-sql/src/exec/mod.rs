@@ -446,6 +446,16 @@ enum Undo {
     Check,
 }
 
+/// A session that ends (its client disconnected) with a transaction open rolls it back, so
+/// its row locks are released at once instead of when they expire.
+impl Drop for Session {
+    fn drop(&mut self) {
+        if self.txn.is_some() {
+            self.rollback();
+        }
+    }
+}
+
 impl Txn {
     /// The buffered state of a document: `Some(None)` deleted, `Some(Some(doc))` written,
     /// `None` untouched.

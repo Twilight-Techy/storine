@@ -653,3 +653,18 @@ fn repeatable_read_and_serializable_validate_what_they_read() {
     ok(&mut m, "UPDATE acct SET balance = 4 WHERE id = 2");
     ok(&mut m, "COMMIT");
 }
+
+#[test]
+fn a_disconnected_session_releases_its_row_locks() {
+    let db = setup("droplocks");
+    let mut a = db.engine.new_session(Dialect::Postgres, "app", None);
+    ok(&mut a, "CREATE TABLE acct (id INT PRIMARY KEY, n INT)");
+    ok(&mut a, "INSERT INTO acct VALUES (1, 0)");
+    ok(&mut a, "BEGIN");
+    ok(&mut a, "SELECT n FROM acct WHERE id = 1 FOR UPDATE");
+    drop(a); // the client went away mid-transaction
+    let mut b = db.engine.new_session(Dialect::Postgres, "app", None);
+    ok(&mut b, "BEGIN");
+    ok(&mut b, "SELECT n FROM acct WHERE id = 1 FOR UPDATE NOWAIT");
+    ok(&mut b, "COMMIT");
+}

@@ -3,7 +3,8 @@
 //! ```text
 //! storine-sql --data ./db                         # embedded database, PostgreSQL on :5432, MySQL on :3306
 //! storine-sql --storine storine://h1,h2,h3        # a running server or cluster
-//!             [--pg 0.0.0.0:5432] [--mysql 0.0.0.0:3306] [--no-pg] [--no-mysql]
+//!             [--pg 0.0.0.0:5432] [--mysql 0.0.0.0:3306] [--mssql 0.0.0.0:1433]
+//!             [--no-pg] [--no-mysql] [--no-mssql]
 //!             [--user name:password]... [--database name]
 //!             [--tls-cert chain.pem --tls-key key.pem | --no-tls] [--require-tls]
 //! ```
@@ -22,7 +23,7 @@ use std::time::Duration;
 use storage_sql::exec::{Engine, EngineConfig};
 use storage_sql::store::Store;
 
-const USAGE: &str = "usage: storine-sql (--data DIR | --storine URL) [--pg ADDR] [--mysql ADDR] [--no-pg] [--no-mysql] [--user NAME:PASSWORD]... [--database NAME] [--tls-cert FILE --tls-key FILE | --no-tls] [--require-tls]";
+const USAGE: &str = "usage: storine-sql (--data DIR | --storine URL) [--pg ADDR] [--mysql ADDR] [--mssql ADDR] [--no-pg] [--no-mysql] [--no-mssql] [--user NAME:PASSWORD]... [--database NAME] [--tls-cert FILE --tls-key FILE | --no-tls] [--require-tls]";
 
 fn main() -> ExitCode {
     match run() {
@@ -40,6 +41,7 @@ fn run() -> Result<(), String> {
     let mut url: Option<String> = None;
     let mut pg = Some("127.0.0.1:5432".to_owned());
     let mut mysql = Some("127.0.0.1:3306".to_owned());
+    let mut mssql = Some("127.0.0.1:1433".to_owned());
     let mut users = HashMap::new();
     let mut config = EngineConfig::default();
     let (mut tls_cert, mut tls_key, mut no_tls, mut require_tls) =
@@ -56,6 +58,8 @@ fn run() -> Result<(), String> {
             "--mysql" => mysql = Some(value("--mysql")?),
             "--no-pg" => pg = None,
             "--no-mysql" => mysql = None,
+            "--mssql" => mssql = Some(value("--mssql")?),
+            "--no-mssql" => mssql = None,
             "--database" => config.database = value("--database")?,
             "--tls-cert" => tls_cert = Some(PathBuf::from(value("--tls-cert")?)),
             "--tls-key" => tls_key = Some(PathBuf::from(value("--tls-key")?)),
@@ -158,8 +162,23 @@ fn run() -> Result<(), String> {
             storage_sql::mysql::serve(e, l, auth)
         }));
     }
+    if let Some(addr) = mssql {
+        let l = TcpListener::bind(&addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
+        eprintln!("storine-sql: SQL Server (TDS) protocol on {addr}");
+        let (e, auth) = (
+            Arc::clone(&engine),
+            Arc::new(storage_sql::tds::Auth {
+                users: users.clone(),
+                tls: tls.clone(),
+                require_tls,
+            }),
+        );
+        threads.push(std::thread::spawn(move || {
+            storage_sql::tds::serve(e, l, auth)
+        }));
+    }
     if threads.is_empty() {
-        return Err("nothing to serve (--no-pg and --no-mysql)".into());
+        return Err("nothing to serve (--no-pg, --no-mysql and --no-mssql)".into());
     }
     if users.is_empty() {
         eprintln!("storine-sql: no --user given: every client is trusted (bind to localhost or add users)");

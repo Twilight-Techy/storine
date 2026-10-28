@@ -15,6 +15,7 @@ pub mod mysql;
 pub mod parser;
 pub mod pg;
 pub mod store;
+pub mod tds;
 pub mod tls;
 
 pub use error::{SqlError, SqlResult};
