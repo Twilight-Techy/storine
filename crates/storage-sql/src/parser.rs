@@ -1021,10 +1021,13 @@ impl Parser {
 
     fn column_def(&mut self) -> SqlResult<ColumnDef> {
         let name = self.ident()?;
+        let start = self.pos;
         let (ty, serial) = self.data_type()?;
+        let precision = self.temporal_precision(&ty, start);
         let mut col = ColumnDef {
             name,
             ty,
+            precision,
             not_null: serial,
             default: None,
             primary_key: false,
@@ -1106,6 +1109,21 @@ impl Parser {
             }
         }
         Ok(())
+    }
+
+    /// The `(p)` of a temporal type parsed from token `start` on.
+    fn temporal_precision(&self, ty: &DataType, start: usize) -> Option<u8> {
+        if !matches!(
+            ty,
+            DataType::Timestamp | DataType::TimestampTz | DataType::Time
+        ) {
+            return None;
+        }
+        let toks = self.tokens.get(start..self.pos)?;
+        toks.windows(2).find_map(|w| match w {
+            [Token::Op("("), Token::Number(n)] => n.parse::<u8>().ok().map(|p| p.min(6)),
+            _ => None,
+        })
     }
 
     /// A column type; the flag is true for serial types (auto-increment).
@@ -1226,7 +1244,9 @@ impl Parser {
                 DataType::Double
             }
             "float8" => DataType::Double,
-            "oid" | "xid" | "cid" | "tid" | "regproc" | "regoper" | "regrole" => DataType::BigInt,
+            "oid" | "xid" | "cid" | "tid" | "regoper" | "regrole" => DataType::BigInt,
+            // Catalog function references (pg_type.typinput, ...) are kept by name.
+            "regproc" | "regprocedure" => DataType::Text,
             "text" | "tinytext" | "mediumtext" | "longtext" | "ntext" | "clob" | "citext"
             | "string" | "bpchar" | "unknown" => DataType::Text,
             "name" => DataType::Name,

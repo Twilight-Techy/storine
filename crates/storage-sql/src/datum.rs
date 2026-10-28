@@ -646,7 +646,11 @@ pub fn cast(d: &Datum, ty: &DataType) -> SqlResult<Datum> {
             }
             _ => return Err(cast_err(d, ty)),
         },
-        DataType::Text | DataType::Name | DataType::Varchar(_) | DataType::Char(_) => {
+        DataType::Text
+        | DataType::Name
+        | DataType::PgChar
+        | DataType::Varchar(_)
+        | DataType::Char(_) => {
             let s = match d {
                 Text(s) => s.clone(),
                 Bytes(b) => String::from_utf8(b.clone()).unwrap_or_else(|_| d.as_text()),
@@ -776,6 +780,7 @@ pub fn type_sql(ty: &DataType) -> String {
         DataType::Double => "double precision".into(),
         DataType::Text => "text".into(),
         DataType::Name => "name".into(),
+        DataType::PgChar => "\"char\"".into(),
         DataType::Varchar(None) => "character varying".into(),
         DataType::Varchar(Some(n)) => format!("character varying({n})"),
         DataType::Char(n) => format!("character({})", n.unwrap_or(1)),

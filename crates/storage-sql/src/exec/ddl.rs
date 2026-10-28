@@ -37,6 +37,7 @@ fn column_from_def(ex: &Exec<'_>, d: &ColumnDef) -> SqlResult<Column> {
         name: d.name.clone(),
         field: field_name(&d.name),
         ty: d.ty.clone(),
+        precision: d.precision,
         not_null: d.not_null,
         default: d.default.clone(),
         auto_increment: d.auto_increment,
@@ -228,6 +229,7 @@ pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlR
             .map(|c| ColumnDef {
                 name: c.name.clone(),
                 ty: c.ty.clone(),
+                precision: None,
                 not_null: false,
                 default: None,
                 primary_key: false,
@@ -797,6 +799,7 @@ pub fn alter_table(s: &mut Session, table: &str, ops: &[AlterOp]) -> SqlResult<O
                     AlterColumn::Redefine(def) => {
                         let in_pk = t.primary_key.contains(&i);
                         t.columns[i].auto_increment = def.auto_increment;
+                        t.columns[i].precision = def.precision;
                         vec![
                             AlterColumn::Type(def.ty.clone()),
                             if def.not_null || in_pk {

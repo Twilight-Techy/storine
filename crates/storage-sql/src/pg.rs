@@ -839,6 +839,7 @@ fn encode_binary(d: &Datum, ty: &DataType) -> Vec<u8> {
             v.extend_from_slice(&(*months as i32).to_be_bytes());
             v
         }
+        (DataType::PgChar, _) => d.as_text().into_bytes().into_iter().take(1).collect(),
         (DataType::Jsonb, _) => {
             let mut v = vec![1u8];
             v.extend_from_slice(encode_text(&d, ty).as_bytes());
@@ -1097,6 +1098,19 @@ fn infer_param_types(engine: &Engine, stmt: &Statement, n: usize) -> Vec<u32> {
                     set(*i, &DataType::Text);
                 }
             }
+            // `col = ANY($1)`: the parameter is an array (of text when the column is unknown).
+            Expr::AnyAll { left, right, .. } => {
+                if let Expr::Param(i) = &**right {
+                    let elem = match &**left {
+                        Expr::Column(p) => col_type(tables, &p[p.len() - 1]),
+                        _ => None,
+                    };
+                    set(
+                        *i,
+                        &DataType::Array(Box::new(elem.unwrap_or(DataType::Text))),
+                    );
+                }
+            }
             _ => {}
         });
     };
@@ -1158,7 +1172,11 @@ fn infer_param_types(engine: &Engine, stmt: &Statement, n: usize) -> Vec<u32> {
             }
         }
         Statement::Query(q) => {
-            if let SetExpr::Select(s) = &q.body {
+            // Every SELECT of the query (derived tables, unions), each with its own tables.
+            let mut selects = Vec::new();
+            collect_selects(q, &mut selects);
+            for s in selects {
+                let mut tables = Vec::new();
                 for f in &s.from {
                     collect_tables(f, &mut |n| add_table(n, &mut tables));
                 }
@@ -1186,6 +1204,37 @@ fn infer_param_types(engine: &Engine, stmt: &Statement, n: usize) -> Vec<u32> {
         .into_iter()
         .map(|t| t.map_or(25, |t| system::type_oid(&t)))
         .collect()
+}
+
+/// The SELECTs of `q`: its body (both sides of set operations) and derived tables.
+fn collect_selects<'q>(q: &'q crate::ast::Query, out: &mut Vec<&'q crate::ast::Select>) {
+    fn body<'q>(e: &'q SetExpr, out: &mut Vec<&'q crate::ast::Select>) {
+        match e {
+            SetExpr::Select(s) => {
+                out.push(s);
+                for f in &s.from {
+                    derived(f, out);
+                }
+            }
+            SetExpr::SetOp { left, right, .. } => {
+                body(left, out);
+                body(right, out);
+            }
+            SetExpr::Nested(q) => collect_selects(q, out),
+            _ => {}
+        }
+    }
+    fn derived<'q>(t: &'q crate::ast::TableRef, out: &mut Vec<&'q crate::ast::Select>) {
+        match t {
+            crate::ast::TableRef::Derived { query, .. } => collect_selects(query, out),
+            crate::ast::TableRef::Join { left, right, .. } => {
+                derived(left, out);
+                derived(right, out);
+            }
+            _ => {}
+        }
+    }
+    body(&q.body, out);
 }
 
 fn collect_tables(t: &crate::ast::TableRef, f: &mut dyn FnMut(&str)) {

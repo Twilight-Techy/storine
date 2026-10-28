@@ -160,6 +160,12 @@ fn default_vars(dialect: Dialect) -> HashMap<String, String> {
         ("character_set_results", "utf8mb4"),
         ("collation_connection", "utf8mb4_0900_ai_ci"),
         ("character_set_server", "utf8mb4"),
+        ("socket", "/tmp/mysql.sock"),
+        ("port", "3306"),
+        ("hostname", "storine"),
+        ("default_storage_engine", "InnoDB"),
+        ("explicit_defaults_for_timestamp", "1"),
+        ("sql_require_primary_key", "0"),
         ("character_set_database", "utf8mb4"),
         ("character_set_system", "utf8mb3"),
         ("collation_server", "utf8mb4_0900_ai_ci"),
@@ -795,6 +801,8 @@ impl Session {
     ) -> SqlResult<Outcome> {
         let v = match value {
             None => Datum::Null,
+            // `SET search_path = "public"`: a (quoted) name is the setting's value.
+            Some(Expr::Column(p)) if !name.starts_with('@') => Datum::Text(p.join(".")),
             Some(e) => eval::Exec::new(self, params).eval_const(e)?,
         };
         if let Some(var) = name.strip_prefix('@') {

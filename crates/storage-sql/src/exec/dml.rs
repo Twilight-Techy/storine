@@ -813,12 +813,14 @@ fn build_row(
     let mut given = vec![false; n];
     for (ti, v) in target.iter().zip(values) {
         if let Some(v) = v {
-            row[*ti] = cast(&v, &table.columns[*ti].ty).map_err(|e| {
-                SqlError::new(
-                    e.code,
-                    format!("{} (column \"{}\")", e.message, table.columns[*ti].name),
-                )
-            })?;
+            row[*ti] = cast(&v, &table.columns[*ti].ty)
+                .map(|d| table.columns[*ti].fit(d))
+                .map_err(|e| {
+                    SqlError::new(
+                        e.code,
+                        format!("{} (column \"{}\")", e.message, table.columns[*ti].name),
+                    )
+                })?;
             given[*ti] = true;
         }
     }
@@ -841,7 +843,7 @@ fn build_row(
         }
         if !given[i] {
             if let Some(d) = &c.default {
-                row[i] = cast(&ex.eval_const(d)?, &c.ty)?;
+                row[i] = c.fit(cast(&ex.eval_const(d)?, &c.ty)?);
             }
         }
     }
@@ -1021,7 +1023,7 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
                                 } else {
                                     ex.eval(e, &env)?
                                 };
-                                new[i] = cast(&v, &table.columns[i].ty)?;
+                                new[i] = table.columns[i].fit(cast(&v, &table.columns[i].ty)?);
                             }
                             check_row(&ex, &table, &new)?;
                             new
@@ -1427,12 +1429,14 @@ pub fn update(s: &mut Session, upd: &Update, params: &[Datum]) -> SqlResult<Outc
                 } else {
                     ex.eval(e, &env)?
                 };
-                new[i] = cast(&v, &table.columns[i].ty).map_err(|e| {
-                    SqlError::new(
-                        e.code,
-                        format!("{} (column \"{}\")", e.message, table.columns[i].name),
-                    )
-                })?;
+                new[i] = cast(&v, &table.columns[i].ty)
+                    .map(|d| table.columns[i].fit(d))
+                    .map_err(|e| {
+                        SqlError::new(
+                            e.code,
+                            format!("{} (column \"{}\")", e.message, table.columns[i].name),
+                        )
+                    })?;
             }
             check_row(&ex, &table, &new)?;
             changes.push((t, new));

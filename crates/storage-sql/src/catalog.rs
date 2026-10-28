@@ -38,11 +38,46 @@ pub struct Column {
     /// Document field holding the column.
     pub field: String,
     pub ty: DataType,
+    /// Fractional-second digits of a temporal column (`None`: the type's default).
+    pub precision: Option<u8>,
     pub not_null: bool,
     pub default: Option<Expr>,
     pub auto_increment: bool,
     /// Value of rows written before the column was added (`ALTER TABLE ... ADD COLUMN ... DEFAULT`).
     pub missing: Option<Datum>,
+}
+
+impl Column {
+    /// `atttypmod`: the declared precision of a temporal column, else the type's modifier.
+    pub fn type_mod(&self) -> i32 {
+        match self.precision {
+            Some(p) => i32::from(p),
+            None => crate::exec::system::type_mod(&self.ty),
+        }
+    }
+
+    /// Fractional-second digits reported for a temporal column (PostgreSQL's default is 6).
+    pub fn datetime_precision(&self) -> Option<i64> {
+        matches!(
+            self.ty,
+            DataType::Timestamp | DataType::TimestampTz | DataType::Time
+        )
+        .then(|| i64::from(self.precision.unwrap_or(6)))
+    }
+
+    /// Rounds a stored temporal value to the column's precision, as PostgreSQL and MySQL do.
+    pub fn fit(&self, d: Datum) -> Datum {
+        let Some(p) = self.precision.filter(|p| *p < 9) else {
+            return d;
+        };
+        let unit = 10i64.pow(9 - u32::from(p));
+        let round = |ns: i64| (ns + unit.div_euclid(2)).div_euclid(unit) * unit;
+        match d {
+            Datum::Timestamp(ns) => Datum::Timestamp(round(ns)),
+            Datum::Time(ns) => Datum::Time(round(ns)),
+            other => other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -201,6 +236,9 @@ impl Table {
                         m.insert("name".into(), Value::Text(c.name.clone()));
                         m.insert("field".into(), Value::Text(c.field.clone()));
                         m.insert("type".into(), Value::Text(datum::type_sql(&c.ty)));
+                        if let Some(p) = c.precision {
+                            m.insert("precision".into(), Value::Int(i64::from(p)));
+                        }
                         m.insert("not_null".into(), Value::Bool(c.not_null));
                         m.insert("auto_increment".into(), Value::Bool(c.auto_increment));
                         m.insert(
@@ -317,6 +355,10 @@ impl Table {
                 name: text(m, "name")?,
                 field: text(m, "field")?,
                 ty,
+                precision: m
+                    .get("precision")
+                    .and_then(Value::as_i64)
+                    .and_then(|p| u8::try_from(p).ok()),
                 not_null: m.get("not_null").and_then(Value::as_bool).unwrap_or(false),
                 auto_increment: m
                     .get("auto_increment")
@@ -583,6 +625,7 @@ mod tests {
             name: name.into(),
             field: field_name(name),
             ty,
+            precision: None,
             not_null: false,
             default: None,
             auto_increment: false,

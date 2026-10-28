@@ -1416,6 +1416,22 @@ impl Exec<'_> {
         for w in &wins {
             self.window(w, &mut work, &cols, outer)?;
         }
+        // Set-returning functions in the select list (`SELECT unnest(a), generate_subscripts(a, 1)`)
+        // expand each row; several run in lockstep, the shorter padded with NULLs.
+        let srf: Vec<Option<(&str, &[Expr])>> = items
+            .iter()
+            .map(|(e, _, _)| match e {
+                Expr::Function {
+                    name,
+                    args,
+                    over: None,
+                    ..
+                } if SELECT_LIST_SRFS.contains(&name.as_str()) => {
+                    Some((name.as_str(), args.as_slice()))
+                }
+                _ => None,
+            })
+            .collect();
         for (row, aggs) in &work {
             let env = Env {
                 cols: &cols,
@@ -1423,12 +1439,52 @@ impl Exec<'_> {
                 outer,
                 aggs: Some(aggs),
             };
-            let out = items
-                .iter()
-                .map(|(e, _, _)| self.eval(e, &env))
-                .collect::<SqlResult<Row>>()?;
-            let keys = order_key(self, &env, &out)?;
-            produced.push((out, keys));
+            if srf.iter().all(Option::is_none) {
+                let out = items
+                    .iter()
+                    .map(|(e, _, _)| self.eval(e, &env))
+                    .collect::<SqlResult<Row>>()?;
+                let keys = order_key(self, &env, &out)?;
+                produced.push((out, keys));
+                continue;
+            }
+            let mut series: Vec<Option<Vec<Datum>>> = Vec::with_capacity(items.len());
+            for f in &srf {
+                series.push(match f {
+                    Some((name, args)) => {
+                        let vals = args
+                            .iter()
+                            .map(|a| self.eval(a, &env))
+                            .collect::<SqlResult<Vec<_>>>()?;
+                        let rel = func::table_function(self, name, &vals)?;
+                        Some(
+                            rel.rows
+                                .into_iter()
+                                .map(|mut r| {
+                                    if r.is_empty() {
+                                        Datum::Null
+                                    } else {
+                                        r.swap_remove(0)
+                                    }
+                                })
+                                .collect(),
+                        )
+                    }
+                    None => None,
+                });
+            }
+            let n = series.iter().flatten().map(Vec::len).max().unwrap_or(0);
+            for k in 0..n {
+                let mut out = Vec::with_capacity(items.len());
+                for ((e, _, _), s) in items.iter().zip(&series) {
+                    out.push(match s {
+                        Some(vals) => vals.get(k).cloned().unwrap_or(Datum::Null),
+                        None => self.eval(e, &env)?,
+                    });
+                }
+                let keys = order_key(self, &env, &out)?;
+                produced.push((out, keys));
+            }
         }
         if sel.distinct {
             let mut seen = HashSet::new();
@@ -1787,6 +1843,15 @@ impl Exec<'_> {
                 name, args, star, ..
             } => (func::return_type(self, name, args, *star, cols), None),
             Expr::Str(_) => (Some(DataType::Text), None),
+            // The first branch whose type is known (THEN true ELSE false is boolean).
+            Expr::Case { whens, else_, .. } => (
+                whens
+                    .iter()
+                    .map(|(_, then)| then)
+                    .chain(else_.as_deref())
+                    .find_map(|e| self.static_type(e, cols).0),
+                None,
+            ),
             _ => (None, None),
         }
     }
@@ -1816,6 +1881,17 @@ fn numeric_result(a: Option<DataType>, b: Option<DataType>) -> Option<DataType> 
         _ => None,
     }
 }
+
+/// Set-returning functions allowed directly in a select list.
+const SELECT_LIST_SRFS: &[&str] = &[
+    "unnest",
+    "generate_series",
+    "generate_subscripts",
+    "json_array_elements",
+    "jsonb_array_elements",
+    "json_array_elements_text",
+    "jsonb_array_elements_text",
+];
 
 /// Upper bound on a join's intermediate rows.
 const MAX_JOIN_ROWS: usize = 20_000_000;

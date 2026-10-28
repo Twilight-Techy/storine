@@ -6,7 +6,8 @@
 #
 # Suites whose toolchain is missing are skipped with a note. Environment:
 #   PYTHON          python with psycopg2, psycopg, asyncpg, sqlalchemy[asyncio], pymysql, django
-#   NODE_PATH       node_modules with pg, mysql2, sequelize, knex
+#   NODE_PATH       node_modules with pg, mysql2, sequelize, knex (and prisma@6, @prisma/client@6)
+#   STORINE_SQL_BIN storine-sql binary for the private Prisma instance (default: target/release)
 #   ELOQUENT_AUTOLOAD  vendor/autoload.php of `composer require illuminate/database:^11`
 #   GEM_HOME/GEM_PATH  with activerecord, pg, trilogy
 set -u
@@ -34,5 +35,16 @@ have dotnet && run dotnet bash -c "cd dotnet && dotnet test --nologo -v q"
 have php && run php php php/test_php.php "$PG" "$MY"
 if have php && [ -n "${ELOQUENT_AUTOLOAD:-}" ]; then run eloquent php php/test_eloquent.php "$ELOQUENT_AUTOLOAD" "$PG" "$MY"; fi
 have ruby && run activerecord ruby ruby/test_activerecord.rb "$PG" "$MY"
+
+# Prisma's `db push` owns the whole database, so it gets a private, empty storine-sql.
+BIN=${STORINE_SQL_BIN:-../../../../target/release/storine-sql}
+if have node && [ -x "$BIN" ] && node -e 'require.resolve("prisma/package.json")' 2>/dev/null; then
+  dir=$(mktemp -d)
+  "$BIN" --data "$dir" --pg 127.0.0.1:55532 --mysql 127.0.0.1:53406 >"$dir.log" 2>&1 &
+  pid=$!
+  for _ in $(seq 50); do (echo >/dev/tcp/127.0.0.1/55532) 2>/dev/null && break; sleep 0.2; done
+  run prisma node prisma/test_prisma.js 55532 53406
+  kill "$pid"; wait "$pid" 2>/dev/null; rm -rf "$dir" "$dir.log"
+fi
 
 if [ ${#failed[@]} -eq 0 ]; then echo "all client suites passed"; else echo "failed: ${failed[*]}"; exit 1; fi

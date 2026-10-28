@@ -2,7 +2,7 @@
 //! table schemas, so drivers, ORMs and admin tools can introspect the database.
 
 use crate::ast::{DataType, Show};
-use crate::catalog::{action_name, Table};
+use crate::catalog::{action_name, Column, Table};
 use crate::datum::{type_sql, Datum};
 use crate::error::{SqlError, SqlResult};
 use crate::exec::eval::Exec;
@@ -24,6 +24,7 @@ pub fn type_oid(ty: &DataType) -> u32 {
         DataType::Int => 23,
         DataType::Text | DataType::Enum(_) => 25,
         DataType::Name => 19,
+        DataType::PgChar => 18,
         DataType::Json => 114,
         DataType::Jsonb => 3802,
         DataType::Real => 700,
@@ -44,6 +45,7 @@ pub fn type_oid(ty: &DataType) -> u32 {
             DataType::Int => 1007,
             DataType::Text | DataType::Enum(_) => 1009,
             DataType::Name => 1003,
+            DataType::PgChar => 1002,
             DataType::Varchar(_) => 1015,
             DataType::BigInt => 1016,
             DataType::Real => 1021,
@@ -204,7 +206,9 @@ fn b(v: bool) -> Datum {
 
 const N: Datum = Datum::Null;
 
-use DataType::{BigInt as I8, Bool as B, Int as I4, Name as NM, SmallInt as I2, Text as T};
+use DataType::{
+    BigInt as I8, Bool as B, Int as I4, Name as NM, PgChar as CH, SmallInt as I2, Text as T,
+};
 
 fn int2vector(cols: &[usize]) -> Datum {
     t(cols
@@ -303,8 +307,8 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 ("reltoastrelid", I8),
                 ("relhasindex", B),
                 ("relisshared", B),
-                ("relpersistence", T),
-                ("relkind", T),
+                ("relpersistence", CH),
+                ("relkind", CH),
                 ("relnatts", I2),
                 ("relchecks", I2),
                 ("relhasrules", B),
@@ -313,7 +317,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 ("relrowsecurity", B),
                 ("relforcerowsecurity", B),
                 ("relispopulated", B),
-                ("relreplident", T),
+                ("relreplident", CH),
                 ("relispartition", B),
                 ("relacl", T),
                 ("reloptions", T),
@@ -410,8 +414,8 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 ("attnotnull", B),
                 ("atthasdef", B),
                 ("atthasmissing", B),
-                ("attidentity", T),
-                ("attgenerated", T),
+                ("attidentity", CH),
+                ("attgenerated", CH),
                 ("attisdropped", B),
                 ("attislocal", B),
                 ("attinhcount", I4),
@@ -445,7 +449,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                         i(k as i64 + 1),
                         i(i64::from(matches!(c.ty, DataType::Array(_)))),
                         i(-1),
-                        i(i64::from(type_mod(&c.ty))),
+                        i(i64::from(c.type_mod())),
                         b(len > 0 && len <= 8),
                         t(if len > 0 { "p" } else { "x" }),
                         t("i"),
@@ -484,11 +488,11 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 ("typowner", I8),
                 ("typlen", I2),
                 ("typbyval", B),
-                ("typtype", T),
-                ("typcategory", T),
+                ("typtype", CH),
+                ("typcategory", CH),
                 ("typispreferred", B),
                 ("typisdefined", B),
-                ("typdelim", T),
+                ("typdelim", CH),
                 ("typrelid", I8),
                 ("typsubscript", T),
                 ("typelem", I8),
@@ -500,8 +504,8 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 ("typmodin", T),
                 ("typmodout", T),
                 ("typanalyze", T),
-                ("typalign", T),
-                ("typstorage", T),
+                ("typalign", CH),
+                ("typstorage", CH),
                 ("typnotnull", B),
                 ("typbasetype", I8),
                 ("typtypmod", I4),
@@ -650,7 +654,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 ("oid", I8),
                 ("conname", NM),
                 ("connamespace", I8),
-                ("contype", T),
+                ("contype", CH),
                 ("condeferrable", B),
                 ("condeferred", B),
                 ("convalidated", B),
@@ -659,9 +663,9 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 ("conindid", I8),
                 ("conparentid", I8),
                 ("confrelid", I8),
-                ("confupdtype", T),
-                ("confdeltype", T),
-                ("confmatchtype", T),
+                ("confupdtype", CH),
+                ("confdeltype", CH),
+                ("confmatchtype", CH),
                 ("conislocal", B),
                 ("coninhcount", I4),
                 ("connoinherit", B),
@@ -996,7 +1000,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
         }
         "pg_am" => {
             let mut bd =
-                Builder::new(&[("oid", I8), ("amname", T), ("amhandler", T), ("amtype", T)]);
+                Builder::new(&[("oid", I8), ("amname", T), ("amhandler", T), ("amtype", CH)]);
             bd.row(vec![i(2), t("heap"), t("heap_tableam_handler"), t("t")]);
             bd.row(vec![i(403), t("btree"), t("bthandler"), t("i")]);
             bd.done()
@@ -1014,7 +1018,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
             ("pronamespace", I8),
             ("prorettype", I8),
             ("proargtypes", T),
-            ("prokind", T),
+            ("prokind", CH),
         ])
         .done(),
         "pg_enum" => Builder::new(&[
@@ -1067,7 +1071,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 ("oid", I8),
                 ("collname", T),
                 ("collnamespace", I8),
-                ("collprovider", T),
+                ("collprovider", CH),
                 ("collencoding", I4),
                 ("collcollate", T),
                 ("collctype", T),
@@ -1167,7 +1171,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
             ("oid", I8),
             ("rulename", T),
             ("ev_class", I8),
-            ("ev_type", T),
+            ("ev_type", CH),
             ("is_instead", B),
         ])
         .done(),
@@ -1175,7 +1179,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
             ("oid", I8),
             ("polname", T),
             ("polrelid", I8),
-            ("polcmd", T),
+            ("polcmd", CH),
             ("polpermissive", B),
         ])
         .done(),
@@ -1184,7 +1188,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
         }
         "pg_partitioned_table" => Builder::new(&[
             ("partrelid", I8),
-            ("partstrat", T),
+            ("partstrat", CH),
             ("partnatts", I8),
             ("partattrs", T),
         ])
@@ -1196,7 +1200,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
             ("refclassid", I8),
             ("refobjid", I8),
             ("refobjsubid", I8),
-            ("deptype", T),
+            ("deptype", CH),
         ])
         .done(),
         "pg_shdescription" => {
@@ -1208,7 +1212,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
             ("evtevent", T),
             ("evtowner", I8),
             ("evtfoid", I8),
-            ("evtenabled", T),
+            ("evtenabled", CH),
         ])
         .done(),
         "pg_cast" => Builder::new(&[
@@ -1216,15 +1220,15 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
             ("castsource", I8),
             ("casttarget", I8),
             ("castfunc", I8),
-            ("castcontext", T),
-            ("castmethod", T),
+            ("castcontext", CH),
+            ("castmethod", CH),
         ])
         .done(),
         "pg_operator" => Builder::new(&[
             ("oid", I8),
             ("oprname", T),
             ("oprnamespace", I8),
-            ("oprkind", T),
+            ("oprkind", CH),
             ("oprleft", I8),
             ("oprright", I8),
             ("oprresult", I8),
@@ -1262,7 +1266,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
             ("stxname", T),
             ("stxnamespace", I8),
             ("stxkeys", T),
-            ("stxkind", T),
+            ("stxkind", CH),
         ])
         .done(),
         "pg_opclass" => Builder::new(&[
@@ -1285,7 +1289,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
         .done(),
         "pg_aggregate" => Builder::new(&[
             ("aggfnoid", I8),
-            ("aggkind", T),
+            ("aggkind", CH),
             ("aggtransfn", I8),
             ("aggfinalfn", I8),
             ("aggtranstype", I8),
@@ -1325,6 +1329,18 @@ fn index_sql(tb: &Table, name: &str, cols: &[usize], unique: bool) -> String {
     )
 }
 
+/// MySQL's spelling of a column's type, with its declared fractional-second precision.
+pub fn mysql_column_type(c: &Column) -> (String, String) {
+    let (dt, ct) = mysql_type(&c.ty);
+    match (c.precision, &c.ty) {
+        (Some(0), DataType::Timestamp | DataType::TimestampTz | DataType::Time) => (dt.clone(), dt),
+        (Some(p), DataType::Timestamp | DataType::TimestampTz | DataType::Time) => {
+            (dt.clone(), format!("{dt}({p})"))
+        }
+        _ => (dt, ct),
+    }
+}
+
 /// MySQL's spelling of a column type.
 pub fn mysql_type(ty: &DataType) -> (String, String) {
     // (DATA_TYPE, COLUMN_TYPE)
@@ -1338,6 +1354,7 @@ pub fn mysql_type(ty: &DataType) -> (String, String) {
         DataType::Real => ("float".into(), "float".into()),
         DataType::Double => ("double".into(), "double".into()),
         DataType::Text | DataType::Name => ("text".into(), "text".into()),
+        DataType::PgChar => ("char".into(), "char(1)".into()),
         DataType::Varchar(n) => ("varchar".into(), format!("varchar({})", n.unwrap_or(255))),
         DataType::Char(n) => ("char".into(), format!("char({})", n.unwrap_or(1))),
         DataType::Bytes => ("blob".into(), "blob".into()),
@@ -1444,6 +1461,10 @@ fn information_schema(
                 ("table_comment", T),
                 ("create_time", DataType::Timestamp),
                 ("is_insertable_into", T),
+                ("create_options", T),
+                ("row_format", T),
+                ("version", I8),
+                ("update_time", DataType::Timestamp),
             ]);
             for tb in tables {
                 bd.row(vec![
@@ -1458,6 +1479,10 @@ fn information_schema(
                     t(""),
                     N,
                     t("YES"),
+                    t(""),
+                    t("Dynamic"),
+                    i(10),
+                    N,
                 ]);
             }
             bd.done()
@@ -1497,7 +1522,7 @@ fn information_schema(
             ]);
             for tb in tables {
                 for (k, c) in tb.columns.iter().enumerate() {
-                    let (my_dt, my_ct) = mysql_type(&c.ty);
+                    let (my_dt, my_ct) = mysql_column_type(c);
                     let (char_len, num_prec, num_scale) = match &c.ty {
                         DataType::Varchar(Some(n)) | DataType::Char(Some(n)) => {
                             (Some(i64::from(*n)), None, None)
@@ -1561,14 +1586,7 @@ fn information_schema(
                             })
                         }),
                         num_scale.map_or(N, i),
-                        if matches!(
-                            c.ty,
-                            DataType::Timestamp | DataType::TimestampTz | DataType::Time
-                        ) {
-                            i(6)
-                        } else {
-                            N
-                        },
+                        c.datetime_precision().map_or(N, i),
                         if matches!(
                             c.ty,
                             DataType::Text | DataType::Varchar(_) | DataType::Char(_)
@@ -2032,9 +2050,18 @@ pub fn format_type(oid: &Datum, typmod: Option<&Datum>) -> Datum {
             }
         }
         1082 => "date".into(),
-        1083 => "time without time zone".into(),
-        1114 => "timestamp without time zone".into(),
-        1184 => "timestamp with time zone".into(),
+        1083 | 1114 | 1184 => {
+            let (base, zone) = match o {
+                1083 => ("time", "without"),
+                1114 => ("timestamp", "without"),
+                _ => ("timestamp", "with"),
+            };
+            if m >= 0 {
+                format!("{base}({m}) {zone} time zone")
+            } else {
+                format!("{base} {zone} time zone")
+            }
+        }
         1186 => "interval".into(),
         1700 => {
             if m > 4 {
@@ -2150,7 +2177,7 @@ pub fn create_table_sql(tb: &Table, dialect: Dialect) -> String {
     let mut lines = Vec::new();
     for c in &tb.columns {
         let ty = if dialect == Dialect::MySql {
-            mysql_type(&c.ty).1
+            mysql_column_type(c).1
         } else {
             type_sql(&c.ty)
         };
@@ -2318,7 +2345,7 @@ pub fn show(s: &mut Session, what: &Show) -> SqlResult<Outcome> {
                     };
                     let mut r = vec![
                         t(&c.name),
-                        t(mysql_type(&c.ty).1),
+                        t(mysql_column_type(c).1),
                         t(if c.not_null { "NO" } else { "YES" }),
                         t(key),
                         c.default.as_ref().map_or(N, |d| t(mysql_default(d))),

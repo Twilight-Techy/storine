@@ -281,6 +281,8 @@ pub struct CreateTable {
 pub struct ColumnDef {
     pub name: String,
     pub ty: DataType,
+    /// Fractional-second digits of a TIMESTAMP(p) / TIME(p) / DATETIME(p) column.
+    pub precision: Option<u8>,
     pub not_null: bool,
     pub default: Option<Expr>,
     pub primary_key: bool,
@@ -405,6 +407,8 @@ pub enum DataType {
     Json,
     /// PostgreSQL `jsonb`: stored and compared like `json`, reported with its own type.
     Jsonb,
+    /// PostgreSQL's one-byte `"char"` (catalog codes such as `pg_constraint.contype`).
+    PgChar,
     /// MySQL `ENUM('a', 'b')`.
     Enum(Vec<String>),
     Array(Box<DataType>),
