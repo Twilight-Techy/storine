@@ -148,7 +148,35 @@
 
 ---
 
-## 6. Verification, Benchmarking & Discipline Rules (`RULE-TEST-*`)
+## 6. Developer Experience: Simplicity, Intuitiveness & Clarity (`RULE-DX-*`)
+
+*(Added for Follow-Up Prompt 2: SDKs and adapters must be simple, intuitive and clear.)*
+
+### RULE-DX-01: One Obvious Way, the Same Everywhere
+- Every SDK exposes the same small vocabulary: `connect` → `collection(name)` → `get`, `put`, `insert`, `replace`, `update`, `delete`, `find`, `count`, `create_index`, plus `transaction`. Names follow each language's conventions (`snake_case`, `camelCase`, `PascalCase`) but never change meaning between languages.
+- The common path needs no configuration: `connect("storine://host:7878")` works; everything else (token, timeouts, follower reads) is an optional, named setting with a safe default.
+- Documents are the language's native map / dictionary / object; values are native types (`Decimal` / `BigDecimal` / `decimal` for money, native date-times, byte arrays, UUIDs). Users never see SVE, opcodes or frames.
+
+### RULE-DX-02: Safe by Default
+- Money-safe arithmetic is the easy path: `update(key, add("balance", amount, min=0))` is one call; there is no SDK helper that reads, modifies locally and writes back.
+- Every write carries an automatically generated request id that the SDK reuses on its own retries, so timeouts, `CommitUnknown`, reconnects and leader changes never apply a write twice. Users do nothing to get exactly-once retries.
+- SDKs follow `NotLeader` redirects and reconnect transparently; reads are linearizable unless the user explicitly opts into follower reads.
+- Floats are never silently converted to decimals (and vice versa).
+
+### RULE-DX-03: Errors That Explain Themselves
+- Errors are typed by what the caller can do about them: `NotFoundError`, `ConflictError` (with the failing write and the current version), `InvalidError`, `UnauthorizedError`, `OverloadedError` / `RateLimitedError` (retry later), `UnavailableError` (no leader / unreachable). Every message states what happened and, where possible, what to do next.
+- Nothing fails silently: an operation either succeeds, or raises / returns an error.
+
+### RULE-DX-04: Small, Dependency-Free, Documented
+- SDKs use only the language's standard library (no runtime dependencies), one module / package, and a README whose first example runs as written. Every public function has a one-line doc comment and an example in the README.
+- Every SDK passes the shared conformance vectors (`protocol/vectors/`) and an end-to-end test against a real `storage-server`.
+
+### RULE-DX-05: Drop-In for Existing Code (SQL Adapter)
+- Existing applications connect with their current driver / ORM and only change the connection string. Unsupported SQL is rejected with a precise message naming the construct, never silently mis-executed.
+
+---
+
+## 7. Verification, Benchmarking & Discipline Rules (`RULE-TEST-*`)
 
 ### RULE-TEST-01: Mandatory Unit, Corruption, Concurrency & Chaos Crash Tests
 - Every subsystem must ship with unit tests, single-bit flip / torn-frame corruption tests, multi-threaded contention tests, and chaos crash-recovery verification.
