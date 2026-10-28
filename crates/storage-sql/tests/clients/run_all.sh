@@ -8,6 +8,7 @@
 #   PYTHON          python with psycopg2, psycopg, asyncpg, sqlalchemy[asyncio], pymysql, django
 #   NODE_PATH       node_modules with pg, mysql2, sequelize, knex (and prisma@6, @prisma/client@6)
 #   STORINE_SQL_BIN storine-sql binary for the private Prisma instance (default: target/release)
+#   STORINE_DATA    the server's --data directory (its TLS certificate is then verified)
 #   ELOQUENT_AUTOLOAD  vendor/autoload.php of `composer require illuminate/database:^11`
 #   GEM_HOME/GEM_PATH  with activerecord, pg, trilogy
 set -u
@@ -16,6 +17,8 @@ PG=${STORINE_PG_PORT:-55432}
 MY=${STORINE_MYSQL_PORT:-53306}
 export STORINE_PG="127.0.0.1:$PG" STORINE_MYSQL="127.0.0.1:$MY"
 PYTHON=${PYTHON:-python3}
+# The server's certificate, for the suites that verify it (storine-sql --data DIR keeps it in DIR/tls).
+[ -n "${STORINE_DATA:-}" ] && [ -f "$STORINE_DATA/tls/server.crt" ] && export STORINE_TLS_CERT="$STORINE_DATA/tls/server.crt"
 failed=()
 
 run() {

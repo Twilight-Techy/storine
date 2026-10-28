@@ -262,3 +262,33 @@ func TestGormPostgres(t *testing.T) {
 func TestGormMySQL(t *testing.T) {
 	gormSuite(t, mysql.Open("root@tcp("+myAddr+")/shop?parseTime=true"))
 }
+
+// TLS with Go's own crypto/tls on both protocols (sslmode=require / tls=skip-verify, and
+// pgx with the server certificate pinned when STORINE_TLS_CERT names it).
+func TestTLS(t *testing.T) {
+	ctx := context.Background()
+	urls := []string{"postgres://app:x@" + pgAddr + "/shop?sslmode=require"}
+	if cert := os.Getenv("STORINE_TLS_CERT"); cert != "" {
+		urls = append(urls, "postgres://app:x@localhost:"+pgAddr[len("127.0.0.1:"):]+"/shop?sslmode=verify-full&sslrootcert="+cert)
+	}
+	for _, u := range urls {
+		c, err := pgx.Connect(ctx, u)
+		if err != nil {
+			t.Fatalf("%s: %v", u, err)
+		}
+		var s string
+		if err := c.QueryRow(ctx, "SELECT repeat('x', 100000)").Scan(&s); err != nil || len(s) != 100000 {
+			t.Fatalf("large result over TLS: %v (%d bytes)", err, len(s))
+		}
+		c.Close(ctx)
+	}
+	db, err := sql.Open("mysql", "root@tcp("+myAddr+")/shop?tls=skip-verify")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow("SELECT 6 * 7").Scan(&n); err != nil || n != 42 {
+		t.Fatalf("mysql over TLS: %v %d", err, n)
+	}
+}

@@ -225,4 +225,21 @@ public class ClientTests
     [Fact]
     public Task EfCoreMySql() =>
         EfSuite(new DbContextOptionsBuilder<Ledger>().UseMySql(MyConn, new MySqlServerVersion(new Version(8, 4, 3))).Options);
+
+    [Fact]
+    public async Task TlsBothProtocols()
+    {
+        await using (var c = new NpgsqlConnection(PgConn + ";SSL Mode=Require"))
+        {
+            await c.OpenAsync();
+            await using var cmd = new NpgsqlCommand("SELECT repeat('n', 70000)", c);
+            Assert.Equal(70000, ((string)(await cmd.ExecuteScalarAsync())!).Length);
+        }
+        await using (var c = new MySqlConnection(MyConn.Replace("SslMode=None", "SslMode=Required")))
+        {
+            await c.OpenAsync();
+            await using var cmd = new MySqlCommand("SELECT 6 * 7", c);
+            Assert.Equal(42L, Convert.ToInt64(await cmd.ExecuteScalarAsync()));
+        }
+    }
 }

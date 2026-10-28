@@ -472,3 +472,10 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - `nextval` silently created unknown sequences.
 - **Security**: SCRAM-SHA-256 / native-password authentication with constant-time comparison; every protocol message length bounded (`MAX_MESSAGE`); COPY records and fields bounded; recursion depth limits (views 32, FK cascades 32); validated-read and recursive-CTE row caps; no statement is silently ignored except session settings that do not apply.
 - **Known limitations** (documented in `crates/storage-sql/README.md`): no TLS yet (`TASK-117`), DDL not transactional, one schema per database, SERIALIZABLE does not detect range phantoms, no stored procedures / triggers, no TDS yet (`TASK-118`).
+- **TLS (`TASK-117`)**:
+  - Built in-house to keep the zero-dependency rule: X25519 / Ed25519 with five 51-bit limbs, Montgomery ladder and constant-time selects; Barrett reduction mod L; SHA-512; HKDF; a TLS 1.3 server state machine.
+  - Verified against RFC 7748, RFC 8032 and RFC 8448 values. `openssl verify` accepts the generated certificate.
+  - Interop is covered by OpenSSL, JSSE, .NET, Go and Node clients across the full client matrix: 83 handshakes in one run, every suite passing.
+  - Bounds: records ≤ 2^14 + 256 bytes, handshake messages ≤ 64 KiB, sequence numbers checked; fatal alerts on every protocol error.
+  - Every ClientHello, including the one after a HelloRetryRequest, must offer TLS 1.3, ChaCha20-Poly1305 and Ed25519.
+  - Ephemeral keys come from the OS CSPRNG. The private key file is created with mode 0600.

@@ -12,6 +12,7 @@ storine-sql --storine storine://h1,h2,h3     # or in front of a running Storine 
             [--pg 0.0.0.0:5432] [--mysql 0.0.0.0:3306] [--no-pg] [--no-mysql]
             [--user name:password]...        # without --user every client is trusted (keep it on localhost)
             [--database shop]                # name of the default database (default: storine)
+            [--tls-cert chain.pem --tls-key key.pem | --no-tls] [--require-tls]
 ```
 
 Then point the application at it, exactly as you would at PostgreSQL or MySQL:
@@ -24,6 +25,26 @@ mysql://app:secret@127.0.0.1:3306/shop
 Users can also come from `STORINE_SQL_USERS=name:password,name2:password2`. PostgreSQL clients
 authenticate with SCRAM-SHA-256, MySQL clients with `mysql_native_password` (both standard; no
 plaintext passwords on the wire). Set `STORINE_SQL_LOG=1` to log every statement.
+
+## TLS
+
+Both endpoints speak **TLS 1.3**, implemented in-house like the rest of Storine (no OpenSSL):
+`TLS_CHACHA20_POLY1305_SHA256` with `x25519` key exchange and an Ed25519 certificate.
+It is on by default:
+
+- With `--data DIR`, a self-signed certificate for `localhost`, `127.0.0.1` and `::1` is
+  created once in `DIR/tls/` (`server.crt`, `server.key` with mode 0600) and reused. Clients
+  using `sslmode=require` / `ssl-mode=REQUIRED` connect as is. For full verification, pin it:
+  `sslmode=verify-full sslrootcert=DIR/tls/server.crt`.
+- `--tls-cert chain.pem --tls-key key.pem` serves your own certificate. The key must be
+  Ed25519 (`openssl genpkey -algorithm ed25519 -out key.pem`, then have your CA sign it).
+- `--require-tls` refuses clients that stay in plaintext; `--no-tls` turns TLS off.
+
+Verified with OpenSSL (libpq, psycopg, asyncpg, PyMySQL, PHP, Ruby, `openssl s_client`,
+including HelloRetryRequest and KeyUpdate), Java's JSSE (pgJDBC, Connector/J), .NET (Npgsql,
+MySqlConnector), Go's `crypto/tls` (pgx, go-sql-driver) and Node (pg, mysql2). Clients
+restricted to AES cipher suites or to RSA/ECDSA certificates (some FIPS configurations)
+cannot connect.
 
 ## Tested clients
 
@@ -109,9 +130,8 @@ what Django's and Rails' test databases and Prisma's shadow databases rely on.
 
 ## Known limitations
 
-- **No TLS yet**: run `storine-sql` on the same host or a private network, and use
-  `sslmode=disable` / `prefer` (PostgreSQL) or `ssl-mode=DISABLED` / `PREFERRED` (MySQL).
-  Clients that *require* TLS cannot connect yet.
+- **TLS**: TLS 1.3 only, ChaCha20-Poly1305 only, Ed25519 certificates only (see above). No
+  client-certificate authentication.
 - **DDL is applied immediately**, even inside a transaction (MySQL behavior). On the
   PostgreSQL endpoint, a `ROLLBACK` undoes the transaction's data changes but not its `CREATE
   / ALTER / DROP`. A migration that fails halfway leaves the steps it already ran.

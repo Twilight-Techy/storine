@@ -5,7 +5,12 @@
 //! storine-sql --storine storine://h1,h2,h3        # a running server or cluster
 //!             [--pg 0.0.0.0:5432] [--mysql 0.0.0.0:3306] [--no-pg] [--no-mysql]
 //!             [--user name:password]... [--database name]
+//!             [--tls-cert chain.pem --tls-key key.pem | --no-tls] [--require-tls]
 //! ```
+//!
+//! TLS is on by default: with `--data`, a self-signed Ed25519 certificate is created once in
+//! `DIR/tls/` (clients using `sslmode=require` / `ssl-mode=REQUIRED` accept it; pin it with
+//! `sslrootcert=DIR/tls/server.crt` for `verify-full`).
 
 use std::collections::HashMap;
 use std::net::TcpListener;
@@ -17,7 +22,7 @@ use std::time::Duration;
 use storage_sql::exec::{Engine, EngineConfig};
 use storage_sql::store::Store;
 
-const USAGE: &str = "usage: storine-sql (--data DIR | --storine URL) [--pg ADDR] [--mysql ADDR] [--no-pg] [--no-mysql] [--user NAME:PASSWORD]... [--database NAME]";
+const USAGE: &str = "usage: storine-sql (--data DIR | --storine URL) [--pg ADDR] [--mysql ADDR] [--no-pg] [--no-mysql] [--user NAME:PASSWORD]... [--database NAME] [--tls-cert FILE --tls-key FILE | --no-tls] [--require-tls]";
 
 fn main() -> ExitCode {
     match run() {
@@ -37,6 +42,8 @@ fn run() -> Result<(), String> {
     let mut mysql = Some("127.0.0.1:3306".to_owned());
     let mut users = HashMap::new();
     let mut config = EngineConfig::default();
+    let (mut tls_cert, mut tls_key, mut no_tls, mut require_tls) =
+        (None::<PathBuf>, None::<PathBuf>, false, false);
     while let Some(a) = args.next() {
         let mut value = |name: &str| {
             args.next()
@@ -50,6 +57,10 @@ fn run() -> Result<(), String> {
             "--no-pg" => pg = None,
             "--no-mysql" => mysql = None,
             "--database" => config.database = value("--database")?,
+            "--tls-cert" => tls_cert = Some(PathBuf::from(value("--tls-cert")?)),
+            "--tls-key" => tls_key = Some(PathBuf::from(value("--tls-key")?)),
+            "--no-tls" => no_tls = true,
+            "--require-tls" => require_tls = true,
             "--user" => {
                 let v = value("--user")?;
                 let (u, p) = v.split_once(':').ok_or("--user takes NAME:PASSWORD")?;
@@ -70,6 +81,38 @@ fn run() -> Result<(), String> {
             }
         }
     }
+    let tls = match (no_tls, &tls_cert, &tls_key) {
+        (true, None, None) if require_tls => {
+            return Err("--require-tls needs TLS (drop --no-tls)".into())
+        }
+        (true, None, None) => None,
+        (true, _, _) => {
+            return Err("--no-tls cannot be combined with --tls-cert / --tls-key".into())
+        }
+        (false, Some(c), Some(k)) => {
+            let read = |p: &PathBuf| {
+                std::fs::read_to_string(p).map_err(|e| format!("cannot read {}: {e}", p.display()))
+            };
+            Some(
+                storage_sql::tls::TlsConfig::from_pem(&read(c)?, &read(k)?)
+                    .map_err(|e| e.to_string())?,
+            )
+        }
+        (false, None, None) => Some(match &data {
+            Some(dir) => {
+                storage_sql::tls::TlsConfig::load_or_create(&dir.join("tls")).map_err(|e| {
+                    format!(
+                        "cannot set up the TLS certificate in {}: {e}",
+                        dir.join("tls").display()
+                    )
+                })?
+            }
+            None => storage_sql::tls::TlsConfig::self_signed(&["localhost", "127.0.0.1", "::1"])
+                .map_err(|e| e.to_string())?,
+        }),
+        _ => return Err("--tls-cert and --tls-key go together".into()),
+    }
+    .map(Arc::new);
     let (engine, _embedded) = match (data, url) {
         (Some(dir), None) => {
             let e = storage_sql::embedded::start(&dir, config).map_err(|e| e.to_string())?;
@@ -92,6 +135,8 @@ fn run() -> Result<(), String> {
             Arc::clone(&engine),
             Arc::new(storage_sql::pg::Auth {
                 users: users.clone(),
+                tls: tls.clone(),
+                require_tls,
             }),
         );
         threads.push(std::thread::spawn(move || {
@@ -105,6 +150,8 @@ fn run() -> Result<(), String> {
             Arc::clone(&engine),
             Arc::new(storage_sql::mysql::Auth {
                 users: users.clone(),
+                tls: tls.clone(),
+                require_tls,
             }),
         );
         threads.push(std::thread::spawn(move || {

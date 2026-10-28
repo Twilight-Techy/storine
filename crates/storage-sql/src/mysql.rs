@@ -20,6 +20,10 @@ use crate::parser::{parse, parse_one};
 #[derive(Debug, Clone, Default)]
 pub struct Auth {
     pub users: HashMap<String, String>,
+    /// TLS identity; `None` disables TLS.
+    pub tls: Option<Arc<crate::tls::TlsConfig>>,
+    /// Refuse clients that do not switch to TLS.
+    pub require_tls: bool,
 }
 
 /// Accepts MySQL clients on `listener` forever (one thread per connection).
@@ -47,6 +51,7 @@ const CLIENT_FOUND_ROWS: u32 = 2;
 const CLIENT_LONG_FLAG: u32 = 4;
 const CLIENT_CONNECT_WITH_DB: u32 = 8;
 const CLIENT_PROTOCOL_41: u32 = 0x200;
+const CLIENT_SSL: u32 = 0x800;
 const CLIENT_TRANSACTIONS: u32 = 0x2000;
 const CLIENT_SECURE_CONNECTION: u32 = 0x8000;
 const CLIENT_MULTI_STATEMENTS: u32 = 0x1_0000;
@@ -110,9 +115,50 @@ struct Prepared {
     long_data: HashMap<usize, Vec<u8>>,
 }
 
+/// The connection's input: plaintext, or TLS once the client asked for it.
+enum Input {
+    Plain(BufReader<TcpStream>),
+    Tls(crate::tls::TlsReader<BufReader<TcpStream>>),
+    Switching,
+}
+
+impl Read for Input {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Input::Plain(r) => r.read(buf),
+            Input::Tls(r) => r.read(buf),
+            Input::Switching => Err(io::Error::other("connection is switching to TLS")),
+        }
+    }
+}
+
+enum Output {
+    Plain(BufWriter<TcpStream>),
+    Tls(BufWriter<crate::tls::TlsWriter<TcpStream>>),
+    Switching,
+}
+
+impl Write for Output {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Output::Plain(w) => w.write(buf),
+            Output::Tls(w) => w.write(buf),
+            Output::Switching => Err(io::Error::other("connection is switching to TLS")),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Output::Plain(w) => w.flush(),
+            Output::Tls(w) => w.flush(),
+            Output::Switching => Ok(()),
+        }
+    }
+}
+
 struct Conn {
-    r: BufReader<TcpStream>,
-    w: BufWriter<TcpStream>,
+    r: Input,
+    w: Output,
     seq: u8,
     caps: u32,
     session: Session,
@@ -211,6 +257,25 @@ impl<'a> Rd<'a> {
 }
 
 impl Conn {
+    /// Replaces the plaintext streams with a TLS session over the same socket.
+    fn start_tls(&mut self, cfg: &crate::tls::TlsConfig) -> io::Result<()> {
+        self.w.flush()?;
+        let (Input::Plain(r), Output::Plain(w)) = (
+            std::mem::replace(&mut self.r, Input::Switching),
+            std::mem::replace(&mut self.w, Output::Switching),
+        ) else {
+            return Err(io::Error::other("TLS requested twice"));
+        };
+        let tcp = w.into_inner().map_err(|e| e.into_error())?;
+        let (tr, tw) = crate::tls::accept(r, tcp, cfg, "mysql")?;
+        if crate::log_enabled() {
+            eprintln!("[mysql {}] TLS 1.3 established", self.session.id);
+        }
+        self.r = Input::Tls(tr);
+        self.w = Output::Tls(BufWriter::with_capacity(16 * 1024, tw));
+        Ok(())
+    }
+
     fn read_packet(&mut self) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
         loop {
@@ -310,8 +375,9 @@ impl Conn {
     }
 
     fn run(engine: Arc<Engine>, stream: TcpStream, auth: &Auth) -> io::Result<()> {
-        let r = BufReader::new(stream.try_clone()?);
-        let w = BufWriter::new(stream);
+        let r = Input::Plain(BufReader::new(stream.try_clone()?));
+        let w = Output::Plain(BufWriter::new(stream));
+        let server_caps = SERVER_CAPS | if auth.tls.is_some() { CLIENT_SSL } else { 0 };
         let session = engine.new_session(Dialect::MySql, "", None);
         let mut c = Conn {
             r,
@@ -333,10 +399,10 @@ impl Conn {
         p.extend_from_slice(&(c.session.id as u32).to_le_bytes());
         p.extend_from_slice(&nonce[..8]);
         p.push(0);
-        p.extend_from_slice(&(SERVER_CAPS as u16).to_le_bytes());
+        p.extend_from_slice(&(server_caps as u16).to_le_bytes());
         p.push(255); // utf8mb4_0900_ai_ci
         p.extend_from_slice(&STATUS_AUTOCOMMIT.to_le_bytes());
-        p.extend_from_slice(&((SERVER_CAPS >> 16) as u16).to_le_bytes());
+        p.extend_from_slice(&((server_caps >> 16) as u16).to_le_bytes());
         p.push(21);
         p.extend_from_slice(&[0u8; 10]);
         p.extend_from_slice(&nonce[8..]);
@@ -346,22 +412,37 @@ impl Conn {
         c.seq = 0;
         c.write_packet(&p)?;
         c.w.flush()?;
-        let resp = c.read_packet()?;
+        let mut resp = c.read_packet()?;
+        // A 32-byte response with CLIENT_SSL is the SSL request: TLS starts right after it,
+        // then the real handshake response arrives encrypted.
+        let first_caps = resp
+            .get(..4)
+            .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+        if first_caps & CLIENT_SSL != 0 && resp.len() <= 32 {
+            let Some(cfg) = &auth.tls else {
+                c.err(&SqlError::new(
+                    "08004",
+                    "TLS is disabled on this server; connect with ssl-mode=DISABLED",
+                ))?;
+                c.w.flush()?;
+                return Ok(());
+            };
+            c.start_tls(cfg)?;
+            resp = c.read_packet()?;
+        } else if auth.require_tls {
+            c.err(&SqlError::new(
+                "28000",
+                "this server requires TLS (connect with ssl-mode=REQUIRED)",
+            ))?;
+            c.w.flush()?;
+            return Ok(());
+        }
         let mut rd = Rd { b: &resp, pos: 0 };
         let caps = rd.u32()?;
         if caps & CLIENT_PROTOCOL_41 == 0 {
             c.err(&SqlError::new(
                 "08004",
                 "this server needs a MySQL 4.1+ client",
-            ))?;
-            c.w.flush()?;
-            return Ok(());
-        }
-        if caps & 0x800 != 0 && rd.left() <= 28 {
-            // The client wants TLS (SSL request packet), which this server does not offer.
-            c.err(&SqlError::new(
-                "08004",
-                "TLS is not supported by storine-sql; connect with ssl disabled",
             ))?;
             c.w.flush()?;
             return Ok(());

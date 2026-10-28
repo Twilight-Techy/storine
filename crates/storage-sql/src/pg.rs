@@ -21,6 +21,10 @@ use crate::parser::parse;
 #[derive(Debug, Clone, Default)]
 pub struct Auth {
     pub users: HashMap<String, String>,
+    /// TLS identity; `None` disables TLS.
+    pub tls: Option<Arc<crate::tls::TlsConfig>>,
+    /// Refuse clients that do not switch to TLS.
+    pub require_tls: bool,
 }
 
 /// Accepts PostgreSQL clients on `listener` forever (one thread per connection).
@@ -57,9 +61,12 @@ struct Portal {
     result: Option<(Outcome, usize)>,
 }
 
+type Reader = Box<dyn Read + Send>;
+type Writer = Box<dyn Write + Send>;
+
 struct Conn {
-    r: BufReader<TcpStream>,
-    w: BufWriter<TcpStream>,
+    r: Reader,
+    w: Writer,
     session: Session,
     prepared: HashMap<String, Prepared>,
     portals: HashMap<String, Portal>,
@@ -159,16 +166,51 @@ impl Msg {
 
 impl Conn {
     fn run(engine: Arc<Engine>, stream: TcpStream, auth: &Auth) -> io::Result<()> {
-        let mut r = BufReader::new(stream.try_clone()?);
-        let mut w = BufWriter::new(stream);
-        // Startup (answer 'N' to SSL / GSS encryption requests: the client continues in clear).
-        let params = loop {
-            let len = read_i32(&mut r)? as usize;
-            if !(8..=10_000).contains(&len) {
-                return Err(bad_input("bad startup packet"));
+        // Encryption negotiation: SSLRequest -> 'S' and a TLS handshake when TLS is configured,
+        // 'N' otherwise (and always for GSSENCRequest); the startup packet follows.
+        let mut plain_r = BufReader::new(stream.try_clone()?);
+        let mut plain_w = BufWriter::new(stream);
+        let (mut r, mut w, mut pending): (Reader, Writer, Option<Vec<u8>>) = loop {
+            let body = read_startup(&mut plain_r)?;
+            let code = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+            match (code, &auth.tls) {
+                (80_877_103, Some(cfg)) => {
+                    plain_w.write_all(b"S")?;
+                    plain_w.flush()?;
+                    let tcp = plain_w.into_inner().map_err(|e| e.into_error())?;
+                    let (tr, tw) = crate::tls::accept(plain_r, tcp, cfg, "postgresql")?;
+                    if crate::log_enabled() {
+                        eprintln!("[pg] TLS 1.3 established");
+                    }
+                    break (
+                        Box::new(tr),
+                        Box::new(BufWriter::with_capacity(16 * 1024, tw)),
+                        None,
+                    );
+                }
+                (80_877_103 | 80_877_104, _) => {
+                    plain_w.write_all(b"N")?;
+                    plain_w.flush()?;
+                }
+                _ => {
+                    if auth.require_tls && code != 80_877_102 {
+                        let e = SqlError::new(
+                            "28000",
+                            "this server requires TLS (connect with sslmode=require)",
+                        );
+                        send_raw(&mut plain_w, error_msg(&e, "FATAL"))?;
+                        plain_w.flush()?;
+                        return Ok(());
+                    }
+                    break (Box::new(plain_r), Box::new(plain_w), Some(body));
+                }
             }
-            let mut body = vec![0u8; len - 4];
-            r.read_exact(&mut body)?;
+        };
+        let params = loop {
+            let body = match pending.take() {
+                Some(b) => b,
+                None => read_startup(&mut r)?,
+            };
             let code = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
             match code {
                 80_877_103 | 80_877_104 => {
@@ -1036,6 +1078,17 @@ fn io_err(e: io::Error) -> SqlError {
 
 fn io_sql(e: io::Error) -> SqlError {
     SqlError::new("08P01", e.to_string())
+}
+
+/// One startup-phase packet (length-prefixed, no type byte).
+fn read_startup(r: &mut impl Read) -> io::Result<Vec<u8>> {
+    let len = read_i32(r)? as usize;
+    if !(8..=10_000).contains(&len) {
+        return Err(bad_input("bad startup packet"));
+    }
+    let mut body = vec![0u8; len - 4];
+    r.read_exact(&mut body)?;
+    Ok(body)
 }
 
 fn send_raw(w: &mut impl Write, m: Msg) -> io::Result<()> {

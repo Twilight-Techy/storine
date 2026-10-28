@@ -240,4 +240,21 @@ class JdbcTest {
     void hibernateMySql() {
         hibernateSuite("jdbc:mysql://" + my() + "/shop?useSSL=false&allowPublicKeyRetrieval=true", "root", null);
     }
+
+    // TLS through Java's own JSSE stack on both protocols.
+    @Test
+    void tlsBothProtocols() throws Exception {
+        try (Connection c = DriverManager.getConnection("jdbc:postgresql://" + pg() + "/shop?sslmode=require", "app", "x");
+             Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("SELECT repeat('j', 70000)")) {
+            assertTrue(rs.next());
+            assertEquals(70000, rs.getString(1).length());
+        }
+        try (Connection c = DriverManager.getConnection("jdbc:mysql://" + my() + "/shop?sslMode=REQUIRED", "root", "");
+             Statement st = c.createStatement();
+             ResultSet rs = st.executeQuery("SELECT 6 * 7")) {
+            assertTrue(rs.next());
+            assertEquals(42, rs.getInt(1));
+        }
+    }
 }

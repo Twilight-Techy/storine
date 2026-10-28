@@ -136,6 +136,17 @@ async function main() {
     await knex.destroy();
   });
 
+  await section("TLS: node-postgres and mysql2 over Node's TLS", async () => {
+    const c = new Client({ host: "127.0.0.1", port: PG_PORT, user: "app", password: "x", database: "shop", ssl: { rejectUnauthorized: false } });
+    await c.connect();
+    assert.strictEqual((await c.query("SELECT repeat('n', 70000) AS s")).rows[0].s.length, 70000);
+    await c.end();
+    const m = await mysql.createConnection({ host: "127.0.0.1", port: MY_PORT, user: "root", database: "shop", ssl: { rejectUnauthorized: false } });
+    const [[row]] = await m.query("SELECT 6 * 7 AS n");
+    assert.strictEqual(Number(row.n), 42);
+    await m.end();
+  });
+
   console.log("all node client tests passed");
 }
 

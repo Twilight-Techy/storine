@@ -132,6 +132,23 @@ def run_all():
                     cp.set_types(["int8", "numeric"])
                     assert list(cp.rows()) == [(100, D("0.0100")), (101, D("0.0101"))]
 
+    import os, ssl
+
+    @section("TLS: psycopg sslmode=verify-full (pinned certificate) and PyMySQL with TLS")
+    def _():
+        cert = os.environ.get("STORINE_TLS_CERT")
+        mode = f"sslmode=verify-full sslrootcert={cert}" if cert else "sslmode=require"
+        with psycopg.connect(f"host=localhost port={PG_PORT} user=app dbname=shop {mode}") as c:
+            assert c.info.pgconn.ssl_in_use
+            assert len(c.execute("SELECT repeat('p', 100000)").fetchone()[0]) == 100000
+        ctx = ssl.create_default_context(cafile=cert) if cert else ssl._create_unverified_context()
+        import pymysql as _pm
+        m = _pm.connect(host="localhost", port=MY_PORT, user="root", database="shop", ssl=ctx)
+        cur = m.cursor()
+        cur.execute("SELECT 6 * 7")
+        assert cur.fetchone() == (42,)
+        m.close()
+
     import asyncpg
 
     @section("asyncpg: binary protocol, prepared statements, transactions")

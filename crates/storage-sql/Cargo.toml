@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 storine = { path = "../../sdks/rust" }
 storage-types = { path = "../storage-types" }
+storage-codec = { path = "../storage-codec" }
 storage-core = { path = "../storage-core" }
 storage-server = { path = "../storage-server" }
 
