@@ -764,3 +764,21 @@ This document defines the strict chronological execution order for building the 
   - **Reactor**: the same `ReadyPoller` loop as Linux; `STORINE_REACTOR=poll` falls back to `WSAPoll`.
   - **Verification so far**: `cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc`: `0` warnings (type-checked and linted against the Windows standard library, including `deny(clippy::undocumented_unsafe_blocks)`; not executed: no Windows machine here). Linux behavior unchanged.
   - **To close**: on Windows, run `cargo test --workspace` (runs `test_afd_poll_reports_only_ready_sockets_and_tracks_interest` and every server test through the AFD reactor) and `cargo run --release -p storage-benches --bin reactor-scale` with and without `STORINE_REACTOR=poll`.
+
+## Stage 25: Client SDKs — Protocol Specification, Conformance Vectors & Six Languages (`TASK-103` – `TASK-111`)
+
+*(Follow-Up Prompt 2: "build sdks for popular backend languages … with simplicity and user intuitiveness/clarity included as rules"; Follow-Up Prompt 3: PHP and Ruby as TODO.)*
+
+- [x] **TASK-103: Protocol Specification & Golden Conformance Vectors (`RULE-DX-01` – `RULE-DX-05`)**
+  - `protocol/PROTOCOL.md`: framing, statuses, SVE values, every document request / response, retry and redirect rules (request ids reused across retries, `NotLeader` hints, `CommitUnknown`).
+  - `protocol/vectors/vectors.json`: values, a document, 22 requests and the response bodies, generated from the server's own encoders and pinned by `storage-server/tests/protocol_vectors.rs` (regenerate with `STORINE_UPDATE_VECTORS=1`).
+- [x] **TASK-104: Python SDK** (`sdks/python`) — reference implementation; `Decimal`, `datetime`, `uuid`; context-manager transactions.
+- [x] **TASK-105: TypeScript / Node.js SDK** (`sdks/typescript`) — promise API, exact `Decimal`, `bigint` versions, connection pool.
+- [x] **TASK-106: Go SDK** (`sdks/go`) — `context.Context` on every call, `errors.Is(err, storine.ErrConflict)`, `-race` clean.
+- [x] **TASK-107: Java SDK** (`sdks/java`) — `BigDecimal`, `Optional`, lazy `Stream` scans, lambda transactions, unchecked exceptions.
+- [x] **TASK-108: C# / .NET SDK** (`sdks/csharp`) — async-first with `CancellationToken`, `decimal` money, nanosecond `Timestamp`, `& | !` filters, `IAsyncEnumerable` scans.
+- [x] **TASK-109: Rust SDK** (`sdks/rust`) — standalone crate (not a workspace member), `forbid(unsafe_code)`, `doc!` / `list!` macros, `& | !` filters.
+  - **Exit Criteria (103 – 109)**: every SDK passes every request / response / value vector byte for byte, rejects every truncation of a hostile value, and passes the same end-to-end suite against the release server: CRUD with every value type, 800 concurrent `+0.01` deposits summing exactly, overdraft refused atomically, atomic transfers, version-conditioned writes, indexed vs. unindexed queries, pagination over 120 documents, TTL expiry, invalid names rejected, and a 3-node cluster whose leader is killed mid-run with every deposit applied exactly once.
+- [ ] **TASK-110: PHP SDK** — *TODO (Follow-Up Prompt 3)*.
+- [ ] **TASK-111: Ruby SDK** — *TODO (Follow-Up Prompt 3)*.
+

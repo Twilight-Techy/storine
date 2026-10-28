@@ -1,0 +1,14 @@
+[package]
+name = "storine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Client for the Storine database. No dependencies."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/twilight-techy/storine"
+readme = "README.md"
+
+# Standalone crate: not a member of the engine workspace.
+[workspace]
+
+[dependencies]
