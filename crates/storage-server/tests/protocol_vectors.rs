@@ -116,7 +116,7 @@ fn build() -> String {
     for (i, (name, v)) in values.iter().enumerate() {
         let mut b = Vec::new();
         encode_value(v, &mut b);
-        let _ = write!(out, "    {{\"name\":{},\"value\":{},\"hex\":\"{}\"}}{}\n", esc(name), describe(v), hex(&b), if i + 1 < n { "," } else { "" });
+        let _ = writeln!(out, "    {{\"name\":{},\"value\":{},\"hex\":\"{}\"}}{}", esc(name), describe(v), hex(&b), if i + 1 < n { "," } else { "" });
     }
     out.push_str("  ],\n  \"documents\": [\n");
     let d = doc(&[("balance", dec("100.00")), ("owner", PropertyValue::Text("alice".into())), ("active", PropertyValue::Bool(true))]);
@@ -132,7 +132,8 @@ fn build() -> String {
         reqs.push(("get accounts/alice".into(), 0x20, b));
     }
     let w = |c: &str, k: &str, op: DocOp, pre: Precondition| DocWrite { collection: c.into(), key: k.into(), op, precondition: pre };
-    let write_cases: Vec<(&str, Vec<DocWrite>, Option<[u8; 16]>)> = vec![
+    type WriteCase<'a> = (&'a str, Vec<DocWrite>, Option<[u8; 16]>);
+    let write_cases: Vec<WriteCase<'_>> = vec![
         ("put", vec![w("accounts", "alice", DocOp::Put(d.clone()), Precondition::None)], None),
         ("insert (must not exist) with request id", vec![w("accounts", "alice", DocOp::Put(d.clone()), Precondition::Absent)], Some([0xAB; 16])),
         ("replace if version 7", vec![w("accounts", "alice", DocOp::Put(d.clone()), Precondition::Version(Version(7)))], None),
@@ -211,7 +212,7 @@ fn build() -> String {
     reqs.push(("info: list collections".into(), 0x25, vec![3u8]));
     let n = reqs.len();
     for (i, (name, op, body)) in reqs.iter().enumerate() {
-        let _ = write!(out, "    {{\"name\":{},\"opcode\":{},\"body_hex\":\"{}\"}}{}\n", esc(name), op, hex(body), if i + 1 < n { "," } else { "" });
+        let _ = writeln!(out, "    {{\"name\":{},\"opcode\":{},\"body_hex\":\"{}\"}}{}", esc(name), op, hex(body), if i + 1 < n { "," } else { "" });
     }
     out.push_str("  ],\n  \"responses\": [\n");
     let mut wr = Vec::new();
