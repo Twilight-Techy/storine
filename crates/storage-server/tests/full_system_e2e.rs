@@ -500,15 +500,10 @@ fn test_full_system_end_to_end_all_features() {
         .with_token("rw-tok", RbacRole::ReadWrite)
         .with_token("admin-tok", RbacRole::Admin)
         .with_backup_root(&bak_root);
-    let tcp_raft = Arc::new(RaftNode::new(9, Arc::clone(&tcp_engine)).unwrap());
-    let mut server = StorageServer::start_with_raft(
-        "127.0.0.1:0",
-        Arc::clone(&tcp_engine),
-        128,
-        sec,
-        Some(Arc::clone(&tcp_raft)),
-    )
-    .unwrap();
+    // Client CRUD runs against a standalone node: a Raft replica's engine is written only
+    // through consensus (its Raft RPCs are exercised on a separate replica in 18f/18g).
+    let raft_sec = sec.clone();
+    let mut server = StorageServer::start_with_config("127.0.0.1:0", Arc::clone(&tcp_engine), 128, sec).unwrap();
     let addr = server.local_addr();
 
     // 18a. Unauthenticated → rejected (at the header stage; the connection is closed)
@@ -586,8 +581,20 @@ fn test_full_system_end_to_end_all_features() {
     assert!(adm.admin_backup("../outside").is_err());
     assert!(adm.admin_checkpoint().unwrap().contains("checkpoint wrote"));
 
-    // 18f. Raft Vote RPC — served by the attached RaftNode, Admin only
-    let mut rw = StorageClient::connect(addr).unwrap();
+    // 18f. Raft Vote RPC — served by an attached RaftNode (a separate replica), Admin only
+    let raft_engine = Arc::new(StorageEngine::<AgentObjectRecord>::open(root.join("raft_replica"), EngineConfig::default()).unwrap());
+    let tcp_raft = Arc::new(RaftNode::new(9, Arc::clone(&raft_engine)).unwrap());
+    let mut raft_server = StorageServer::start_with_raft(
+        "127.0.0.1:0",
+        Arc::clone(&raft_engine),
+        16,
+        raft_sec,
+        Some(Arc::clone(&tcp_raft)),
+    )
+    .unwrap();
+    let mut adm_r = StorageClient::connect(raft_server.local_addr()).unwrap();
+    adm_r.authenticate("admin-tok").unwrap();
+    let mut rw = StorageClient::connect(raft_server.local_addr()).unwrap();
     rw.authenticate("rw-tok").unwrap();
     let vreq = RequestVoteReq {
         term: 7,
@@ -597,7 +604,7 @@ fn test_full_system_end_to_end_all_features() {
         pre_vote: false,
     };
     assert!(!matches!(rw.raft_vote(&vreq), Ok((0x00, _, _))));
-    let (st, tm, rb) = adm.raft_vote(&vreq).unwrap();
+    let (st, tm, rb) = adm_r.raft_vote(&vreq).unwrap();
     assert_eq!(st, 0x00);
     assert_eq!(tm, 7);
     assert!(RequestVoteResp::from_wire_bytes(&rb).unwrap().vote_granted);
@@ -611,7 +618,8 @@ fn test_full_system_end_to_end_all_features() {
         entries: Vec::new(),
         leader_commit: 0,
     };
-    let (st, tm, rb) = adm.raft_append(&ae).unwrap();
+    let (st, tm, rb) = adm_r.raft_append(&ae).unwrap();
+    raft_server.stop();
     assert_eq!(st, 0x00);
     assert_eq!(tm, 7);
     let ar = AppendEntriesResp::from_wire_bytes(&rb).unwrap();
