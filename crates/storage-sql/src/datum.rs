@@ -890,7 +890,9 @@ pub fn from_value(v: &storine::Value, ty: Option<&DataType>) -> Datum {
     match ty {
         None => natural,
         Some(DataType::Array(_)) => natural,
-        Some(DataType::Vector(n)) => crate::vector::coerce(&natural, *n).map(Datum::Vector).unwrap_or(natural),
+        Some(DataType::Vector(n)) => crate::vector::coerce(&natural, *n)
+            .map(Datum::Vector)
+            .unwrap_or(natural),
         Some(DataType::Json | DataType::Jsonb) => match natural {
             Datum::Text(s) => Datum::Json(s),
             other => other,

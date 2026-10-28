@@ -16,20 +16,25 @@ pub const VECTOR_ARRAY_OID: u32 = 16_393;
 
 /// `[1,2,3]` (whitespace allowed) as a vector.
 pub fn parse(text: &str) -> SqlResult<Vec<f32>> {
-    let bad = || SqlError::invalid_text(format!("invalid input syntax for type vector: \"{text}\""));
+    let bad =
+        || SqlError::invalid_text(format!("invalid input syntax for type vector: \"{text}\""));
     let inner = text
         .trim()
         .strip_prefix('[')
         .and_then(|t| t.strip_suffix(']'))
         .ok_or_else(bad)?;
     if inner.trim().is_empty() {
-        return Err(SqlError::invalid_text("vector must have at least 1 dimension"));
+        return Err(SqlError::invalid_text(
+            "vector must have at least 1 dimension",
+        ));
     }
     let mut out = Vec::new();
     for part in inner.split(',') {
         let x: f32 = part.trim().parse().map_err(|_| bad())?;
         if !x.is_finite() {
-            return Err(SqlError::invalid_text("NaN and infinite values not allowed in vector"));
+            return Err(SqlError::invalid_text(
+                "NaN and infinite values not allowed in vector",
+            ));
         }
         out.push(x);
     }
@@ -39,10 +44,14 @@ pub fn parse(text: &str) -> SqlResult<Vec<f32>> {
 
 fn check_dims(n: usize) -> SqlResult<()> {
     if n == 0 {
-        return Err(SqlError::invalid_text("vector must have at least 1 dimension"));
+        return Err(SqlError::invalid_text(
+            "vector must have at least 1 dimension",
+        ));
     }
     if n > MAX_DIMS {
-        return Err(SqlError::invalid_text(format!("vector cannot have more than {MAX_DIMS} dimensions")));
+        return Err(SqlError::invalid_text(format!(
+            "vector cannot have more than {MAX_DIMS} dimensions"
+        )));
     }
     Ok(())
 }
@@ -74,7 +83,10 @@ pub fn encode_binary(v: &[f32]) -> Vec<u8> {
 
 pub fn decode_binary(b: &[u8]) -> SqlResult<Vec<f32>> {
     let bad = || SqlError::invalid_text("invalid binary vector");
-    let dims = usize::from(u16::from_be_bytes([*b.first().ok_or_else(bad)?, *b.get(1).ok_or_else(bad)?]));
+    let dims = usize::from(u16::from_be_bytes([
+        *b.first().ok_or_else(bad)?,
+        *b.get(1).ok_or_else(bad)?,
+    ]));
     if b.get(2..4) != Some(&[0, 0]) || b.len() != 4 + dims * 4 {
         return Err(bad());
     }
@@ -84,7 +96,9 @@ pub fn decode_binary(b: &[u8]) -> SqlResult<Vec<f32>> {
         .map(|c| f32::from_be_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     if v.iter().any(|x| !x.is_finite()) {
-        return Err(SqlError::invalid_text("NaN and infinite values not allowed in vector"));
+        return Err(SqlError::invalid_text(
+            "NaN and infinite values not allowed in vector",
+        ));
     }
     Ok(v)
 }
@@ -98,22 +112,32 @@ pub fn coerce(d: &Datum, dims: Option<u32>) -> SqlResult<Vec<f32>> {
         Datum::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for x in items {
-                let f = crate::datum::to_f64(x)
-                    .ok_or_else(|| SqlError::datatype_mismatch("cannot cast this array to vector"))?;
+                let f = crate::datum::to_f64(x).ok_or_else(|| {
+                    SqlError::datatype_mismatch("cannot cast this array to vector")
+                })?;
                 if !f.is_finite() {
-                    return Err(SqlError::invalid_text("NaN and infinite values not allowed in vector"));
+                    return Err(SqlError::invalid_text(
+                        "NaN and infinite values not allowed in vector",
+                    ));
                 }
                 out.push(f as f32);
             }
             check_dims(out.len())?;
             out
         }
-        _ => return Err(SqlError::datatype_mismatch("cannot cast this value to vector")),
+        _ => {
+            return Err(SqlError::datatype_mismatch(
+                "cannot cast this value to vector",
+            ))
+        }
     };
     if let Some(n) = dims {
         if v.len() != n as usize {
             // pgvector reports dimension errors as data exceptions (SQLSTATE 22000).
-            return Err(SqlError::new("22000", format!("expected {n} dimensions, not {}", v.len())));
+            return Err(SqlError::new(
+                "22000",
+                format!("expected {n} dimensions, not {}", v.len()),
+            ));
         }
     }
     Ok(v)
@@ -174,13 +198,18 @@ pub fn elementwise(op: char, a: &[f32], b: &[f32]) -> SqlResult<Vec<f32>> {
         })
         .collect();
     if out.iter().any(|x| !x.is_finite()) {
-        return Err(SqlError::numeric_out_of_range("value out of range: overflow"));
+        return Err(SqlError::numeric_out_of_range(
+            "value out of range: overflow",
+        ));
     }
     Ok(out)
 }
 
 pub fn norm(v: &[f32]) -> f64 {
-    v.iter().map(|x| f64::from(*x) * f64::from(*x)).sum::<f64>().sqrt()
+    v.iter()
+        .map(|x| f64::from(*x) * f64::from(*x))
+        .sum::<f64>()
+        .sqrt()
 }
 
 #[cfg(test)]
@@ -198,7 +227,10 @@ mod tests {
         let (a, b) = ([1.0, 0.0], [0.0, 2.0]);
         assert!((distance(Metric::L2, &a, &b).unwrap() - 5f64.sqrt()).abs() < 1e-12);
         assert_eq!(distance(Metric::L1, &a, &b).unwrap(), 3.0);
-        assert_eq!(distance(Metric::NegInner, &[1.0, 2.0], &[3.0, 4.0]).unwrap(), -11.0);
+        assert_eq!(
+            distance(Metric::NegInner, &[1.0, 2.0], &[3.0, 4.0]).unwrap(),
+            -11.0
+        );
         assert!((distance(Metric::Cosine, &a, &b).unwrap() - 1.0).abs() < 1e-12);
         assert!(distance(Metric::Cosine, &[0.0, 0.0], &b).unwrap().is_nan());
         assert!(distance(Metric::L2, &[1.0], &b).is_err());

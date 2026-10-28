@@ -170,7 +170,9 @@ fn wanted_storage_indexes(t: &Table) -> Vec<String> {
 fn wanted_vector_indexes(t: &Table) -> Vec<(String, u32)> {
     let mut out: Vec<(String, u32)> = Vec::new();
     for i in t.indexes.iter().filter(|i| i.is_vector()) {
-        let Some(&c) = i.columns.first() else { continue };
+        let Some(&c) = i.columns.first() else {
+            continue;
+        };
         if let DataType::Vector(Some(n)) = t.columns[c].ty {
             let f = t.columns[c].field.clone();
             if !out.iter().any(|(x, _)| *x == f) {
@@ -183,7 +185,11 @@ fn wanted_vector_indexes(t: &Table) -> Vec<(String, u32)> {
 
 fn sync_vector_indexes(s: &Session, t: &Table) -> SqlResult<()> {
     let want = wanted_vector_indexes(t);
-    let have = s.engine.store.vector_indexes(&t.collection).unwrap_or_default();
+    let have = s
+        .engine
+        .store
+        .vector_indexes(&t.collection)
+        .unwrap_or_default();
     for (f, dims) in &have {
         if !want.iter().any(|(w, d)| w == f && d == dims) {
             let _ = s.engine.store.drop_vector_index(&t.collection, f);
@@ -191,7 +197,9 @@ fn sync_vector_indexes(s: &Session, t: &Table) -> SqlResult<()> {
     }
     for (f, dims) in want {
         if !have.iter().any(|(h, d)| *h == f && *d == dims) {
-            s.engine.store.create_vector_index(&t.collection, &f, dims)?;
+            s.engine
+                .store
+                .create_vector_index(&t.collection, &f, dims)?;
         }
     }
     Ok(())
@@ -511,10 +519,16 @@ pub fn create_index(s: &mut Session, ci: &CreateIndex) -> SqlResult<Outcome> {
         }
     } else {
         let method = ci.method.clone().filter(|m| m != "btree");
-        let def = IndexDef { name, columns: cols, method };
+        let def = IndexDef {
+            name,
+            columns: cols,
+            method,
+        };
         if def.is_vector() {
             // pgvector: one vector column, of a fixed dimension for the storage index.
-            if def.columns.len() != 1 || !matches!(t.columns[def.columns[0]].ty, DataType::Vector(_)) {
+            if def.columns.len() != 1
+                || !matches!(t.columns[def.columns[0]].ty, DataType::Vector(_))
+            {
                 return Err(SqlError::new(
                     "42809",
                     "an hnsw / ivfflat index covers exactly one vector column",

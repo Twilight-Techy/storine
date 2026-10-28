@@ -1103,8 +1103,12 @@ impl Exec<'_> {
         limit: Option<usize>,
         offset: usize,
     ) -> SqlResult<Option<super::eval::VectorHint>> {
-        let (Some(limit), [ob]) = (limit, order_by) else { return Ok(None) };
-        let [TableRef::Named { name, .. }] = sel.from.as_slice() else { return Ok(None) };
+        let (Some(limit), [ob]) = (limit, order_by) else {
+            return Ok(None);
+        };
+        let [TableRef::Named { name, .. }] = sel.from.as_slice() else {
+            return Ok(None);
+        };
         if ob.desc
             || sel.distinct
             || !sel.distinct_on.is_empty()
@@ -1132,22 +1136,39 @@ impl Exec<'_> {
         let mut key = &ob.expr;
         if let Expr::Column(p) = key {
             if p.len() == 1 {
-                if let Some((e, _)) = items.iter().find(|(_, a)| a.is_some_and(|a| a.eq_ignore_ascii_case(&p[0]))) {
+                if let Some((e, _)) = items
+                    .iter()
+                    .find(|(_, a)| a.is_some_and(|a| a.eq_ignore_ascii_case(&p[0])))
+                {
                     key = e;
                 }
             }
         }
         if let Expr::Number(n) = key {
-            if let Some((e, _)) = n.parse::<usize>().ok().and_then(|i| i.checked_sub(1)).and_then(|i| items.get(i)) {
+            if let Some((e, _)) = n
+                .parse::<usize>()
+                .ok()
+                .and_then(|i| i.checked_sub(1))
+                .and_then(|i| items.get(i))
+            {
                 key = e;
             }
         }
-        let Expr::Binary { op: BinaryOp::VecCosine, left, right } = key else { return Ok(None) };
+        let Expr::Binary {
+            op: BinaryOp::VecCosine,
+            left,
+            right,
+        } = key
+        else {
+            return Ok(None);
+        };
         let (col, probe) = match (&**left, &**right) {
             (Expr::Column(p), other) | (other, Expr::Column(p)) => (p, other),
             _ => return Ok(None),
         };
-        let Some(table) = self.s.engine.find_table(name)? else { return Ok(None) };
+        let Some(table) = self.s.engine.find_table(name)? else {
+            return Ok(None);
+        };
         let Some(ci) = table
             .columns
             .iter()
@@ -1155,12 +1176,22 @@ impl Exec<'_> {
         else {
             return Ok(None);
         };
-        let DataType::Vector(Some(dims)) = table.columns[ci].ty else { return Ok(None) };
-        if !table.indexes.iter().any(|i| i.is_vector() && i.columns == [ci]) {
+        let DataType::Vector(Some(dims)) = table.columns[ci].ty else {
+            return Ok(None);
+        };
+        if !table
+            .indexes
+            .iter()
+            .any(|i| i.is_vector() && i.columns == [ci])
+        {
             return Ok(None);
         }
-        let Ok(probe) = self.eval_const(probe) else { return Ok(None) };
-        let Ok(vector) = crate::vector::coerce(&probe, Some(dims)) else { return Ok(None) };
+        let Ok(probe) = self.eval_const(probe) else {
+            return Ok(None);
+        };
+        let Ok(vector) = crate::vector::coerce(&probe, Some(dims)) else {
+            return Ok(None);
+        };
         let k = limit.saturating_add(offset);
         if k == 0 || k > storage_core_max_k() {
             return Ok(None);
@@ -1247,19 +1278,29 @@ impl Exec<'_> {
             .unwrap_or_default();
         let hint = {
             let mut h = self.vector_hint.borrow_mut();
-            if h.as_ref().is_some_and(|h| h.collection == table.collection) { h.take() } else { None }
+            if h.as_ref().is_some_and(|h| h.collection == table.collection) {
+                h.take()
+            } else {
+                None
+            }
         };
         let docs = match hint {
             // Candidates from the vector index: twice the rows asked for, so a WHERE clause the
             // storage filter could not express rarely leaves the result short (`select` falls
             // back to a full scan when it does).
-            Some(h) if !store.vector_indexes(&table.collection)?.iter().any(|(f, _)| *f == h.field) => {
+            Some(h)
+                if !store
+                    .vector_indexes(&table.collection)?
+                    .iter()
+                    .any(|(f, _)| *f == h.field) =>
+            {
                 store.scan(&table.collection, filter)?
             }
             Some(h) => {
                 self.vector_hint_used.set(true);
                 let k = (h.k * 2).max(h.k + 16).min(storage_core_max_k());
-                let mut docs = store.nearest(&table.collection, &h.field, &h.vector, k as u32, filter)?;
+                let mut docs =
+                    store.nearest(&table.collection, &h.field, &h.vector, k as u32, filter)?;
                 for d in &mut docs {
                     d.fields.remove("$score");
                 }
@@ -2241,7 +2282,9 @@ impl Exec<'_> {
                 BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
                     let (a, _) = self.static_type(left, cols);
                     let (b, _) = self.static_type(right, cols);
-                    if matches!(a, Some(DataType::Vector(_))) || matches!(b, Some(DataType::Vector(_))) {
+                    if matches!(a, Some(DataType::Vector(_)))
+                        || matches!(b, Some(DataType::Vector(_)))
+                    {
                         return (Some(DataType::Vector(None)), None);
                     }
                     (numeric_result(a, b), None)

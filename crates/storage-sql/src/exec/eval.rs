@@ -685,11 +685,16 @@ impl<'a> Exec<'a> {
                 (Some(x), Some(y)) => Datum::Bool(x != y),
                 _ => Datum::Null,
             },
-            Add | Sub | Mul if matches!((&a, &b), (Datum::Vector(_), _) | (_, Datum::Vector(_))) => {
+            Add | Sub | Mul
+                if matches!((&a, &b), (Datum::Vector(_), _) | (_, Datum::Vector(_))) =>
+            {
                 if a.is_null() || b.is_null() {
                     Datum::Null
                 } else {
-                    let (x, y) = (crate::vector::coerce(&a, None)?, crate::vector::coerce(&b, None)?);
+                    let (x, y) = (
+                        crate::vector::coerce(&a, None)?,
+                        crate::vector::coerce(&b, None)?,
+                    );
                     let c = match op {
                         Add => '+',
                         Sub => '-',
@@ -790,7 +795,10 @@ impl<'a> Exec<'a> {
                         VecNegInner => crate::vector::Metric::NegInner,
                         _ => crate::vector::Metric::L1,
                     };
-                    let (x, y) = (crate::vector::coerce(&a, None)?, crate::vector::coerce(&b, None)?);
+                    let (x, y) = (
+                        crate::vector::coerce(&a, None)?,
+                        crate::vector::coerce(&b, None)?,
+                    );
                     Datum::Float(crate::vector::distance(metric, &x, &y)?)
                 }
             }
