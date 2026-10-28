@@ -68,13 +68,13 @@ fn test_hostile_raft_wire_messages_never_panic() {
         prev_log_index: 0,
         prev_log_term: 0,
         entries: vec![
-            RaftLogEntry { term: 3, index: 1, id: InlineId::new("a").unwrap(), version: Version(1), frame: Some(frame) },
-            RaftLogEntry { term: 3, index: 2, id: InlineId::new("b").unwrap(), version: Version(2), frame: None },
+            RaftLogEntry::record(3, 1, InlineId::new("a").unwrap(), Some(frame)),
+            RaftLogEntry::record(3, 2, InlineId::new("b").unwrap(), None),
         ],
         leader_commit: 1,
     }
     .to_wire_bytes();
-    let vote = RequestVoteReq { term: 2, candidate_id: 1, last_log_index: 4, last_log_term: 1 }.to_wire_bytes();
+    let vote = RequestVoteReq { term: 2, candidate_id: 1, last_log_index: 4, last_log_term: 1, pre_vote: false }.to_wire_bytes();
     let vote_resp = RequestVoteResp { term: 2, vote_granted: true }.to_wire_bytes();
     let append_resp = AppendEntriesResp { term: 2, success: true, match_index: 9 }.to_wire_bytes();
     for _ in 0..20_000 {
@@ -149,7 +149,7 @@ fn test_corrupting_any_database_file_never_panics_on_open_or_read() {
             leader_id: 2,
             prev_log_index: 0,
             prev_log_term: 0,
-            entries: vec![RaftLogEntry { term: 1, index: 1, id: record(77).id, version: Version(1), frame: Some(frame) }],
+            entries: vec![RaftLogEntry::record(1, 1, record(77).id, Some(frame))],
             leader_commit: 0,
         });
     }

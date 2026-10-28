@@ -1629,6 +1629,58 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         Ok(expired_count)
     }
 
+    /// Removes every record whose TTL expired at `now_ns`, bypassing the replica guard (Raft's
+    /// replicated sweep: every replica removes exactly the same records).
+    pub(crate) fn sweep_expired_at(&self, now_ns: u64) -> Result<usize> {
+        let Some(expired) = self.inner.expired_ordinals_at(now_ns) else {
+            return Ok(0);
+        };
+        let mut removed = 0usize;
+        for ord in expired.to_vec() {
+            let Some(id) = self.inner.primary.resolve_ordinal(ord) else {
+                continue;
+            };
+            let _lock = self.inner.locks.lock_one(id);
+            if self.inner.live_version_at(id, now_ns).is_none() && self.inner.delete_record_locked(id)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// `true` if any record carries a TTL.
+    pub(crate) fn has_ttl_records(&self) -> bool {
+        !self
+            .inner
+            .ttl_ordinals
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    }
+
+    /// Writes `record` with exactly `version` and `ttl_expires_at_ns` (Raft snapshot install;
+    /// bypasses the replica guard).
+    pub(crate) fn install_exact(&self, id: InlineId, record: &T, version: Version, ttl_expires_at_ns: u64) -> Result<()> {
+        let _lock = self.inner.locks.lock_one(id);
+        let flags = if ttl_expires_at_ns > 0 { RecordFlags::HAS_TTL } else { RecordFlags::NONE };
+        self.inner
+            .write_record_locked(id, None, record, version, current_time_ns(), ttl_expires_at_ns, flags)
+            .map(|_| ())
+    }
+
+    /// Deletes `id`, bypassing the replica guard (Raft snapshot install / reset).
+    pub(crate) fn delete_internal(&self, id: InlineId) -> Result<bool> {
+        let _lock = self.inner.locks.lock_one(id);
+        self.inner.delete_record_locked(id)
+    }
+
+    /// `(version, ttl_expires_at_ns)` of `id` if present.
+    pub(crate) fn version_and_ttl(&self, id: InlineId) -> Option<(Version, u64)> {
+        self.inner
+            .primary
+            .with_entry(id, |e| (e.version, e.ttl_expires_at_ns))
+    }
+
     /// Flushes all pending coalesced dirty records to disk and writes an updated `primary.idx` checkpoint.
     pub fn flush_all(&self) -> Result<usize> {
         // Pick the WAL cutoff first, then wait out in-flight writes: every write whose WAL frame
@@ -2529,11 +2581,19 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         &self,
         id: InlineId,
     ) -> Result<(Version, T, Option<InlineId>, u64, RecordFlags)> {
+        self.load_mutable_draft_at(id, current_time_ns())
+    }
+
+    fn load_mutable_draft_at(
+        &self,
+        id: InlineId,
+        now_ns: u64,
+    ) -> Result<(Version, T, Option<InlineId>, u64, RecordFlags)> {
         let entry = self
             .primary
             .get(id)
             .ok_or_else(|| StorageError::not_found(id))?;
-        if entry.ttl_expires_at_ns > 0 && current_time_ns() >= entry.ttl_expires_at_ns {
+        if entry.ttl_expires_at_ns > 0 && now_ns >= entry.ttl_expires_at_ns {
             return Err(StorageError::not_found(id));
         }
 
@@ -2811,9 +2871,16 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
     /// Current version of `id` if it exists and has not expired.
     #[inline]
     fn live_version(&self, id: InlineId) -> Option<Version> {
+        self.live_version_at(id, current_time_ns())
+    }
+
+    /// [`Self::live_version`] with expiry evaluated at `now_ns` (Raft applies use the leader's
+    /// proposal time so every replica decides identically).
+    #[inline]
+    fn live_version_at(&self, id: InlineId, now_ns: u64) -> Option<Version> {
         self.primary
             .with_entry(id, |e| {
-                if e.ttl_expires_at_ns > 0 && current_time_ns() >= e.ttl_expires_at_ns {
+                if e.ttl_expires_at_ns > 0 && now_ns >= e.ttl_expires_at_ns {
                     None
                 } else {
                     Some(e.version)
@@ -2824,6 +2891,10 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
 
     /// Ordinals of TTL records that have expired (`None` when there are none). `O(#TTL records)`.
     fn expired_ordinals(&self) -> Option<CompressedBitmap> {
+        self.expired_ordinals_at(current_time_ns())
+    }
+
+    fn expired_ordinals_at(&self, now: u64) -> Option<CompressedBitmap> {
         let ttl = self
             .ttl_ordinals
             .read()
@@ -2831,7 +2902,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         if ttl.is_empty() {
             return None;
         }
-        let now = current_time_ns();
+        
         let mut expired = CompressedBitmap::new();
         for ord in ttl.to_vec() {
             let is_expired = self
@@ -3571,6 +3642,17 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         ops: Vec<WriteOp<T>>,
         min_version: Option<Version>,
     ) -> Result<Vec<WriteResult>> {
+        self.commit_at(ops, min_version, current_time_ns())
+    }
+
+    /// [`Self::commit_with_min_version`] evaluating TTL expiry and stamping writes at `now_ns`
+    /// (deterministic replay on every Raft replica).
+    pub(crate) fn commit_at(
+        &self,
+        ops: Vec<WriteOp<T>>,
+        min_version: Option<Version>,
+        now_ns: u64,
+    ) -> Result<Vec<WriteResult>> {
         if ops.is_empty() {
             return Ok(Vec::new());
         }
@@ -3578,7 +3660,6 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         keys.sort_unstable();
         keys.dedup();
         let _guards = self.inner.locks.lock_many(&keys);
-        let now_ns = current_time_ns();
 
         // Stage every operation in order against the current state.
         let mut order: Vec<InlineId> = Vec::with_capacity(keys.len());
@@ -3589,14 +3670,14 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(v) => {
                     order.push(op.id);
-                    let original = self.inner.live_version(op.id);
+                    let original = self.inner.live_version_at(op.id, now_ns);
                     v.insert(StagedRecord { original, state: None, loaded: false, changed: false, same_version: false })
                 }
             };
             // Lazily load the current record when an operation needs its contents.
             let needs_body = matches!(op.kind, WriteKind::Patch(_) | WriteKind::Rewrite(_));
             if needs_body && !rec.loaded && !rec.changed && rec.original.is_some() {
-                let (_, draft, _pg, ttl, flags) = self.inner.load_mutable_draft_locked(op.id)?;
+                let (_, draft, _pg, ttl, flags) = self.inner.load_mutable_draft_at(op.id, now_ns)?;
                 rec.state = Some((draft, ttl, flags));
                 rec.loaded = true;
             }

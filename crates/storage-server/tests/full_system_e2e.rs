@@ -594,6 +594,7 @@ fn test_full_system_end_to_end_all_features() {
         candidate_id: 1,
         last_log_index: 20,
         last_log_term: 6,
+        pre_vote: false,
     };
     assert!(!matches!(rw.raft_vote(&vreq), Ok((0x00, _, _))));
     let (st, tm, rb) = adm.raft_vote(&vreq).unwrap();

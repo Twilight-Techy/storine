@@ -383,6 +383,35 @@ impl<'a, T: ZeroCopyRecord + Indexable> ReadSnapshot<'a, T> {
         Ok(current)
     }
 
+    /// [`Self::get`] plus the record's TTL expiry (`0` = none) as of the snapshot.
+    pub fn get_with_ttl(&self, id: InlineId) -> Result<Option<(Version, u64, T)>> {
+        if let Some(node) = self.engine.mvcc().get_visible_at(id, self.read_ts) {
+            let Some(ref frame) = node.frame else {
+                return Ok(None);
+            };
+            let (hdr, owned) = RecordCodec::decode_owned::<T>(frame.as_slice())?;
+            return Ok(Some((node.version, hdr.ttl_expires_at_ns, owned)));
+        }
+        let meta = self.engine.version_and_ttl(id);
+        let current = match self.engine.get_owned(id) {
+            Ok(pair) => Some(pair),
+            Err(storage_types::StorageError::RecordNotFound { .. }) => None,
+            Err(e) => return Err(e),
+        };
+        // A write after the snapshot created a chain: answer from it (see `get`).
+        if let Some(node) = self.engine.mvcc().get_visible_at(id, self.read_ts) {
+            let Some(ref frame) = node.frame else {
+                return Ok(None);
+            };
+            let (hdr, owned) = RecordCodec::decode_owned::<T>(frame.as_slice())?;
+            return Ok(Some((node.version, hdr.ttl_expires_at_ns, owned)));
+        }
+        Ok(current.map(|(v, rec)| {
+            let ttl = meta.filter(|(mv, _)| *mv == v).map_or(0, |(_, t)| t);
+            (v, ttl, rec)
+        }))
+    }
+
     /// Returns `Some(state)` when `id` has a version chain (`state` may be a tombstone `None`).
     fn get_from_chain(&self, id: InlineId) -> Result<Option<Option<(Version, T)>>> {
         let Some(node) = self.engine.mvcc().get_visible_at(id, self.read_ts) else {

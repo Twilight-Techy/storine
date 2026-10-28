@@ -24,6 +24,7 @@ pub mod mvcc;
 pub mod optimizer;
 pub mod query;
 pub mod raft;
+pub mod raft_runtime;
 pub mod sharding;
 pub mod telemetry;
 pub mod write_queue;

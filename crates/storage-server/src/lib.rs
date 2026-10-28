@@ -2421,6 +2421,7 @@ mod tests {
             candidate_id: 1,
             last_log_index: 10,
             last_log_term: 4,
+            pre_vote: false,
         };
         // ReadWrite may not drive consensus: rejected at the header stage.
         assert!(!matches!(writer_client.raft_vote(&vote_req), Ok((STATUS_OK, _, _))));
@@ -2530,7 +2531,7 @@ mod tests {
         query[0..2].copy_from_slice(&FIELD_SCORE.to_le_bytes());
         query[10..18].copy_from_slice(&i64::MAX.to_le_bytes());
         query[18..22].copy_from_slice(&10u32.to_le_bytes());
-        let vote = RequestVoteReq { term: 2, candidate_id: 9, last_log_index: 0, last_log_term: 0 }
+        let vote = RequestVoteReq { term: 2, candidate_id: 9, last_log_index: 0, last_log_term: 0, pre_vote: false }
             .to_wire_bytes()
             .to_vec();
         let append = AppendEntriesReq {

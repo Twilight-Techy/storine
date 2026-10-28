@@ -19,15 +19,16 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use storage_codec::{checksum_payload, AlignedBytes, RecordCodec, RecordView, ZeroCopyRecord};
 use storage_index::Indexable;
 use storage_mmap::atomic_write_replace;
-use storage_types::{FastHashSet, InlineId, RecordFlags, Result, StorageError, Version};
+use storage_types::{FastHashMap, FastHashSet, InlineId, RecordFlags, Result, StorageError, Version};
 use storage_types::wire::{read_u16_le, read_u32_le, read_u64_le, read_array_24};
 
-use crate::engine::StorageEngine;
+use crate::engine::{Precondition, StorageEngine, WriteKind, WriteOp, WriteResult};
 use crate::sharding::NodeId;
 
 const RAFT_META_MAGIC: u32 = 0x5241_4654; // "RAFT"
@@ -40,15 +41,144 @@ pub enum RaftRole {
     Leader,
 }
 
-/// Replicated Raft log entry carrying a 64B-aligned zero-copy record frame (or deletion tombstone).
+/// What a committed Raft log entry does to the replicated state machine (`TASK-099`).
+#[derive(Clone, Debug)]
+pub enum RaftCommand {
+    /// Blind insert-or-replace of one record (legacy `replicate_put`).
+    Upsert { id: InlineId, frame: AlignedBytes },
+    /// Deletion of one record.
+    Delete { id: InlineId },
+    /// An atomic conditional batch ([`encode_raft_ops`]): puts, deletes, field patches, checks
+    /// and rewrites with preconditions, evaluated deterministically at apply time.
+    Ops(AlignedBytes),
+    /// No-op appended by a new leader so entries of earlier terms commit (Raft §5.4.2, §8).
+    Noop,
+    /// Removes every record whose TTL expired at `now_ns` (deterministic on every replica).
+    SweepExpired { now_ns: u64 },
+}
+
+/// Replicated Raft log entry.
 #[derive(Clone, Debug)]
 pub struct RaftLogEntry {
     pub term: u64,
     pub index: u64,
-    pub id: InlineId,
-    pub version: Version,
-    /// `Some(frame)` for `Upsert`, `None` for `Delete`.
-    pub frame: Option<AlignedBytes>,
+    pub command: RaftCommand,
+}
+
+impl RaftLogEntry {
+    /// Convenience constructor for a blind upsert (`frame`) or deletion (`None`).
+    pub fn record(term: u64, index: u64, id: InlineId, frame: Option<AlignedBytes>) -> Self {
+        let command = match frame {
+            Some(frame) => RaftCommand::Upsert { id, frame },
+            None => RaftCommand::Delete { id },
+        };
+        Self { term, index, command }
+    }
+}
+
+/// Outcome of applying one entry: the per-operation results, or the deterministic rejection
+/// (failed precondition, invalid value, ...) every replica reached identically.
+pub type ApplyOutcome = core::result::Result<Vec<WriteResult>, StorageError>;
+
+const OPS_PUT: u8 = 1;
+const OPS_PUT_TTL: u8 = 2;
+const OPS_DELETE: u8 = 3;
+const OPS_PATCH: u8 = 4;
+const OPS_CHECK: u8 = 5;
+const OPS_REWRITE: u8 = 6;
+
+/// Encodes an atomic batch for [`RaftCommand::Ops`]:
+/// `now_ns u64 | count u32 | (id 24B | precondition u8 | version u64 | kind u8 | ttl_ms u64 |
+/// len u32 | payload)*`, where `payload` is a record frame (put / rewrite) or encoded field
+/// operations (patch).
+pub fn encode_raft_ops<T: ZeroCopyRecord>(ops: &[WriteOp<T>], now_ns: u64) -> Result<AlignedBytes> {
+    let mut out = Vec::with_capacity(16 + ops.len() * 64);
+    out.extend_from_slice(&now_ns.to_le_bytes());
+    out.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+    for op in ops {
+        out.extend_from_slice(&op.id.to_raw_bytes());
+        let (pre, ver) = match op.precondition {
+            Precondition::None => (0u8, 0u64),
+            Precondition::Absent => (1, 0),
+            Precondition::Exists => (2, 0),
+            Precondition::Version(v) => (3, v.0),
+        };
+        out.push(pre);
+        out.extend_from_slice(&ver.to_le_bytes());
+        let mut payload = Vec::new();
+        let (kind, ttl_ms) = match &op.kind {
+            WriteKind::Put(r) => {
+                payload.extend_from_slice(RecordCodec::encode_aligned(r, Version(0), 0, RecordFlags::NONE, 0).as_slice());
+                (OPS_PUT, 0u64)
+            }
+            WriteKind::PutWithTtl(r, ttl) => {
+                payload.extend_from_slice(RecordCodec::encode_aligned(r, Version(0), 0, RecordFlags::NONE, 0).as_slice());
+                (OPS_PUT_TTL, u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX))
+            }
+            WriteKind::Delete => (OPS_DELETE, 0),
+            WriteKind::Patch(fops) => {
+                storage_codec::field_ops::encode_field_ops(fops, &mut payload);
+                (OPS_PATCH, 0)
+            }
+            WriteKind::Check => (OPS_CHECK, 0),
+            WriteKind::Rewrite(r) => {
+                payload.extend_from_slice(RecordCodec::encode_aligned(r, Version(0), 0, RecordFlags::NONE, 0).as_slice());
+                (OPS_REWRITE, 0)
+            }
+        };
+        out.push(kind);
+        out.extend_from_slice(&ttl_ms.to_le_bytes());
+        let len = u32::try_from(payload.len())
+            .map_err(|_| StorageError::invalid_value("raft operation payload too large"))?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&payload);
+    }
+    AlignedBytes::try_copy_from_slice(&out)
+}
+
+/// Decodes [`encode_raft_ops`] bytes (untrusted: every length is bounds-checked).
+pub fn decode_raft_ops<T: ZeroCopyRecord>(bytes: &[u8]) -> Result<(u64, Vec<WriteOp<T>>)> {
+    let mut r = storage_codec::value_wire::SveReader::new(bytes);
+    let now_ns = r.u64()?;
+    let n = r.count(49)?;
+    let mut ops = Vec::with_capacity(n);
+    for _ in 0..n {
+        let id = InlineId::from_raw_bytes(read_array_24(r.take(24)?, 0))?;
+        let pre = r.u8()?;
+        let ver = Version(r.u64()?);
+        let precondition = match pre {
+            0 => Precondition::None,
+            1 => Precondition::Absent,
+            2 => Precondition::Exists,
+            3 => Precondition::Version(ver),
+            _ => return Err(StorageError::corrupted_header("unknown raft precondition")),
+        };
+        let kind = r.u8()?;
+        let ttl_ms = r.u64()?;
+        let len = r.u32()? as usize;
+        let payload = r.take(len)?;
+        let record = |p: &[u8]| -> Result<T> {
+            let aligned = AlignedBytes::try_copy_from_slice(p)?;
+            Ok(RecordCodec::decode_owned::<T>(aligned.as_slice())?.1)
+        };
+        let kind = match kind {
+            OPS_PUT => WriteKind::Put(record(payload)?),
+            OPS_PUT_TTL => WriteKind::PutWithTtl(record(payload)?, std::time::Duration::from_millis(ttl_ms)),
+            OPS_DELETE => WriteKind::Delete,
+            OPS_PATCH => {
+                let mut pr = storage_codec::value_wire::SveReader::new(payload);
+                WriteKind::Patch(storage_codec::field_ops::decode_field_ops(&mut pr)?)
+            }
+            OPS_CHECK => WriteKind::Check,
+            OPS_REWRITE => WriteKind::Rewrite(record(payload)?),
+            _ => return Err(StorageError::corrupted_header("unknown raft operation kind")),
+        };
+        ops.push(WriteOp { id, kind, precondition });
+    }
+    if r.remaining() != 0 {
+        return Err(StorageError::corrupted_header("trailing bytes after raft operations"));
+    }
+    Ok((now_ns, ops))
 }
 
 /// Raft `RequestVote` RPC request.
@@ -58,18 +188,23 @@ pub struct RequestVoteReq {
     pub candidate_id: NodeId,
     pub last_log_index: u64,
     pub last_log_term: u64,
+    /// Pre-vote (Raft thesis §9.6): "would you vote for me in `term`?" — answered without
+    /// changing any state, so a partitioned node cannot disrupt a healthy cluster when it returns.
+    pub pre_vote: bool,
 }
 
 impl RequestVoteReq {
-    pub fn to_wire_bytes(&self) -> [u8; 26] {
-        let mut out = [0u8; 26];
+    pub fn to_wire_bytes(&self) -> [u8; 27] {
+        let mut out = [0u8; 27];
         out[0..8].copy_from_slice(&self.term.to_le_bytes());
         out[8..10].copy_from_slice(&self.candidate_id.to_le_bytes());
         out[10..18].copy_from_slice(&self.last_log_index.to_le_bytes());
         out[18..26].copy_from_slice(&self.last_log_term.to_le_bytes());
+        out[26] = u8::from(self.pre_vote);
         out
     }
 
+    /// Accepts the 26-byte format of earlier versions (no pre-vote flag).
     pub fn from_wire_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < 26 {
             return Err(StorageError::corrupted_header("RequestVoteReq wire frame < 26B"));
@@ -79,6 +214,7 @@ impl RequestVoteReq {
             candidate_id: read_u16_le(bytes, 8),
             last_log_index: read_u64_le(bytes, 10),
             last_log_term: read_u64_le(bytes, 18),
+            pre_vote: bytes.get(26).is_some_and(|&b| b != 0),
         })
     }
 }
@@ -370,54 +506,59 @@ fn for_each_snapshot_record(
     Ok(meta)
 }
 
+// Entry layout: `term u64 | index u64 | id 24B | aux u64 | kind u8 | len u32 | payload`.
+// `kind`: 0 delete, 1 upsert (payload = frame), 2 ops batch, 3 no-op, 4 TTL sweep (`aux` =
+// `now_ns`). Kinds 0 and 1 are the original format, so existing logs stay readable.
+const ENTRY_DELETE: u8 = 0;
+const ENTRY_UPSERT: u8 = 1;
+const ENTRY_OPS: u8 = 2;
+const ENTRY_NOOP: u8 = 3;
+const ENTRY_SWEEP: u8 = 4;
+
 fn encode_log_entry(entry: &RaftLogEntry, out: &mut Vec<u8>) {
     out.extend_from_slice(&entry.term.to_le_bytes());
     out.extend_from_slice(&entry.index.to_le_bytes());
-    out.extend_from_slice(&entry.id.to_raw_bytes());
-    out.extend_from_slice(&entry.version.0.to_le_bytes());
-    match entry.frame {
-        Some(ref frame) => {
-            out.push(1u8);
-            let slice = frame.as_slice();
-            out.extend_from_slice(&(slice.len() as u32).to_le_bytes());
-            out.extend_from_slice(slice);
-        }
-        None => {
-            out.push(0u8);
-            out.extend_from_slice(&0u32.to_le_bytes());
-        }
-    }
+    let (id, aux, kind, payload): (InlineId, u64, u8, &[u8]) = match &entry.command {
+        RaftCommand::Upsert { id, frame } => (*id, entry.index, ENTRY_UPSERT, frame.as_slice()),
+        RaftCommand::Delete { id } => (*id, entry.index, ENTRY_DELETE, &[]),
+        RaftCommand::Ops(bytes) => (InlineId::EMPTY, 0, ENTRY_OPS, bytes.as_slice()),
+        RaftCommand::Noop => (InlineId::EMPTY, 0, ENTRY_NOOP, &[]),
+        RaftCommand::SweepExpired { now_ns } => (InlineId::EMPTY, *now_ns, ENTRY_SWEEP, &[]),
+    };
+    out.extend_from_slice(&id.to_raw_bytes());
+    out.extend_from_slice(&aux.to_le_bytes());
+    out.push(kind);
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
 }
 
 fn decode_log_entry(bytes: &[u8], cursor: usize) -> Result<(RaftLogEntry, usize)> {
-    if cursor + 53 > bytes.len() {
+    if cursor.checked_add(53).is_none_or(|e| e > bytes.len()) {
         return Err(StorageError::corrupted_header("RaftLogEntry truncated header"));
     }
     let term = read_u64_le(bytes, cursor);
     let index = read_u64_le(bytes, cursor + 8);
-    let id = InlineId::from_raw_bytes(read_array_24(bytes, cursor + 16))?;
-    let ver = Version(read_u64_le(bytes, cursor + 40));
-    let has_frame = bytes[cursor + 48] != 0;
-    let frame_len = read_u32_le(bytes, cursor + 49) as usize;
-    let end = cursor + 53 + frame_len;
-    if end > bytes.len() {
-        return Err(StorageError::corrupted_header("RaftLogEntry truncated frame"));
-    }
-    let frame = if has_frame {
-        Some(AlignedBytes::try_copy_from_slice(&bytes[cursor + 53..end])?)
-    } else {
-        None
-    };
-    Ok((
-        RaftLogEntry {
-            term,
-            index,
-            id,
-            version: ver,
-            frame,
+    let raw_id = read_array_24(bytes, cursor + 16);
+    let aux = read_u64_le(bytes, cursor + 40);
+    let kind = bytes[cursor + 48];
+    let len = read_u32_le(bytes, cursor + 49) as usize;
+    let end = cursor
+        .checked_add(53 + len)
+        .filter(|&e| e <= bytes.len())
+        .ok_or_else(|| StorageError::corrupted_header("RaftLogEntry truncated payload"))?;
+    let payload = &bytes[cursor + 53..end];
+    let command = match kind {
+        ENTRY_UPSERT => RaftCommand::Upsert {
+            id: InlineId::from_raw_bytes(raw_id)?,
+            frame: AlignedBytes::try_copy_from_slice(payload)?,
         },
-        end,
-    ))
+        ENTRY_DELETE => RaftCommand::Delete { id: InlineId::from_raw_bytes(raw_id)? },
+        ENTRY_OPS => RaftCommand::Ops(AlignedBytes::try_copy_from_slice(payload)?),
+        ENTRY_NOOP => RaftCommand::Noop,
+        ENTRY_SWEEP => RaftCommand::SweepExpired { now_ns: aux },
+        _ => return Err(StorageError::corrupted_header("unknown RaftLogEntry kind")),
+    };
+    Ok((RaftLogEntry { term, index, command }, end))
 }
 
 /// Compact the log once this many applied entries are retained in it.
@@ -675,6 +816,22 @@ pub struct RaftNode<T: ZeroCopyRecord + Indexable> {
     apply_lock: Mutex<()>,
     /// Serializes snapshot generation (leader) and chunk reception (follower).
     snapshot_lock: Mutex<()>,
+    /// Outcomes of applied entries a local proposer is waiting for (only awaited indexes are
+    /// kept, so memory stays bounded by in-flight proposals).
+    outcomes: Mutex<Outcomes>,
+    /// Signalled whenever entries are applied.
+    applied_cv: Condvar,
+    /// Last time a valid leader contacted this node or this node granted a vote (election timer).
+    last_contact: Mutex<Instant>,
+    /// When set, votes are refused while a leader was heard from within this window ("leader
+    /// stickiness", Raft thesis §4.2.3), which keeps leader leases safe.
+    vote_stickiness: Mutex<Option<Duration>>,
+}
+
+#[derive(Debug, Default)]
+struct Outcomes {
+    awaited: FastHashSet<u64>,
+    done: FastHashMap<u64, ApplyOutcome>,
 }
 
 impl<T: ZeroCopyRecord + Indexable> core::fmt::Debug for RaftNode<T> {
@@ -713,7 +870,14 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             state: Mutex::new(initial_state),
             apply_lock: Mutex::new(()),
             snapshot_lock: Mutex::new(()),
+            outcomes: Mutex::new(Outcomes::default()),
+            applied_cv: Condvar::new(),
+            last_contact: Mutex::new(Instant::now()),
+            vote_stickiness: Mutex::new(None),
         };
+        // A replicated engine changes only through consensus: refuse direct writes
+        // (`ReadOnlyReplica`) on every replica, leader included.
+        node.engine.set_replica_mode(true);
         if node.storage.installing_path.exists() {
             node.recover_interrupted_install()?;
         }
@@ -777,13 +941,45 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             candidate_id: self.node_id,
             last_log_index,
             last_log_term,
+            pre_vote: false,
         })
+    }
+
+    /// A pre-vote request for the next term (changes nothing locally).
+    pub fn pre_vote_request(&self) -> RequestVoteReq {
+        let st = self.lock_state();
+        let (last_log_index, last_log_term) = st.last_log_index_and_term();
+        RequestVoteReq {
+            term: st.current_term + 1,
+            candidate_id: self.node_id,
+            last_log_index,
+            last_log_term,
+            pre_vote: true,
+        }
     }
 
     /// Processes a `RequestVoteReq` according to the Raft Election Safety and Log Up-To-Date rules.
     /// A vote is only granted after it has been durably persisted.
     pub fn handle_request_vote(&self, req: RequestVoteReq) -> RequestVoteResp {
+        let sticky = *self.vote_stickiness.lock().unwrap_or_else(|p| p.into_inner());
         let mut st = self.lock_state();
+        if let Some(window) = sticky {
+            let heard_from_leader = st.leader_id.is_some_and(|l| l != req.candidate_id)
+                && (st.role == RaftRole::Leader || self.since_contact() < window);
+            if heard_from_leader {
+                // A live leader exists: do not help depose it (and do not adopt the term).
+                return RequestVoteResp { term: st.current_term, vote_granted: false };
+            }
+        }
+        if req.pre_vote {
+            let (my_last_idx, my_last_term) = st.last_log_index_and_term();
+            let up_to_date = req.last_log_term > my_last_term
+                || (req.last_log_term == my_last_term && req.last_log_index >= my_last_idx);
+            return RequestVoteResp {
+                term: st.current_term,
+                vote_granted: req.term > st.current_term && up_to_date,
+            };
+        }
         let mut dirty = false;
         if req.term > st.current_term {
             st.current_term = req.term;
@@ -813,6 +1009,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             st.voted_for = Some(req.candidate_id);
             if self.storage.save_hard_state(&st).is_ok() {
                 granted = true;
+                self.touch_contact();
             } else {
                 st.voted_for = prev_vote;
             }
@@ -831,13 +1028,122 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         if st.current_term == term && st.role == RaftRole::Candidate {
             st.role = RaftRole::Leader;
             st.leader_id = Some(self.node_id);
+            // A no-op of the new term lets earlier-term entries commit (Raft §5.4.2) and gives
+            // read-index a committed entry of the current term (§8).
+            let (prev, _) = st.last_log_index_and_term();
+            let entry = RaftLogEntry { term: st.current_term, index: prev + 1, command: RaftCommand::Noop };
+            if self.storage.append_log(core::slice::from_ref(&entry)).is_err() {
+                st.role = RaftRole::Follower;
+                st.leader_id = None;
+                return false;
+            }
+            st.log.push(entry);
             true
         } else {
             false
         }
     }
 
-    /// Appends a new entry to the leader's durable log (prior to replication).
+    /// Leader: appends `command` to the durable log and returns its index. The caller replicates
+    /// it and waits with [`Self::wait_applied`].
+    pub fn propose(&self, command: RaftCommand) -> Result<u64> {
+        let mut st = self.lock_state();
+        if st.role != RaftRole::Leader {
+            return Err(StorageError::NotLeader { leader: st.leader_id.map(u64::from) });
+        }
+        let (prev, _) = st.last_log_index_and_term();
+        let entry = RaftLogEntry { term: st.current_term, index: prev + 1, command };
+        self.storage.append_log(core::slice::from_ref(&entry))?;
+        st.log.push(entry);
+        self.outcomes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .awaited
+            .insert(prev + 1);
+        Ok(prev + 1)
+    }
+
+    /// Leader: proposes an atomic conditional batch (see [`StorageEngine::commit`]) stamped with
+    /// the current time (TTL decisions use it on every replica).
+    pub fn propose_ops(&self, ops: &[WriteOp<T>]) -> Result<u64> {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        self.propose(RaftCommand::Ops(encode_raft_ops(ops, now_ns)?))
+    }
+
+    /// Waits up to `timeout` until the entry at `index` is applied and returns its outcome.
+    /// On timeout the outcome is unknown ([`StorageError::CommitUnknown`]): the entry may still
+    /// commit. If another entry replaced it (leader change), the result is `CommitUnknown` too.
+    pub fn wait_applied(&self, index: u64, timeout: Duration) -> Result<Vec<WriteResult>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            // Never hold `outcomes` while taking `state` (`propose` locks `state -> outcomes`).
+            let applied = self.last_applied() >= index;
+            let mut out = self.outcomes.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(result) = out.done.remove(&index) {
+                out.awaited.remove(&index);
+                return result;
+            }
+            if applied {
+                // Applied without an outcome for us: our entry was replaced after a leader change.
+                out.awaited.remove(&index);
+                return Err(StorageError::CommitUnknown { index });
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                out.awaited.remove(&index);
+                return Err(StorageError::CommitUnknown { index });
+            }
+            // Bounded wait: re-check `last_applied` (outside this lock) at least every 50 ms.
+            let wait = (deadline - now).min(Duration::from_millis(50));
+            drop(
+                self.applied_cv
+                    .wait_timeout(out, wait)
+                    .unwrap_or_else(|p| p.into_inner()),
+            );
+        }
+    }
+
+    /// Refuse votes while a leader was heard from within `window` (`None` disables). The networked
+    /// runtime sets this to the minimum election timeout so a leader lease can never overlap a
+    /// newer leader.
+    pub fn set_vote_stickiness(&self, window: Option<Duration>) {
+        *self.vote_stickiness.lock().unwrap_or_else(|p| p.into_inner()) = window;
+    }
+
+    /// Records that a valid leader (or a candidate we voted for) contacted this node now.
+    #[inline]
+    pub fn touch_contact(&self) {
+        *self.last_contact.lock().unwrap_or_else(|p| p.into_inner()) = Instant::now();
+    }
+
+    /// Time since the last valid leader contact or granted vote.
+    pub fn since_contact(&self) -> Duration {
+        self.last_contact.lock().unwrap_or_else(|p| p.into_inner()).elapsed()
+    }
+
+    /// Current leader known to this node.
+    pub fn leader_id(&self) -> Option<NodeId> {
+        self.lock_state().leader_id
+    }
+
+    /// Steps down to follower if `term` is newer than ours (seen in an RPC response).
+    pub fn observe_term(&self, term: u64) -> Result<bool> {
+        let mut st = self.lock_state();
+        if term > st.current_term {
+            st.current_term = term;
+            st.role = RaftRole::Follower;
+            st.voted_for = None;
+            st.leader_id = None;
+            self.storage.save_hard_state(&st)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Appends a blind upsert (`Some`) or deletion (`None`) of `id` to the leader's durable log
+    /// (prior to replication).
     pub fn append_leader_entry(
         &self,
         id: InlineId,
@@ -845,23 +1151,17 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     ) -> Result<(RaftLogEntry, u64, u64)> {
         let mut st = self.lock_state();
         if st.role != RaftRole::Leader {
-            return Err(StorageError::invalid_key("node is not Raft Leader"));
+            return Err(StorageError::NotLeader { leader: st.leader_id.map(u64::from) });
         }
         let (prev_idx, prev_term) = st.last_log_index_and_term();
         let next_idx = prev_idx + 1;
-        let next_ver = Version(next_idx);
         let frame = record.map(|rec| {
-            RecordCodec::encode_aligned(rec, next_ver, 0, RecordFlags::NONE, 0)
+            RecordCodec::encode_aligned(rec, Version(next_idx), 0, RecordFlags::NONE, 0)
         });
-        let entry = RaftLogEntry {
-            term: st.current_term,
-            index: next_idx,
-            id,
-            version: next_ver,
-            frame,
-        };
+        let entry = RaftLogEntry::record(st.current_term, next_idx, id, frame);
         self.storage.append_log(core::slice::from_ref(&entry))?;
         st.log.push(entry.clone());
+        self.outcomes.lock().unwrap_or_else(|p| p.into_inner()).awaited.insert(next_idx);
         Ok((entry, prev_idx, prev_term))
     }
 
@@ -891,6 +1191,58 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         })
     }
 
+    /// [`Self::build_append_entries_from`] carrying at most `max_entries` entries and roughly
+    /// `max_bytes` of payload (at least one entry), so a long-lagging follower is caught up in
+    /// bounded messages.
+    pub fn build_append_entries_bounded(
+        &self,
+        from_index: u64,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<AppendEntriesReq> {
+        let st = self.lock_state();
+        if st.role != RaftRole::Leader {
+            return Err(StorageError::NotLeader { leader: st.leader_id.map(u64::from) });
+        }
+        let from_index = from_index.max(1);
+        let prev_log_index = (from_index - 1).min(st.last_log_index());
+        if prev_log_index < st.snapshot_index {
+            return Err(StorageError::invalid_key(
+                "follower is behind the compacted Raft log: send it a snapshot (build_install_snapshot)",
+            ));
+        }
+        let prev_log_term = st.term_at(prev_log_index).unwrap_or(0);
+        let start = st.pos_of(prev_log_index + 1).unwrap_or(0).min(st.log.len());
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < st.log.len() && end - start < max_entries.max(1) {
+            let size = match &st.log[end].command {
+                RaftCommand::Upsert { frame, .. } => frame.len(),
+                RaftCommand::Ops(b) => b.len(),
+                _ => 0,
+            } + 53;
+            if end > start && bytes + size > max_bytes {
+                break;
+            }
+            bytes += size;
+            end += 1;
+        }
+        Ok(AppendEntriesReq {
+            term: st.current_term,
+            leader_id: self.node_id,
+            prev_log_index,
+            prev_log_term,
+            entries: st.log[start..end].to_vec(),
+            leader_commit: st.commit_index,
+        })
+    }
+
+    /// `true` while this node believes it is the leader.
+    #[inline]
+    pub fn is_leader(&self) -> bool {
+        self.lock_state().role == RaftRole::Leader
+    }
+
     /// Processes an `AppendEntriesReq` from the leader, durably appends its entries, and applies
     /// newly committed entries to `StorageEngine<T>`.
     pub fn handle_append_entries(&self, req: AppendEntriesReq) -> Result<AppendEntriesResp> {
@@ -911,6 +1263,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             // Same-term step-down keeps `voted_for` (a node votes at most once per term).
             st.role = RaftRole::Follower;
             st.leader_id = Some(req.leader_id);
+            self.touch_contact();
 
             // Entries must be contiguous and directly follow `prev_log_index`.
             let well_formed = req
@@ -1035,10 +1388,25 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             let Some(entry) = next else {
                 break;
             };
-            self.apply_entry_to_engine(&entry)?;
-            let mut st = self.lock_state();
-            st.last_applied = st.last_applied.max(entry.index);
-            self.storage.save_hard_state(&st)?;
+            let outcome = self.apply_entry_to_engine(&entry)?;
+            // Publish the outcome BEFORE advancing `last_applied`: a waiter that observes the
+            // index as applied is then guaranteed to find its result. Lock order is always
+            // `state -> outcomes`; neither lock is held while taking the other here.
+            {
+                let mut out = self.outcomes.lock().unwrap_or_else(|p| p.into_inner());
+                if out.awaited.contains(&entry.index) {
+                    out.done.insert(entry.index, outcome);
+                }
+            }
+            {
+                let mut st = self.lock_state();
+                st.last_applied = st.last_applied.max(entry.index);
+                self.storage.save_hard_state(&st)?;
+            }
+            // Notify under the outcomes lock so a waiter between its check and its wait cannot
+            // miss the wake-up.
+            let _out = self.outcomes.lock().unwrap_or_else(|p| p.into_inner());
+            self.applied_cv.notify_all();
         }
         // Bound log memory and disk (anti-bloat): compact once enough applied entries pile up,
         // keeping a tail for lagging followers.
@@ -1187,10 +1555,11 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         w.write_all(&[0u8; SNAPSHOT_HEADER_LEN]).map_err(io)?;
         let mut count = 0u64;
         for id in ids {
-            let Some((version, record)) = read.get(id)? else {
+            let Some((version, ttl, record)) = read.get_with_ttl(id)? else {
                 continue;
             };
-            let frame = RecordCodec::encode_aligned(&record, version, 0, RecordFlags::NONE, 0);
+            let flags = if ttl > 0 { RecordFlags::HAS_TTL } else { RecordFlags::NONE };
+            let frame = RecordCodec::encode_aligned(&record, version, 0, flags, ttl);
             let id_raw = id.to_raw_bytes();
             let len = u32::try_from(frame.len())
                 .map_err(|_| StorageError::invalid_archive("snapshot frame exceeds u32"))?;
@@ -1227,6 +1596,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             }
             st.role = RaftRole::Follower;
             st.leader_id = Some(req.leader_id);
+            self.touch_contact();
             if req.last_included_index <= st.last_applied {
                 // Our state already covers the snapshot.
                 return Ok(InstallSnapshotResp { term: st.current_term, next_offset: 0, installed: true });
@@ -1300,12 +1670,13 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         atomic_write_replace(&self.storage.installing_path, &last_index.to_le_bytes(), true)?;
         // 3. Engine state := snapshot state.
         for_each_snapshot_record(recv, |id, frame| {
-            let (_hdr, record) = RecordCodec::decode_owned::<T>(frame.as_slice())?;
-            self.engine.put(id, &record).map(|_| ())
+            let (hdr, record) = RecordCodec::decode_owned::<T>(frame.as_slice())?;
+            // Exact version and TTL: every replica holds identical versions.
+            self.engine.install_exact(id, &record, hdr.version(), hdr.ttl_expires_at_ns)
         })?;
         for id in self.engine.live_ids() {
             if !ids.contains(&id) {
-                let _ = self.engine.delete(id)?;
+                let _ = self.engine.delete_internal(id)?;
             }
         }
         self.engine.sync_wal()?;
@@ -1352,7 +1723,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         {
             let _apply = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
             for id in self.engine.live_ids() {
-                let _ = self.engine.delete(id)?;
+                let _ = self.engine.delete_internal(id)?;
             }
             self.engine.sync_wal()?;
             let mut st = self.lock_state();
@@ -1369,17 +1740,37 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             .map_err(|e| StorageError::io("clear raft install marker", e))
     }
 
-    fn apply_entry_to_engine(&self, entry: &RaftLogEntry) -> Result<()> {
-        match entry.frame {
-            Some(ref frame) => {
+    /// Applies one committed entry deterministically. Every new version is at least the entry's
+    /// log index (identical on every replica, monotonic across delete + re-create), and TTL
+    /// decisions use the leader's proposal time. A rejected batch (failed precondition, invalid
+    /// value) is a normal, replicated outcome; only environment failures (I/O, memory) are errors
+    /// that stop the apply loop.
+    fn apply_entry_to_engine(&self, entry: &RaftLogEntry) -> Result<ApplyOutcome> {
+        let min = Some(Version(entry.index));
+        let now_fallback = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        };
+        let outcome = match &entry.command {
+            RaftCommand::Upsert { id, frame } => {
                 let (_hdr, owned) = RecordCodec::decode_owned::<T>(frame.as_slice())?;
-                self.engine.put(entry.id, &owned)?;
+                self.engine.commit_at(vec![WriteOp::put(*id, owned)], min, now_fallback())
             }
-            None => {
-                let _ = self.engine.delete(entry.id)?;
+            RaftCommand::Delete { id } => {
+                self.engine.commit_at(vec![WriteOp::delete(*id)], min, now_fallback())
             }
+            RaftCommand::Ops(bytes) => match decode_raft_ops::<T>(bytes.as_slice()) {
+                Ok((now_ns, ops)) => self.engine.commit_at(ops, min, now_ns),
+                Err(e) => Err(e),
+            },
+            RaftCommand::Noop => Ok(Vec::new()),
+            RaftCommand::SweepExpired { now_ns } => self.engine.sweep_expired_at(*now_ns).map(|_| Vec::new()),
+        };
+        match outcome {
+            Err(e @ (StorageError::Io { .. } | StorageError::ResourceExhausted { .. })) => Err(e),
+            other => Ok(other),
         }
-        Ok(())
     }
 }
 
@@ -1555,44 +1946,56 @@ impl<T: ZeroCopyRecord + Indexable> RaftReplicationGroup<T> {
             .cloned()
     }
 
-    /// Proposes a replicated `PUT` through the current Raft leader and waits for quorum commit ($\lfloor N/2 \rfloor + 1$).
-    /// Returns the committed Raft log index.
+    /// Proposes a replicated `PUT` through the current Raft leader and waits for quorum commit
+    /// ($\lfloor N/2 \rfloor + 1$). Returns the committed Raft log index.
+    ///
+    /// If no quorum acknowledges the entry the outcome is unknown ([`StorageError::CommitUnknown`]):
+    /// the entry stays in the leader's log and may still commit later.
     pub fn replicate_put(&self, id: InlineId, record: &T) -> Result<u64> {
         let leader = self
             .current_leader()
-            .ok_or_else(|| StorageError::invalid_key("no active Raft leader"))?;
+            .ok_or(StorageError::NotLeader { leader: None })?;
         let (entry, _prev_idx, _prev_term) = leader.append_leader_entry(id, Some(record))?;
+        self.replicate_index(&leader, entry.index)?;
+        let _ = leader.wait_applied(entry.index, Duration::from_secs(5));
+        Ok(entry.index)
+    }
 
+    /// Replicates an atomic conditional batch through the leader and returns the per-operation
+    /// results once applied (a failed precondition is returned as the deterministic error every
+    /// replica reached).
+    pub fn replicate_ops(&self, ops: &[WriteOp<T>]) -> Result<Vec<WriteResult>> {
+        let leader = self
+            .current_leader()
+            .ok_or(StorageError::NotLeader { leader: None })?;
+        let index = leader.propose_ops(ops)?;
+        self.replicate_index(&leader, index)?;
+        leader.wait_applied(index, Duration::from_secs(5))
+    }
+
+    /// Replicates the leader's log up to `index`, commits it on a quorum and broadcasts the commit.
+    fn replicate_index(&self, leader: &Arc<RaftNode<T>>, index: u64) -> Result<()> {
         let mut acks = 1usize; // leader itself
         for peer in &self.nodes {
             if peer.node_id() == leader.node_id() || self.is_isolated(peer.node_id()) {
                 continue;
             }
-            if self
-                .sync_follower(&leader, peer)
-                .is_some_and(|m| m >= entry.index)
-            {
+            if self.sync_follower(leader, peer).is_some_and(|m| m >= index) {
                 acks += 1;
             }
         }
-
         if acks < self.quorum_size() {
-            return Err(StorageError::invalid_key(
-                "write failed to reach Raft replication quorum",
-            ));
+            return Err(StorageError::CommitUnknown { index });
         }
-
-        let committed_idx = leader.advance_leader_commit(entry.index)?;
-
-        // Broadcast the new `leader_commit` so reachable followers apply up to `committed_idx`.
+        leader.advance_leader_commit(index)?;
+        // Broadcast the new `leader_commit` so reachable followers apply it.
         for peer in &self.nodes {
             if peer.node_id() == leader.node_id() || self.is_isolated(peer.node_id()) {
                 continue;
             }
-            let _ = self.sync_follower(&leader, peer);
+            let _ = self.sync_follower(leader, peer);
         }
-
-        Ok(committed_idx)
+        Ok(())
     }
 }
 
@@ -1635,7 +2038,10 @@ mod tests {
             assert_eq!(n.compact_log_through(applied).unwrap(), applied);
         }
         // A stray local record on the lagging node must disappear with the install.
+        // (Simulated divergence: bypass the replica guard on purpose.)
+        engines[2].set_replica_mode(false);
         engines[2].put(InlineId::new("stray").unwrap(), &AgentObjectRecord::new(InlineId::new("stray").unwrap(), "x", 1, 0)).unwrap();
+        engines[2].set_replica_mode(true);
         assert!(nodes[0].needs_snapshot(nodes[2].last_log_index() + 1));
 
         group.set_node_isolated(3, false);
@@ -1736,7 +2142,8 @@ mod tests {
                 .replicate_put(id, &AgentObjectRecord::new(id, "v", 1, i as i64))
                 .unwrap();
         }
-        // Every node has applied all 30 entries; compact through 25 everywhere.
+        // Every node has applied all 31 entries (the leader's no-op + 30 puts); compact through
+        // 25 everywhere.
         let raft_log_path = std::fs::read_dir(base.join("c2"))
             .unwrap()
             .flatten()
@@ -1745,14 +2152,14 @@ mod tests {
             .expect("raft log file");
         let full_log = std::fs::read(&raft_log_path).unwrap();
         for n in &nodes {
-            assert_eq!(n.last_applied(), 30);
+            assert_eq!(n.last_applied(), 31);
             assert_eq!(n.compact_log_through(25).unwrap(), 25);
             assert_eq!(n.snapshot_index(), 25);
-            assert_eq!(n.log_len(), 5);
+            assert_eq!(n.log_len(), 6);
             // Compaction never goes past what was applied.
-            assert_eq!(n.compact_log_through(u64::MAX).unwrap(), 30);
+            assert_eq!(n.compact_log_through(u64::MAX).unwrap(), 31);
             assert_eq!(n.log_len(), 0);
-            assert_eq!(n.last_log_index(), 30);
+            assert_eq!(n.last_log_index(), 31);
         }
         drop(group);
 
@@ -1767,8 +2174,8 @@ mod tests {
             .map(|(i, e)| Arc::new(RaftNode::new(i as NodeId + 1, Arc::clone(e)).unwrap()))
             .collect();
         for n in &nodes {
-            assert_eq!(n.snapshot_index(), 30);
-            assert_eq!(n.last_log_index(), 30);
+            assert_eq!(n.snapshot_index(), 31);
+            assert_eq!(n.last_log_index(), 31);
             assert_eq!(n.log_len(), 0);
             assert!(n.current_term() >= term);
         }
@@ -1780,7 +2187,7 @@ mod tests {
         let idx = group
             .replicate_put(extra, &AgentObjectRecord::new(extra, "v", 1, 7))
             .unwrap();
-        assert_eq!(idx, 31);
+        assert_eq!(idx, 33, "32 is the new leader's no-op");
         for e in &engines {
             assert_eq!(e.get_owned(extra).unwrap().1.score, 7);
             assert_eq!(e.get_owned(ids[29]).unwrap().1.score, 29);
@@ -1788,9 +2195,9 @@ mod tests {
 
         // A follower that needs a compacted entry gets an explicit "snapshot required" error.
         let leader = group.current_leader().unwrap();
-        leader.compact_log_through(31).unwrap();
+        leader.compact_log_through(33).unwrap();
         assert!(leader.build_append_entries_from(5).is_err());
-        assert!(leader.build_append_entries_from(32).is_ok());
+        assert!(leader.build_append_entries_from(34).is_ok());
         drop(group);
         drop(nodes);
         drop(engines);
@@ -1835,7 +2242,7 @@ mod tests {
         let id1 = InlineId::from_static("raft_rec_01");
         let rec1 = AgentObjectRecord::new(id1, "Raft Replicated 1", 1000, 111);
         let idx1 = group.replicate_put(id1, &rec1).unwrap();
-        assert_eq!(idx1, 1);
+        assert_eq!(idx1, 2, "index 1 is the new leader's no-op");
 
         let follower_score = n2
             .read_at_commit_index(id1, idx1, |v| v.score)
@@ -1852,7 +2259,7 @@ mod tests {
         let id2 = InlineId::from_static("raft_rec_02");
         let rec2 = AgentObjectRecord::new(id2, "Raft Failover Write", 2000, 222);
         let idx2 = group.replicate_put(id2, &rec2).unwrap();
-        assert_eq!(idx2, 2);
+        assert_eq!(idx2, 4, "index 3 is the second leader's no-op");
 
         assert_eq!(
             n3.read_at_commit_index(id2, idx2, |v| v.score).unwrap(),
@@ -1864,7 +2271,7 @@ mod tests {
         let id3 = InlineId::from_static("raft_rec_03");
         let rec3 = AgentObjectRecord::new(id3, "Raft Healed Write", 3000, 333);
         let idx3 = group.replicate_put(id3, &rec3).unwrap();
-        assert_eq!(idx3, 3);
+        assert_eq!(idx3, 5);
         assert_eq!(n1.role(), RaftRole::Follower);
         assert_eq!(
             n1.read_at_commit_index(id2, idx3, |v| v.score).unwrap(),
@@ -1884,7 +2291,7 @@ mod tests {
         let reloaded = RaftNode::new(2, Arc::clone(&e2)).unwrap();
         assert_eq!(reloaded.current_term(), 2);
         assert_eq!(reloaded.voted_for(), Some(2));
-        assert_eq!(reloaded.last_log_index(), 3);
+        assert_eq!(reloaded.last_log_index(), 5);
         drop(reloaded);
 
         drop(e1);
@@ -1920,6 +2327,7 @@ mod tests {
             candidate_id: 3,
             last_log_index: 0,
             last_log_term: 0,
+            pre_vote: false,
         });
         assert!(!resp.vote_granted);
 
@@ -1929,13 +2337,7 @@ mod tests {
             leader_id: 2,
             prev_log_index: 0,
             prev_log_term: 0,
-            entries: vec![RaftLogEntry {
-                term: 1,
-                index: 0,
-                id: InlineId::from_static("x"),
-                version: Version(1),
-                frame: None,
-            }],
+            entries: vec![RaftLogEntry::record(1, 0, InlineId::from_static("x"), None)],
             leader_commit: 0,
         };
         assert!(!node.handle_append_entries(bad).unwrap().success);
