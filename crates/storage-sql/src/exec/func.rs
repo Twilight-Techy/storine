@@ -839,7 +839,13 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
         "format_type" => crate::exec::system::format_type(&a0, args.get(1)),
         "pg_get_expr" => crate::exec::system::pg_get_expr(ex, &a0, args.get(1))?,
         "pg_get_constraintdef" => crate::exec::system::constraint_def(ex, &a0)?,
-        "pg_get_indexdef" => crate::exec::system::index_def(ex, &a0)?,
+        "pg_get_indexdef" => {
+            let column = match args.get(1) {
+                Some(d) if !d.is_null() => d.as_i64()?,
+                _ => 0,
+            };
+            crate::exec::system::index_def(ex, &a0, column)?
+        }
         "pg_relation_size" | "pg_total_relation_size" | "pg_table_size" | "pg_indexes_size" => {
             Datum::Int(0)
         }
@@ -1637,6 +1643,22 @@ pub fn table_function(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Re
             }
             Ok(Rel {
                 cols: vec![ColMeta::new("generate_series", Some(DataType::BigInt))],
+                rows,
+            })
+        }
+        "generate_subscripts" => {
+            // int2vector / oidvector text ("1 2") is zero-based; arrays are one-based.
+            let (lo, n) = match args.first() {
+                Some(Datum::Array(a)) => (1, a.len()),
+                Some(Datum::Text(s)) if s.trim_start().starts_with('{') => {
+                    (1, datum::parse_array(s)?.len())
+                }
+                Some(Datum::Text(s)) => (0, s.split_whitespace().count()),
+                _ => (1, 0),
+            };
+            let rows = (0..n as i64).map(|k| vec![Datum::Int(lo + k)]).collect();
+            Ok(Rel {
+                cols: vec![ColMeta::new("generate_subscripts", Some(DataType::Int))],
                 rows,
             })
         }

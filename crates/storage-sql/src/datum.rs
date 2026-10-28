@@ -1237,6 +1237,13 @@ pub fn parse_interval(s: &str) -> Option<Datum> {
 /// PostgreSQL array literal `{a,"b c",NULL}` (one dimension).
 pub fn parse_array(s: &str) -> SqlResult<Vec<Datum>> {
     let t = s.trim();
+    // int2vector / oidvector text ("1 3"), as pg_index.indkey reads.
+    if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit() || b == b' ') {
+        return Ok(t
+            .split_whitespace()
+            .map(|n| n.parse().map_or(Datum::Null, Datum::Int))
+            .collect());
+    }
     let inner = t
         .strip_prefix('{')
         .and_then(|x| x.strip_suffix('}'))

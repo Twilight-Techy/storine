@@ -1069,9 +1069,30 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 ("collnamespace", I8),
                 ("collprovider", T),
                 ("collencoding", I4),
+                ("collcollate", T),
+                ("collctype", T),
+                ("collisdeterministic", B),
             ]);
-            bd.row(vec![i(100), t("default"), i(NS_PG_CATALOG), t("d"), i(-1)]);
-            bd.row(vec![i(950), t("C"), i(NS_PG_CATALOG), t("c"), i(-1)]);
+            bd.row(vec![
+                i(100),
+                t("default"),
+                i(NS_PG_CATALOG),
+                t("d"),
+                i(-1),
+                N,
+                N,
+                b(true),
+            ]);
+            bd.row(vec![
+                i(950),
+                t("C"),
+                i(NS_PG_CATALOG),
+                t("c"),
+                i(-1),
+                t("C"),
+                t("C"),
+                b(true),
+            ]);
             bd.done()
         }
         "pg_stat_activity" => {
@@ -1099,27 +1120,177 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
             ]);
             bd.done()
         }
-        "pg_locks"
-        | "pg_stat_user_tables"
-        | "pg_statio_user_tables"
-        | "pg_stat_database"
-        | "pg_publication"
-        | "pg_rewrite"
-        | "pg_policy"
-        | "pg_foreign_table"
-        | "pg_partitioned_table"
-        | "pg_depend"
-        | "pg_shdescription"
-        | "pg_event_trigger"
-        | "pg_cast"
-        | "pg_operator"
-        | "pg_range"
-        | "pg_tablespace"
-        | "pg_seclabel"
-        | "pg_statistic_ext"
-        | "pg_opclass"
-        | "pg_language"
-        | "pg_aggregate" => Builder::new(&[("oid", I8)]).done(),
+        // Catalogs of features this gateway does not have: empty, with their real columns
+        // so introspection queries that name them still run.
+        "pg_locks" => Builder::new(&[
+            ("locktype", T),
+            ("database", I8),
+            ("relation", I8),
+            ("pid", I8),
+            ("mode", T),
+            ("granted", B),
+        ])
+        .done(),
+        "pg_stat_user_tables" => Builder::new(&[
+            ("relid", I8),
+            ("schemaname", T),
+            ("relname", T),
+            ("seq_scan", I8),
+            ("n_live_tup", I8),
+            ("n_dead_tup", I8),
+        ])
+        .done(),
+        "pg_statio_user_tables" => Builder::new(&[
+            ("relid", I8),
+            ("schemaname", T),
+            ("relname", T),
+            ("heap_blks_read", I8),
+            ("heap_blks_hit", I8),
+        ])
+        .done(),
+        "pg_stat_database" => Builder::new(&[
+            ("datid", I8),
+            ("datname", T),
+            ("numbackends", I8),
+            ("xact_commit", I8),
+            ("xact_rollback", I8),
+        ])
+        .done(),
+        "pg_publication" => Builder::new(&[
+            ("oid", I8),
+            ("pubname", T),
+            ("pubowner", I8),
+            ("puballtables", B),
+        ])
+        .done(),
+        "pg_rewrite" => Builder::new(&[
+            ("oid", I8),
+            ("rulename", T),
+            ("ev_class", I8),
+            ("ev_type", T),
+            ("is_instead", B),
+        ])
+        .done(),
+        "pg_policy" => Builder::new(&[
+            ("oid", I8),
+            ("polname", T),
+            ("polrelid", I8),
+            ("polcmd", T),
+            ("polpermissive", B),
+        ])
+        .done(),
+        "pg_foreign_table" => {
+            Builder::new(&[("ftrelid", I8), ("ftserver", I8), ("ftoptions", T)]).done()
+        }
+        "pg_partitioned_table" => Builder::new(&[
+            ("partrelid", I8),
+            ("partstrat", T),
+            ("partnatts", I8),
+            ("partattrs", T),
+        ])
+        .done(),
+        "pg_depend" => Builder::new(&[
+            ("classid", I8),
+            ("objid", I8),
+            ("objsubid", I8),
+            ("refclassid", I8),
+            ("refobjid", I8),
+            ("refobjsubid", I8),
+            ("deptype", T),
+        ])
+        .done(),
+        "pg_shdescription" => {
+            Builder::new(&[("objoid", I8), ("classoid", I8), ("description", T)]).done()
+        }
+        "pg_event_trigger" => Builder::new(&[
+            ("oid", I8),
+            ("evtname", T),
+            ("evtevent", T),
+            ("evtowner", I8),
+            ("evtfoid", I8),
+            ("evtenabled", T),
+        ])
+        .done(),
+        "pg_cast" => Builder::new(&[
+            ("oid", I8),
+            ("castsource", I8),
+            ("casttarget", I8),
+            ("castfunc", I8),
+            ("castcontext", T),
+            ("castmethod", T),
+        ])
+        .done(),
+        "pg_operator" => Builder::new(&[
+            ("oid", I8),
+            ("oprname", T),
+            ("oprnamespace", I8),
+            ("oprkind", T),
+            ("oprleft", I8),
+            ("oprright", I8),
+            ("oprresult", I8),
+            ("oprcode", I8),
+        ])
+        .done(),
+        "pg_range" => Builder::new(&[
+            ("rngtypid", I8),
+            ("rngsubtype", I8),
+            ("rngmultitypid", I8),
+            ("rngcollation", I8),
+            ("rngsubopc", I8),
+            ("rngcanonical", I8),
+            ("rngsubdiff", I8),
+        ])
+        .done(),
+        "pg_tablespace" => Builder::new(&[
+            ("oid", I8),
+            ("spcname", T),
+            ("spcowner", I8),
+            ("spcoptions", T),
+        ])
+        .done(),
+        "pg_seclabel" => Builder::new(&[
+            ("objoid", I8),
+            ("classoid", I8),
+            ("objsubid", I8),
+            ("provider", T),
+            ("label", T),
+        ])
+        .done(),
+        "pg_statistic_ext" => Builder::new(&[
+            ("oid", I8),
+            ("stxrelid", I8),
+            ("stxname", T),
+            ("stxnamespace", I8),
+            ("stxkeys", T),
+            ("stxkind", T),
+        ])
+        .done(),
+        "pg_opclass" => Builder::new(&[
+            ("oid", I8),
+            ("opcmethod", I8),
+            ("opcname", T),
+            ("opcnamespace", I8),
+            ("opcfamily", I8),
+            ("opcintype", I8),
+            ("opcdefault", B),
+        ])
+        .done(),
+        "pg_language" => Builder::new(&[
+            ("oid", I8),
+            ("lanname", T),
+            ("lanowner", I8),
+            ("lanispl", B),
+            ("lanpltrusted", B),
+        ])
+        .done(),
+        "pg_aggregate" => Builder::new(&[
+            ("aggfnoid", I8),
+            ("aggkind", T),
+            ("aggtransfn", I8),
+            ("aggfinalfn", I8),
+            ("aggtranstype", I8),
+        ])
+        .done(),
         // Other catalogs (publications, policies, statistics...) describe features this
         // gateway does not have: they are empty.
         _ => Builder::new(&[("oid", I8)]).done(),
@@ -1944,13 +2115,20 @@ pub fn constraint_def(ex: &Exec<'_>, oid: &Datum) -> SqlResult<Datum> {
     Ok(Datum::Null)
 }
 
-pub fn index_def(ex: &Exec<'_>, oid: &Datum) -> SqlResult<Datum> {
+/// `pg_get_indexdef(oid)`, or with `column` > 0 the name of that index column.
+pub fn index_def(ex: &Exec<'_>, oid: &Datum, column: i64) -> SqlResult<Datum> {
     let Ok(o) = oid.as_i64() else {
         return Ok(Datum::Null);
     };
     for tb in ex.s.engine.catalog.all() {
         for (name, cols) in index_list(&tb) {
             if object_oid("i", &tb.name, &name) == o {
+                if column > 0 {
+                    return Ok(usize::try_from(column - 1)
+                        .ok()
+                        .and_then(|k| cols.get(k))
+                        .map_or(Datum::Null, |c| Datum::Text(tb.columns[*c].name.clone())));
+                }
                 let unique = name.ends_with("_pkey") || tb.uniques.iter().any(|u| u.name == name);
                 return Ok(Datum::Text(index_sql(&tb, &name, &cols, unique)));
             }

@@ -403,6 +403,27 @@ fn window_functions_and_sequences() {
         "42P20"
     );
 
+    // Comma joins use the WHERE equalities (hash join), with the same results as JOIN ... ON.
+    ok(
+        &mut s,
+        "CREATE TABLE regions (name TEXT PRIMARY KEY, manager TEXT)",
+    );
+    ok(
+        &mut s,
+        "INSERT INTO regions VALUES ('east', 'Ann'), ('west', 'Bo')",
+    );
+    let r = rows(
+        &mut s,
+        "SELECT g.manager, count(*), sum(s.amount) FROM sales s, regions g \
+         WHERE s.region = g.name AND s.amount > 6 GROUP BY g.manager ORDER BY 1",
+    );
+    assert_eq!(r, vec![vec!["Ann", "3", "50.00"], vec!["Bo", "1", "7.50"]]);
+    let r = rows(
+        &mut s,
+        "SELECT count(*) FROM sales a, sales b, regions g WHERE a.region = b.region AND b.region = g.name",
+    );
+    assert_eq!(r, vec![vec!["13"]]);
+
     ok(
         &mut s,
         "CREATE SEQUENCE order_no START WITH 100 INCREMENT BY 10",

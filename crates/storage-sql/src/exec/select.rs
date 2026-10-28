@@ -417,7 +417,37 @@ impl Exec<'_> {
             let rel = self.eval_from_entry(item, pushable, outer, acc.as_ref())?;
             acc = Some(match acc {
                 None => rel,
-                Some(l) => self.join(l, rel, JoinKind::Cross, &JoinConstraint::None, outer)?,
+                Some(l) => {
+                    // `FROM a, b WHERE a.x = b.y`: the WHERE conjuncts linking the two sides
+                    // join them (as a hash join) instead of filtering a cross product.
+                    // WHERE still re-checks them afterwards.
+                    let linking: Vec<Expr> = pushable
+                        .iter()
+                        .filter(|c| {
+                            let refs = column_refs(c);
+                            let mut both = l.cols.clone();
+                            both.extend(rel.cols.iter().cloned());
+                            !refs.is_empty()
+                                && refs.iter().all(|p| resolves(&both, p))
+                                && refs
+                                    .iter()
+                                    .any(|p| resolves(&l.cols, p) && !resolves(&rel.cols, p))
+                                && refs
+                                    .iter()
+                                    .any(|p| resolves(&rel.cols, p) && !resolves(&l.cols, p))
+                        })
+                        .map(|c| (*c).clone())
+                        .collect();
+                    match linking
+                        .into_iter()
+                        .reduce(|a, b| Expr::binary(BinaryOp::And, a, b))
+                    {
+                        Some(on) => {
+                            self.join(l, rel, JoinKind::Inner, &JoinConstraint::On(on), outer)?
+                        }
+                        None => self.join(l, rel, JoinKind::Cross, &JoinConstraint::None, outer)?,
+                    }
+                }
             });
         }
         Ok(acc.unwrap_or(Rel {
@@ -476,7 +506,14 @@ impl Exec<'_> {
                     .iter()
                     .map(|a| self.eval(a, &env))
                     .collect::<SqlResult<Vec<_>>>()?;
-                func::table_function(self, name, &vals)?.requalify(alias, Some(name))
+                let mut rel = func::table_function(self, name, &vals)?;
+                // `FROM unnest(..) AS k`: a single-column function's alias names the column too.
+                if let (Some(a), [c]) = (alias, rel.cols.as_mut_slice()) {
+                    if a.columns.is_empty() {
+                        c.name = a.name.clone();
+                    }
+                }
+                rel.requalify(alias, Some(name))
             }
             TableRef::Join {
                 left,
@@ -792,6 +829,13 @@ impl Exec<'_> {
                     matched = true;
                     r_matched[ri] = true;
                     out.push(row);
+                    if out.len() > MAX_JOIN_ROWS {
+                        // Refuse rather than exhaust the server's memory.
+                        return Err(SqlError::new(
+                            "54000",
+                            format!("join produces more than {MAX_JOIN_ROWS} rows; add a join condition or a filter"),
+                        ));
+                    }
                 }
             }
             if !matched && matches!(kind, JoinKind::Left | JoinKind::Full) {
@@ -1772,6 +1816,9 @@ fn numeric_result(a: Option<DataType>, b: Option<DataType>) -> Option<DataType> 
         _ => None,
     }
 }
+
+/// Upper bound on a join's intermediate rows.
+const MAX_JOIN_ROWS: usize = 20_000_000;
 
 fn resolves(cols: &[ColMeta], p: &[String]) -> bool {
     let q = if p.len() > 1 {
