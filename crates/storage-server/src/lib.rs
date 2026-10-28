@@ -2466,15 +2466,33 @@ mod tests {
         assert_eq!((snap_resp.next_offset, snap_resp.installed), (0, false));
         assert_eq!(raft.last_applied(), 0);
 
-        // ── 6. Shard migration RPC (Admin only) ───────────────────────────
+        // A raft replica's engine changes only through consensus: a direct shard import into it is
+        // refused (`ReadOnlyReplica`).
         let mig_id = InlineId::from_static("migrated_rec_01");
         let mig_rec = AgentObjectRecord::new(mig_id, "Migrated Shard Record", 300, 77);
-        let imported = client
+        assert!(client.migrate_vshard(42u16, 2u16, &[(mig_id, mig_rec.clone())]).is_err());
+
+        // ── 6. Shard migration RPC (Admin only) into a standalone node ──────
+        let mig_dir = dir.join("standalone");
+        let mig_engine = Arc::new(
+            StorageEngine::<AgentObjectRecord>::open(&mig_dir, EngineConfig::default()).unwrap(),
+        );
+        let mut mig_server = StorageServer::start_with_config(
+            "127.0.0.1:0",
+            Arc::clone(&mig_engine),
+            16,
+            SecurityConfig::new(true).with_token("admin-tok", RbacRole::Admin),
+        )
+        .unwrap();
+        let mut mig_client = StorageClient::connect(mig_server.local_addr()).unwrap();
+        mig_client.authenticate("admin-tok").unwrap();
+        let imported = mig_client
             .migrate_vshard(42u16, 2u16, &[(mig_id, mig_rec)])
             .unwrap();
         assert_eq!(imported, 1);
+        mig_server.stop();
         // Verify the migrated record actually landed in the engine
-        let (_, owned) = engine.get_owned(mig_id).unwrap();
+        let (_, owned) = mig_engine.get_owned(mig_id).unwrap();
         assert_eq!(owned.title, "Migrated Shard Record");
         assert_eq!(owned.score, 77);
 
