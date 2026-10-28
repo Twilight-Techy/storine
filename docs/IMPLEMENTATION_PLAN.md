@@ -146,3 +146,82 @@ flowchart TD
   - Produces a deterministic `QueryPlanExplain` showing estimated rows, chosen driver index (`TagBitmapScan`, `PagedBTreeRange`, `HnswVectorAnn`, or `ExactSimdVectorScan`), and actual execution nanoseconds.
 - **Lock-Free HDR-Style Latency Histograms & Prometheus Telemetry**:
   - Records nanosecond latencies into 64-bucket logarithmic atomic histograms (`CachePadded<[AtomicU64; 64]>`) with `< 3 ns` overhead and `0` heap allocations, Computing exact `p50`, `p95`, `p99`, and `p99.9` live in production and exporting standard Prometheus text format.
+
+---
+
+## 4. Beyond the Target Domain: Analytics, Planet Scale & the Enterprise (Stages 28–31, Follow-Up Prompt 5)
+
+The rule for all four stages: nothing already built gets slower, bigger or less safe. Each capability is additive, measured against the system it is meant to beat, and verified with the tests of Stage 29.
+
+### 4.1 Stage 28: Columnar HTAP Analytics (`TASK-125` – `TASK-131`)
+
+- **Columnar projection, not a second database**:
+  - A collection opts in (`create_columnar(collection)`). Its documents are then also kept as immutable, memory-mapped **column segments**: up to 65,536 rows per row group, one column per field path, with a validity bitmap and a zone map (min, max, null count) per column chunk.
+  - Encodings are chosen per chunk by measured size: constant, bit-packed frame-of-reference, delta + frame-of-reference (sorted integers, timestamps), dictionary + bit-packed codes, run-length, bitmaps for booleans, and LZ4 blocks for long text.
+  - Decimals are stored as `i128` mantissas at one scale per chunk, so sums stay exact.
+  - Segments use the record checksums (`XXH3-64 + CRC32C`) and encryption-at-rest (sealed like index files), are validated once when mapped (`RULE-SAFE-04`), and have golden-format tests (`RULE-SAFE-05`).
+- **Delta + segments = one consistent snapshot**:
+  - Rows written since a segment was built live only in the row store: the **delta**, a set of ids.
+  - A commit to a columnar collection adds the id to the delta and marks the row's old position in its segment's delete bitmap. That is `O(1)` and allocation-free; the commit never touches column data.
+  - A background merger turns the delta into new segments from an MVCC snapshot and swaps them in atomically (an epoch + `Arc` swap, so readers never block).
+  - An analytic query reads `segments − deleted rows + delta rows` at one read version, so its result is exact and transactionally consistent with OLTP writes (HTAP).
+  - Delete bitmaps and the delta set are rebuilt at open by comparing segment row versions with the primary index (`O(rows)`, sequential), so no new WAL record type is needed.
+- **Vectorized execution**:
+  - Batches of 2,048 values with selection vectors.
+  - Kernels (comparisons, `BETWEEN`, `IN`, dictionary-code filters, bitmap combination, `count` / `sum` / `min` / `max` / `avg`, hash group-by with open addressing, top-K) live in `storage-codec::simd`. They have AVX2 / SSE4.2 / NEON paths selected at runtime and a portable fallback, and every path returns bit-identical results (`RULE-OLAP-03`).
+  - Integer sums are checked and widened to `i128`; decimal sums are exact; float sums use a fixed pairwise order per batch, so results never depend on the CPU or thread count.
+  - Zone maps skip chunks; columns are materialized late (filters run on codes, values are decoded only for surviving rows).
+- **Parallelism and memory**:
+  - Morsel-driven: row groups are handed out to a worker pool sized to the cores.
+  - Each query has a memory budget. Group-by and sort spill partitioned runs to disk beyond it instead of failing; nothing grows without a bound (`RULE-OLAP-04`).
+- **Push-down from every entry point**:
+  - `OP_DOC_AGGREGATE`: filter, group keys (fields, time buckets), aggregates (`count`, exact `count distinct`, `approx_count_distinct` (HyperLogLog), `sum`, `avg`, `min`, `max`, `stddev`, `variance`), `HAVING`, ordering and limit, executed on the server.
+  - `OP_DOC_SCAN_COLUMNS`: projected columns streamed in a columnar batch format, for joins evaluated in the gateway.
+  - All 8 SDKs get `aggregate(...)`. The SQL planner pushes single-table aggregation, filters, projections and `ORDER BY ... LIMIT` down, and runs joins over columnar scans with hash joins.
+- **Verification**: TPC-H Q1 / Q6 and a ClickBench subset (scaled to this machine's disk) against DuckDB on the same machine, interleaved A/B/A/B; storage footprint compared too; every result published (`RULE-TEST-01`, `RULE-TEST-02`).
+
+### 4.2 Stage 29: Deterministic Simulation & Fault Injection (`TASK-132` – `TASK-136`)
+
+- **One I/O seam**: all file I/O in WAL, arena, index and checkpoint code goes through a `Vfs` trait. The real implementation is the current code with no indirection on hot reads (mapped pages stay mapped). The simulated one keeps writes that have not been synced and, on a simulated power cut, drops, tears or reorders them the way real disks may.
+- **Deterministic cluster simulation**:
+  - Raft nodes, clients, the network (delay, loss, duplication, reordering, partitions) and clocks (skew, jumps) run on one seeded scheduler, so a failing seed replays bit for bit.
+  - Every run checks election safety, log matching, leader completeness, state-machine safety, and linearizability of the client history (a P-compositional Wing–Gong / Porcupine-style checker).
+- **Crash-point testing**: a workload is killed at every `k`-th I/O call (`k = 1, 2, 3, ...`), recovered, and checked: no acknowledged write lost, no torn state visible, indexes equal to a rebuild.
+- **Structure-aware fuzzing**: generators for every decoder (frames, SVE, documents, SQL text, PostgreSQL / MySQL / TDS messages, TLS records, column segments) run millions of iterations under `debug_assertions`, with corpora seeded from the conformance vectors.
+- **Process-level chaos**: real binaries behind a fault proxy (partitions, delays, half-open sockets), plus `SIGKILL` / `SIGSTOP` of nodes, checked by the same linearizability checker.
+
+### 4.3 Stage 30: Scale-Out & Multi-Region (`TASK-137` – `TASK-144`)
+
+- **Multi-Raft ranges**:
+  - The key space is split into ranges, and each range is its own Raft group. A node hosts many ranges over its one engine and WAL.
+  - Heartbeats are coalesced per node pair and idle ranges go quiescent, so idle cost grows with nodes, not ranges.
+  - Range descriptors live in a replicated meta range. Servers and SDKs cache them and route directly to the leaseholder, refreshing on `RangeMoved`.
+- **Automatic rebalancing**: ranges split by size and load and merge when small. Replicas move with the existing learner → promote → remove sequence (`TASK-121`), so a move is never unsafe; placement balances by range count, disk use and load.
+- **Time without atomic clocks**: hybrid logical clocks plus a configured maximum clock offset. Reads use uncertainty intervals (no stale read after a causally later write), a node whose offset exceeds the bound fences itself, and an optional commit-wait mode uses a bounded-error clock source when one is available.
+- **Distributed transactions**:
+  - Transaction records and write intents.
+  - Parallel commits: a cross-range commit in one round trip when nothing conflicts.
+  - Serializable isolation through timestamp ordering with read refresh.
+  - Deadlock detection by pushing transactions along a wait-for graph, plus asynchronous intent resolution.
+  - Request ids (`RULE-SAFE-08`) extend to coordinators, so a retried distributed commit applies at most once.
+- **Locality**:
+  - Nodes declare region and zone. Zone configurations set the replica count, constraints, lease preferences and a survival goal (zone or region).
+  - Follower reads at closed timestamps serve bounded-staleness reads in any region.
+  - Global tables serve consistent, low-latency reads everywhere (writes pay the cross-region cost).
+  - Regional-by-row tables keep each row's leaseholder in its home region.
+- **Operations**: cluster-wide consistent backups at one timestamp, and change data capture (changefeeds) to a sink, resumable from a cursor.
+- **Verification**: Stage 29 simulation with region-scale latencies and region outages; multi-process clusters behind the fault proxy. Real multi-region latency and petabyte scale cannot be measured here and are reported as unverified.
+
+### 4.4 Stage 31: Enterprise SQL & Ecosystem (`TASK-145` – `TASK-152`)
+
+- **Real access control**: roles, users and passwords (SCRAM verifiers), and `GRANT` / `REVOKE` on databases, schemas, tables and columns, enforced on every statement in all three dialects. Row-level security policies. Today `GRANT` and `REVOKE` are accepted and ignored, which is a security defect closed first.
+- **Control of running work**: PostgreSQL `CancelRequest`, MySQL `KILL [QUERY]`, the TDS attention signal; `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`, and per-query memory limits.
+- **Introspection**:
+  - PostgreSQL: `pg_stat_activity`, `pg_stat_statements`, `pg_locks`.
+  - MySQL: `information_schema.processlist`, `performance_schema` basics.
+  - SQL Server: `sys.dm_exec_*` basics.
+  - Real `EXPLAIN [ANALYZE]` output in all three.
+- **Cost-based optimizer** in the gateway: `ANALYZE` statistics (histograms, HyperLogLog distinct counts), join reordering (dynamic programming up to 10 relations, greedy beyond), index and push-down selection, subquery decorrelation.
+- **SQL surface used by tools and ad-hoc users**: cursors (`DECLARE` / `FETCH` / `MOVE`, psycopg named cursors), temporary tables, materialized views, SQL and PL/pgSQL-subset functions, triggers, `LISTEN` / `NOTIFY`, generated columns, and range / network types, prioritized by what the tool suites need.
+- **Tool suites** in `tests/clients/`, run headless where the tool allows: Metabase, DBeaver (its JDBC metadata calls), pgAdmin 4, Grafana, Apache Superset, and Tableau / Power BI through psqlODBC on unixODBC.
+- **Soak**: a mixed OLTP + analytics workload under fault injection for hours, with memory and file-descriptor ceilings checked throughout.

@@ -36,6 +36,17 @@
   - The SQL adapter is a separate crate, `crates/storage-sql`, with its own binary (`storine-sql`), speaking the PostgreSQL v3 and MySQL wire protocols (then SQL Server TDS) so existing drivers and ORMs work by changing only the connection string. SQLite is "near-zero change" (no network protocol to impersonate).
 - **Work order**: (1) close every engine gap raised in the two audit answers (lost updates over TCP, `put` blind overwrites, version ABA after delete/re-insert, `BATCH_PUT` without OCC, money-safe decimal type and checked arithmetic, `i128` indexing, Raft integrity gaps, read-only replicas, Windows IOCP-class readiness); (2) protocol spec + conformance vectors; (3) SDKs; (4) SQL adapter. Commit and push after each stage.
 
+## Follow-Up Prompt 5: Beyond the Target Domain (Recorded Verbatim)
+
+The user pasted an answer from another assistant (Antigravity) to "So you can say that Storine is essentially the best database that exists right now?". That answer named three areas where other systems still win: (1) massive columnar analytics (DuckDB / ClickHouse: columnar storage, vectorized SIMD execution, billions of rows per second); (2) planetary multi-region distributed scale (CockroachDB / Spanner: multi-region synchronized clocks, cross-datacenter atomic transactions, automatic petabyte-scale rebalancing); (3) general enterprise business applications (PostgreSQL: hundreds of developers writing ad-hoc SQL, BI dashboards such as Power BI, Tableau and Metabase, administration GUIs such as DBeaver and pgAdmin, decades of battle-testing against power-failure edge cases). The user then wrote:
+
+> We're going to build it to support those other things and do it better without sacrifiicing any of the optimizations, rules and principles in docs and the master prompts that's been guiding this project's development from the beginning. Read them first.
+
+- **Decisions** (taken under the master prompt's "decide yourself" mandate; plan in `IMPLEMENTATION_PLAN.md` §4, tasks `TASK-125` onward):
+  - **No sacrifice**: every new capability is additive and opt-in where it costs anything. The OLTP read path stays zero-copy with `0` allocations, binaries stay `< 1 MiB`, and no external runtime crates are added. Columnar data is a per-collection, background-maintained projection: a commit pays `O(1)` extra bookkeeping, never a column rewrite.
+  - **Order**: (1) columnar HTAP analytics with vectorized execution and SQL push-down; (2) deterministic simulation, fault injection and crash-point testing, which every later distributed change is verified with; (3) multi-Raft scale-out, distributed transactions, HLC clocks and multi-region placement; (4) enterprise SQL: real roles and grants, cancellation and timeouts, statistics catalogs, a cost-based optimizer, cursors, and BI / GUI tool compatibility suites.
+  - **Honesty gates**: every "better" claim is a measured A/B/A/B benchmark on the same machine against the named system (DuckDB is installable here). Every result is published, including losses. Claims that cannot be verified in this environment (petabyte scale, real multi-region latency, decades of field use) are stated as unverified rather than asserted.
+
 ---
 
 ## The 6 Canonical Project Documents

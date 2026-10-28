@@ -185,3 +185,34 @@
 
 ### RULE-TEST-02: Benchmark & Footprint Gate
 - Every stage is verified against `cargo run --release -p storage-benches` to guarantee zero hot-read heap allocations (`0.00 Allocs/Op`), sub-microsecond hot reads, and minimal binary/data footprint.
+
+### RULE-TEST-03: Deterministic Simulation for Distribution and Durability
+- Every consensus, replication, distributed-transaction and durability component runs under the seeded simulator (Stage 29). A failing seed reproduces bit for bit, and fixed seeds join the regression suite.
+- Durability claims are tested with simulated power loss (writes since the last sync dropped, torn or reordered) and with crash points at every I/O call, not only with process kills.
+- "Better than X" claims require an interleaved A/B/A/B benchmark against X on the same machine; results are published whether they win or lose.
+
+---
+
+## 8. Analytics & Distribution Rules (`RULE-OLAP-*`, `RULE-DIST-*`, Follow-Up Prompt 5)
+
+### RULE-OLAP-01: Analytics Never Taxes OLTP
+- Columnar storage is opt-in per collection. A commit to a columnar collection pays only `O(1)` allocation-free bookkeeping (a delta-set insert and a delete-bitmap bit); column data is built off the commit path from an MVCC snapshot.
+- The point-read path (`RULE-MEM-01`) and its benchmarks are unchanged with columnar storage on or off.
+
+### RULE-OLAP-02: Exact and Consistent Results
+- Analytic results are computed at one read version over `segments − deleted rows + delta rows`: exact, and consistent with every committed OLTP write.
+- Approximate algorithms run only when the caller names them (`approx_count_distinct`). Integer and decimal aggregates never overflow silently: they widen or fail.
+
+### RULE-OLAP-03: Deterministic Vectorized Kernels
+- Every SIMD kernel has a portable fallback, and all paths return bit-identical results. Floating-point sums use a fixed pairwise order per batch, so results never depend on the CPU, the SIMD level or the thread count.
+- Intrinsics live only in `storage-codec` (`RULE-SAFE-01`); callers use safe wrappers.
+
+### RULE-OLAP-04: Bounded Query Memory
+- Every analytic query runs under a memory budget. Hash aggregation, joins and sorts spill partitioned runs to disk beyond it; a query that cannot complete within its disk and memory budget fails with a clear error, never an OOM.
+
+### RULE-DIST-01: Clocks Are Hints, Bounded
+- Correctness never depends on synchronized clocks beyond the configured maximum offset. Timestamps are hybrid logical clocks; reads honor uncertainty intervals; a node that detects an offset above the bound stops serving.
+
+### RULE-DIST-02: Serializable Across Ranges, Exactly Once
+- A transaction spanning ranges is serializable and atomic. Its coordinator's request id makes a retried commit apply at most once. A commit whose outcome is unknown is reported as `CommitUnknown`, never as success or failure (`RULE-SAFE-09`).
+- Idle cost scales with nodes, not ranges: heartbeats are coalesced per node pair and idle ranges stop heartbeating.

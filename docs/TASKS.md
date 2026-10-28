@@ -829,3 +829,45 @@ This document defines the strict chronological execution order for building the 
   - Application locks stored in the database (lease-renewed, version-conditioned, shared by every gateway): PostgreSQL advisory locks (session / transaction, exclusive / shared, `lock_timeout`), MySQL `GET_LOCK` and family, SQL Server `sp_getapplock` / `sp_releaseapplock` with `EXEC @status = ...` (the old `sp_getapplock` stub granted every lock without locking).
   - **Exit Criteria**: `tests/clients/pgbouncer` (session and transaction pooling; 24 clients x 25 locked deposits exact on a pool of 4 server connections; concurrent transfers; aborted and abandoned transactions do not leak; `DISCARD ALL` between clients on one server connection; psycopg 3 server-side prepares, asyncpg pool, SQLAlchemy `NullPool`); executor tests for every lock function and the session resets; the full client matrix (15 suites) green.
 
+
+## Stage 28: Columnar HTAP Analytics (`TASK-125` – `TASK-131`)
+
+*(Follow-Up Prompt 5: beat DuckDB / ClickHouse at analytics without slowing anything else.)*
+
+- [ ] **TASK-125: Column Segment Format (`F-OLAP-01`)** — immutable mapped column segments: row groups of 65,536, per-chunk encodings chosen by size (constant, bit-packed FOR, delta-FOR, dictionary, RLE, bitmap, LZ4 text), validity bitmaps, zone maps, exact `i128` decimals, checksums, sealing, validate-once, golden format tests, hostile-bytes tests.
+- [ ] **TASK-126: HTAP Maintenance (`F-OLAP-02`)** — opt-in per collection; `O(1)` commit bookkeeping (delta set + delete bitmap); background merge from an MVCC snapshot with atomic segment swap; rebuild of delta and delete state at open; consistent `segments − deleted + delta` reads.
+- [ ] **TASK-127: Vectorized Kernels (`F-OLAP-03`)** — `storage-codec::simd`: filters on values and dictionary codes, bitmap combination, checked / exact aggregates, deterministic float sums, hash group-by, top-K; AVX2 / SSE4.2 / NEON with portable fallback, bit-identical across paths.
+- [ ] **TASK-128: Parallel, Memory-Bounded Execution (`F-OLAP-04`)** — morsel-driven workers, zone-map pruning, late materialization, per-query memory budget with partitioned spill for group-by and sort.
+- [ ] **TASK-129: Aggregation & Columnar Scan Protocol (`F-OLAP-05`)** — `OP_DOC_AGGREGATE`, `OP_DOC_SCAN_COLUMNS`, `PROTOCOL.md`, conformance vectors, `aggregate(...)` in all 8 SDKs.
+- [ ] **TASK-130: SQL Push-Down (`F-OLAP-06`)** — single-table aggregation, filters, projections and `ORDER BY ... LIMIT` pushed down from all three dialects; joins over columnar scans with hash joins; `EXPLAIN` shows the push-down.
+- [ ] **TASK-131: Analytics Benchmarks vs DuckDB (`F-OLAP-07`)** — TPC-H Q1 / Q6 and a ClickBench subset, interleaved A/B/A/B on this machine, plus storage footprint; results published in `BENCHMARK_REPORT.md`.
+
+## Stage 29: Deterministic Simulation & Fault Injection (`TASK-132` – `TASK-136`)
+
+- [ ] **TASK-132: `Vfs` I/O Seam & Simulated Power Loss (`F-SIM-01`)** — every durable write path through one trait; the simulated file system drops, tears or reorders unsynced writes on a simulated power cut; no indirection on mapped hot reads.
+- [ ] **TASK-133: Deterministic Cluster Simulator (`F-SIM-02`)** — seeded scheduler, simulated network and clocks; Raft safety invariants checked every run; failing seeds reproduce bit for bit.
+- [ ] **TASK-134: Linearizability Checker & Process Chaos (`F-SIM-03`)** — P-compositional history checker; fault proxy (partitions, delays, half-open sockets) and `SIGKILL` / `SIGSTOP` of real binaries.
+- [ ] **TASK-135: Structure-Aware Fuzzing (`F-SIM-04`)** — generators for every decoder and parser, millions of iterations, corpora from the conformance vectors.
+- [ ] **TASK-136: Crash-Point Sweeps (`F-SIM-05`)** — kill at every `k`-th I/O call, recover, check acknowledged writes, torn state and index equality.
+
+## Stage 30: Scale-Out & Multi-Region (`TASK-137` – `TASK-144`)
+
+- [ ] **TASK-137: Multi-Raft Ranges (`F-GEO-01`)** — many Raft groups per node over one engine / WAL; coalesced heartbeats; quiescent idle ranges.
+- [ ] **TASK-138: Meta Range, Routing & Rebalancing (`F-GEO-02`)** — replicated range descriptors; leaseholder routing in servers and SDKs; splits, merges and replica moves balanced by count, disk and load.
+- [ ] **TASK-139: Hybrid Logical Clocks & Uncertainty (`F-GEO-03`)** — HLC timestamps, maximum-offset enforcement with self-fencing, uncertainty-interval reads, optional commit-wait.
+- [ ] **TASK-140: Distributed Transactions (`F-GEO-04`)** — transaction records, write intents, parallel commits, serializable timestamp ordering with read refresh, deadlock detection, intent resolution, exactly-once coordinators.
+- [ ] **TASK-141: Locality, Zone Configurations & Survival Goals (`F-GEO-05`)** — region / zone labels, constraints, lease preferences, zone / region survival; closed-timestamp follower reads; global and regional-by-row tables.
+- [ ] **TASK-142: Region-Scale Verification (`F-GEO-06`)** — simulator runs with region latencies and outages; multi-process clusters behind the fault proxy.
+- [ ] **TASK-143: SDK & SQL Integration (`F-GEO-07`)** — range-aware SDK routing in 8 languages; SQL transactions across ranges.
+- [ ] **TASK-144: Cluster Backups & Changefeeds (`F-GEO-08`)** — consistent cluster-wide backups at one timestamp; resumable change data capture.
+
+## Stage 31: Enterprise SQL & Ecosystem (`TASK-145` – `TASK-152`)
+
+- [ ] **TASK-145: Roles, Grants & Row-Level Security (`F-ENT-01`)** — enforced `GRANT` / `REVOKE` (currently accepted and ignored), users with SCRAM verifiers, row-level security policies, in all three dialects.
+- [ ] **TASK-146: Cancellation, Timeouts & Limits (`F-ENT-02`)** — PostgreSQL `CancelRequest`, MySQL `KILL`, TDS attention; statement / lock / idle-in-transaction timeouts; per-query memory limits.
+- [ ] **TASK-147: Activity, Statistics & `EXPLAIN` (`F-ENT-03`)** — `pg_stat_activity`, `pg_stat_statements`, `pg_locks`, `processlist`, `sys.dm_exec_*`; real `EXPLAIN [ANALYZE]`.
+- [ ] **TASK-148: Cost-Based Optimizer (`F-ENT-04`)** — `ANALYZE` histograms and HyperLogLog distinct counts, join reordering, index and push-down choice, subquery decorrelation.
+- [ ] **TASK-149: SQL Surface for Tools & Ad-Hoc Use (`F-ENT-05`)** — cursors, temporary tables, materialized views, functions (SQL, PL/pgSQL subset), triggers, `LISTEN` / `NOTIFY`, generated columns, range / network types.
+- [ ] **TASK-150: BI & GUI Tool Suites (`F-ENT-06`)** — Metabase, DBeaver (JDBC metadata), pgAdmin 4, Grafana, Superset, Tableau / Power BI through psqlODBC; run headless where possible.
+- [ ] **TASK-151: Soak Under Faults (`F-ENT-07`)** — hours of mixed OLTP + analytics with fault injection; memory and descriptor ceilings checked throughout.
+- [ ] **TASK-152: Final Audit (Stages 28–31)** — full-project review for gaps, bugs and vulnerabilities; docs brought in line with the code.

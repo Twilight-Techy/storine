@@ -194,6 +194,40 @@
 | **F-SQL-09** | **Poolers & Application Locks** | PgBouncer in session and transaction pooling; real `DISCARD ALL` / `RESET`; PostgreSQL advisory locks, MySQL `GET_LOCK` and SQL Server `sp_getapplock` stored in the database and shared by every gateway. | v1.2 |
 | **F-SQL-06** | **Real-Client Compatibility Matrix** | `tests/clients/run_all.sh`: 15 suites over Python, Node, Go, Java, .NET, PHP and Ruby drivers and ORMs, and PgBouncer. | v1.2 |
 
+### 6.13 Analytics, Simulation, Scale-Out & Enterprise (`F-OLAP-*`, `F-SIM-*`, `F-GEO-*`, `F-ENT-*`, Stages 28–31, planned)
+
+Targets from Follow-Up Prompt 5. Each row is marked done in `TASKS.md` only when its exit criteria pass.
+
+| Feature ID | Feature Name | Description | Target Tier |
+| :--- | :--- | :--- | :--- |
+| **F-OLAP-01** | **Column Segments** | Immutable mapped column chunks with size-chosen encodings, zone maps and exact decimals. | v2.0 |
+| **F-OLAP-02** | **HTAP Consistency** | Opt-in columnar projection kept current off the commit path; analytic reads consistent with OLTP writes. | v2.0 |
+| **F-OLAP-03** | **Deterministic Vectorized Kernels** | SIMD filters and aggregates with bit-identical portable fallbacks. | v2.0 |
+| **F-OLAP-04** | **Parallel, Bounded Execution** | Morsel-driven parallelism, zone-map pruning, late materialization, spill under a memory budget. | v2.0 |
+| **F-OLAP-05** | **Aggregation Protocol** | `OP_DOC_AGGREGATE` / `OP_DOC_SCAN_COLUMNS` and `aggregate(...)` in every SDK. | v2.0 |
+| **F-OLAP-06** | **SQL Push-Down** | Aggregation, filters, projections and top-K pushed down from PostgreSQL, MySQL and T-SQL. | v2.0 |
+| **F-OLAP-07** | **Published Analytics Benchmarks** | TPC-H and ClickBench subsets against DuckDB on the same machine. | v2.0 |
+| **F-SIM-01** | **Simulated Power Loss** | `Vfs` seam; unsynced writes dropped, torn or reordered on a simulated power cut. | v2.0 |
+| **F-SIM-02** | **Deterministic Cluster Simulation** | Seeded network, clock and crash faults; Raft invariants checked; seeds reproduce exactly. | v2.0 |
+| **F-SIM-03** | **Linearizability Checking & Chaos** | History checker; fault proxy and process kills / pauses against real binaries. | v2.0 |
+| **F-SIM-04** | **Structure-Aware Fuzzing** | Every decoder and parser fuzzed from conformance-vector corpora. | v2.0 |
+| **F-SIM-05** | **Crash-Point Sweeps** | Recovery verified after a crash at every I/O call of a workload. | v2.0 |
+| **F-GEO-01** | **Multi-Raft Ranges** | Many Raft groups per node; idle cost proportional to nodes, not ranges. | v2.0 |
+| **F-GEO-02** | **Automatic Rebalancing** | Splits, merges and safe replica moves; leaseholder routing. | v2.0 |
+| **F-GEO-03** | **Hybrid Logical Clocks** | Bounded clock offset, uncertainty intervals, self-fencing, optional commit-wait. | v2.0 |
+| **F-GEO-04** | **Distributed Transactions** | Serializable cross-range transactions with parallel commits and exactly-once retries. | v2.0 |
+| **F-GEO-05** | **Multi-Region Placement** | Localities, zone configurations, survival goals, follower reads, global and regional tables. | v2.0 |
+| **F-GEO-06** | **Region-Scale Verification** | Simulated region latencies and outages; fault-proxy clusters. | v2.0 |
+| **F-GEO-07** | **Range-Aware Clients** | SDK routing to leaseholders; SQL transactions across ranges. | v2.0 |
+| **F-GEO-08** | **Cluster Backups & Changefeeds** | Consistent cluster snapshots; resumable change data capture. | v2.0 |
+| **F-ENT-01** | **Enforced Access Control** | Roles, grants and row-level security in all three dialects. | v2.0 |
+| **F-ENT-02** | **Cancellation & Limits** | Query cancel in all three protocols; statement, lock and idle timeouts; memory limits. | v2.0 |
+| **F-ENT-03** | **Activity & Statistics Catalogs** | `pg_stat_*`, processlist, DMVs, real `EXPLAIN [ANALYZE]`. | v2.0 |
+| **F-ENT-04** | **Cost-Based SQL Optimizer** | Statistics-driven join order and access paths. | v2.0 |
+| **F-ENT-05** | **Tool-Grade SQL Surface** | Cursors, temp tables, materialized views, functions, triggers, notifications. | v2.0 |
+| **F-ENT-06** | **BI & GUI Compatibility** | Metabase, DBeaver, pgAdmin, Grafana, Superset, ODBC-based BI tools. | v2.0 |
+| **F-ENT-07** | **Soak Under Faults** | Long mixed workloads under fault injection within resource ceilings. | v2.0 |
+
 ---
 
 ## 7. Verified Implementation Status (full-project audits, 2026-10-20/21, `TASK-067` – `TASK-081`)
