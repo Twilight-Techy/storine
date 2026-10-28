@@ -51,6 +51,14 @@ pub enum Statement {
         value: Option<Expr>,
     },
     Show(Show),
+    /// T-SQL `DECLARE @a type [= value], ...`: session variables.
+    Declare(Vec<(String, DataType, Option<Expr>)>),
+    /// T-SQL `IF condition statement [ELSE statement]`.
+    If {
+        cond: Expr,
+        then: Box<Statement>,
+        otherwise: Option<Box<Statement>>,
+    },
     /// `USE db`: switches the session to another database.
     Use(String),
     Explain(Box<Statement>),

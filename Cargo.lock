@@ -92,6 +92,7 @@ dependencies = [
 name = "storage-sql"
 version = "0.1.0"
 dependencies = [
+ "storage-codec",
  "storage-core",
  "storage-server",
  "storage-types",

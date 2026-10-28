@@ -740,6 +740,22 @@ impl Session {
 
     /// Runs one statement with bound parameters.
     pub fn execute(&mut self, stmt: &Statement, params: &[Datum]) -> SqlResult<Outcome> {
+        if let Statement::If {
+            cond,
+            then,
+            otherwise,
+        } = stmt
+        {
+            let yes = eval::Exec::new(self, params)
+                .eval_const(cond)?
+                .truthy()?
+                .unwrap_or(false);
+            return match (yes, otherwise) {
+                (true, _) => self.execute(then, params),
+                (false, Some(o)) => self.execute(o, params),
+                (false, None) => Ok(Outcome::command("IF")),
+            };
+        }
         // Transaction control first: it works even in a failed transaction.
         match stmt {
             Statement::Begin { isolation } => {
@@ -1034,6 +1050,17 @@ impl Session {
             }
             Statement::Set { name, value } => self.set_var(name, value.as_ref(), params),
             Statement::Show(s) => system::show(self, s),
+            Statement::Declare(vars) => {
+                for (name, ty, value) in vars {
+                    let v = match value {
+                        Some(e) => crate::datum::cast(&eval::Exec::new(self, params).eval_const(e)?, ty)?,
+                        None => Datum::Null,
+                    };
+                    self.user_vars.insert(name.to_ascii_lowercase(), v);
+                }
+                Ok(Outcome::command("DECLARE"))
+            }
+            Statement::If { .. } => unreachable!("IF is dispatched by execute"),
             Statement::Use(db) => {
                 self.use_database(db)?;
                 Ok(Outcome::command("USE"))

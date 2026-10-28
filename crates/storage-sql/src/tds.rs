@@ -63,7 +63,6 @@ const PT_PRELOGIN: u8 = 0x12;
 const TK_RETURNSTATUS: u8 = 0x79;
 const TK_COLMETADATA: u8 = 0x81;
 const TK_ERROR: u8 = 0xaa;
-const TK_INFO: u8 = 0xab;
 const TK_RETURNVALUE: u8 = 0xac;
 const TK_LOGINACK: u8 = 0xad;
 const TK_ROW: u8 = 0xd1;
@@ -385,7 +384,7 @@ impl Wire {
                 let ns = timestamp_ns(d)?;
                 let days = ns.div_euclid(86_400_000_000_000);
                 let tod = ns.rem_euclid(86_400_000_000_000);
-                let ticks = ((tod as i128 * 300 + 500_000_000) / 1_000_000_000) as u32; // 1/300 s
+                let ticks = ((i128::from(tod) * 300 + 500_000_000) / 1_000_000_000) as u32; // 1/300 s
                 t.u8(8)
                     .bytes(&((days + DAYS_1900_TO_1970) as i32).to_le_bytes())
                     .u32(ticks);
@@ -496,7 +495,7 @@ struct Conn {
 }
 
 struct Prepared {
-    stmt: Statement,
+    stmts: Vec<Statement>,
     /// Parameter names in declaration order (`@p1`, `@name`, ...).
     names: Vec<String>,
 }
@@ -720,11 +719,7 @@ impl Conn {
             b.u8(8).u8(8).u64(self.txn).u8(0);
             t.with_len(TK_ENVCHANGE, &b);
         } else if before && !after {
-            let kind = if matches!(st, Statement::Rollback | Statement::RollbackToSavepoint(_)) {
-                10
-            } else {
-                9
-            };
+            let kind = if rolls_back(st) { 10 } else { 9 };
             let mut b = Tokens::default();
             b.u8(kind).u8(0).u8(8).u64(self.txn);
             t.with_len(TK_ENVCHANGE, &b);
@@ -775,18 +770,259 @@ impl Conn {
         }
     }
 
-    fn rpc_calls(&mut self, body: &[u8], _t: &mut Tokens) -> Result<(), SqlError> {
-        let _ = body;
-        Err(SqlError::unsupported(
-            "RPC requests (sp_executesql) over TDS yet",
-        ))
+    fn rpc_calls(&mut self, body: &[u8], t: &mut Tokens) -> Result<(), SqlError> {
+        let mut rd = Rd { b: body, pos: 0 };
+        loop {
+            let call = read_rpc(&mut rd, self.version)?;
+            self.rpc_call(call, t)?;
+            // Further calls follow a batch separator (0x80, or 0xFF from TDS 7.2).
+            match rd.peek() {
+                Some(0x80 | 0xff) => rd.pos += 1,
+                _ => return Ok(()),
+            }
+            if rd.left() == 0 {
+                return Ok(());
+            }
+        }
     }
 
+    fn rpc_call(&mut self, call: RpcCall, t: &mut Tokens) -> Result<(), SqlError> {
+        if crate::log_enabled() {
+            eprintln!(
+                "[tds {}] rpc {} ({} params)",
+                self.session.id,
+                call.proc,
+                call.params.len()
+            );
+        }
+        let text_param = |call: &RpcCall, i: usize| -> String {
+            call.params
+                .get(i)
+                .map(|p| p.value.as_text())
+                .unwrap_or_default()
+        };
+        match call.proc.as_str() {
+            "sp_executesql" => {
+                let sql = text_param(&call, 0);
+                let declared = declared_names(&text_param(&call, 1));
+                // Unnamed values bind to the declared names in order.
+                let bound: Vec<(String, Datum)> = call
+                    .params
+                    .iter()
+                    .skip(2)
+                    .enumerate()
+                    .map(|(i, p)| {
+                        (
+                            if p.name.is_empty() {
+                                declared.get(i).cloned().unwrap_or_default()
+                            } else {
+                                p.name.clone()
+                            },
+                            p.value.clone(),
+                        )
+                    })
+                    .collect();
+                self.run_with_params(&sql, &bound, t);
+            }
+            "sp_prepare" | "sp_prepexec" => {
+                let declared = declared_names(&text_param(&call, 1));
+                let sql = text_param(&call, 2);
+                let stmts = parse(&sql, Dialect::MsSql)?.0;
+                let handle = self.next_handle;
+                self.next_handle += 1;
+                self.prepared.insert(
+                    handle,
+                    Prepared {
+                        stmts: stmts.clone(),
+                        names: declared.clone(),
+                    },
+                );
+                if call.proc == "sp_prepexec" {
+                    let bound: Vec<(String, Datum)> = declared
+                        .iter()
+                        .cloned()
+                        .zip(call.params.iter().skip(3).map(|p| p.value.clone()))
+                        .collect();
+                    self.run_prepared(&stmts, &bound, t);
+                }
+                self.return_status(t, 0);
+                self.return_value(
+                    t,
+                    0,
+                    &call
+                        .params
+                        .first()
+                        .map(|p| p.name.clone())
+                        .unwrap_or_default(),
+                    handle,
+                );
+                self.done(t, TK_DONEPROC, 0, 0, 0);
+            }
+            "sp_execute" => {
+                let handle = call
+                    .params
+                    .first()
+                    .map(|p| p.value.as_i64())
+                    .transpose()?
+                    .unwrap_or(0) as i32;
+                let Some(p) = self.prepared.get(&handle) else {
+                    return Err(SqlError::new(
+                        "26000",
+                        format!("Could not find prepared statement with handle {handle}."),
+                    ));
+                };
+                let stmts = p.stmts.clone();
+                let bound: Vec<(String, Datum)> = p
+                    .names
+                    .iter()
+                    .cloned()
+                    .zip(call.params.iter().skip(1).map(|p| p.value.clone()))
+                    .collect();
+                self.run_prepared(&stmts, &bound, t);
+                self.return_status(t, 0);
+                self.done(t, TK_DONEPROC, 0, 0, 0);
+            }
+            "sp_unprepare" => {
+                let handle = call
+                    .params
+                    .first()
+                    .map(|p| p.value.as_i64())
+                    .transpose()?
+                    .unwrap_or(0) as i32;
+                self.prepared.remove(&handle);
+                self.return_status(t, 0);
+                self.done(t, TK_DONEPROC, 0, 0, 0);
+            }
+            other => return Err(SqlError::unsupported(format!("stored procedure {other}"))),
+        }
+        Ok(())
+    }
+
+    /// `sp_executesql`: every statement of `sql` with `params` bound as variables.
+    fn run_with_params(&mut self, sql: &str, params: &[(String, Datum)], t: &mut Tokens) {
+        if crate::log_enabled() {
+            eprintln!("[tds {}] {sql}", self.session.id);
+        }
+        match parse(sql, Dialect::MsSql) {
+            Ok((stmts, _)) => {
+                let saved = self.bind(params);
+                for st in &stmts {
+                    if !self.statement(st, &[], t, TK_DONEINPROC, DONE_MORE) {
+                        break;
+                    }
+                }
+                self.unbind(saved);
+            }
+            Err(e) => self.error_token(t, &e, 1),
+        }
+        self.return_status(t, 0);
+        self.done(t, TK_DONEPROC, 0, 0, 0);
+    }
+
+    fn run_prepared(&mut self, stmts: &[Statement], params: &[(String, Datum)], t: &mut Tokens) {
+        let saved = self.bind(params);
+        for st in stmts {
+            if !self.statement(st, &[], t, TK_DONEINPROC, DONE_MORE) {
+                break;
+            }
+        }
+        self.unbind(saved);
+    }
+
+    /// Binds parameters as session variables; returns what they shadowed.
+    fn bind(&mut self, params: &[(String, Datum)]) -> Vec<(String, Option<Datum>)> {
+        params
+            .iter()
+            .map(|(n, v)| {
+                let key = n.trim_start_matches('@').to_ascii_lowercase();
+                let old = self.session.user_vars.insert(key.clone(), v.clone());
+                (key, old)
+            })
+            .collect()
+    }
+
+    fn unbind(&mut self, saved: Vec<(String, Option<Datum>)>) {
+        for (k, old) in saved.into_iter().rev() {
+            match old {
+                Some(v) => self.session.user_vars.insert(k, v),
+                None => self.session.user_vars.remove(&k),
+            };
+        }
+    }
+
+    fn return_status(&self, t: &mut Tokens, status: i32) {
+        t.u8(TK_RETURNSTATUS).u32(status as u32);
+    }
+
+    /// RETURNVALUE for an INT output parameter (prepared statement handles).
+    fn return_value(&self, t: &mut Tokens, ordinal: u16, name: &str, value: i32) {
+        t.u8(TK_RETURNVALUE).u16(ordinal).b_varchar(name).u8(0x01);
+        if self.version >= TDS72 {
+            t.u32(0);
+        } else {
+            t.u16(0);
+        }
+        t.u16(0x0009).u8(0x26).u8(4).u8(4).u32(value as u32);
+    }
+
+    /// Transaction-manager request: begin / commit / rollback / save.
     fn transaction_request(&mut self, msg: &[u8], t: &mut Tokens) {
-        let _ = msg;
-        let e = SqlError::unsupported("transaction manager requests yet");
-        self.error_token(t, &e, 1);
-        self.done(t, TK_DONE, DONE_ERROR, 0, 0);
+        let body = self.skip_headers(msg).to_vec();
+        let kind = body
+            .get(..2)
+            .map_or(0, |b| u16::from_le_bytes([b[0], b[1]]));
+        // BEGIN (isolation u8, name B_VARCHAR), COMMIT / ROLLBACK (name B_VARCHAR, flags with
+        // fBeginXact), SAVE (name B_VARCHAR).
+        let name_at = |off: usize| -> String {
+            let n = body.get(off).copied().map_or(0, usize::from);
+            body.get(off + 1..off + 1 + 2 * n)
+                .map(from_utf16)
+                .unwrap_or_default()
+        };
+        let stmt = match kind {
+            5 => Ok(Statement::Begin {
+                isolation: tm_isolation(body.get(2).copied().unwrap_or(0)),
+            }),
+            7 => Ok(Statement::Commit),
+            8 => {
+                let name = name_at(2);
+                Ok(if name.is_empty() {
+                    Statement::Rollback
+                } else {
+                    Statement::RollbackToSavepoint(name)
+                })
+            }
+            9 => Ok(Statement::Savepoint(name_at(2))),
+            other => Err(SqlError::unsupported(format!(
+                "transaction manager request {other}"
+            ))),
+        };
+        let begin_again = matches!(kind, 7 | 8)
+            && body
+                .get(3 + 2 * body.get(2).copied().map_or(0, usize::from))
+                .is_some_and(|f| f & 1 == 1);
+        match stmt {
+            Ok(st) => {
+                let before = self.session.in_transaction();
+                let r = self.session.execute(&st, &[]);
+                self.track_transaction(before, &st, t);
+                if let Err(e) = r {
+                    self.error_token(t, &e, 1);
+                    self.done(t, TK_DONE, DONE_ERROR, 0, 0);
+                    return;
+                }
+                if begin_again {
+                    let st = Statement::Begin { isolation: None };
+                    let _ = self.session.execute(&st, &[]);
+                    self.track_transaction(false, &st, t);
+                }
+                self.done(t, TK_DONE, 0, 0, 0);
+            }
+            Err(e) => {
+                self.error_token(t, &e, 1);
+                self.done(t, TK_DONE, DONE_ERROR, 0, 0);
+            }
+        }
     }
 
     // ── tokens ──
@@ -961,11 +1197,365 @@ fn parse_login7(b: &[u8]) -> Result<Login, SqlError> {
     })
 }
 
-#[allow(dead_code)]
-fn decimal_from_tds(sign: u8, magnitude: u128, scale: u8) -> Option<Decimal> {
-    let m = i128::try_from(magnitude).ok()?;
-    Decimal::new(if sign == 0 { -m } else { m }, scale).ok()
+/// The isolation level of a transaction-manager BEGIN.
+fn tm_isolation(level: u8) -> Option<String> {
+    match level {
+        0x01 => Some("read uncommitted".into()),
+        0x02 => Some("read committed".into()),
+        0x04 => Some("repeatable read".into()),
+        0x08 => Some("serializable".into()),
+        0x10 => Some("snapshot".into()),
+        _ => None,
+    }
 }
 
-#[allow(dead_code)]
-const UNUSED: [u8; 4] = [TK_RETURNSTATUS, TK_INFO, TK_RETURNVALUE, TK_DONEINPROC];
+/// Parameter names of an `sp_executesql` / `sp_prepare` declaration (`@P1 int, @P2 nvarchar(50)`).
+fn declared_names(decl: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0;
+    let mut current = String::new();
+    for c in decl.chars().chain(std::iter::once(',')) {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                if let Some(name) = current
+                    .split_whitespace()
+                    .next()
+                    .filter(|n| n.starts_with('@'))
+                {
+                    out.push(name.to_owned());
+                }
+                current.clear();
+                continue;
+            }
+            _ => {}
+        }
+        current.push(c);
+    }
+    out
+}
+
+// ── RPC requests ──
+
+struct RpcParam {
+    name: String,
+    value: Datum,
+}
+
+struct RpcCall {
+    proc: String,
+    params: Vec<RpcParam>,
+}
+
+/// A cursor over a request body.
+struct Rd<'a> {
+    b: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Rd<'a> {
+    fn bad() -> SqlError {
+        SqlError::new("08P01", "malformed RPC request")
+    }
+    fn left(&self) -> usize {
+        self.b.len() - self.pos
+    }
+    fn peek(&self) -> Option<u8> {
+        self.b.get(self.pos).copied()
+    }
+    fn take(&mut self, n: usize) -> Result<&'a [u8], SqlError> {
+        let s = self.b.get(self.pos..self.pos + n).ok_or_else(Rd::bad)?;
+        self.pos += n;
+        Ok(s)
+    }
+    fn u8(&mut self) -> Result<u8, SqlError> {
+        Ok(self.take(1)?[0])
+    }
+    fn u16(&mut self) -> Result<u16, SqlError> {
+        let s = self.take(2)?;
+        Ok(u16::from_le_bytes([s[0], s[1]]))
+    }
+    fn u32(&mut self) -> Result<u32, SqlError> {
+        let s = self.take(4)?;
+        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    fn u64(&mut self) -> Result<u64, SqlError> {
+        let s = self.take(8)?;
+        Ok(u64::from_le_bytes(s.try_into().map_err(|_| Rd::bad())?))
+    }
+    fn b_varchar(&mut self) -> Result<String, SqlError> {
+        let n = usize::from(self.u8()?);
+        Ok(from_utf16(self.take(n * 2)?))
+    }
+    fn us_varchar(&mut self) -> Result<String, SqlError> {
+        let n = usize::from(self.u16()?);
+        Ok(from_utf16(self.take(n * 2)?))
+    }
+    /// A PLP value (`None`: NULL).
+    fn plp(&mut self) -> Result<Option<Vec<u8>>, SqlError> {
+        let total = self.u64()?;
+        if total == u64::MAX {
+            return Ok(None);
+        }
+        let mut out = Vec::new();
+        loop {
+            let n = self.u32()? as usize;
+            if n == 0 {
+                return Ok(Some(out));
+            }
+            out.extend_from_slice(self.take(n)?);
+            if out.len() > MAX_MESSAGE {
+                return Err(Rd::bad());
+            }
+        }
+    }
+}
+
+const PROC_IDS: [(u16, &str); 6] = [
+    (10, "sp_executesql"),
+    (11, "sp_prepare"),
+    (12, "sp_execute"),
+    (13, "sp_prepexec"),
+    (14, "sp_prepexecrpc"),
+    (15, "sp_unprepare"),
+];
+
+fn read_rpc(rd: &mut Rd<'_>, version: u32) -> Result<RpcCall, SqlError> {
+    let len = rd.u16()?;
+    let proc = if len == 0xffff {
+        let id = rd.u16()?;
+        PROC_IDS
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, n)| (*n).to_owned())
+            .ok_or_else(|| SqlError::unsupported(format!("system procedure #{id}")))?
+    } else {
+        let name = from_utf16(rd.take(usize::from(len) * 2)?);
+        // [sys].[sp_executesql], dbo.sp_executesql, ...
+        name.rsplit('.')
+            .next()
+            .unwrap_or(&name)
+            .trim_matches(|c| c == '[' || c == ']')
+            .to_ascii_lowercase()
+    };
+    rd.u16()?; // option flags
+    let mut params = Vec::new();
+    while rd.left() > 0 && !matches!(rd.peek(), Some(0x80 | 0xff)) {
+        let name = rd.b_varchar()?;
+        rd.u8()?; // status flags (output, default)
+        let value = read_typed_value(rd, version)?;
+        params.push(RpcParam { name, value });
+    }
+    Ok(RpcCall { proc, params })
+}
+
+/// TYPE_INFO followed by its value.
+fn read_typed_value(rd: &mut Rd<'_>, version: u32) -> Result<Datum, SqlError> {
+    let _ = version;
+    let ty = rd.u8()?;
+    Ok(match ty {
+        0x1f => Datum::Null,
+        0x30 => Datum::Int(i64::from(rd.u8()?)),
+        0x32 => Datum::Bool(rd.u8()? != 0),
+        0x34 => Datum::Int(i64::from(rd.u16()? as i16)),
+        0x38 => Datum::Int(i64::from(rd.u32()? as i32)),
+        0x7f => Datum::Int(rd.u64()? as i64),
+        0x3b => Datum::Float(f64::from(f32::from_bits(rd.u32()?))),
+        0x3e => Datum::Float(f64::from_bits(rd.u64()?)),
+        0x3c => money(rd.take(8)?)?,
+        0x7a => money(rd.take(4)?)?,
+        0x3d => datetime(rd.take(8)?)?,
+        0x3a => datetime(rd.take(4)?)?,
+        // Byte-length types: maxlen (+ precision, scale), then a 1-byte value length.
+        0x24 | 0x26 | 0x68 | 0x6d | 0x6e | 0x6f | 0x6a | 0x6c => {
+            rd.u8()?;
+            let scale = if matches!(ty, 0x6a | 0x6c) {
+                rd.u8()?;
+                rd.u8()?
+            } else {
+                0
+            };
+            let n = usize::from(rd.u8()?);
+            if n == 0 {
+                return Ok(Datum::Null);
+            }
+            let v = rd.take(n)?;
+            match ty {
+                0x24 => {
+                    let g: [u8; 16] = v.try_into().map_err(|_| Rd::bad())?;
+                    Datum::Uuid(guid_bytes(&g))
+                }
+                0x26 => Datum::Int(match n {
+                    1 => i64::from(v[0]),
+                    2 => i64::from(i16::from_le_bytes([v[0], v[1]])),
+                    4 => i64::from(i32::from_le_bytes([v[0], v[1], v[2], v[3]])),
+                    8 => i64::from_le_bytes(v.try_into().map_err(|_| Rd::bad())?),
+                    _ => return Err(Rd::bad()),
+                }),
+                0x68 => Datum::Bool(v[0] != 0),
+                0x6d => match n {
+                    4 => Datum::Float(f64::from(f32::from_le_bytes([v[0], v[1], v[2], v[3]]))),
+                    8 => Datum::Float(f64::from_le_bytes(v.try_into().map_err(|_| Rd::bad())?)),
+                    _ => return Err(Rd::bad()),
+                },
+                0x6e => money(v)?,
+                0x6f => datetime(v)?,
+                _ => {
+                    let body = &v[1..];
+                    if body.len() > 16 {
+                        return Err(Rd::bad());
+                    }
+                    let mut mag = [0u8; 16];
+                    mag[..body.len()].copy_from_slice(body);
+                    let m = i128::try_from(u128::from_le_bytes(mag)).map_err(|_| Rd::bad())?;
+                    let m = if v[0] == 0 { -m } else { m };
+                    Datum::Numeric(
+                        Decimal::new(m, scale)
+                            .map_err(|e| SqlError::new("22003", e.to_string()))?,
+                    )
+                }
+            }
+        }
+        0x28 => {
+            let n = usize::from(rd.u8()?);
+            if n == 0 {
+                return Ok(Datum::Null);
+            }
+            let v = rd.take(n)?;
+            Datum::Date((le_uint(v) as i64 - DAYS_0001_TO_1970) as i32)
+        }
+        0x29..=0x2b => {
+            let scale = u32::from(rd.u8()?.min(7));
+            let n = usize::from(rd.u8()?);
+            if n == 0 {
+                return Ok(Datum::Null);
+            }
+            let v = rd.take(n)?;
+            let time_len = match scale {
+                0..=2 => 3,
+                3..=4 => 4,
+                _ => 5,
+            };
+            let ns = le_uint(v.get(..time_len).ok_or_else(Rd::bad)?) as i64 * 10i64.pow(9 - scale);
+            if ty == 0x29 {
+                Datum::Time(ns)
+            } else {
+                // DATETIMEOFFSET stores UTC; the offset only affects display.
+                let days = le_uint(v.get(time_len..time_len + 3).ok_or_else(Rd::bad)?) as i64
+                    - DAYS_0001_TO_1970;
+                Datum::Timestamp(days * 86_400_000_000_000 + ns)
+            }
+        }
+        // Short-length types: maxlen (u16; 0xFFFF = MAX, sent as PLP), collation for text.
+        0xa5 | 0xa7 | 0xad | 0xaf | 0xe7 | 0xef => {
+            let max = rd.u16()?;
+            if matches!(ty, 0xa7 | 0xaf | 0xe7 | 0xef) {
+                rd.take(5)?;
+            }
+            let raw = if max == 0xffff {
+                rd.plp()?
+            } else {
+                let n = rd.u16()?;
+                if n == 0xffff {
+                    None
+                } else {
+                    Some(rd.take(usize::from(n))?.to_vec())
+                }
+            };
+            match raw {
+                None => Datum::Null,
+                Some(b) => match ty {
+                    0xe7 | 0xef => Datum::Text(from_utf16(&b)),
+                    0xa7 | 0xaf => Datum::Text(String::from_utf8_lossy(&b).into_owned()),
+                    _ => Datum::Bytes(b),
+                },
+            }
+        }
+        // Legacy long types: TEXT, NTEXT, IMAGE.
+        0x23 | 0x63 | 0x22 => {
+            rd.u32()?;
+            if ty != 0x22 {
+                rd.take(5)?;
+            }
+            let n = rd.u32()?;
+            if n == u32::MAX {
+                return Ok(Datum::Null);
+            }
+            let b = rd.take(n as usize)?.to_vec();
+            match ty {
+                0x63 => Datum::Text(from_utf16(&b)),
+                0x23 => Datum::Text(String::from_utf8_lossy(&b).into_owned()),
+                _ => Datum::Bytes(b),
+            }
+        }
+        // XML: schema info, then PLP.
+        0xf1 => {
+            if rd.u8()? != 0 {
+                rd.b_varchar()?;
+                rd.b_varchar()?;
+                rd.us_varchar()?;
+            }
+            rd.plp()?
+                .map_or(Datum::Null, |b| Datum::Text(from_utf16(&b)))
+        }
+        other => {
+            return Err(SqlError::unsupported(format!(
+                "parameter type 0x{other:02x}"
+            )))
+        }
+    })
+}
+
+fn le_uint(b: &[u8]) -> u64 {
+    b.iter()
+        .rev()
+        .fold(0u64, |acc, x| (acc << 8) | u64::from(*x))
+}
+
+/// MONEY (8 bytes: high then low 32 bits) / SMALLMONEY (4 bytes), in ten-thousandths.
+fn money(v: &[u8]) -> Result<Datum, SqlError> {
+    let units = match v.len() {
+        4 => i64::from(i32::from_le_bytes([v[0], v[1], v[2], v[3]])),
+        8 => {
+            let hi = i32::from_le_bytes([v[0], v[1], v[2], v[3]]);
+            let lo = u32::from_le_bytes([v[4], v[5], v[6], v[7]]);
+            (i64::from(hi) << 32) | i64::from(lo)
+        }
+        _ => return Err(Rd::bad()),
+    };
+    Ok(Datum::Numeric(
+        Decimal::new(i128::from(units), 4).map_err(|e| SqlError::new("22003", e.to_string()))?,
+    ))
+}
+
+/// DATETIME (days since 1900 + 1/300 s ticks) / SMALLDATETIME (days + minutes).
+fn datetime(v: &[u8]) -> Result<Datum, SqlError> {
+    let (days, ns) = match v.len() {
+        8 => {
+            let days = i64::from(i32::from_le_bytes([v[0], v[1], v[2], v[3]]));
+            let ticks = i64::from(u32::from_le_bytes([v[4], v[5], v[6], v[7]]));
+            (days, ticks * 1_000_000_000 / 300)
+        }
+        4 => {
+            let days = i64::from(u16::from_le_bytes([v[0], v[1]]));
+            let minutes = i64::from(u16::from_le_bytes([v[2], v[3]]));
+            (days, minutes * 60_000_000_000)
+        }
+        _ => return Err(Rd::bad()),
+    };
+    Ok(Datum::Timestamp(
+        (days - DAYS_1900_TO_1970) * 86_400_000_000_000 + ns,
+    ))
+}
+
+/// Whether a statement ending a transaction rolled it back (ENVCHANGE 10) rather than committed it.
+fn rolls_back(st: &Statement) -> bool {
+    match st {
+        Statement::Rollback | Statement::RollbackToSavepoint(_) => true,
+        Statement::If {
+            then, otherwise, ..
+        } => rolls_back(then) || otherwise.as_deref().is_some_and(rolls_back),
+        _ => false,
+    }
+}

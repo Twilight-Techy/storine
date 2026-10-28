@@ -226,12 +226,9 @@ pub fn tokenize(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Token>, Params)> 
                 j += 1;
             }
             if j > start {
+                // T-SQL `@name` is a variable too: RPC parameters are bound as variables.
                 let name = sql[start..j].to_owned();
-                if dialect == Dialect::MsSql && !system {
-                    out.push(Token::Param(named(&mut params, &name)));
-                } else {
-                    out.push(Token::Variable { name, system });
-                }
+                out.push(Token::Variable { name, system });
                 i = j;
                 continue;
             }
@@ -497,8 +494,18 @@ mod tests {
         assert_eq!((t[2].clone(), p.count), (Token::Param(2), 3));
         let (t, p) = tokenize("@b = @a and @b", Dialect::MsSql).unwrap();
         assert_eq!(
-            (t[0].clone(), t[2].clone(), t[4].clone(), p.count),
-            (Token::Param(0), Token::Param(1), Token::Param(0), 2)
+            (t[0].clone(), t[2].clone(), p.count),
+            (
+                Token::Variable {
+                    name: "b".into(),
+                    system: false
+                },
+                Token::Variable {
+                    name: "a".into(),
+                    system: false
+                },
+                0
+            )
         );
         assert_eq!(
             toks("@@version @x", Dialect::MySql),

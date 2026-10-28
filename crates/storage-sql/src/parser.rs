@@ -130,12 +130,46 @@ pub fn parse(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Statement>, usize)> 
             break;
         }
         out.push(p.statement()?);
-        if !p.at_end() && !p.eat_op(";") {
+        // T-SQL separates statements with whitespace as often as with `;`.
+        let next_starts = dialect == Dialect::MsSql
+            && p.peek()
+                .and_then(Token::keyword)
+                .is_some_and(|k| TSQL_STATEMENT_STARTS.contains(&k.as_str()));
+        if !p.at_end() && !next_starts && !p.eat_op(";") {
             return Err(p.unexpected("end of statement"));
         }
     }
     Ok((out, params.count))
 }
+
+/// Keywords that begin a new T-SQL statement after one ends without `;`.
+const TSQL_STATEMENT_STARTS: &[&str] = &[
+    "select",
+    "insert",
+    "update",
+    "delete",
+    "merge",
+    "set",
+    "declare",
+    "if",
+    "begin",
+    "commit",
+    "rollback",
+    "save",
+    "exec",
+    "execute",
+    "create",
+    "drop",
+    "alter",
+    "truncate",
+    "use",
+    "print",
+    "with",
+    "while",
+    "return",
+    "raiserror",
+    "throw",
+];
 
 /// Parses exactly one statement (an empty string gives `Statement::Empty`).
 pub fn parse_one(sql: &str, dialect: Dialect) -> SqlResult<(Statement, usize)> {
@@ -434,6 +468,22 @@ impl Parser {
                 Ok(Statement::ReleaseSavepoint(self.ident()?))
             }
             "set" => self.set(),
+            "declare" if self.dialect == Dialect::MsSql => self.declare(),
+            "if" if self.dialect == Dialect::MsSql => {
+                self.pos += 1;
+                let cond = self.expr()?;
+                let then = Box::new(self.statement()?);
+                let otherwise = if self.eat_kw("else") {
+                    Some(Box::new(self.statement()?))
+                } else {
+                    None
+                };
+                Ok(Statement::If {
+                    cond,
+                    then,
+                    otherwise,
+                })
+            }
             "show" => self.show(),
             "use" => {
                 self.pos += 1;
@@ -552,6 +602,35 @@ impl Parser {
         })
     }
 
+    fn declare(&mut self) -> SqlResult<Statement> {
+        self.pos += 1; // DECLARE
+        let mut vars = Vec::new();
+        loop {
+            let name = match self.next() {
+                Some(Token::Variable {
+                    name,
+                    system: false,
+                }) => name,
+                _ => return Err(self.unexpected("a @variable")),
+            };
+            let _ = self.eat_kw("as");
+            if self.is_kw("table") || self.is_kw("cursor") {
+                return Err(SqlError::unsupported("table variables and cursors"));
+            }
+            let (ty, _) = self.data_type()?;
+            let value = if self.eat_op("=") {
+                Some(self.expr()?)
+            } else {
+                None
+            };
+            vars.push((name, ty, value));
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        Ok(Statement::Declare(vars))
+    }
+
     fn set(&mut self) -> SqlResult<Statement> {
         self.pos += 1; // SET
                        // SET TRANSACTION ... (this / the next transaction) and the session-wide forms.
@@ -633,7 +712,27 @@ impl Parser {
         };
         if !self.eat_op("=") && !self.eat_kw("to") {
             if self.dialect == Dialect::MsSql {
-                // SET NOCOUNT ON, SET ANSI_NULLS ON ...
+                // SET NOCOUNT ON, SET IMPLICIT_TRANSACTIONS OFF ...: one option keeps its value;
+                // option lists (SET ANSI_NULLS, QUOTED_IDENTIFIER ON) do not apply.
+                if let Some(on) = ["on", "off"].into_iter().find(|w| self.is_kw(w)) {
+                    self.pos += 1;
+                    if self.at_end() {
+                        // Implicit transactions are autocommit turned off.
+                        return Ok(if name == "implicit_transactions" {
+                            Statement::Set {
+                                name: "autocommit".into(),
+                                value: Some(Expr::Str(
+                                    if on == "on" { "off" } else { "on" }.into(),
+                                )),
+                            }
+                        } else {
+                            Statement::Set {
+                                name,
+                                value: Some(Expr::Str(on.into())),
+                            }
+                        });
+                    }
+                }
                 self.skip_to_end();
                 return Ok(Statement::NoOp("SET"));
             }

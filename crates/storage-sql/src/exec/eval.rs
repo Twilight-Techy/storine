@@ -789,6 +789,9 @@ impl<'a> Exec<'a> {
             .trim_start_matches("global.")
             .trim_start_matches("local.");
         match n {
+            "version" if self.dialect() == Dialect::MsSql => {
+                Datum::Text(crate::MSSQL_VERSION_STRING.into())
+            }
             "version" => Datum::Text(crate::MYSQL_VERSION.into()),
             "version_comment" => Datum::Text("Storine".into()),
             "identity" | "last_insert_id" => Datum::Int(self.s.last_insert_id),
@@ -803,6 +806,7 @@ impl<'a> Exec<'a> {
             "spid" => Datum::Int(self.s.id as i64),
             "servername" | "hostname" => Datum::Text("storine".into()),
             "trancount" => Datum::Int(i64::from(self.s.in_transaction())),
+            "rowcount" if self.s.last_row_count >= 0 => Datum::Int(self.s.last_row_count),
             "rowcount" => Datum::Int(self.s.last_found_rows as i64),
             other => match self.s.vars.get(other) {
                 Some(v) => match v.parse::<i64>() {

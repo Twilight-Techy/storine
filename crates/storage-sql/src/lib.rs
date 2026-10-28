@@ -27,6 +27,9 @@ pub const PG_VERSION_NUM: &str = "160000";
 pub const PG_VERSION_STRING: &str =
     "PostgreSQL 16.0 (Storine SQL gateway) on x86_64, compiled by rustc, 64-bit";
 /// Version reported to MySQL clients.
+/// `@@VERSION` on the SQL Server endpoint.
+pub const MSSQL_VERSION_STRING: &str =
+    "Microsoft SQL Server 2022 (RTM) - 16.0.1000.6 (X64) Storine SQL gateway (compatible)";
 pub const MYSQL_VERSION: &str = "8.4.3-storine";
 
 /// A random id of this gateway process (row-lock ownership).
