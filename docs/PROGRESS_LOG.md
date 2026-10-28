@@ -458,3 +458,17 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Correctness built into every client**: a fresh random request id per logical write, reused on every retry (timeouts, reconnects, `CommitUnknown`, leader changes) so writes apply at most once; `NotLeader` hints followed, stale hints naming a dead node ignored, failed seeds avoided; retries bounded by 3x the timeout; response decoders bound every count by the bytes present.
 - **Bugs found while building the SDKs**: Python `Decimal.scaleb` rounded large exponents (replaced by exact string construction); a missing-document update returned the wrong error with a precondition (fixed); early cluster failover retried too few times during an election (time-based retry budget); TypeScript map decoding allowed `__proto__` keys to reach the prototype (keys are now defined as own properties).
 - **Verification**: each SDK's vector suite and end-to-end suite pass (Python, TypeScript 11/11, Go `-race`, Java 12/12, C# 12/12, Rust 10/10 incl. doc tests), every one including the 3-node leader-kill failover test.
+
+### Stage 26: SQL Gateway (`TASK-112` – `TASK-118`) — 2026-10-28
+
+- **Layout decision** (Follow-Up Prompt 2): a separate crate in this repository, `crates/storage-sql`, with its own binary `storine-sql`; it talks to Storine through the Rust SDK (`sdks/rust`), embedded (`--data`) or over the network (`--storine storine://...`).
+- **Approach**: impersonate the servers, not the client libraries. Speaking the PostgreSQL and MySQL wire protocols and emulating their catalogs means every existing driver and ORM works by changing the connection string only. Each compatibility claim is backed by a real-client suite (`tests/clients/run_all.sh`, 12 suites across Python, Node, Go, Java, .NET, PHP and Ruby).
+- **Correctness bugs found by the real clients and fixed**:
+  - MySQL `SERVER_STATUS_AUTOCOMMIT` reported after `SET autocommit = 0`, so PyMySQL skipped `SET autocommit = 1` and its writes stayed uncommitted.
+  - `ROW_COUNT()` returned the last query's row count, which caused false EF Core concurrency conflicts.
+  - A comma join of four catalogs built a full cross product and exhausted memory. Comma joins now hash-join on the linking WHERE conjuncts, and joins are capped at 20M intermediate rows.
+  - A parent `DELETE` racing a child `INSERT` could leave an orphan. Reference markers fix it, with a deterministic test that fails without the fix.
+  - REPEATABLE READ / SERIALIZABLE behaved as READ COMMITTED. Reads are now validated at commit.
+  - `nextval` silently created unknown sequences.
+- **Security**: SCRAM-SHA-256 / native-password authentication with constant-time comparison; every protocol message length bounded (`MAX_MESSAGE`); COPY records and fields bounded; recursion depth limits (views 32, FK cascades 32); validated-read and recursive-CTE row caps; no statement is silently ignored except session settings that do not apply.
+- **Known limitations** (documented in `crates/storage-sql/README.md`): no TLS yet (`TASK-117`), DDL not transactional, one schema per database, SERIALIZABLE does not detect range phantoms, no stored procedures / triggers, no TDS yet (`TASK-118`).

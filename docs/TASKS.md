@@ -782,3 +782,15 @@ This document defines the strict chronological execution order for building the 
 - [ ] **TASK-110: PHP SDK** — *TODO (Follow-Up Prompt 3)*.
 - [ ] **TASK-111: Ruby SDK** — *TODO (Follow-Up Prompt 3)*.
 
+
+## Stage 26: SQL Gateway — PostgreSQL & MySQL Wire Compatibility (`TASK-112` – `TASK-118`)
+
+*(Follow-Up Prompt 2: "build the SQL adapter separately … so that existing projects with SQL and/or ORMs can work with it with zero changes to their codebase or at least almost zero. It should support the different popular SQL formats.")*
+
+- [x] **TASK-112: SQL Engine over Documents** (`crates/storage-sql`) — tables as document collections (primary key encoded in the document key), schemas in `_sql_tables`, unique markers with absent preconditions, sequences, row locks, foreign keys with referential actions, an OCC transaction overlay (statement rollback, savepoints, autocommit retries), filter push-down, primary-key lookups, hash / lookup joins, window functions, CTEs (recursive), views, `DISTINCT ON`, correlated `LATERAL`, set-returning functions.
+- [x] **TASK-113: PostgreSQL v3 Endpoint** — SCRAM-SHA-256, simple and extended protocol, text and binary formats (`numeric`, arrays), `pg_catalog` / `information_schema` emulation with stable OIDs, `COPY` in text / CSV / binary.
+- [x] **TASK-114: MySQL Endpoint** — `mysql_native_password` with auth switch, text protocol, `COM_STMT_*` binary prepared statements, accurate server status flags, `information_schema` / `SHOW` emulation.
+- [x] **TASK-115: Real-Client Compatibility Matrix** (`tests/clients/run_all.sh`) — psycopg2, psycopg 3, asyncpg, PyMySQL, SQLAlchemy, Django; pg, mysql2, Sequelize, Knex, TypeORM, Drizzle, Prisma; pgx, lib/pq, go-sql-driver, GORM; pgJDBC, Connector/J, Hibernate; Npgsql, MySqlConnector, EF Core; PDO, pgsql, mysqli, Eloquent; ActiveRecord (pg, trilogy).
+- [x] **TASK-116: Integrity Semantics** — no lost updates (versioned writes), REPEATABLE READ / SERIALIZABLE read validation, race-free foreign keys (reference markers), separate namespaces per `CREATE DATABASE`.
+- [ ] **TASK-117: TLS for Both Endpoints** — zero-dependency TLS 1.3 (`sslmode=require`, `ssl-mode=REQUIRED`).
+- [ ] **TASK-118: SQL Server (TDS) Endpoint**.
