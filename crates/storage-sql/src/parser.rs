@@ -737,7 +737,22 @@ impl Parser {
                     {
                         columns.push(args[0].column_name().unwrap_or_default().to_owned())
                     }
+                    // MySQL prefix indexes: name(10).
+                    Expr::Function { name, args, .. }
+                        if matches!(args.as_slice(), [Expr::Number(_)]) =>
+                    {
+                        columns.push(name)
+                    }
                     _ => return Err(SqlError::unsupported("index on an expression")),
+                }
+                // Operator class (varchar_pattern_ops, gin_trgm_ops): ordering is unaffected.
+                if !self.is_op(",")
+                    && !self.is_op(")")
+                    && !self.is_kw("asc")
+                    && !self.is_kw("desc")
+                    && !self.is_kw("nulls")
+                {
+                    self.ident()?;
                 }
                 let _ = self.eat_kw("asc") || self.eat_kw("desc");
                 if self.eat_kw("nulls") {
@@ -1264,7 +1279,8 @@ impl Parser {
                 DataType::Interval
             }
             "uuid" | "uniqueidentifier" => DataType::Uuid,
-            "json" | "jsonb" => DataType::Json,
+            "json" => DataType::Json,
+            "jsonb" => DataType::Jsonb,
             "enum" => {
                 self.expect_op("(")?;
                 let mut values = Vec::new();
@@ -1490,7 +1506,7 @@ impl Parser {
             }
             return Ok(AlterOp::AlterColumn {
                 name: column.name.clone(),
-                change: AlterColumn::Type(column.ty),
+                change: AlterColumn::Redefine(Box::new(column)),
             });
         }
         Err(SqlError::unsupported("this ALTER TABLE operation"))
@@ -2351,7 +2367,8 @@ impl Parser {
             };
             if let Some(ci) = like {
                 // MySQL LIKE is case-insensitive under its default collations.
-                let ci = ci || self.dialect == Dialect::MySql;
+                // MySQL LIKE ignores case unless the pattern is BINARY.
+                let ci = ci || (self.dialect == Dialect::MySql && !self.is_kw("binary"));
                 let pattern = self.bit_or()?;
                 let escape = if self.eat_kw("escape") {
                     Some(Box::new(self.primary()?))
@@ -2597,6 +2614,16 @@ impl Parser {
                     expr: Box::new(other),
                 },
             });
+        }
+        // MySQL `BINARY expr`: a byte-wise (case-sensitive) comparison, which is already
+        // how text compares here.
+        if self.dialect == Dialect::MySql
+            && self.is_kw("binary")
+            && !self.is_op_at(1, ")")
+            && !self.is_op_at(1, ",")
+        {
+            self.pos += 1;
+            return self.unary();
         }
         if self.eat_op("+") {
             return self.unary();

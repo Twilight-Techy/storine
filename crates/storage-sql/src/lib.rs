@@ -24,7 +24,7 @@ pub const PG_VERSION_NUM: &str = "160000";
 pub const PG_VERSION_STRING: &str =
     "PostgreSQL 16.0 (Storine SQL gateway) on x86_64, compiled by rustc, 64-bit";
 /// Version reported to MySQL clients.
-pub const MYSQL_VERSION: &str = "8.0.36-storine";
+pub const MYSQL_VERSION: &str = "8.4.3-storine";
 
 /// A random id of this gateway process (row-lock ownership).
 pub fn instance_id() -> &'static str {

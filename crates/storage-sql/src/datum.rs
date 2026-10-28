@@ -717,7 +717,7 @@ pub fn cast(d: &Datum, ty: &DataType) -> SqlResult<Datum> {
             Bytes(b) if b.len() == 16 => Uuid(b.as_slice().try_into().unwrap_or([0; 16])),
             _ => return Err(cast_err(d, ty)),
         },
-        DataType::Json => match d {
+        DataType::Json | DataType::Jsonb => match d {
             Json(s) => Json(s.clone()),
             Text(s) => Json(s.clone()),
             other => Json(json_of(other)),
@@ -787,6 +787,7 @@ pub fn type_sql(ty: &DataType) -> String {
         DataType::Interval => "interval".into(),
         DataType::Uuid => "uuid".into(),
         DataType::Json => "json".into(),
+        DataType::Jsonb => "jsonb".into(),
         DataType::Enum(v) => format!(
             "enum({})",
             v.iter()
@@ -861,7 +862,7 @@ pub fn from_value(v: &storine::Value, ty: Option<&DataType>) -> Datum {
     match ty {
         None => natural,
         Some(DataType::Array(_)) => natural,
-        Some(DataType::Json) => match natural {
+        Some(DataType::Json | DataType::Jsonb) => match natural {
             Datum::Text(s) => Datum::Json(s),
             other => other,
         },

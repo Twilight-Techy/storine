@@ -839,6 +839,11 @@ fn encode_binary(d: &Datum, ty: &DataType) -> Vec<u8> {
             v.extend_from_slice(&(*months as i32).to_be_bytes());
             v
         }
+        (DataType::Jsonb, _) => {
+            let mut v = vec![1u8];
+            v.extend_from_slice(encode_text(&d, ty).as_bytes());
+            v
+        }
         (DataType::Array(inner), Datum::Array(items)) => {
             let mut v = Vec::new();
             v.extend_from_slice(&1i32.to_be_bytes());

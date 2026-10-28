@@ -1531,9 +1531,18 @@ pub fn describe_returning(
     Ok(ex.result_set(rel)?.columns)
 }
 
+/// Key of a sequence named in DDL (the parser has already folded the identifier).
+fn sequence_ddl_key(name: &str) -> String {
+    format!("seq:{}", name.rsplit('.').next().unwrap_or(name))
+}
+
+/// `nextval('name')` follows identifier rules: unquoted names fold to lower case.
 fn sequence_key(name: &str) -> String {
-    let bare = name.rsplit('.').next().unwrap_or(name).trim_matches('"');
-    format!("seq:{bare}")
+    let last = name.rsplit('.').next().unwrap_or(name);
+    match last.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+        Some(quoted) => format!("seq:{quoted}"),
+        None => format!("seq:{}", last.to_lowercase()),
+    }
 }
 
 /// The stored sequence behind `name`: a `CREATE SEQUENCE` one, or the implicit
@@ -1575,7 +1584,7 @@ pub fn create_sequence(
     doc.insert("increment".into(), Value::Int(increment));
     let w = Write {
         collection: SEQUENCES.into(),
-        key: sequence_key(name),
+        key: sequence_ddl_key(name),
         op: Op::Put(doc),
         pre: Pre::Absent,
         tag: Tag::Internal,
@@ -1595,7 +1604,7 @@ pub fn create_sequence(
 
 pub fn drop_sequences(s: &mut Session, names: &[String], if_exists: bool) -> SqlResult<Outcome> {
     for n in names {
-        let key = sequence_key(n);
+        let key = sequence_ddl_key(n);
         if s.engine.store.get(SEQUENCES, &key)?.is_none() {
             if if_exists {
                 continue;

@@ -25,6 +25,7 @@ pub fn type_oid(ty: &DataType) -> u32 {
         DataType::Text | DataType::Enum(_) => 25,
         DataType::Name => 19,
         DataType::Json => 114,
+        DataType::Jsonb => 3802,
         DataType::Real => 700,
         DataType::Double => 701,
         DataType::Char(_) => 1042,
@@ -53,6 +54,7 @@ pub fn type_oid(ty: &DataType) -> u32 {
             DataType::Numeric(_) => 1231,
             DataType::Uuid => 2951,
             DataType::Json => 199,
+            DataType::Jsonb => 3807,
             _ => 1009,
         },
     }
@@ -1174,6 +1176,7 @@ pub fn mysql_type(ty: &DataType) -> (String, String) {
         DataType::Interval => ("varchar".into(), "varchar(64)".into()),
         DataType::Uuid => ("char".into(), "char(36)".into()),
         DataType::Json => ("json".into(), "json".into()),
+        DataType::Jsonb => ("jsonb".into(), "jsonb".into()),
         DataType::Enum(v) => (
             "enum".into(),
             format!(

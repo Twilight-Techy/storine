@@ -355,7 +355,7 @@ impl<'a> Exec<'a> {
             }
             Expr::Cast { expr, ty } => {
                 let v = self.eval(expr, env)?;
-                if *ty == DataType::Json {
+                if matches!(ty, DataType::Json | DataType::Jsonb) {
                     return Ok(match v {
                         Datum::Text(s) => Datum::Json(s),
                         other => cast(&other, ty)?,

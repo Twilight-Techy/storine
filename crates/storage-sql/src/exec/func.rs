@@ -739,6 +739,25 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             ))
         }
         "timezone" => args.get(1).cloned().unwrap_or(Datum::Null),
+        // MySQL CONVERT_TZ: fixed offsets and UTC; named zones are NULL, as in a MySQL
+        // without time zone tables.
+        "convert_tz" => {
+            if null_if_any(args) || args.len() < 3 {
+                return Ok(Datum::Null);
+            }
+            match (
+                tz_offset_secs(&text(&args[1])),
+                tz_offset_secs(&text(&args[2])),
+            ) {
+                (Some(from), Some(to)) => {
+                    let Datum::Timestamp(ns) = cast(&a0, &DataType::Timestamp)? else {
+                        return Ok(Datum::Null);
+                    };
+                    Datum::Timestamp(ns + (to - from) * 1_000_000_000)
+                }
+                _ => Datum::Null,
+            }
+        }
         // ── identity / session ──
         "version" => Datum::Text(if mysql {
             crate::MYSQL_VERSION.into()
@@ -1462,6 +1481,25 @@ fn trim_avg(d: Decimal) -> Decimal {
     d.normalize()
 }
 
+/// Seconds east of UTC for `UTC`, `Z`, `GMT`, `SYSTEM` (the server runs in UTC) or `±hh:mm`.
+fn tz_offset_secs(z: &str) -> Option<i64> {
+    let z = z.trim();
+    if ["utc", "z", "gmt", "system", "etc/utc"]
+        .iter()
+        .any(|n| z.eq_ignore_ascii_case(n))
+    {
+        return Some(0);
+    }
+    let (sign, rest) = match z.as_bytes().first()? {
+        b'+' => (1, &z[1..]),
+        b'-' => (-1, &z[1..]),
+        _ => return None,
+    };
+    let (h, m) = rest.split_once(':').unwrap_or((rest, "0"));
+    let (h, m) = (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?);
+    (h <= 14 && m < 60).then_some(sign * (h * 3600 + m * 60))
+}
+
 // ── table functions ──
 
 /// Reserved words reported by `pg_get_keywords()` and `information_schema.keywords`.
@@ -1630,15 +1668,38 @@ pub fn table_function(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Re
             Ok(Rel { cols, rows })
         }
         "unnest" => {
-            let items = match args.first() {
-                Some(Datum::Array(a)) => a.clone(),
-                Some(Datum::Text(s)) => datum::parse_array(s)?,
-                _ => Vec::new(),
-            };
-            Ok(Rel {
-                cols: vec![ColMeta::new("unnest", None)],
-                rows: items.into_iter().map(|d| vec![d]).collect(),
-            })
+            // Several arrays zip into columns, padded with NULLs to the longest.
+            let arrays = args
+                .iter()
+                .map(|a| match a {
+                    Datum::Array(a) => Ok(a.clone()),
+                    Datum::Text(s) => datum::parse_array(s),
+                    _ => Ok(Vec::new()),
+                })
+                .collect::<SqlResult<Vec<_>>>()?;
+            let n = arrays.iter().map(Vec::len).max().unwrap_or(0);
+            let rows = (0..n)
+                .map(|i| {
+                    arrays
+                        .iter()
+                        .map(|a| a.get(i).cloned().unwrap_or(Datum::Null))
+                        .collect()
+                })
+                .collect();
+            // Distinct names so `SELECT *` can expand them (PostgreSQL repeats "unnest").
+            let cols = (0..arrays.len().max(1))
+                .map(|i| {
+                    ColMeta::new(
+                        if i == 0 {
+                            "unnest".to_owned()
+                        } else {
+                            format!("unnest_{}", i + 1)
+                        },
+                        None,
+                    )
+                })
+                .collect();
+            Ok(Rel { cols, rows })
         }
         "json_array_elements"
         | "jsonb_array_elements"
@@ -2074,7 +2135,7 @@ pub fn return_type(
             }
         }
         "localtimestamp" | "utc_timestamp" | "sysdate" | "getdate" | "date_trunc"
-        | "from_unixtime" | "date_add" | "date_sub" => DataType::Timestamp,
+        | "from_unixtime" | "date_add" | "date_sub" | "convert_tz" => DataType::Timestamp,
         "current_date" | "curdate" | "date" | "to_date" | "make_date" => DataType::Date,
         "current_time" | "curtime" => DataType::Time,
         "gen_random_uuid" | "uuid_generate_v4" | "newid" => DataType::Uuid,

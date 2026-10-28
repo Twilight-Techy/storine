@@ -424,6 +424,15 @@ impl Session {
         self.txn.as_ref().is_some_and(|t| t.explicit)
     }
 
+    /// False after MySQL `SET autocommit = 0`.
+    pub fn autocommit(&self) -> bool {
+        !self.vars.get("autocommit").is_some_and(|v| {
+            ["0", "off", "false"]
+                .iter()
+                .any(|f| v.eq_ignore_ascii_case(f))
+        })
+    }
+
     pub fn transaction_failed(&self) -> bool {
         self.txn.as_ref().is_some_and(|t| t.explicit && t.failed)
     }
@@ -512,13 +521,7 @@ impl Session {
             return Err(SqlError::in_failed_transaction());
         }
         // MySQL `autocommit = 0`: every statement runs in an open transaction until COMMIT.
-        if !self.in_transaction()
-            && self
-                .vars
-                .get("autocommit")
-                .is_some_and(|v| v == "0" || v == "off")
-            && !matches!(stmt, Statement::Set { .. })
-        {
+        if !self.in_transaction() && !self.autocommit() && !matches!(stmt, Statement::Set { .. }) {
             self.txn = Some(Txn {
                 explicit: true,
                 ..Txn::default()
@@ -787,7 +790,11 @@ impl Session {
             "transaction_isolation" | "tx_isolation" => "transaction_isolation",
             other => other,
         };
-        if key == "autocommit" && matches!(text.as_str(), "0" | "off" | "false") {
+        if key == "autocommit"
+            && ["0", "off", "false"]
+                .iter()
+                .any(|f| text.eq_ignore_ascii_case(f))
+        {
             // MySQL autocommit=0: an implicit transaction stays open until COMMIT.
             if !self.in_transaction() {
                 self.txn = Some(Txn {

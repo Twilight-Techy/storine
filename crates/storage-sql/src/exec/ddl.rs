@@ -792,39 +792,61 @@ pub fn alter_table(s: &mut Session, table: &str, ops: &[AlterOp]) -> SqlResult<O
             }
             AlterOp::AlterColumn { name, change } => {
                 let i = t.column(name)?;
-                match change {
-                    AlterColumn::SetDefault(e) => t.columns[i].default = Some(e.clone()),
-                    AlterColumn::DropDefault => t.columns[i].default = None,
-                    AlterColumn::DropNotNull => {
-                        if t.primary_key.contains(&i) {
-                            return Err(SqlError::new(
-                                "42P16",
-                                format!("column \"{name}\" is in a primary key"),
-                            ));
-                        }
-                        t.columns[i].not_null = false;
+                // A MySQL redefinition is a type change plus nullability and default.
+                let steps = match change {
+                    AlterColumn::Redefine(def) => {
+                        let in_pk = t.primary_key.contains(&i);
+                        t.columns[i].auto_increment = def.auto_increment;
+                        vec![
+                            AlterColumn::Type(def.ty.clone()),
+                            if def.not_null || in_pk {
+                                AlterColumn::SetNotNull
+                            } else {
+                                AlterColumn::DropNotNull
+                            },
+                            def.default
+                                .clone()
+                                .map_or(AlterColumn::DropDefault, AlterColumn::SetDefault),
+                        ]
                     }
-                    AlterColumn::SetNotNull => {
-                        let field = t.columns[i].field.clone();
-                        let has_null = t.columns[i].missing.is_none()
-                            && s.engine
-                                .store
-                                .count(&t.collection, Some(storine::missing(&field)))?
-                                > 0;
-                        if has_null {
-                            return Err(SqlError::new(
-                                "23502",
-                                format!(
-                                    "column \"{name}\" of relation \"{}\" contains null values",
-                                    t.name
-                                ),
-                            ));
+                    other => vec![other.clone()],
+                };
+                for change in &steps {
+                    match change {
+                        AlterColumn::SetDefault(e) => t.columns[i].default = Some(e.clone()),
+                        AlterColumn::DropDefault => t.columns[i].default = None,
+                        AlterColumn::DropNotNull => {
+                            if t.primary_key.contains(&i) {
+                                return Err(SqlError::new(
+                                    "42P16",
+                                    format!("column \"{name}\" is in a primary key"),
+                                ));
+                            }
+                            t.columns[i].not_null = false;
                         }
-                        t.columns[i].not_null = true;
+                        AlterColumn::SetNotNull => {
+                            let field = t.columns[i].field.clone();
+                            let has_null = t.columns[i].missing.is_none()
+                                && s.engine
+                                    .store
+                                    .count(&t.collection, Some(storine::missing(&field)))?
+                                    > 0;
+                            if has_null {
+                                return Err(SqlError::new(
+                                    "23502",
+                                    format!(
+                                        "column \"{name}\" of relation \"{}\" contains null values",
+                                        t.name
+                                    ),
+                                ));
+                            }
+                            t.columns[i].not_null = true;
+                        }
+                        AlterColumn::Type(ty) => change_type(s, &t, i, ty)?
+                            .into_iter()
+                            .for_each(|c| t.columns[i] = c),
+                        AlterColumn::Redefine(_) => {} // expanded above
                     }
-                    AlterColumn::Type(ty) => change_type(s, &t, i, ty)?
-                        .into_iter()
-                        .for_each(|c| t.columns[i] = c),
                 }
             }
             AlterOp::AddConstraint(c) => {

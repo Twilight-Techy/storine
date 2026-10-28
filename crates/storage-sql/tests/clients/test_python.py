@@ -271,6 +271,17 @@ def run_all():
             c.rollback()
             cur.execute("SHOW TABLES")
             assert ("my_items",) in cur.fetchall()
+            # Switching autocommit back on must take effect: PyMySQL only sends SET autocommit
+            # when the server status flags disagree, so the flags have to be accurate.
+            assert not c.get_autocommit()
+            c.autocommit(True)
+            assert c.get_autocommit()
+            cur.execute("UPDATE my_items SET qty = 42 WHERE sku = 'C3'")
+            other = pymysql.connect(host="127.0.0.1", port=MY_PORT, user="root", database="shop")
+            oc = other.cursor()
+            oc.execute("SELECT qty FROM my_items WHERE sku = 'C3'")
+            assert oc.fetchone() == (42,)
+            other.close()
             c.close()
 
         @section("SQLAlchemy ORM over PyMySQL (MySQL)")

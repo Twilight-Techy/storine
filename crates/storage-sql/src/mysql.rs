@@ -246,12 +246,16 @@ impl Conn {
         }
     }
 
+    /// Drivers track autocommit from these flags (PyMySQL skips `SET autocommit` when they agree).
     fn status(&self) -> u16 {
+        let mut st = 0;
         if self.session.in_transaction() {
-            STATUS_IN_TRANS
-        } else {
-            STATUS_AUTOCOMMIT
+            st |= STATUS_IN_TRANS;
         }
+        if self.session.autocommit() {
+            st |= STATUS_AUTOCOMMIT;
+        }
+        st
     }
 
     fn ok(&mut self, affected: u64, last_id: u64, more: bool, info: &str) -> io::Result<()> {
@@ -719,7 +723,9 @@ fn wire_type(ty: &DataType) -> (u8, u16, u32, u8, u16) {
         DataType::Timestamp | DataType::TimestampTz => (T_DATETIME, 128, 26, 6, BIN),
         DataType::Date => (T_DATE, 128, 10, 0, BIN),
         DataType::Time => (T_TIME, 128, 17, 6, BIN),
-        DataType::Json | DataType::Array(_) => (T_JSON, 16 | 128, 4_294_967_295, 0, BIN),
+        DataType::Json | DataType::Jsonb | DataType::Array(_) => {
+            (T_JSON, 16 | 128, 4_294_967_295, 0, BIN)
+        }
         DataType::Varchar(n) | DataType::Char(n) => {
             (T_VAR_STRING, 0, n.unwrap_or(255).saturating_mul(4), 0, UTF8)
         }

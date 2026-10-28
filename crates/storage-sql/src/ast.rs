@@ -366,6 +366,8 @@ pub enum AlterColumn {
     SetNotNull,
     DropNotNull,
     Type(DataType),
+    /// MySQL `MODIFY` / `CHANGE`: the whole definition (type, nullability, default).
+    Redefine(Box<ColumnDef>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -401,6 +403,8 @@ pub enum DataType {
     Interval,
     Uuid,
     Json,
+    /// PostgreSQL `jsonb`: stored and compared like `json`, reported with its own type.
+    Jsonb,
     /// MySQL `ENUM('a', 'b')`.
     Enum(Vec<String>),
     Array(Box<DataType>),
