@@ -3,6 +3,7 @@
     python3 duckdb_bench.py <dir> load            # dir/lineitem.csv -> dir/lineitem.duckdb
     python3 duckdb_bench.py <dir> <q1|q6> <reps>  # timings and result rows
 """
+import os
 import sys
 import time
 
@@ -34,6 +35,8 @@ def main():
         print(f"duckdb loaded in {time.time() - t:.1f} s")
         return
     reps = int(sys.argv[3]) if len(sys.argv) > 3 else 5
+    if os.environ.get("DUCKDB_THREADS"):
+        con.execute(f"SET threads = {int(os.environ['DUCKDB_THREADS'])}")
     q = {"q1": Q1, "q6": Q6}[what]
     times, rows = [], None
     for _ in range(reps):

@@ -29,7 +29,7 @@ thread_local! {
 }
 
 /// A buffer of `n` values (contents unspecified: every caller overwrites it).
-fn take_i64(n: usize) -> Vec<i64> {
+pub(super) fn take_i64(n: usize) -> Vec<i64> {
     let mut v = POOL.with(|p| p.borrow_mut().pop()).unwrap_or_default();
     if v.len() < n {
         v.resize(n, 0);
@@ -39,7 +39,7 @@ fn take_i64(n: usize) -> Vec<i64> {
     v
 }
 
-fn give_i64(v: Vec<i64>) {
+pub(super) fn give_i64(v: Vec<i64>) {
     if v.capacity() > 0 {
         POOL.with(|p| {
             let mut p = p.borrow_mut();
@@ -565,7 +565,7 @@ fn apply_f(a: f64, b: f64, op: Op) -> f64 {
 
 /// `i64` arithmetic; `None` on any overflow (the caller widens to `i128`).
 fn max_abs(v: &[i64]) -> u128 {
-    u128::from(v.iter().fold(0u64, |m, &x| m.max(x.unsigned_abs())))
+    u128::from(simd::abs_bound_i64(v))
 }
 
 fn i64_op(x: &[i64], sx: u8, y: &[i64], sy: u8, op: Op, valid: &[u64]) -> Option<(Vec<i64>, u8)> {
@@ -777,10 +777,15 @@ fn key_col(k: &GroupKey, rg: &RowGroupView<'_>, sel: &[u64]) -> KeyCol {
                         })
                         .collect();
                     if matches!(kind, Kind::Text | Kind::Bytes) {
-                        let mut c = vec![0u64; n];
-                        codes.unpack_into(0, &mut c);
                         let last = entries.len().saturating_sub(1) as u64;
-                        return KeyCol::Codes(c.into_iter().map(|x| x.min(last) as u32).collect(), entries);
+                        let mut c = Vec::with_capacity(n);
+                        let mut buf = [0u64; 2048];
+                        for start in (0..n).step_by(buf.len()) {
+                            let k = (n - start).min(buf.len());
+                            codes.unpack_into(start, &mut buf[..k]);
+                            c.extend(buf[..k].iter().map(|&x| x.min(last) as u32));
+                        }
+                        return KeyCol::Codes(c, entries);
                     }
                 }
             }
@@ -890,7 +895,6 @@ fn run_row_group(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>, si: usize, g: 
         return Ok(());
     }
     st.matched += selected;
-    // Group id of every selected row.
     // Groups. Dictionary-coded keys with a small combined code space get a local slot per row
     // (`SINK` for rows outside the selection), so aggregates scatter into a few accumulators
     // without per-row hashing; other keys fall back to one group lookup per row.
@@ -972,6 +976,8 @@ const SINK: u8 = 255;
 struct Local {
     slot: Vec<u8>,
     gids: Vec<u32>,
+    /// Selected rows per slot.
+    counts: Vec<u64>,
 }
 
 /// Calls `f(i)` for every set bit, stopping at the first error.
@@ -994,9 +1000,14 @@ fn local_slots(
     st: &mut State<'_>,
 ) -> Result<Option<Local>> {
     // Combined code of every row (mixed radix over the keys' dictionaries).
-    let mut idx = vec![0u32; n];
-    for k in keys {
+    let mut idx: Vec<u32> = Vec::new();
+    for (i, k) in keys.iter().enumerate() {
         if let KeyCol::Codes(c, e) = k {
+            if i == 0 {
+                idx.extend_from_slice(&c[..n.min(c.len())]);
+                idx.resize(n, 0);
+                continue;
+            }
             let radix = e.len().max(1) as u32;
             for (x, &code) in idx.iter_mut().zip(c) {
                 *x = *x * radix + code;
@@ -1042,7 +1053,40 @@ fn local_slots(
         slot[i] = slot_of[code];
         Ok(())
     })?;
-    Ok((!overflow).then_some(Local { slot, gids }))
+    if overflow {
+        return Ok(None);
+    }
+    let counts = slot_counts(&slot, gids.len());
+    Ok(Some(Local { slot, gids, counts }))
+}
+
+/// Rows per slot (the sink excluded), four interleaved counters breaking store-to-load chains.
+fn slot_counts(slots: &[u8], groups: usize) -> Vec<u64> {
+    let mut c = [[0u32; 256]; 4];
+    for (i, &s) in slots.iter().enumerate() {
+        c[i & 3][s as usize] += 1;
+    }
+    (0..groups).map(|k| c.iter().map(|a| u64::from(a[k])).sum()).collect()
+}
+
+/// Exact sum per slot. Narrow values (the bound proves no i64 overflow) accumulate in i64.
+fn slot_sums(slots: &[u8], v: &[i64], groups: usize) -> Vec<i128> {
+    let n = slots.len().min(v.len());
+    let (slots, v) = (&slots[..n], &v[..n]);
+    let narrow = u128::from(simd::abs_bound_i64(v)) * (n as u128) < 1u128 << 63;
+    if narrow {
+        let mut s = [[0i64; 256]; 4];
+        for (i, (&k, &x)) in slots.iter().zip(v).enumerate() {
+            s[i & 3][k as usize] += x;
+        }
+        (0..groups).map(|k| s.iter().map(|a| i128::from(a[k])).sum()).collect()
+    } else {
+        let mut s = [[0i128; 256]; 4];
+        for (i, (&k, &x)) in slots.iter().zip(v).enumerate() {
+            s[i & 3][k as usize] += i128::from(x);
+        }
+        (0..groups).map(|k| s.iter().map(|a| a[k]).sum()).collect()
+    }
 }
 
 /// Count / sum / avg over slot-grouped rows: one branch-free scatter pass into a few
@@ -1072,23 +1116,13 @@ fn update_local(
         masked = s;
         &masked
     };
-    let mut counts = [[0u64; 256]; 4];
-    let mut sums = [[0i128; 256]; 4];
-    match col.map(|c| &c.col) {
-        Some(Col::I64 { v, .. }) => {
-            for (i, (&s, &x)) in slots.iter().zip(v.iter()).enumerate() {
-                sums[i & 3][s as usize] += i128::from(x);
-                counts[i & 3][s as usize] += 1;
-            }
-        }
-        _ => {
-            for (i, &s) in slots.iter().enumerate() {
-                counts[i & 3][s as usize] += 1;
-            }
-        }
-    }
+    let counts = if rows == sel { l.counts.clone() } else { slot_counts(slots, l.gids.len()) };
+    let sums: Vec<i128> = match col.map(|c| &c.col) {
+        Some(Col::I64 { v, .. }) if func != AggFunc::Count => slot_sums(slots, v, l.gids.len()),
+        _ => Vec::new(),
+    };
     for (k, &g) in l.gids.iter().enumerate() {
-        let c: u64 = counts.iter().map(|a| a[k]).sum();
+        let c = counts[k];
         if c == 0 {
             continue;
         }
@@ -1096,10 +1130,10 @@ fn update_local(
         match (&mut *acc, col.map(|c| &c.col)) {
             (Acc::Count(cs), _) => cs[g] += c,
             (Acc::Sum(ss), Some(Col::I64 { scale, dec, .. })) => {
-                ss[g].add_exact(sums.iter().map(|a| a[k]).sum(), *scale, *dec)
+                ss[g].add_exact(sums[k], *scale, *dec)
             }
             (Acc::Avg(ss, cs), Some(Col::I64 { scale, dec, .. })) => {
-                ss[g].add_exact(sums.iter().map(|a| a[k]).sum(), *scale, *dec);
+                ss[g].add_exact(sums[k], *scale, *dec);
                 cs[g] += c;
             }
             _ => {}

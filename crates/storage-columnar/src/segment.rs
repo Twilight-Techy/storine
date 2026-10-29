@@ -41,7 +41,7 @@ pub const SEGMENT_VERSION: u32 = 1;
 const HEADER_LEN: usize = 64;
 const FLAG_SEALED: u32 = 1;
 /// Default rows per row group.
-pub const ROW_GROUP_ROWS: usize = 65_536;
+pub const ROW_GROUP_ROWS: usize = 16_384;
 /// Index of the hidden key column.
 pub const KEY_COLUMN: usize = 0;
 /// Index of the hidden version column.

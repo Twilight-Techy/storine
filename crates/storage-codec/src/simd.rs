@@ -103,14 +103,22 @@ fn unpack64<const W: usize>(src: &[u64; 64], out: &mut [u64]) {
 #[inline(always)]
 fn unpack64_bytes<const W: usize>(blk: &[u8], out: &mut [u64]) {
     let mask = (1u64 << W) - 1;
-    for (j, o) in out.iter_mut().take(64).enumerate() {
-        let bit = j * W;
-        let at = bit >> 3;
-        let b: [u8; 8] = blk
-            .get(at..at + 8)
-            .and_then(|s| s.try_into().ok())
-            .unwrap_or_default();
-        *o = (u64::from_le_bytes(b) >> (bit & 7)) & mask;
+    // Fixed lengths let every offset below fold to a constant with no bounds checks: value `j`
+    // ends by byte `(63 * W) / 8 + 8 <= W * 8 + 8`.
+    let (Some(blk), Some(out)) = (blk.get(..W * 8 + 8), out.get_mut(..64)) else {
+        return;
+    };
+    // Every 8 values span exactly `W` bytes, so each group starts byte-aligned and the 8
+    // offsets inside a group are constants (the inner loop unrolls).
+    for g in 0..8 {
+        let gb = &blk[g * W..g * W + W + 8];
+        let o = &mut out[g * 8..g * 8 + 8];
+        for k in 0..8 {
+            let bit = k * W;
+            let at = bit >> 3;
+            let b = [gb[at], gb[at + 1], gb[at + 2], gb[at + 3], gb[at + 4], gb[at + 5], gb[at + 6], gb[at + 7]];
+            o[k] = (u64::from_le_bytes(b) >> (bit & 7)) & mask;
+        }
     }
 }
 
@@ -251,6 +259,12 @@ multiversion! {
             out.fill(0);
             return;
         }
+        if table.len() <= 64 {
+            // Small tables: one register holds the whole table.
+            let bitmap = table.iter().enumerate().fold(0u64, |m, (i, &t)| m | (u64::from(t != 0) << i));
+            bits_where(codes, out, |c| (bitmap >> c.min(last as u64)) & 1 != 0);
+            return;
+        }
         for (w, chunk) in out.iter_mut().zip(codes.chunks(64)) {
             let mut bytes = [0u8; 64];
             for (b, &c) in bytes.iter_mut().zip(chunk) {
@@ -262,6 +276,33 @@ multiversion! {
             }
             *w = m;
         }
+    }
+}
+
+multiversion! {
+    /// A bound on `|v|` over `vals`: every `|v| <= abs_bound_i64(vals)` (within a factor of two of
+    /// the largest magnitude). Bitwise only, so it vectorizes without 64-bit min/max.
+    pub fn abs_bound_i64(vals: &[i64]) -> u64 {
+        // `v ^ (v >> 63)` is `|v| - 1` for negatives and `v` otherwise; OR keeps every top bit.
+        // A comparison, not `>> 63`: AVX2 has 64-bit compares but no arithmetic shift.
+        let r = vals.iter().fold(0u64, |m, &v| m | (v ^ -i64::from(v < 0)) as u64);
+        // Every value is below the next power of two of the OR (plus one for the negative case).
+        if r == 0 {
+            if vals.iter().any(|&v| v != 0) { 1 } else { 0 }
+        } else {
+            (u64::MAX >> r.leading_zeros()).saturating_add(1)
+        }
+    }
+}
+
+multiversion! {
+    /// `(min, max)` of `vals`, `None` when empty.
+    pub fn min_max_i64(vals: &[i64]) -> Option<(i64, i64)> {
+        let first = *vals.first()?;
+        // Plain folds: they vectorize as reductions (an 8-lane array would be transposed).
+        let lo = vals.iter().fold(first, |m, &v| m.min(v));
+        let hi = vals.iter().fold(first, |m, &v| m.max(v));
+        Some((lo, hi))
     }
 }
 
@@ -447,6 +488,10 @@ mod tests {
             let mm = vals.iter().enumerate().filter(|(i, _)| m[i / 64] >> (i % 64) & 1 == 1).map(|(_, &v)| v);
             let want_mm = mm.clone().min().zip(mm.max());
             assert_eq!(min_max_i64_masked(&vals, &m), want_mm);
+            assert_eq!(min_max_i64(&vals), vals.iter().copied().min().zip(vals.iter().copied().max()));
+            let b = abs_bound_i64(&vals);
+            let top = vals.iter().map(|v| v.unsigned_abs()).max().unwrap_or(0);
+            assert!(top <= b && b / 2 <= top.max(1), "bound {b} for max {top}");
             assert_eq!(count_ones(&m), vals.iter().filter(|v| (lo..=hi).contains(*v)).count() as u64);
         }
         // Extremes sum exactly.

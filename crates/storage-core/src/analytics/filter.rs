@@ -343,7 +343,7 @@ fn convex_interval(f: &Filter, a: i64, b: i64, ctor: &dyn Fn(i64) -> PropertyVal
 /// is not handled here.
 fn ordered_rows(f: &Filter, vals: &[i64], ctor: &dyn Fn(i64) -> PropertyValue, out: &mut [u64]) -> bool {
     let n = vals.len();
-    let (Some(&a), Some(&b)) = (vals.iter().min(), vals.iter().max()) else {
+    let Some((a, b)) = simd::min_max_i64(vals) else {
         out.fill(0);
         return true;
     };
@@ -378,8 +378,9 @@ fn ordered_rows(f: &Filter, vals: &[i64], ctor: &dyn Fn(i64) -> PropertyValue, o
     true
 }
 
-/// Selection bits of dictionary-coded rows: `allowed[code]` per row, in 64-row words, skipping
-/// words without an active row.
+/// Selection bits of dictionary-coded rows: `allowed[code]` per row, a block of codes at a
+/// time, skipping blocks without an active row. Allowed codes forming one run (a convex
+/// predicate over a sorted dictionary) become a vectorized range test on the codes.
 fn code_rows(
     codes: &storage_columnar::bits::Packed<'_>,
     allowed: &[u8],
@@ -388,15 +389,32 @@ fn code_rows(
     out: &mut [u64],
 ) {
     out.fill(0);
-    let mut buf = [0u64; 64];
-    for (w, &a) in active.iter().enumerate() {
-        if a == 0 {
+    let (Some(first), Some(last)) = (allowed.iter().position(|&a| a != 0), allowed.iter().rposition(|&a| a != 0)) else {
+        return;
+    };
+    // Codes past the dictionary decode clamped to its last entry, so they follow that entry.
+    let run = allowed[first..=last].iter().all(|&a| a != 0).then(|| {
+        let hi = if last + 1 == allowed.len() { u64::MAX } else { last as u64 };
+        (first as u64, hi)
+    });
+    const BLOCK: usize = 2048;
+    let mut buf = vec![0u64; BLOCK.min(n)];
+    for start in (0..n).step_by(BLOCK) {
+        let k = (n - start).min(BLOCK);
+        let (w0, w1) = (start / 64, (start + k).div_ceil(64));
+        if active[w0..w1].iter().all(|&a| a == 0) {
             continue;
         }
-        let start = w * 64;
-        let k = (n - start).min(64);
         codes.unpack_into(start, &mut buf[..k]);
-        simd::lookup_bits(&buf[..k], allowed, &mut out[w..w + 1]);
+        match run {
+            Some((lo, hi)) => simd::range_u64(&buf[..k], lo, hi, &mut out[w0..w1]),
+            None => simd::lookup_bits(&buf[..k], allowed, &mut out[w0..w1]),
+        }
+        for (o, &a) in out[w0..w1].iter_mut().zip(&active[w0..w1]) {
+            if a == 0 {
+                *o = 0;
+            }
+        }
     }
 }
 
@@ -415,17 +433,29 @@ fn int_leaf(
             true
         }
         IntChunk::Dict { dict, codes } => {
-            let allowed: Vec<u8> = dict
-                .iter()
-                .map(|&x| u8::from(with_ref(&ctor(x), |r| f.matches_value(r))))
-                .collect();
+            let convex = matches!(f, Filter::Eq(..) | Filter::Lt(..) | Filter::Le(..) | Filter::Gt(..) | Filter::Ge(..) | Filter::Between(..));
+            let allowed: Vec<u8> = match (dict.first(), dict.last()) {
+                // Sorted dictionary and a convex predicate: the matching entries are one run,
+                // found by binary search instead of evaluating every entry.
+                (Some(&a), Some(&b)) if convex && dict.windows(2).all(|w| w[0] < w[1]) => {
+                    let mut allowed = vec![0u8; dict.len()];
+                    if let Some((lo, hi)) = convex_interval(f, a, b, ctor) {
+                        let (i, j) = (dict.partition_point(|&x| x < lo), dict.partition_point(|&x| x <= hi));
+                        allowed[i..j].fill(1);
+                    }
+                    allowed
+                }
+                _ => dict.iter().map(|&x| u8::from(with_ref(&ctor(x), |r| f.matches_value(r)))).collect(),
+            };
             code_rows(codes, &allowed, n, active, out);
             true
         }
         _ => {
-            let mut vals = vec![0i64; n];
+            let mut vals = super::exec::take_i64(n);
             ic.decode_into(0, &mut vals);
-            ordered_rows(f, &vals, ctor, out)
+            let handled = ordered_rows(f, &vals, ctor, out);
+            super::exec::give_i64(vals);
+            handled
         }
     }
 }

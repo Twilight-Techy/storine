@@ -99,6 +99,18 @@ impl Bits {
     pub fn words(&self) -> &[u64] {
         &self.words
     }
+
+    /// The 64 bits starting at bit `start` (zeros past the end).
+    #[inline]
+    pub fn word_at(&self, start: usize) -> u64 {
+        let (w, b) = (start / 64, start % 64);
+        let lo = self.words.get(w).copied().unwrap_or(0);
+        if b == 0 {
+            return lo;
+        }
+        let hi = self.words.get(w + 1).copied().unwrap_or(0);
+        (lo >> b) | (hi << (64 - b))
+    }
 }
 
 /// One published segment and its deleted rows.
@@ -732,10 +744,8 @@ impl ColumnarSnapshot<'_> {
             }
         }
         let first = g.first_row as usize;
-        for i in 0..n {
-            if s.deleted.get(first + i) {
-                mask[i / 64] &= !(1 << (i % 64));
-            }
+        for (k, m) in mask.iter_mut().enumerate() {
+            *m &= !s.deleted.word_at(first + k * 64);
         }
         if let Some(h) = self.hidden.get(seg) {
             let lo = h.partition_point(|&r| (r as usize) < first);
