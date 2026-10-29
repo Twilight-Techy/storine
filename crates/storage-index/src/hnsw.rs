@@ -675,7 +675,7 @@ impl HnswVectorIndex {
 
         if let Some(parent) = path.parent() {
             if !parent.exists() {
-                fs::create_dir_all(parent).map_err(|e| StorageError::io("create hnsw dir", e))?;
+                storage_types::vfs::at(parent).create_dir_all(parent).map_err(|e| StorageError::io("create hnsw dir", e))?;
             }
         }
         atomic_write_replace(path, &full, true)

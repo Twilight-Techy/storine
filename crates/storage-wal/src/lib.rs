@@ -15,13 +15,14 @@
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::fs;
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 
 use storage_codec::{checksum_payload, compress_lz4, decompress_lz4};
+use storage_types::vfs::{OpenOpts, VfsHandle, VfsRef};
 use storage_types::{CachePadded, InlineId, Result, StorageError, Version, MAX_PAYLOAD_SIZE};
 
 const WAL_MAGIC: u32 = 0x5741_4C31; // "WAL1"
@@ -151,7 +152,8 @@ pub struct GroupCommitWal {
     next_txn_id: CachePadded<AtomicU64>,
     state: Mutex<GroupCommitState>,
     cv: Condvar,
-    io: Mutex<BufWriter<File>>,
+    io: Mutex<BufWriter<VfsHandle>>,
+    vfs: VfsRef,
     total_batches: CachePadded<AtomicU64>,
     total_frames: CachePadded<AtomicU64>,
 }
@@ -253,29 +255,18 @@ fn committed_from_frames(frames: Vec<RawFrame>) -> Vec<WalEntry> {
     committed
 }
 
-fn read_file_if_exists(path: &Path) -> Result<Vec<u8>> {
-    if !path.exists() {
+fn read_file_if_exists(vfs: &VfsRef, path: &Path) -> Result<Vec<u8>> {
+    if !vfs.exists(path) {
         return Ok(Vec::new());
     }
-    let mut file = File::open(path).map_err(|e| StorageError::io("open WAL for reading", e))?;
-    let mut raw = Vec::new();
-    file.read_to_end(&mut raw)
-        .map_err(|e| StorageError::io("read WAL", e))?;
-    Ok(raw)
+    vfs.read(path).map_err(|e| StorageError::io("read WAL", e))
 }
 
-#[cfg(unix)]
-fn sync_parent_dir(path: &Path) -> Result<()> {
+fn sync_parent_dir(vfs: &VfsRef, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        let dir = File::open(parent).map_err(|e| StorageError::io("open WAL dir for fsync", e))?;
-        dir.sync_all()
+        vfs.sync_dir(parent)
             .map_err(|e| StorageError::io("fsync WAL directory", e))?;
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn sync_parent_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -286,14 +277,22 @@ impl GroupCommitWal {
     /// counters resume after the highest values found in the file.
     pub fn open(path: impl Into<PathBuf>, policy: SyncPolicy) -> Result<Self> {
         let path = path.into();
+        let vfs = storage_types::vfs::at(&path);
+        Self::open_with(path, policy, vfs)
+    }
+
+    /// [`Self::open`] on the given file system (`F-SIM-01`).
+    pub fn open_with(path: impl Into<PathBuf>, policy: SyncPolicy, vfs: VfsRef) -> Result<Self> {
+        let path = path.into();
         if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent)
+            if !vfs.exists(parent) {
+                vfs.create_dir_all(parent)
                     .map_err(|e| StorageError::io("create WAL directory", e))?;
             }
         }
 
-        let raw = read_file_if_exists(&path)?;
+        let existed = vfs.exists(&path);
+        let raw = read_file_if_exists(&vfs, &path)?;
         let (frames, valid_len) = parse_frames(&raw);
         let mut max_lsn = 0u64;
         let mut max_txn = 0u64;
@@ -306,13 +305,15 @@ impl GroupCommitWal {
             }
         }
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
+        let mut file = vfs
+            .open(&path, OpenOpts::create())
             .map_err(|e| StorageError::io("open WAL file", e))?;
+        if !existed {
+            // A new WAL's directory entry must be durable before any commit relies on it.
+            file.sync_all()
+                .map_err(|e| StorageError::io("fsync new WAL file", e))?;
+            sync_parent_dir(&vfs, &path)?;
+        }
         if valid_len < raw.len() {
             file.set_len(valid_len as u64)
                 .map_err(|e| StorageError::io("truncate torn WAL tail", e))?;
@@ -337,6 +338,7 @@ impl GroupCommitWal {
             }),
             cv: Condvar::new(),
             io: Mutex::new(BufWriter::with_capacity(256 * 1024, file)),
+            vfs,
             total_batches: CachePadded::new(AtomicU64::new(0)),
             total_frames: CachePadded::new(AtomicU64::new(0)),
         })
@@ -456,7 +458,7 @@ impl GroupCommitWal {
     }
 
     #[inline]
-    fn lock_io(&self) -> std::sync::MutexGuard<'_, BufWriter<File>> {
+    fn lock_io(&self) -> std::sync::MutexGuard<'_, BufWriter<VfsHandle>> {
         self.io.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
@@ -528,7 +530,7 @@ impl GroupCommitWal {
 
     /// Completes a batch: under `Immediate` / `GroupCommit` flushes to the OS and `fsync`s;
     /// under `AsyncMemoryFirst` leaves the frames buffered for [`Self::flush_buffered`].
-    fn finish_batch_io(&self, io: &mut BufWriter<File>) -> Result<()> {
+    fn finish_batch_io(&self, io: &mut BufWriter<VfsHandle>) -> Result<()> {
         if self.policy.syncs() {
             io.flush()
                 .map_err(|e| StorageError::io("flush WAL buffer", e))?;
@@ -664,7 +666,7 @@ impl GroupCommitWal {
     /// `f` sets its `poison` flag when it fails in a way that leaves the active WAL handle unusable.
     fn with_exclusive_io<R>(
         &self,
-        f: impl FnOnce(&mut BufWriter<File>, &mut bool) -> Result<R>,
+        f: impl FnOnce(&mut BufWriter<VfsHandle>, &mut bool) -> Result<R>,
     ) -> Result<R> {
         let mut guard = self.lock_state();
         while guard.flushing {
@@ -715,7 +717,7 @@ impl GroupCommitWal {
         self.with_exclusive_io(|io, poison| {
             io.flush()
                 .map_err(|e| StorageError::io("flush WAL before checkpoint truncate", e))?;
-            let raw = read_file_if_exists(&self.path)?;
+            let raw = read_file_if_exists(&self.vfs, &self.path)?;
             let (frames, _) = parse_frames(&raw);
 
             let mut kept_txns: HashSet<u64> = HashSet::new();
@@ -745,20 +747,19 @@ impl GroupCommitWal {
             }
 
             if let (Some(dir), Some(first_lsn)) = (archive_dir, first_removed_lsn) {
-                fs::create_dir_all(dir)
+                self.vfs
+                    .create_dir_all(dir)
                     .map_err(|e| StorageError::io("create WAL archive directory", e))?;
                 let seg_path = dir.join(format!("wal_{first_lsn:020}.log"));
-                let mut seg = OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .truncate(true)
-                    .open(&seg_path)
+                let mut seg = self
+                    .vfs
+                    .open(&seg_path, OpenOpts::create_truncate())
                     .map_err(|e| StorageError::io("create archived WAL segment", e))?;
                 seg.write_all(&removed)
                     .map_err(|e| StorageError::io("write archived WAL segment", e))?;
                 seg.sync_all()
                     .map_err(|e| StorageError::io("fsync archived WAL segment", e))?;
-                sync_parent_dir(&seg_path)?;
+                sync_parent_dir(&self.vfs, &seg_path)?;
             }
 
             // Head marker preserving the LSN / txn-id high-water marks across restarts.
@@ -779,12 +780,9 @@ impl GroupCommitWal {
             let mut next_path = self.path.as_os_str().to_os_string();
             next_path.push(".next");
             let next_path = PathBuf::from(next_path);
-            let mut next = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .truncate(true)
-                .open(&next_path)
+            let mut next = self
+                .vfs
+                .open(&next_path, OpenOpts::create_truncate())
                 .map_err(|e| StorageError::io("create replacement WAL file", e))?;
             next.write_all(&new_contents)
                 .map_err(|e| StorageError::io("write replacement WAL file", e))?;
@@ -792,19 +790,20 @@ impl GroupCommitWal {
                 .map_err(|e| StorageError::io("fsync replacement WAL file", e))?;
 
             // Close the old handle before replacing the file (required on Windows).
-            let placeholder = BufWriter::with_capacity(
-                256 * 1024,
-                next.try_clone()
-                    .map_err(|e| StorageError::io("clone replacement WAL handle", e))?,
-            );
+            drop(next);
+            let reopened = self
+                .vfs
+                .open(&next_path, OpenOpts::read_write())
+                .map_err(|e| StorageError::io("reopen replacement WAL file", e))?;
+            let placeholder = BufWriter::with_capacity(256 * 1024, reopened);
             let old = std::mem::replace(io, placeholder);
             drop(old.into_parts().0);
-            if let Err(e) = fs::rename(&next_path, &self.path) {
+            if let Err(e) = self.vfs.rename(&next_path, &self.path) {
                 // The old handle is closed and the new file is not in place: stop accepting writes.
                 *poison = true;
                 return Err(StorageError::io("atomically replace WAL file", e));
             }
-            if let Err(e) = sync_parent_dir(&self.path) {
+            if let Err(e) = sync_parent_dir(&self.vfs, &self.path) {
                 *poison = true;
                 return Err(e);
             }
@@ -825,7 +824,12 @@ impl GroupCommitWal {
     /// Transactions are returned only when their commit barrier is present; a torn tail is
     /// ignored (it is truncated when the WAL is next opened for writing).
     pub fn recover_committed(path: &Path) -> Result<Vec<WalEntry>> {
-        let raw = read_file_if_exists(path)?;
+        Self::recover_committed_with(&storage_types::vfs::at(path), path)
+    }
+
+    /// [`Self::recover_committed`] on the given file system.
+    pub fn recover_committed_with(vfs: &VfsRef, path: &Path) -> Result<Vec<WalEntry>> {
+        let raw = read_file_if_exists(vfs, path)?;
         let (frames, _) = parse_frames(&raw);
         Ok(committed_from_frames(frames))
     }
@@ -851,7 +855,9 @@ impl GroupCommitWal {
         self.with_exclusive_io(|io, _poison| {
             io.flush()
                 .map_err(|e| StorageError::io("flush WAL before copy", e))?;
-            fs::copy(&self.path, dest).map_err(|e| StorageError::io("copy active WAL", e))?;
+            self.vfs
+                .copy(&self.path, dest)
+                .map_err(|e| StorageError::io("copy active WAL", e))?;
             Ok(())
         })
     }
@@ -893,10 +899,11 @@ impl GroupCommitWal {
     pub fn prune_archived_segments_before_lsn(wal_dir: &Path, min_keep_lsn: u64) -> Result<usize> {
         let mut pruned = 0usize;
         for seg in Self::list_archived_segments(wal_dir)? {
-            let raw = read_file_if_exists(&seg)?;
+            let vfs = storage_types::vfs::at(&seg);
+            let raw = read_file_if_exists(&vfs, &seg)?;
             let (frames, _) = parse_frames(&raw);
             let max_lsn = frames.iter().map(|f| f.entry.lsn).max().unwrap_or(0);
-            if max_lsn < min_keep_lsn && fs::remove_file(&seg).is_ok() {
+            if max_lsn < min_keep_lsn && vfs.remove_file(&seg).is_ok() {
                 pruned += 1;
             }
         }
@@ -1029,12 +1036,84 @@ fn decode_wal_frame_header(hdr: &[u8]) -> Option<DecodedHeader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::sync::Arc;
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// `F-SIM-01`: under simulated power loss and crash points, every acknowledged frame is
+    /// recovered, in order, and nothing that was never appended appears; checkpoints
+    /// (replacement file + rename) included.
+    #[test]
+    fn power_loss_never_loses_an_acknowledged_frame() {
+        use storage_types::vfs::{CutMode, SimVfs};
+        let dir = temp_dir("storage_wal_power_loss");
+        let wal_path = dir.join("engine.wal");
+        for seed in 1..=120u64 {
+            let _ = fs::remove_dir_all(&dir);
+            let sim = SimVfs::new(&dir, seed).unwrap();
+            if seed % 10 == 0 {
+                sim.set_mode(CutMode::LoseAll);
+            }
+            let mut acked: Vec<u64> = Vec::new(); // versions acknowledged
+            let mut checkpointed = 0u64;
+            let mut version = 0u64;
+            for life in 0..3 {
+                let wal = match GroupCommitWal::open_with(&wal_path, SyncPolicy::Immediate, sim.as_ref()) {
+                    Ok(w) => w,
+                    Err(e) => panic!("seed {seed} life {life}: reopen failed: {e}"),
+                };
+                sim.fail_at(5 + (seed * 7 + life) % 40);
+                let id = InlineId::new("rec").unwrap();
+                loop {
+                    version += 1;
+                    let body = vec![(version % 251) as u8; 100 + (version as usize * 37) % 1500];
+                    match wal.append_single(1, WalOpKind::Upsert, id, Version(version), &body) {
+                        Ok(_) => acked.push(version),
+                        Err(_) => break,
+                    }
+                    if version % 9 == 0 {
+                        // A checkpoint that fails after its rename may still take effect.
+                        checkpointed = version;
+                        if wal.checkpoint_truncate().is_err() {
+                            break;
+                        }
+                    }
+                }
+                drop(wal);
+                sim.power_cut().unwrap();
+                let got: Vec<u64> = GroupCommitWal::recover_committed(&wal_path)
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.version.0)
+                    .collect();
+                // Acknowledged and not checkpointed away: must be present, in order.
+                let must: Vec<u64> = acked.iter().copied().filter(|v| *v > checkpointed).collect();
+                let mut it = got.iter();
+                for v in &must {
+                    assert!(it.any(|g| g == v), "seed {seed} life {life}: acknowledged v{v} lost; got {got:?}");
+                }
+                for g in &got {
+                    assert!(*g <= version && g > &0, "seed {seed}: invented frame v{g}");
+                }
+                for w in got.windows(2) {
+                    assert!(w[0] < w[1], "seed {seed}: frames out of order {got:?}");
+                }
+                // A frame that was attempted but not acknowledged may survive; treat it as acked
+                // from now on (recovery made it durable).
+                for g in got {
+                    if !acked.contains(&g) {
+                        acked.push(g);
+                    }
+                }
+                acked.sort_unstable();
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

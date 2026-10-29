@@ -22,7 +22,7 @@
 //! messages in-process, and `storage-server` exposes `RequestVote` / `AppendEntries` over TCP
 //! when started with a `RaftNode`.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use storage_codec::{checksum_payload, AlignedBytes, RecordCodec, RecordView, ZeroCopyRecord};
 use storage_index::Indexable;
 use storage_mmap::atomic_write_replace;
+use storage_types::vfs::OpenOpts;
 use storage_types::{FastHashMap, FastHashSet, InlineId, RecordFlags, Result, StorageError, Version};
 use storage_types::wire::{read_u16_le, read_u32_le, read_u64_le, read_array_24};
 
@@ -622,6 +623,14 @@ impl SnapshotMeta {
 }
 
 #[inline]
+/// Syncs the directory holding `path`, making a rename into it durable.
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(dir) => storage_types::vfs::at(dir).sync_dir(dir),
+        None => Ok(()),
+    }
+}
+
 fn snapshot_record_check(id: &[u8; 24], frame: &[u8]) -> u64 {
     checksum_payload(frame) ^ checksum_payload(id).rotate_left(29)
 }
@@ -961,10 +970,7 @@ impl RaftStorage {
         for e in entries {
             Self::encode_log_frame(e, &mut buf);
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_path)
+        let mut file = storage_types::vfs::at(&self.log_path).open(&self.log_path, storage_types::vfs::OpenOpts::append())
             .map_err(|e| StorageError::io("open raft log", e))?;
         file.write_all(&buf)
             .map_err(|e| StorageError::io("append raft log", e))?;
@@ -1891,7 +1897,8 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
         let io = |e| StorageError::io("write raft snapshot", e);
-        let mut w = BufWriter::with_capacity(RAFT_SNAPSHOT_CHUNK, File::create(&tmp).map_err(io)?);
+        let vfs = storage_types::vfs::at(&tmp);
+        let mut w = BufWriter::with_capacity(RAFT_SNAPSHOT_CHUNK, vfs.open(&tmp, OpenOpts::create_truncate()).map_err(io)?);
         w.write_all(&[0u8; SNAPSHOT_HEADER_LEN]).map_err(io)?;
         w.write_all(&encode_config_block(config.as_ref())).map_err(io)?;
         let mut count = 0u64;
@@ -1918,7 +1925,9 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             .and_then(|()| file.sync_all())
             .map_err(io)?;
         drop(file);
-        fs::rename(&tmp, &self.storage.snapshot_path).map_err(io)?;
+        vfs.rename(&tmp, &self.storage.snapshot_path).map_err(io)?;
+        // The log is compacted behind this snapshot next: its name must survive a power cut.
+        sync_parent(&self.storage.snapshot_path).map_err(io)?;
         Ok(meta)
     }
 
@@ -1967,12 +1976,8 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 return Ok(InstallSnapshotResp { term, next_offset: staged, installed: false });
             }
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(req.offset == 0)
-            .open(path)
-            .map_err(io)?;
+        let opts = if req.offset == 0 { OpenOpts::create_truncate() } else { OpenOpts::create() };
+        let mut file = storage_types::vfs::at(path).open(path, opts).map_err(io)?;
         file.seek(SeekFrom::Start(req.offset))
             .and_then(|_| file.write_all(&req.data))
             .map_err(io)?;
@@ -1986,7 +1991,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             Ok(()) => Ok(InstallSnapshotResp { term, next_offset, installed: true }),
             Err(StorageError::CorruptedHeader { .. } | StorageError::ChecksumMismatch { .. } | StorageError::InvalidArchiveLayout { .. }) => {
                 // A damaged transfer is discarded and restarted, never applied.
-                let _ = fs::remove_file(path);
+                let _ = storage_types::vfs::at(path).remove_file(path);
                 Ok(restart)
             }
             Err(e) => Err(e),
@@ -2045,9 +2050,10 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             self.storage.rewrite_log(&st.log)?;
         }
         // 5. The installed snapshot becomes this node's own (served if it is elected leader).
-        fs::rename(recv, &self.storage.snapshot_path)
+        storage_types::vfs::at(&self.storage.snapshot_path).rename(recv, &self.storage.snapshot_path)
+            .and_then(|()| sync_parent(&self.storage.snapshot_path))
             .map_err(|e| StorageError::io("keep installed raft snapshot", e))?;
-        fs::remove_file(&self.storage.installing_path)
+        storage_types::vfs::at(&self.storage.installing_path).remove_file(&self.storage.installing_path)
             .map_err(|e| StorageError::io("clear raft install marker", e))
     }
 
@@ -2060,7 +2066,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         let target = (marker.len() == 8).then(|| read_u64_le(&marker, 0));
         if target.is_some_and(|t| t <= applied) {
             // The install completed; only the marker removal was lost.
-            return fs::remove_file(&self.storage.installing_path)
+            return storage_types::vfs::at(&self.storage.installing_path).remove_file(&self.storage.installing_path)
                 .map_err(|e| StorageError::io("clear raft install marker", e));
         }
         if let Some(meta) = SnapshotMeta::read(&self.storage.recv_path).filter(|m| Some(m.last_index) == target) {
@@ -2083,8 +2089,8 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             self.storage.save_hard_state(&st)?;
             self.storage.rewrite_log(&st.log)?;
         }
-        let _ = fs::remove_file(&self.storage.recv_path);
-        fs::remove_file(&self.storage.installing_path)
+        let _ = storage_types::vfs::at(&self.storage.recv_path).remove_file(&self.storage.recv_path);
+        storage_types::vfs::at(&self.storage.installing_path).remove_file(&self.storage.installing_path)
             .map_err(|e| StorageError::io("clear raft install marker", e))
     }
 

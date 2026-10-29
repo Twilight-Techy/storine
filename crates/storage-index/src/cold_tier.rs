@@ -17,7 +17,6 @@
 //! page into a stack buffer when sealed). Everything after the header page is one sealed region
 //! when encryption is on (`paged_files::GenerationSealer`), verified once at open.
 
-use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -80,11 +79,11 @@ fn pad64(n: usize) -> usize {
 }
 
 /// Writes one region piece (encrypting it first when the generation is sealed).
-type Emit<'a> = dyn FnMut(&mut BufWriter<File>, &mut [u8]) -> std::io::Result<()> + 'a;
+type Emit<'a> = dyn FnMut(&mut BufWriter<storage_types::vfs::VfsHandle>, &mut [u8]) -> std::io::Result<()> + 'a;
 
 /// Finalizes (count, checksum) and emits a full or final entry page, then resets it.
 fn flush_page(
-    w: &mut BufWriter<File>,
+    w: &mut BufWriter<storage_types::vfs::VfsHandle>,
     page: &mut [u8; PAGE],
     count: &mut u16,
     used: &mut usize,
@@ -380,19 +379,14 @@ impl ColdTier {
     ) -> Result<Self> {
         let io = |what: &'static str| move |e: std::io::Error| StorageError::io(what, e);
         if let Some(parent) = data_path.parent() {
-            std::fs::create_dir_all(parent).map_err(io("create cold tier dir"))?;
+            storage_types::vfs::at(parent).create_dir_all(parent).map_err(io("create cold tier dir"))?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(true)
-            .open(tmp_path)
+        let file = storage_types::vfs::at(tmp_path).open(tmp_path, storage_types::vfs::OpenOpts::create_truncate())
             .map_err(io("create cold tier generation"))?;
         let mut w = BufWriter::with_capacity(16 * PAGE, file);
         w.write_all(&[0u8; PAGE]).map_err(io("write cold tier header placeholder"))?;
         let mut sealer = GenerationSealer::begin(seal, data_path);
-        let mut emit = |w: &mut BufWriter<File>, piece: &mut [u8]| -> std::io::Result<()> {
+        let mut emit = |w: &mut BufWriter<storage_types::vfs::VfsHandle>, piece: &mut [u8]| -> std::io::Result<()> {
             if let Some(s) = sealer.as_mut() {
                 s.seal(piece)?;
             }

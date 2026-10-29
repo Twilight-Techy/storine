@@ -721,7 +721,7 @@ impl PrimaryIndex {
         write_manifest(manifest, COLD_MANIFEST_MAGIC, generation, stamp)?;
         if let Some(old) = old.filter(|o| *o != data) {
             // Best effort: still mapped by in-flight readers on Windows; removed at next open.
-            let _ = std::fs::remove_file(old);
+            let _ = storage_types::vfs::at(&old).remove_file(&old);
         }
         Ok(())
     }
@@ -729,7 +729,7 @@ impl PrimaryIndex {
     /// Deletes a cold tier's manifest and generations (after converting back to the memory tier).
     pub fn remove_cold_files(manifest: &Path) {
         remove_stale_generations(manifest, None);
-        let _ = std::fs::remove_file(manifest);
+        let _ = storage_types::vfs::at(manifest).remove_file(manifest);
     }
 
     /// Path of the cold generation backing this index (`None` in the memory tier).

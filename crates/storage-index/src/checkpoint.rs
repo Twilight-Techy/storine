@@ -30,7 +30,6 @@
 //! v2 / v1 ordinals are not persisted: they are reassigned densely on load
 //! (`PrimaryIndex::restore_entry`). Legacy v1 (`STGEIDX1`, fixed 88-byte rows) is still readable.
 
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -249,7 +248,7 @@ pub fn save_primary_checkpoint_entries_sealed(
     seal.seal_in_place(seal_context(path), 0, &mut buf)?;
 
     atomic_write_replace(path, &buf, true)?;
-    let _ = std::fs::remove_file(delta_checkpoint_path(path));
+    let _ = storage_types::vfs::at(&delta_checkpoint_path(path)).remove_file(&delta_checkpoint_path(path));
     Ok(entries.len())
 }
 
@@ -305,23 +304,21 @@ pub fn append_primary_checkpoint_delta_sealed(
     let delta_path = delta_checkpoint_path(base_idx_path);
     if let Some(parent) = delta_path.parent() {
         if !parent.exists() {
-            std::fs::create_dir_all(parent)
+            storage_types::vfs::at(parent).create_dir_all(parent)
                 .map_err(|e| StorageError::io("create checkpoint delta directory", e))?;
         }
     }
     let _serial = seal
         .sealing()
         .then(|| SEALED_DELTA_APPEND.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&delta_path)
+    let vfs = storage_types::vfs::at(&delta_path);
+    let created = !vfs.exists(&delta_path);
+    let mut file = vfs.open(&delta_path, storage_types::vfs::OpenOpts::append())
         .map_err(|e| StorageError::io("open primary checkpoint delta file", e))?;
     if prefix > 0 {
         let offset = file
-            .metadata()
-            .map_err(|e| StorageError::io("stat primary checkpoint delta file", e))?
-            .len();
+            .len()
+            .map_err(|e| StorageError::io("stat primary checkpoint delta file", e))?;
         let mut sealed = frame.split_off(12);
         seal.seal_in_place(seal_context(&delta_path), offset, &mut sealed)?;
         let sealed_len = u32::try_from(sealed.len())
@@ -334,6 +331,12 @@ pub fn append_primary_checkpoint_delta_sealed(
         .map_err(|e| StorageError::io("write primary checkpoint delta frame", e))?;
     file.sync_data()
         .map_err(|e| StorageError::io("fsync primary checkpoint delta file", e))?;
+    if created {
+        if let Some(parent) = delta_path.parent() {
+            vfs.sync_dir(parent)
+                .map_err(|e| StorageError::io("fsync primary checkpoint delta directory", e))?;
+        }
+    }
 
     Ok(upserts.len() + deleted_ids.len())
 }

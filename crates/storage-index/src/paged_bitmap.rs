@@ -23,7 +23,8 @@
 //!   `field u16 | tag [u8; 24] | chunk_count u32 | cardinality u64 | (chunk_id u32, block u32)*`
 //!   with strictly increasing chunk ids.
 
-use std::fs::{self, OpenOptions};
+#[cfg(test)]
+use std::fs;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -504,7 +505,7 @@ impl PagedBitmapIndex {
                     let old_path = old.path.clone();
                     drop(old);
                     // Best effort: a leftover generation is removed at the next open.
-                    let _ = fs::remove_file(old_path);
+                    let _ = storage_types::vfs::at(&old_path).remove_file(&old_path);
                 }
                 Ok(written)
             }
@@ -539,7 +540,7 @@ impl PagedBitmapIndex {
         if let Some(old) = old {
             let old_path = old.path.clone();
             drop(old);
-            let _ = fs::remove_file(old_path);
+            let _ = storage_types::vfs::at(&old_path).remove_file(&old_path);
         }
         Ok(())
     }
@@ -577,16 +578,11 @@ impl PagedBitmapIndex {
     ) -> Result<(BaseGeneration, usize)> {
         let io = |what: &'static str| move |e: std::io::Error| StorageError::io(what, e);
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(io("create paged bitmap dir"))?;
+            storage_types::vfs::at(parent).create_dir_all(parent).map_err(io("create paged bitmap dir"))?;
         }
         let data_path = generation_path(&self.path, generation);
         let tmp_path = temp_generation_path(&self.path, generation);
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)
+        let file = storage_types::vfs::at(&tmp_path).open(&tmp_path, storage_types::vfs::OpenOpts::create_truncate())
             .map_err(io("create bitmap generation file"))?;
         let mut writer = BufWriter::with_capacity(64 * BITMAP_BLOCK_BYTES, file);
         writer

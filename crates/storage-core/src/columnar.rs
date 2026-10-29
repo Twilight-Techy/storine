@@ -184,7 +184,7 @@ impl ColumnarCollection {
     pub fn open(engine: Arc<StorageEngine<DocumentRecord>>, name: &str) -> Result<Arc<Self>> {
         let watch = engine.watch_tag(COLLECTION_FIELD_ID, collection_tag(name));
         let dir = collection_dir(engine.base_dir(), name);
-        fs::create_dir_all(&dir).map_err(io("create columnar directory"))?;
+        storage_types::vfs::at(&dir).create_dir_all(&dir).map_err(io("create columnar directory"))?;
         let c = Arc::new(Self {
             name: name.to_owned(),
             dir,
@@ -236,7 +236,7 @@ impl ColumnarCollection {
 
     /// Deletes every file of the projection (after [`Self::close`]).
     pub fn remove_files(&self) {
-        let _ = fs::remove_dir_all(&self.dir);
+        let _ = storage_types::vfs::at(&self.dir).remove_dir_all(&self.dir);
     }
 
     // ── manifest ──
@@ -255,7 +255,7 @@ impl ColumnarCollection {
         for e in entries.flatten() {
             let p = e.path();
             if !wanted.contains(&p) {
-                let _ = fs::remove_file(&p);
+                let _ = storage_types::vfs::at(&p).remove_file(&p);
             }
         }
     }
@@ -610,7 +610,7 @@ impl ColumnarCollection {
         };
         for p in obsolete {
             // A file still mapped by a reader cannot be removed on Windows; open sweeps it later.
-            let _ = fs::remove_file(p);
+            let _ = storage_types::vfs::at(&p).remove_file(&p);
         }
         Ok(MergeReport { rows_written, segments_before: segs_now.len(), segments_after: next.len(), delta_after })
     }

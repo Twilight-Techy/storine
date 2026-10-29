@@ -146,7 +146,7 @@ impl DatabaseCatalog {
     pub fn open(base_dir: impl Into<PathBuf>, wal_sync_policy: SyncPolicy) -> Result<Self> {
         let base_dir = base_dir.into();
         if !base_dir.exists() {
-            fs::create_dir_all(&base_dir)
+            storage_types::vfs::at(&base_dir).create_dir_all(&base_dir)
                 .map_err(|e| StorageError::io("create catalog base_dir", e))?;
         }
 

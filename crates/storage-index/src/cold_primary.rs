@@ -1,6 +1,7 @@
 //! 64-Byte Split-Block Bloom Filter and Tiered Cold Primary Index (`TASK-035`, `F-PIDX-03`,
 //! `F-INDX-08`, `RULE-CPU-01`, `RULE-MEM-03`).
 
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -220,7 +221,7 @@ impl ColdPrimaryIndex {
         let mmap = if !pages_buf.is_empty() {
             if let Some(parent) = path.parent() {
                 if !parent.exists() {
-                    fs::create_dir_all(parent)
+                    storage_types::vfs::at(parent).create_dir_all(parent)
                         .map_err(|e| StorageError::io("create cold primary dir", e))?;
                 }
             }

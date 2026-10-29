@@ -52,7 +52,7 @@ pub(crate) fn remove_stale_generations(manifest: &Path, keep: Option<&Path>) {
         let is_generation = hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit());
         let path = entry.path();
         if is_generation && Some(path.as_path()) != keep {
-            let _ = fs::remove_file(&path);
+            let _ = storage_types::vfs::at(&path).remove_file(&path);
         }
     }
 }
@@ -89,7 +89,7 @@ pub(crate) fn read_manifest(manifest: &Path, magic: u32) -> Result<Option<(u64, 
 
 /// Publishes a finished temporary generation file under its final name.
 pub(crate) fn publish_generation(tmp: &Path, final_path: &Path) -> Result<()> {
-    fs::rename(tmp, final_path).map_err(|e| StorageError::io("publish index generation file", e))
+    storage_types::vfs::at(final_path).rename(tmp, final_path).map_err(|e| StorageError::io("publish index generation file", e))
 }
 
 pub(crate) fn map_path_read_only(path: &Path) -> Result<MmapRegion> {

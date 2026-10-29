@@ -456,10 +456,10 @@ fn migrate_legacy_segments(legacy_dir: &Path, seg_dir: &Path) -> Result<()> {
     if legacy.is_empty() {
         return Ok(());
     }
-    fs::create_dir_all(seg_dir).map_err(|e| StorageError::io("create arena segment dir", e))?;
+    storage_types::vfs::at(seg_dir).create_dir_all(seg_dir).map_err(|e| StorageError::io("create arena segment dir", e))?;
     for path in legacy {
         if let Some(name) = path.file_name() {
-            fs::rename(&path, seg_dir.join(name))
+            storage_types::vfs::at(&seg_dir.join(name)).rename(&path, &seg_dir.join(name))
                 .map_err(|e| StorageError::io("migrate legacy arena segment", e))?;
         }
     }
@@ -580,7 +580,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
     ) -> Result<Self> {
         let base_dir = base_dir.into();
         if !base_dir.exists() {
-            fs::create_dir_all(&base_dir)
+            storage_types::vfs::at(&base_dir).create_dir_all(&base_dir)
                 .map_err(|e| StorageError::io("create engine base directory", e))?;
         }
         let stem = collection_file_stem(&config.collection_name)?;
@@ -3152,7 +3152,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
 
     /// Removes a deleted record's file, queueing a retry if it is still in use (Windows).
     fn remove_record_file(&self, id: InlineId, path: PathBuf) {
-        if fs::remove_file(&path).is_err() && path.exists() {
+        if storage_types::vfs::at(&path).remove_file(&path).is_err() && path.exists() {
             self.pending_file_removals
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3170,7 +3170,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             if self.primary.version_of(*id).is_some() {
                 return false; // re-created: the file now belongs to the live record
             }
-            fs::remove_file(path).is_err() && path.exists()
+            storage_types::vfs::at(path).remove_file(path).is_err() && path.exists()
         });
     }
 
@@ -3493,8 +3493,8 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             }
             PrimaryCut::Cold(cut) => {
                 self.primary.write_cold_checkpoint(cut, &self.cold_manifest, stamp, &seal)?;
-                let _ = fs::remove_file(delta_checkpoint_path(&self.idx_path));
-                let _ = fs::remove_file(&self.idx_path);
+                let _ = storage_types::vfs::at(&delta_checkpoint_path(&self.idx_path)).remove_file(&delta_checkpoint_path(&self.idx_path));
+                let _ = storage_types::vfs::at(&self.idx_path).remove_file(&self.idx_path);
             }
         }
         Ok(())
@@ -3680,7 +3680,7 @@ fn load_primary_state(
                 stamp
             }
         };
-        let _ = fs::remove_file(idx_path);
+        let _ = storage_types::vfs::at(idx_path).remove_file(idx_path);
         stamp
     } else {
         None
@@ -3695,13 +3695,13 @@ fn load_primary_state(
 
 /// Opens an empty paged range index at `path`, discarding any previous files.
 fn fresh_paged_btree(path: &Path, seal: &FileSeal<'_>) -> Result<PagedBTreeIndex> {
-    let _ = fs::remove_file(path);
+    let _ = storage_types::vfs::at(path).remove_file(path);
     PagedBTreeIndex::open_sealed(path, seal)
 }
 
 /// Opens an empty paged tag index at `path`, discarding any previous files.
 fn fresh_paged_bitmap(path: &Path, seal: &FileSeal<'_>) -> Result<PagedBitmapIndex> {
-    let _ = fs::remove_file(path);
+    let _ = storage_types::vfs::at(path).remove_file(path);
     PagedBitmapIndex::open_sealed(path, seal)
 }
 
@@ -4139,7 +4139,7 @@ fn current_time_ns() -> u64 {
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<usize> {
-    fs::create_dir_all(dst).map_err(|e| StorageError::io("create snapshot dir", e))?;
+    storage_types::vfs::at(dst).create_dir_all(dst).map_err(|e| StorageError::io("create snapshot dir", e))?;
     let mut files_copied = 0usize;
     for entry in fs::read_dir(src).map_err(|e| StorageError::io("read source dir", e))? {
         let entry = entry.map_err(|e| StorageError::io("read dir entry", e))?;
@@ -4151,7 +4151,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<usize> {
         if path.is_dir() {
             files_copied += copy_dir_recursive(&path, &dest_path)?;
         } else {
-            fs::copy(&path, &dest_path).map_err(|e| StorageError::io("copy snapshot file", e))?;
+            storage_types::vfs::at(&dest_path).copy(&path, &dest_path).map_err(|e| StorageError::io("copy snapshot file", e))?;
             files_copied += 1;
         }
     }

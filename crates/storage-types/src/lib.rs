@@ -9,6 +9,7 @@ pub mod error;
 pub mod header;
 pub mod id;
 pub mod padded;
+pub mod vfs;
 #[doc(hidden)]
 pub mod testing;
 pub mod wire;

@@ -22,7 +22,9 @@
 //! read and the result is cached (`RULE-SAFE-04`).
 
 use std::borrow::Cow;
-use std::fs::{self, File};
+#[cfg(test)]
+use std::fs;
+use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,7 +76,7 @@ pub struct SegmentRow<'a> {
 pub struct SegmentWriter<'s> {
     path: PathBuf,
     tmp: PathBuf,
-    out: BufWriter<File>,
+    out: BufWriter<storage_types::vfs::VfsHandle>,
     pos: u64,
     seal: FileSeal<'s>,
     context: Vec<u8>,
@@ -119,7 +121,9 @@ impl<'s> SegmentWriter<'s> {
         let mut tmp = path.as_os_str().to_os_string();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
-        let file = File::create(&tmp).map_err(io_err("create column segment"))?;
+        let file = storage_types::vfs::at(&tmp)
+            .open(&tmp, storage_types::vfs::OpenOpts::create_truncate())
+            .map_err(io_err("create column segment"))?;
         let mut out = BufWriter::with_capacity(1 << 20, file);
         out.write_all(&[0u8; HEADER_LEN]).map_err(io_err("write column segment"))?;
         let mut w = Self {
@@ -305,8 +309,8 @@ impl<'s> SegmentWriter<'s> {
         file.write_all(&header).map_err(io_err("write column segment"))?;
         file.sync_all().map_err(io_err("sync column segment"))?;
         drop(file);
-        fs::rename(&self.tmp, &self.path).map_err(io_err("publish column segment"))?;
-        sync_parent(&self.path);
+        storage_types::vfs::at(&self.path).rename(&self.tmp, &self.path).map_err(io_err("publish column segment"))?;
+        sync_parent(&self.path).map_err(io_err("sync column segment directory"))?;
         Ok(SegmentSummary { rows: self.rows, bytes: self.pos, columns: ncols - 2 })
     }
 }
@@ -320,16 +324,14 @@ pub struct SegmentSummary {
     pub columns: usize,
 }
 
-fn sync_parent(path: &Path) {
-    #[cfg(unix)]
-    if let Some(dir) = path.parent() {
-        let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
-        if let Ok(d) = File::open(dir) {
-            let _ = d.sync_all();
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(dir) => {
+            let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+            storage_types::vfs::at(dir).sync_dir(dir)
         }
+        None => Ok(()),
     }
-    #[cfg(not(unix))]
-    let _ = path;
 }
 
 // ── reading ──

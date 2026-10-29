@@ -3,10 +3,11 @@
 //! Solves OS inode and file-descriptor exhaustion at 10M+ record scale by packing small records
 //! at 64-byte cache-line-aligned offsets inside shared memory-mapped segment files.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 
+use storage_types::vfs::{self, OpenOpts, VfsHandle};
 use storage_types::{FastHashMap, RecordHeader, Result, StorageError, HEADER_SIZE};
 
 use crate::raw::MmapRegion;
@@ -85,7 +86,7 @@ pub struct ArenaLocation {
 
 #[derive(Debug)]
 struct SegmentWriter {
-    file: File,
+    file: VfsHandle,
     write_head: usize,
     persisted_head: usize,
     unsynced_appends: u32,
@@ -112,7 +113,7 @@ impl Drop for ArenaSegment {
     fn drop(&mut self) {
         if let Ok(mut w) = self.writer.lock() {
             if w.write_head != w.persisted_head {
-                let _ = write_all_at(&w.file, &(w.write_head as u64).to_le_bytes(), 12);
+                let _ = write_all_at(w.file.file(), &(w.write_head as u64).to_le_bytes(), 12);
                 w.persisted_head = w.write_head;
             }
         }
@@ -131,31 +132,27 @@ impl Drop for ArenaManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
         for p in pending.drain(..) {
-            let _ = fs::remove_file(p);
+            let _ = vfs::at(&p).remove_file(&p);
         }
     }
 }
 
 impl ArenaSegment {
     pub fn open_or_create(segment_id: u32, path: PathBuf, max_capacity: usize) -> Result<Self> {
+        let vfs = vfs::at(&path);
         if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent)
+            if !vfs.exists(parent) {
+                vfs.create_dir_all(parent)
                     .map_err(|e| StorageError::io("create arena directory", e))?;
             }
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)
+        let file = vfs
+            .open(&path, OpenOpts::create())
             .map_err(|e| StorageError::io("open arena segment file", e))?;
 
         let current_len = file
-            .metadata()
-            .map_err(|e| StorageError::io("stat arena segment file", e))?
-            .len() as usize;
+            .len()
+            .map_err(|e| StorageError::io("stat arena segment file", e))? as usize;
 
         let max_capacity = max_capacity
             .max(INITIAL_SEGMENT_BYTES)
@@ -170,7 +167,7 @@ impl ArenaSegment {
             superblock[0..8].copy_from_slice(SEGMENT_MAGIC);
             superblock[8..12].copy_from_slice(&segment_id.to_le_bytes());
             superblock[12..20].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
-            write_all_at(&file, &superblock, 0)
+            write_all_at(file.file(), &superblock, 0)
                 .map_err(|e| StorageError::io("write arena superblock", e))?;
             (init_cap, HEADER_SIZE)
         } else {
@@ -180,8 +177,18 @@ impl ArenaSegment {
                     .map_err(|e| StorageError::io("align arena segment length", e))?;
             }
             let mut sb = [0u8; HEADER_SIZE];
-            read_exact_at(&file, &mut sb, 0)
+            read_exact_at(file.file(), &mut sb, 0)
                 .map_err(|e| StorageError::io("read arena superblock", e))?;
+            if sb.iter().all(|&b| b == 0) {
+                // Created but never synced (lost in a power cut): nothing durable references
+                // it, since a frame's location is checkpointed only after the segment is synced.
+                // Frames that did reach the disk are still found by the scan below.
+                sb[0..8].copy_from_slice(SEGMENT_MAGIC);
+                sb[8..12].copy_from_slice(&segment_id.to_le_bytes());
+                sb[12..20].copy_from_slice(&(HEADER_SIZE as u64).to_le_bytes());
+                write_all_at(file.file(), &sb, 0)
+                    .map_err(|e| StorageError::io("rewrite lost arena superblock", e))?;
+            }
             if &sb[0..8] != SEGMENT_MAGIC {
                 return Err(StorageError::corrupted_header(
                     "invalid arena segment superblock magic",
@@ -196,7 +203,7 @@ impl ArenaSegment {
             // `RecordHeader` frames written after the last lazy superblock update.
             let mut hdr_buf = [0u8; HEADER_SIZE];
             while cursor + HEADER_SIZE <= cap {
-                if read_exact_at(&file, &mut hdr_buf, cursor as u64).is_err() {
+                if read_exact_at(file.file(), &mut hdr_buf, cursor as u64).is_err() {
                     break;
                 }
                 let Ok(hdr) = RecordHeader::from_slice_verified(&hdr_buf) else {
@@ -213,12 +220,12 @@ impl ArenaSegment {
                 cursor += aligned_step;
             }
             if cursor != persisted_head {
-                let _ = write_all_at(&file, &(cursor as u64).to_le_bytes(), 12);
+                let _ = write_all_at(file.file(), &(cursor as u64).to_le_bytes(), 12);
             }
             (cap, cursor)
         };
 
-        let region = Arc::new(MmapRegion::map_read_only(&file, capacity)?);
+        let region = Arc::new(MmapRegion::map_read_only(file.file(), capacity)?);
         Ok(Self {
             segment_id,
             path,
@@ -327,7 +334,7 @@ impl ArenaSegment {
                     .get_mut(&(aligned_len as u32))
                     .and_then(|slots| slots.pop())
                 {
-                    write_all_at(&w.file, frame, u64::from(reused_offset))
+                    write_all_at(w.file.file(), frame, u64::from(reused_offset))
                         .map_err(|e| StorageError::io("write frame to recycled arena slot", e))?;
                     drop(region_guard);
                     w.dead_bytes = w.dead_bytes.saturating_sub(aligned_len);
@@ -360,7 +367,7 @@ impl ArenaSegment {
                 .map_err(|e| StorageError::io("grow arena segment file", e))?;
             w.capacity = new_cap;
             w.max_capacity = w.max_capacity.max(new_cap);
-            let new_region = Arc::new(MmapRegion::map_read_only(&w.file, w.capacity)?);
+            let new_region = Arc::new(MmapRegion::map_read_only(w.file.file(), w.capacity)?);
             let old_region = core::mem::replace(
                 &mut *self
                     .region
@@ -374,7 +381,7 @@ impl ArenaSegment {
         }
 
         // Single positional write syscall (`TASK-051`)
-        write_all_at(&w.file, frame, offset as u64)
+        write_all_at(w.file.file(), frame, offset as u64)
             .map_err(|e| StorageError::io("write frame to arena segment", e))?;
 
         w.write_head = next_head;
@@ -382,7 +389,7 @@ impl ArenaSegment {
 
         // Lazily update superblock `write_head` on segment growth, explicit sync, or every 64 appends
         if grew_capacity || sync_data || w.unsynced_appends >= SUPERBLOCK_SYNC_INTERVAL {
-            write_all_at(&w.file, &(next_head as u64).to_le_bytes(), 12)
+            write_all_at(w.file.file(), &(next_head as u64).to_le_bytes(), 12)
                 .map_err(|e| StorageError::io("update arena superblock head", e))?;
             w.persisted_head = next_head;
             w.unsynced_appends = 0;
@@ -408,7 +415,7 @@ impl ArenaSegment {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if w.write_head != w.persisted_head {
-            write_all_at(&w.file, &(w.write_head as u64).to_le_bytes(), 12)
+            write_all_at(w.file.file(), &(w.write_head as u64).to_le_bytes(), 12)
                 .map_err(|e| StorageError::io("update arena superblock head", e))?;
             w.persisted_head = w.write_head;
             w.unsynced_appends = 0;
@@ -676,7 +683,7 @@ impl ArenaManager {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             pending.push(path);
             // Retry every pending deletion; files still mapped by readers (Windows) stay queued.
-            pending.retain(|p| fs::remove_file(p).is_err() && p.exists());
+            pending.retain(|p| vfs::at(p).remove_file(p).is_err() && p.exists());
             true
         } else {
             false
@@ -697,7 +704,10 @@ impl ArenaManager {
         for seg in segs {
             seg.sync()?;
         }
-        Ok(())
+        // New segment files (and removed ones) are durable only once their directory is.
+        vfs::at(&self.seg_dir)
+            .sync_dir(&self.seg_dir)
+            .map_err(|e| StorageError::io("fsync arena directory", e))
     }
 
     /// Returns the ids of all currently open segments.
@@ -823,7 +833,7 @@ mod tests {
             assert_eq!(seg.dead_bytes(), 0);
 
             // Simulate power loss before superblock flush by resetting superblock head to 64
-            let f = OpenOptions::new().write(true).open(&seg_path).unwrap();
+            let f = std::fs::OpenOptions::new().write(true).open(&seg_path).unwrap();
             write_all_at(&f, &64u64.to_le_bytes(), 12).unwrap();
             // Prevent Drop from overwriting our simulated stale superblock head
             std::mem::forget(seg);

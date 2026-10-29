@@ -905,11 +905,38 @@ This document defines the strict chronological execution order for building the 
 
 ## Stage 29: Deterministic Simulation & Fault Injection (`TASK-132` – `TASK-136`)
 
-- [ ] **TASK-132: `Vfs` I/O Seam & Simulated Power Loss (`F-SIM-01`)** — every durable write path through one trait; the simulated file system drops, tears or reorders unsynced writes on a simulated power cut; no indirection on mapped hot reads.
+- [x] **TASK-132: `Vfs` I/O Seam & Simulated Power Loss (`F-SIM-01`)** — every durable write path through one trait; the simulated file system drops, tears or reorders unsynced writes on a simulated power cut; no indirection on mapped hot reads.
+  - **Seam** (`storage-types/src/vfs.rs`): `Vfs` / `VfsFile`. `vfs::at(path)` returns the simulator mounted over the path, or `RealVfs`; with nothing mounted that costs one relaxed atomic load per open.
+    - Covered: the WAL (append, checkpoint replacement, archive), record files (temp + rename, ping-pong), arena segments, primary checkpoints and deltas, paged and cold index generations and manifests, HNSW files, column segments, Raft log, meta, snapshots and installs, and backups.
+    - Mapped files are mapped from `VfsFile::file()`: hot reads are unchanged (bench gate: `with_ref` p50 66 ns, 0 allocations).
+  - **Simulator** (`SimVfs`, over a real directory like a page cache): it remembers each file's contents at its last sync and the journal of creates, renames and removes. On a power cut:
+    - every unsynced 512-byte sector is kept or lost on its own (torn and reordered writes);
+    - the length lands anywhere between the synced and the written length;
+    - unsynced directory changes roll back to a random journal prefix.
+  - **Modes and capture**: `CutMode::LoseAll` / `KeepAll` (process crash), crash points (`fail_at(k)`), and freezing (writes after the crash, including through mappings, don't count). Same seed, same disk.
+  - **Bugs found and fixed**:
+    - a new WAL's directory entry was never synced;
+    - a new ping-pong record file was never synced;
+    - a new primary-checkpoint delta was never synced;
+    - Raft snapshots (taken and installed) were renamed into place without a directory sync, before the log was compacted behind them;
+    - the arena directory was never synced after adding segments;
+    - an arena segment whose superblock never reached the disk made recovery refuse the database (now re-initialised and scanned).
+  - **Exit Criteria (met)**:
+    - The WAL test (120 seeds × 3 lives, checkpoints included) loses no acknowledged frame and invents none; removing the new-WAL directory sync makes it fail.
+    - The engine test (`tests/power_loss.rs`: 4 layouts / index tiers × 24 seeds × 3 lives, power cuts and process crashes; 200 seeds verified) holds these properties:
+      - acknowledged writes all present;
+      - the in-flight write all-or-nothing, transactions included;
+      - no torn records;
+      - the score index equal to the records;
+      - no file written around the seam.
 - [ ] **TASK-133: Deterministic Cluster Simulator (`F-SIM-02`)** — seeded scheduler, simulated network and clocks; Raft safety invariants checked every run; failing seeds reproduce bit for bit.
 - [ ] **TASK-134: Linearizability Checker & Process Chaos (`F-SIM-03`)** — P-compositional history checker; fault proxy (partitions, delays, half-open sockets) and `SIGKILL` / `SIGSTOP` of real binaries.
 - [ ] **TASK-135: Structure-Aware Fuzzing (`F-SIM-04`)** — generators for every decoder and parser, millions of iterations, corpora from the conformance vectors.
-- [ ] **TASK-136: Crash-Point Sweeps (`F-SIM-05`)** — kill at every `k`-th I/O call, recover, check acknowledged writes, torn state and index equality.
+- [x] **TASK-136: Crash-Point Sweeps (`F-SIM-05`)** — kill at every `k`-th I/O call, recover, check acknowledged writes, torn state and index equality.
+  - `tests/power_loss.rs::crash_at_every_io_call`: a fixed 40-operation workload (puts, deletes, 3-record transactions, checkpoints) is stopped at every I/O call `k = 1 ..= total + 1` in each of 4 layouts / index tiers, then recovered:
+    - after a random power cut, a process kill and a total loss of unsynced data;
+    - with the same checks as `TASK-132`.
+  - `STORINE_SWEEP_STRIDE` thins the sweep for quick runs. `k = 1` found the lost-arena-superblock bug.
 
 ## Stage 30: Scale-Out & Multi-Region (`TASK-137` – `TASK-144`)
 

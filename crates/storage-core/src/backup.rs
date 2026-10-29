@@ -68,7 +68,7 @@ pub fn archive_wal_for_pitr<T: ZeroCopyRecord + Indexable>(
         ));
     };
     let wal_pitr_dir = backup_dir.join("wal_pitr");
-    fs::create_dir_all(&wal_pitr_dir)
+    storage_types::vfs::at(&wal_pitr_dir).create_dir_all(&wal_pitr_dir)
         .map_err(|e| StorageError::io("create wal_pitr directory", e))?;
 
     // Checkpoint first: every frame up to the checkpoint is moved into the archive.
@@ -85,7 +85,7 @@ pub fn archive_wal_for_pitr<T: ZeroCopyRecord + Indexable>(
             .zip(fs::metadata(&seg).ok())
             .is_some_and(|(a, b)| a.len() == b.len());
         if !same_size {
-            fs::copy(&seg, &dst)
+            storage_types::vfs::at(&dst).copy(&seg, &dst)
                 .map_err(|e| StorageError::io("copy archived WAL segment to backup_dir", e))?;
             copied += 1;
         }
@@ -152,7 +152,7 @@ pub fn restore_point_in_time<T: ZeroCopyRecord + Indexable>(
 }
 
 fn copy_dir_excluding_pitr(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst).map_err(|e| StorageError::io("create restore dir", e))?;
+    storage_types::vfs::at(dst).create_dir_all(dst).map_err(|e| StorageError::io("create restore dir", e))?;
     for entry in fs::read_dir(src).map_err(|e| StorageError::io("read backup dir", e))? {
         let entry = entry.map_err(|e| StorageError::io("read backup dir entry", e))?;
         let fname = entry.file_name();
@@ -167,7 +167,7 @@ fn copy_dir_excluding_pitr(src: &Path, dst: &Path) -> Result<()> {
         if path.is_dir() {
             copy_dir_excluding_pitr(&path, &dst_path)?;
         } else {
-            fs::copy(&path, &dst_path).map_err(|e| StorageError::io("copy backup file", e))?;
+            storage_types::vfs::at(&dst_path).copy(&path, &dst_path).map_err(|e| StorageError::io("copy backup file", e))?;
         }
     }
     Ok(())

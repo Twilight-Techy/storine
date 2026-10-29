@@ -1,27 +1,26 @@
 //! Atomic disk persistence: Temp+Rename replacement and Ping-Pong double-buffered record slots (`TASK-010`, `F-CONC-05`).
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use storage_types::vfs::{self, OpenOpts, Vfs, VfsHandle};
 use storage_types::{RecordHeader, Result, StorageError, HEADER_SIZE};
 
 /// Writes `frame` (`[RecordHeader | Payload]`) to `<target>.tmp.<tid>`, flushes to disk if `sync_data` is true,
 /// and atomically replaces `target` (`MoveFileExW` on Windows, `rename` on POSIX).
 pub fn atomic_write_replace(target: &Path, frame: &[u8], sync_data: bool) -> Result<()> {
+    let vfs = vfs::at(target);
     if let Some(parent) = target.parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent)
+        if !vfs.exists(parent) {
+            vfs.create_dir_all(parent)
                 .map_err(|e| StorageError::io("create record parent directory", e))?;
         }
     }
 
     let tmp_path = temp_path_for(target);
     {
-        let mut tmp_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)
+        let mut tmp_file = vfs
+            .open(&tmp_path, OpenOpts::create_truncate())
             .map_err(|e| StorageError::io("open temporary record file", e))?;
 
         tmp_file
@@ -35,7 +34,26 @@ pub fn atomic_write_replace(target: &Path, frame: &[u8], sync_data: bool) -> Res
         }
     }
 
+    if vfs.is_simulated() {
+        return vfs_rename(&*vfs, &tmp_path, target, sync_data);
+    }
     platform_atomic_rename(&tmp_path, target, sync_data)
+}
+
+/// Rename plus (when `write_through`) a sync of the destination directory.
+fn vfs_rename(vfs: &dyn Vfs, src: &Path, dst: &Path, write_through: bool) -> Result<()> {
+    if let Err(e) = vfs.rename(src, dst) {
+        let _ = vfs.remove_file(src);
+        return Err(StorageError::io("rename atomic replace", e));
+    }
+    if write_through {
+        // A rename is only durable once the containing directory entry is synced.
+        if let Some(parent) = dst.parent() {
+            vfs.sync_dir(parent)
+                .map_err(|e| StorageError::io("fsync parent directory after rename", e))?;
+        }
+    }
+    Ok(())
 }
 
 #[inline]
@@ -85,20 +103,7 @@ extern "system" {
 
 #[cfg(unix)]
 fn platform_atomic_rename(src: &Path, dst: &Path, write_through: bool) -> Result<()> {
-    if let Err(e) = fs::rename(src, dst) {
-        let _ = fs::remove_file(src);
-        return Err(StorageError::io("rename atomic replace", e));
-    }
-    if write_through {
-        // A rename is only durable once the containing directory entry is synced.
-        if let Some(parent) = dst.parent() {
-            let dir = fs::File::open(parent)
-                .map_err(|e| StorageError::io("open parent directory for fsync", e))?;
-            dir.sync_all()
-                .map_err(|e| StorageError::io("fsync parent directory after rename", e))?;
-        }
-    }
-    Ok(())
+    vfs_rename(&vfs::RealVfs, src, dst, write_through)
 }
 
 /// Writes `frame` into a pre-allocated Ping-Pong double-buffered record file (`[Slot 0 | Slot 1]`).
@@ -124,25 +129,22 @@ pub fn write_ping_pong_slot(
         ));
     }
 
+    let vfs = vfs::at(path);
     if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent)
+        if !vfs.exists(parent) {
+            vfs.create_dir_all(parent)
                 .map_err(|e| StorageError::io("create ping-pong parent directory", e))?;
         }
     }
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)
+    let created = !vfs.exists(path);
+    let mut file = vfs
+        .open(path, OpenOpts::create())
         .map_err(|e| StorageError::io("open ping-pong record file", e))?;
 
     let file_len = file
-        .metadata()
-        .map_err(|e| StorageError::io("stat ping-pong record file", e))?
-        .len() as usize;
+        .len()
+        .map_err(|e| StorageError::io("stat ping-pong record file", e))? as usize;
 
     let required_total = stride * 2;
     if file_len < required_total {
@@ -196,6 +198,13 @@ pub fn write_ping_pong_slot(
     if sync_data {
         file.sync_data()
             .map_err(|e| StorageError::io("fsync ping-pong record file", e))?;
+        if created {
+            // A new file's directory entry is not durable until its directory is synced.
+            if let Some(parent) = path.parent() {
+                vfs.sync_dir(parent)
+                    .map_err(|e| StorageError::io("fsync ping-pong record directory", e))?;
+            }
+        }
     }
 
     Ok((target_offset, frame.len()))
@@ -242,6 +251,7 @@ fn check_slot(mapped: &[u8], offset: usize) -> Option<(u64, &[u8])> {
 
 /// Recursively deletes any orphaned `.tmp` files left behind by an interrupted crash before rename (`F-DURA-04`).
 pub fn cleanup_temp_files(root: &Path) -> Result<usize> {
+    let vfs = vfs::at(root);
     if !root.exists() {
         return Ok(0);
     }
@@ -259,7 +269,7 @@ pub fn cleanup_temp_files(root: &Path) -> Result<usize> {
             } else if path
                 .extension()
                 .and_then(|e| e.to_str()) == Some("tmp")
-                && fs::remove_file(&path).is_ok() {
+                && vfs.remove_file(&path).is_ok() {
                     removed += 1;
                 }
         }
@@ -272,7 +282,7 @@ pub fn cleanup_temp_files(root: &Path) -> Result<usize> {
 /// database collection directory (`TASK-059`).
 #[derive(Debug)]
 pub struct DirectoryLock {
-    file: fs::File,
+    file: VfsHandle,
     path: PathBuf,
 }
 
@@ -280,21 +290,18 @@ impl DirectoryLock {
     /// Acquires an immediate non-blocking exclusive lock on `lock_path`.
     /// Returns `Err(StorageError::Io)` if another instance or OS process already holds the lock.
     pub fn try_acquire(lock_path: &Path) -> Result<Self> {
+        let vfs = vfs::at(lock_path);
         if let Some(parent) = lock_path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent)
+            if !vfs.exists(parent) {
+                vfs.create_dir_all(parent)
                     .map_err(|e| StorageError::io("create lock parent directory", e))?;
             }
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path)
+        let file = vfs
+            .open(lock_path, OpenOpts::create())
             .map_err(|e| StorageError::io("open database collection .lock file", e))?;
 
-        platform_try_lock_exclusive(&file)?;
+        platform_try_lock_exclusive(file.file())?;
 
         Ok(Self {
             file,
@@ -310,7 +317,7 @@ impl DirectoryLock {
 
 impl Drop for DirectoryLock {
     fn drop(&mut self) {
-        platform_unlock(&self.file);
+        platform_unlock(self.file.file());
     }
 }
 

@@ -31,7 +31,8 @@
 //! region (see `paged_files`): verified once at open, then each page is decrypted into a stack
 //! copy when read. Separator keys in RAM are plaintext, as are all in-RAM indexes.
 
-use std::fs::{self, OpenOptions};
+#[cfg(test)]
+use std::fs;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
@@ -665,7 +666,7 @@ impl PagedBTreeIndex {
                     let old_path = old.path.clone();
                     drop(old);
                     // Best effort: a leftover generation is removed at the next open.
-                    let _ = fs::remove_file(old_path);
+                    let _ = storage_types::vfs::at(&old_path).remove_file(&old_path);
                 }
                 Ok(written)
             }
@@ -700,7 +701,7 @@ impl PagedBTreeIndex {
         if let Some(old) = old {
             let old_path = old.path.clone();
             drop(old);
-            let _ = fs::remove_file(old_path);
+            let _ = storage_types::vfs::at(&old_path).remove_file(&old_path);
         }
         Ok(())
     }
@@ -737,15 +738,11 @@ impl PagedBTreeIndex {
         stamp: u64,
     ) -> Result<(BaseGeneration, usize)> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|e| StorageError::io("create paged btree dir", e))?;
+            storage_types::vfs::at(parent).create_dir_all(parent).map_err(|e| StorageError::io("create paged btree dir", e))?;
         }
         let data_path = generation_path(&self.path, generation);
         let tmp_path = temp_generation_path(&self.path, generation);
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)
+        let file = storage_types::vfs::at(&tmp_path).open(&tmp_path, storage_types::vfs::OpenOpts::create_truncate())
             .map_err(|e| StorageError::io("create btree generation file", e))?;
         let mut writer = BufWriter::with_capacity(16 * BTREE_PAGE_SIZE, file);
         writer
