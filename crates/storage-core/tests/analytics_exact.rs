@@ -375,6 +375,16 @@ fn spilled_group_by_equals_in_memory() {
         // The distinct-only case needs a budget below its sets' size.
         q.aggregates.push(Aggregate { func: AggFunc::CountDistinct, arg: field("key") });
         let want = run_documents(&q, &docs).unwrap();
+        // In memory (many groups: merged in parallel hash partitions).
+        let inmem = s.aggregate(&q).unwrap();
+        assert_eq!(inmem.spilled_bytes, 0);
+        assert_eq!(inmem.matched, want.matched);
+        assert_eq!(inmem.rows.len(), want.rows.len(), "in-memory groups for {:?}", q.group_by);
+        for (g, w) in inmem.rows.iter().zip(&want.rows) {
+            for (i, (a, b)) in g.iter().zip(w).enumerate() {
+                assert!(same(a, b), "in-memory column {i} differs for {:?}: {a:?} vs {b:?}", q.group_by);
+            }
+        }
         q.memory_budget = 256 << 10;
         let got = s.aggregate(&q).unwrap();
         assert!(got.spilled_bytes > 0, "the query should have spilled for {:?}", q.group_by);

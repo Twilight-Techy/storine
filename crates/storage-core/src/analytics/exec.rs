@@ -149,7 +149,15 @@ struct State<'b> {
     pruned: u64,
     /// Bytes charged to the budget for groups (distinct sets are counted from their sizes).
     charged: usize,
+    /// Group of each plain integer / timestamp key seen (`true`: timestamp), so a high-cardinality
+    /// integer key costs one probe per row instead of building and hashing a key vector.
+    ints: FastHashMap<(bool, i64), u32>,
     budget: &'b Budget,
+}
+
+thread_local! {
+    /// `(budget address, bytes not yet added to it)` of this thread.
+    static BUDGET_BATCH: core::cell::Cell<(usize, usize)> = const { core::cell::Cell::new((0, 0)) };
 }
 
 /// Memory accounting of one query. With a spill directory the limit is soft: workers spill
@@ -197,6 +205,23 @@ impl Budget {
     }
 
     fn take(&self, n: usize) -> Result<()> {
+        // Charges batch per thread (one shared atomic add per 64 KiB instead of one per group):
+        // usage reads at most 64 KiB per worker low, and no worker contends on the counter.
+        let n = BUDGET_BATCH.with(|b| {
+            let (owner, pending) = b.get();
+            let me = core::ptr::from_ref(self) as usize;
+            let pending = if owner == me { pending + n } else { n };
+            if pending < 1 << 16 {
+                b.set((me, pending));
+                0
+            } else {
+                b.set((me, 0));
+                pending
+            }
+        });
+        if n == 0 {
+            return Ok(());
+        }
         let now = self.used.fetch_add(n, Ordering::Relaxed) + n;
         let ceiling = if self.spill_dir.is_some() { self.limit.saturating_add(self.slack) } else { self.limit };
         if now > ceiling {
@@ -239,12 +264,71 @@ impl<'b> State<'b> {
             matched: 0,
             pruned: 0,
             charged: 0,
+            ints: FastHashMap::default(),
             budget,
         };
         if q.group_by.is_empty() {
             s.group(Vec::new(), Vec::new())?;
         }
         Ok(s)
+    }
+
+    /// A state without any group (not even the single group of an ungrouped query).
+    fn empty(q: &AggregateQuery, budget: &'b Budget) -> Self {
+        Self {
+            groups: FastHashMap::default(),
+            reps: Vec::new(),
+            accs: q.aggregates.iter().map(|a| Acc::new(a.func)).collect(),
+            matched: 0,
+            pruned: 0,
+            charged: 0,
+            ints: FastHashMap::default(),
+            budget,
+        }
+    }
+
+    /// Splits the groups into `PARTITIONS` states by key hash (counters stay here).
+    fn split(mut self, q: &AggregateQuery) -> Result<Vec<State<'b>>> {
+        // The groups move: release what this state charged, the parts charge it again.
+        self.budget.release(self.footprint());
+        self.charged = 0;
+        let mut out: Vec<State<'b>> = (0..PARTITIONS).map(|_| State::empty(q, self.budget)).collect();
+        let groups = self.take_keys();
+        let mut reps = core::mem::take(&mut self.reps);
+        let mut accs = core::mem::take(&mut self.accs);
+        for (key, g) in groups {
+            let g = g as usize;
+            let part = &mut out[partition_of(&key)];
+            let ng = part.group(key, core::mem::take(&mut reps[g]))? as usize;
+            for (src, dst) in accs.iter_mut().zip(part.accs.iter_mut()) {
+                match (src, dst) {
+                    (Acc::Count(a), Acc::Count(b)) => b[ng] = a[g],
+                    (Acc::Sum(a), Acc::Sum(b)) => b[ng] = core::mem::take(&mut a[g]),
+                    (Acc::Avg(a, ac), Acc::Avg(b, bc)) => {
+                        b[ng] = core::mem::take(&mut a[g]);
+                        bc[ng] = ac[g];
+                    }
+                    (Acc::Min(a), Acc::Min(b)) | (Acc::Max(a), Acc::Max(b)) => b[ng] = core::mem::take(&mut a[g]),
+                    (Acc::Distinct(a), Acc::Distinct(b)) => b[ng] = core::mem::take(&mut a[g]),
+                    (Acc::Approx(a), Acc::Approx(b)) => b[ng] = core::mem::take(&mut a[g]),
+                    _ => {}
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The group of a single integer (or timestamp) key: the same group `group` gives it.
+    fn int_group(&mut self, x: i64, ts: bool) -> Result<u32> {
+        if let Some(&g) = self.ints.get(&(ts, x)) {
+            // The representative is the plain value unless another kind (`1.0`) came first.
+            let canonical = matches!((&self.reps[g as usize][..], ts), ([PropertyValue::Int64(y)], false) | ([PropertyValue::TimestampNs(y)], true) if *y == x);
+            if canonical {
+                return Ok(g);
+            }
+        }
+        let rep = if ts { PropertyValue::TimestampNs(x) } else { PropertyValue::Int64(x) };
+        self.int_group_rep((ts, x), vec![rep])
     }
 
     /// Bytes this state holds against the budget.
@@ -265,7 +349,8 @@ impl<'b> State<'b> {
     fn spill_out(&mut self, q: &AggregateQuery) -> Result<()> {
         let spill = self.budget.spill()?;
         let mut rec = Vec::new();
-        for (key, &g) in &self.groups {
+        for (key, g) in self.take_keys() {
+            let key = &key;
             let g = g as usize;
             rec.clear();
             put_u32(&mut rec, key.len() as u32);
@@ -300,6 +385,7 @@ impl<'b> State<'b> {
         self.groups = FastHashMap::default();
         self.reps = Vec::new();
         self.accs = q.aggregates.iter().map(|a| Acc::new(a.func)).collect();
+        self.ints = FastHashMap::default();
         self.charged = 0;
         if q.group_by.is_empty() {
             self.group(Vec::new(), Vec::new())?;
@@ -344,6 +430,13 @@ impl<'b> State<'b> {
     }
 
     fn group(&mut self, key: Vec<GroupValue>, rep: Vec<PropertyValue>) -> Result<u32> {
+        // Single integer / timestamp keys live only in `ints` (whatever value kind produced
+        // them: `1`, `1.0` and `1.00` are all `Exact(1, 0)`), so every path finds one group.
+        if let [k] = key.as_slice() {
+            if let Some(ik) = int_key(k) {
+                return self.int_group_rep(ik, rep);
+            }
+        }
         if let Some(&g) = self.groups.get(&key) {
             let cur = &mut self.reps[g as usize];
             for (c, r) in cur.iter_mut().zip(rep) {
@@ -353,16 +446,45 @@ impl<'b> State<'b> {
             }
             return Ok(g);
         }
-        let g = self.reps.len() as u32;
         let mut size = key.iter().map(GroupValue::size).sum::<usize>() + 64;
-        for a in &mut self.accs {
-            size += a.push();
-        }
-        self.budget.take(size)?;
-        self.charged += size;
+        let g = self.new_group(rep, &mut size)?;
         self.groups.insert(key, g);
+        Ok(g)
+    }
+
+    fn new_group(&mut self, rep: Vec<PropertyValue>, size: &mut usize) -> Result<u32> {
+        let g = self.reps.len() as u32;
+        for a in &mut self.accs {
+            *size += a.push();
+        }
+        self.budget.take(*size)?;
+        self.charged += *size;
         self.reps.push(rep);
         Ok(g)
+    }
+
+    /// The group of single key `(timestamp?, value)`, keeping its representative deterministic.
+    fn int_group_rep(&mut self, ik: (bool, i64), rep: Vec<PropertyValue>) -> Result<u32> {
+        if let Some(&g) = self.ints.get(&ik) {
+            let cur = &mut self.reps[g as usize];
+            for (c, r) in cur.iter_mut().zip(rep) {
+                if *c != r {
+                    *c = det_pick(core::mem::replace(c, PropertyValue::Null), r);
+                }
+            }
+            return Ok(g);
+        }
+        let mut size = 48;
+        let g = self.new_group(rep, &mut size)?;
+        self.ints.insert(ik, g);
+        Ok(g)
+    }
+
+    /// Every group's key (generic keys, then integer keys) with its id.
+    fn take_keys(&mut self) -> Vec<(Vec<GroupValue>, u32)> {
+        let mut out: Vec<(Vec<GroupValue>, u32)> = core::mem::take(&mut self.groups).into_iter().collect();
+        out.extend(core::mem::take(&mut self.ints).into_iter().map(|(k, g)| (vec![int_gv(k)], g)));
+        out
     }
 
     fn merge(&mut self, mut other: State<'_>) -> Result<()> {
@@ -371,13 +493,19 @@ impl<'b> State<'b> {
         // `other`'s memory moves here: what this state does not re-charge is released.
         self.budget.release(other.footprint());
         other.charged = 0;
-        let mut order: Vec<(Vec<GroupValue>, u32)> = core::mem::take(&mut other.groups).into_iter().collect();
-        order.sort_by_key(|(_, g)| *g);
+        // Merge order does not matter: every accumulator merge and representative choice is
+        // order-independent.
+        let generic: Vec<(Vec<GroupValue>, u32)> = core::mem::take(&mut other.groups).into_iter().collect();
+        let ints: Vec<((bool, i64), u32)> = core::mem::take(&mut other.ints).into_iter().collect();
         let mut other_reps = core::mem::take(&mut other.reps);
         let mut map = vec![0u32; other_reps.len()];
-        for (key, og) in order {
+        for (key, og) in generic {
             let rep = core::mem::take(&mut other_reps[og as usize]);
             map[og as usize] = self.group(key, rep)?;
+        }
+        for (ik, og) in ints {
+            let rep = core::mem::take(&mut other_reps[og as usize]);
+            map[og as usize] = self.int_group_rep(ik, rep)?;
         }
         let budget = self.budget;
         for (mine, theirs) in self.accs.iter_mut().zip(core::mem::take(&mut other.accs)) {
@@ -420,6 +548,23 @@ impl Drop for State<'_> {
     }
 }
 
+/// The `ints` key of a single group key value, if it is an integer or a timestamp.
+fn int_key(k: &GroupValue) -> Option<(bool, i64)> {
+    match k {
+        GroupValue::Exact(m, 0) => i64::try_from(*m).ok().map(|x| (false, x)),
+        GroupValue::Timestamp(t) => Some((true, *t)),
+        _ => None,
+    }
+}
+
+fn int_gv((ts, x): (bool, i64)) -> GroupValue {
+    if ts {
+        GroupValue::Timestamp(x)
+    } else {
+        GroupValue::Exact(i128::from(x), 0)
+    }
+}
+
 /// Spill partition of a group key.
 fn partition_of(key: &[GroupValue]) -> usize {
     let h = key.iter().fold(0x9E37_79B9_7F4A_7C15u64, |a, v| (a.rotate_left(23) ^ v.hash()).wrapping_mul(0xFF51_AFD7_ED55_8CCD));
@@ -449,6 +594,9 @@ enum Col {
     /// when it fits.
     I128 { v: Vec<i128>, scale: u8, dec: bool, kind: Kind },
     F64(Vec<f64>),
+    /// Timestamps (nanoseconds): typed for min / max / distinct / grouping, not numbers in
+    /// arithmetic (they take the row-by-row path there, as other non-numeric values do).
+    Ts(Vec<i64>),
     /// Anything else, row by row.
     Vals(Vec<Option<Val>>),
 }
@@ -530,6 +678,7 @@ fn field_col(rg: &RowGroupView<'_>, path: &str, sel: &[u64]) -> ColV {
     };
     let col = match &chunk.body {
         Body::Int(Kind::Int, ic) => Col::I64 { v: ints(ic), scale: 0, dec: false, kind: Kind::Int },
+        Body::Int(Kind::Timestamp, ic) => Col::Ts(ints(ic)),
         Body::Int(Kind::UInt, ic) => Col::I128 { v: ints(ic).into_iter().map(|x| i128::from(x as u64 ^ (1 << 63))).collect(), scale: 0, dec: false, kind: Kind::UInt },
         Body::Int128(I128Body::Small(ic)) => Col::I64 { v: ints(ic), scale: 0, dec: false, kind: Kind::Int128 },
         Body::Int128(b) => Col::I128 { v: Body::i128_values(b, n), scale: 0, dec: false, kind: Kind::Int128 },
@@ -590,7 +739,7 @@ fn to_f64(c: &Col, n: usize) -> Vec<f64> {
         Col::I64 { v, scale, .. } => v.iter().map(|&x| exact_f64(i128::from(x), *scale)).collect(),
         Col::I128 { v, scale, .. } => v.iter().map(|&x| exact_f64(x, *scale)).collect(),
         Col::F64(v) => v.clone(),
-        Col::Vals(_) => vec![f64::NAN; n],
+        Col::Ts(_) | Col::Vals(_) => vec![f64::NAN; n],
     }
 }
 
@@ -657,6 +806,7 @@ fn exact_op(x: i128, sx: u8, y: i128, sy: u8, op: Op) -> Result<(i128, u8)> {
 }
 
 fn binop(a: ColV, b: ColV, op: Op, n: usize) -> Result<ColV> {
+    let (a, b) = (untyped_ts(a, n), untyped_ts(b, n));
     let mut valid = a.valid.clone();
     simd::and_words(&mut valid, &b.valid);
     let col = match (a.col, b.col) {
@@ -714,9 +864,18 @@ fn binop(a: ColV, b: ColV, op: Op, n: usize) -> Result<ColV> {
     Ok(ColV { col, valid })
 }
 
+/// Timestamps as row-by-row values (arithmetic treats them as non-numbers).
+fn untyped_ts(c: ColV, n: usize) -> ColV {
+    match c.col {
+        Col::Ts(_) => ColV { col: Col::Vals(col_vals(c.col, n)), valid: c.valid },
+        _ => c,
+    }
+}
+
 fn col_vals(c: Col, n: usize) -> Vec<Option<Val>> {
     match c {
         Col::Vals(v) => v,
+        Col::Ts(v) => v.into_iter().map(|x| Some(Val::Timestamp(x))).collect(),
         Col::I64 { v, scale, dec, kind } => v
             .into_iter()
             .map(|x| {
@@ -857,7 +1016,7 @@ fn eval_expr(e: &Expr, rg: &RowGroupView<'_>, sel: &[u64]) -> Result<ColV> {
 
 /// Subtraction keeps operand order even on the row-by-row path.
 fn sub_op(a: ColV, b: ColV, n: usize) -> Result<ColV> {
-    if matches!(a.col, Col::Vals(_)) || matches!(b.col, Col::Vals(_)) {
+    if matches!(a.col, Col::Vals(_) | Col::Ts(_)) || matches!(b.col, Col::Vals(_) | Col::Ts(_)) {
         let mut valid = a.valid.clone();
         simd::and_words(&mut valid, &b.valid);
         let (xs, ys) = (col_vals(a.col, n), col_vals(b.col, n));
@@ -885,6 +1044,7 @@ fn prop_at(c: &Col, i: usize) -> PropertyValue {
             _ => int_val(v[i]).to_property(),
         },
         Col::F64(v) => PropertyValue::Float64(v[i]),
+        Col::Ts(v) => PropertyValue::TimestampNs(v[i]),
         Col::Vals(v) => v[i].as_ref().map_or(PropertyValue::Null, Val::to_property),
     }
 }
@@ -894,6 +1054,7 @@ fn group_value_at(c: &Col, i: usize) -> GroupValue {
         Col::I64 { v, scale, dec, .. } => GroupValue::of_val(Some(&if *dec { Val::Decimal(i128::from(v[i]), *scale) } else { Val::Int(v[i]) })),
         Col::I128 { v, scale, .. } => GroupValue::of_val(Some(&Val::Decimal(v[i], *scale))),
         Col::F64(v) => GroupValue::of_val(Some(&Val::Float(v[i]))),
+        Col::Ts(v) => GroupValue::of_val(Some(&Val::Timestamp(v[i]))),
         Col::Vals(v) => GroupValue::of_val(v[i].as_ref()),
     }
 }
@@ -904,7 +1065,23 @@ fn group_value_at(c: &Col, i: usize) -> GroupValue {
 /// chunks) or per-row values.
 enum KeyCol {
     Codes(Vec<u32>, Vec<(GroupValue, PropertyValue)>),
+    /// Plain integers or timestamps (`ts`), with their present rows.
+    Ints { v: Vec<i64>, valid: Vec<u64>, ts: bool },
     Rows(Vec<(GroupValue, PropertyValue)>),
+}
+
+impl KeyCol {
+    fn at(&self, i: usize) -> (GroupValue, PropertyValue) {
+        match self {
+            Self::Codes(c, e) => e[c[i] as usize].clone(),
+            Self::Ints { v, valid, ts } => match (bit(valid, i), ts) {
+                (false, _) => (GroupValue::Null, PropertyValue::Null),
+                (true, true) => (GroupValue::Timestamp(v[i]), PropertyValue::TimestampNs(v[i])),
+                (true, false) => (GroupValue::Exact(i128::from(v[i]), 0), PropertyValue::Int64(v[i])),
+            },
+            Self::Rows(r) => r[i].clone(),
+        }
+    }
 }
 
 fn bucket(v: &PropertyValue, width: i64, offset: i64) -> PropertyValue {
@@ -978,6 +1155,33 @@ fn key_col(k: &GroupKey, rg: &RowGroupView<'_>, sel: &[u64]) -> KeyCol {
                         }
                         return KeyCol::Codes(c, entries);
                     }
+                }
+            }
+        }
+    }
+    if bucket_by.is_none() && !rg.has_children(path) {
+        if let Some(chunk) = rg.chunks.get(path) {
+            if let Body::Int(kind @ (Kind::Int | Kind::Timestamp), ic) = &chunk.body {
+                let ts = *kind == Kind::Timestamp;
+                // Integer dictionaries without nulls: one key per entry, as for text.
+                if let (None, IntChunk::Dict { dict, codes }) = (&chunk.validity, ic) {
+                    let entries: Vec<(GroupValue, PropertyValue)> = dict
+                        .iter()
+                        .map(|&x| if ts { (GroupValue::Timestamp(x), PropertyValue::TimestampNs(x)) } else { (GroupValue::Exact(i128::from(x), 0), PropertyValue::Int64(x)) })
+                        .collect();
+                    let last = entries.len().saturating_sub(1) as u64;
+                    let mut c = Vec::with_capacity(n);
+                    let mut buf = [0u64; 2048];
+                    for start in (0..n).step_by(buf.len()) {
+                        let k = (n - start).min(buf.len());
+                        codes.unpack_into(start, &mut buf[..k]);
+                        c.extend(buf[..k].iter().map(|&x| x.min(last) as u32));
+                    }
+                    return KeyCol::Codes(c, entries);
+                }
+                let col = field_col(rg, path, sel);
+                if let Col::I64 { v, .. } | Col::Ts(v) = col.col {
+                    return KeyCol::Ints { v, valid: col.valid, ts };
                 }
             }
         }
@@ -1132,20 +1336,40 @@ fn aggregate_row_group(q: &AggregateQuery, rg: &RowGroupView<'_>, sel: Vec<u64>,
         }
         if local.is_none() {
             let mut g = vec![0u32; n];
-            for_each_set_try(&sel, |i| {
-                let mut key = Vec::with_capacity(keys.len());
-                let mut rep = Vec::with_capacity(keys.len());
-                for k in &keys {
-                    let (gv, pv) = match k {
-                        KeyCol::Codes(c, e) => e[c[i] as usize].clone(),
-                        KeyCol::Rows(r) => r[i].clone(),
-                    };
-                    key.push(gv);
-                    rep.push(pv);
+            match keys.as_slice() {
+                // One dictionary key with too many entries for slots: one lookup per entry.
+                [KeyCol::Codes(c, e)] => {
+                    let mut table = vec![u32::MAX; e.len()];
+                    for_each_set_try(&sel, |i| {
+                        let code = c[i] as usize;
+                        if table[code] == u32::MAX {
+                            let (gv, pv) = e[code].clone();
+                            table[code] = st.group(vec![gv], vec![pv])?;
+                        }
+                        g[i] = table[code];
+                        Ok(())
+                    })?;
                 }
-                g[i] = st.group(key, rep)?;
-                Ok(())
-            })?;
+                [KeyCol::Ints { v, valid, ts }] => {
+                    for_each_set_try(&sel, |i| {
+                        g[i] = if bit(valid, i) { st.int_group(v[i], *ts)? } else { st.group(vec![GroupValue::Null], vec![PropertyValue::Null])? };
+                        Ok(())
+                    })?;
+                }
+                _ => {
+                    for_each_set_try(&sel, |i| {
+                        let mut key = Vec::with_capacity(keys.len());
+                        let mut rep = Vec::with_capacity(keys.len());
+                        for k in &keys {
+                            let (gv, pv) = k.at(i);
+                            key.push(gv);
+                            rep.push(pv);
+                        }
+                        g[i] = st.group(key, rep)?;
+                        Ok(())
+                    })?;
+                }
+            }
             gids = Some(g);
         }
     }
@@ -1385,7 +1609,7 @@ fn update(
         (Acc::Min(m), Some(col)) | (Acc::Max(m), Some(col)) => {
             let max = matches!(func, AggFunc::Max);
             // Typed fast path: one candidate per row group without grouping.
-            if let (None, Col::I64 { v, .. }) = (gids, &col.col) {
+            if let (None, Col::I64 { v, .. } | Col::Ts(v)) = (gids, &col.col) {
                 if let Some((lo, hi)) = simd::min_max_i64_masked(v, rows) {
                     let target = if max { hi } else { lo };
                     if let Some(i) = (0..n).find(|&i| bit(rows, i) && v[i] == target) {
@@ -1469,6 +1693,8 @@ fn sum_into(s: &mut [SumAcc], mut counts: Option<&mut Vec<u64>>, col: &Col, rows
                         Some(x) if num_of(x).is_some() => s[k].add_val(x),
                         _ => continue,
                     },
+                    // Not numbers: skipped, as non-numeric values are.
+                    Col::Ts(_) => continue,
                     Col::I64 { .. } => {}
                 }
                 if let Some(c) = counts.as_deref_mut() {
@@ -1676,7 +1902,24 @@ pub fn run(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>) -> Result<AggregateR
     let scanned = started.elapsed();
     let mut parts = results.into_inner().unwrap_or_else(|p| p.into_inner());
     parts.sort_by_key(|(t, _)| *t);
-    let mut total = State::new(q, &budget)?;
+    // Many groups and no spill: merge and finish hash partitions in parallel.
+    let groups: usize = parts.iter().map(|(_, st)| st.reps.len()).sum();
+    if !q.group_by.is_empty() && groups >= PARALLEL_MERGE_GROUPS && budget.spilled().is_none() {
+        let mut delta = State::new(q, &budget)?;
+        add_documents(q, &snap.delta, &mut delta)?;
+        parts.push((usize::MAX, delta));
+        let out = merge_partitioned(q, parts.into_iter().map(|(_, st)| st).collect(), threads);
+        if profile {
+            eprintln!("[analytics] {} morsels on {threads} threads: scan {scanned:?}, partitioned merge+finish {:?}", morsels.len(), started.elapsed() - scanned);
+        }
+        return out;
+    }
+    // The first worker's state becomes the total (merging it into an empty one would only copy).
+    let mut parts = parts.into_iter();
+    let mut total = match parts.next() {
+        Some((_, st)) => st,
+        None => State::new(q, &budget)?,
+    };
     for (_, st) in parts {
         total.merge(st)?;
         if budget.pressed() {
@@ -1701,6 +1944,90 @@ pub fn run_documents(q: &AggregateQuery, docs: &[Document]) -> Result<AggregateR
     finish(q, st)
 }
 
+/// Group count from which worker states merge in parallel hash partitions.
+const PARALLEL_MERGE_GROUPS: usize = 16_384;
+
+/// Splits every state into hash partitions, then merges and finishes the partitions in parallel
+/// (top-K per partition) and orders the rows as `finish` orders them. Partitions merge their
+/// parts in input order, so the result does not depend on scheduling.
+fn merge_partitioned<'b>(q: &AggregateQuery, parts: Vec<State<'b>>, threads: usize) -> Result<AggregateResult> {
+    let matched = parts.iter().map(|st| st.matched).sum();
+    let pruned = parts.iter().map(|st| st.pruned).sum();
+    let n = parts.len();
+    let t0 = std::time::Instant::now();
+    let slots: Vec<Mutex<Option<State<'b>>>> = parts.into_iter().map(|st| Mutex::new(Some(st))).collect();
+    let split: Vec<Mutex<Option<Vec<State<'b>>>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let failure: Mutex<Option<StorageError>> = Mutex::new(None);
+    let fail = |e: StorageError| {
+        failure.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert(e);
+    };
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads.min(n).max(1) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= n {
+                    break;
+                }
+                let Some(st) = slots[i].lock().unwrap_or_else(|p| p.into_inner()).take() else { continue };
+                match st.split(q) {
+                    Ok(p) => *split[i].lock().unwrap_or_else(|p| p.into_inner()) = Some(p),
+                    Err(e) => fail(e),
+                }
+            });
+        }
+    });
+    if let Some(e) = failure.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        return Err(e);
+    }
+    let t_split = t0.elapsed();
+    // by_partition[p] = the parts' states of partition p, in part order.
+    let mut by_partition: Vec<Vec<State<'b>>> = (0..PARTITIONS).map(|_| Vec::with_capacity(n)).collect();
+    for s in split {
+        for (p, st) in s.into_inner().unwrap_or_else(|p| p.into_inner()).unwrap_or_default().into_iter().enumerate() {
+            by_partition[p].push(st);
+        }
+    }
+    let work: Vec<Mutex<Vec<State<'b>>>> = by_partition.into_iter().map(Mutex::new).collect();
+    let rows: Vec<Mutex<Vec<Vec<PropertyValue>>>> = (0..PARTITIONS).map(|_| Mutex::new(Vec::new())).collect();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads.max(1) {
+            scope.spawn(|| loop {
+                let p = next.fetch_add(1, Ordering::Relaxed);
+                if p >= PARTITIONS {
+                    break;
+                }
+                let states = core::mem::take(&mut *work[p].lock().unwrap_or_else(|e| e.into_inner()));
+                let mut it = states.into_iter();
+                let Some(mut total) = it.next() else { continue };
+                let done = (|| -> Result<Vec<Vec<PropertyValue>>> {
+                    for st in it {
+                        total.merge(st)?;
+                    }
+                    Ok(finish(q, total)?.rows)
+                })();
+                match done {
+                    Ok(r) => *rows[p].lock().unwrap_or_else(|e| e.into_inner()) = r,
+                    Err(e) => fail(e),
+                }
+            });
+        }
+    });
+    if let Some(e) = failure.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        return Err(e);
+    }
+    if std::env::var_os("STORINE_PROFILE").is_some() {
+        eprintln!("[analytics] split {t_split:?}, merge+finish {:?}", t0.elapsed() - t_split);
+    }
+    let mut out: Vec<Vec<PropertyValue>> = Vec::new();
+    for r in rows {
+        out.extend(r.into_inner().unwrap_or_else(|p| p.into_inner()));
+    }
+    sort_rows(q, &mut out);
+    Ok(AggregateResult { rows: out, matched, pruned_row_groups: pruned, spilled_bytes: 0 })
+}
+
 /// Finishes a query whose groups partly live in spill runs: every partition is merged and
 /// finished on its own (top-K per partition), then the rows are ordered as `finish` orders them.
 fn finish_spilled(q: &AggregateQuery, mut total: State<'_>, budget: &Budget) -> Result<AggregateResult> {
@@ -1710,15 +2037,7 @@ fn finish_spilled(q: &AggregateQuery, mut total: State<'_>, budget: &Budget) -> 
     drop(total);
     let mut rows = Vec::new();
     for p in 0..PARTITIONS {
-        let mut part = State {
-            groups: FastHashMap::default(),
-            reps: Vec::new(),
-            accs: q.aggregates.iter().map(|a| Acc::new(a.func)).collect(),
-            matched: 0,
-            pruned: 0,
-            charged: 0,
-            budget,
-        };
+        let mut part = State::empty(q, budget);
         spill.read(p, |rec| part.load(rec))?;
         if !part.reps.is_empty() {
             rows.extend(finish(q, part)?.rows);
@@ -1728,20 +2047,70 @@ fn finish_spilled(q: &AggregateQuery, mut total: State<'_>, budget: &Budget) -> 
     Ok(AggregateResult { rows, matched, pruned_row_groups: pruned, spilled_bytes: spill.bytes_written() })
 }
 
+fn agg_value(acc: &Acc, g: usize) -> Result<PropertyValue> {
+    Ok(match acc {
+        Acc::Count(c) => PropertyValue::Int64(c[g] as i64),
+        Acc::Sum(s) => s[g].sum()?,
+        Acc::Avg(s, c) => s[g].avg(c[g])?,
+        Acc::Min(m) | Acc::Max(m) => m[g].value.clone().unwrap_or(PropertyValue::Null),
+        Acc::Distinct(d) => PropertyValue::Int64(d[g].len() as i64),
+        Acc::Approx(h) => PropertyValue::Int64(h[g].estimate() as i64),
+    })
+}
+
 fn finish(q: &AggregateQuery, st: State<'_>) -> Result<AggregateResult> {
     let groups = st.reps.len();
-    let mut rows: Vec<Vec<PropertyValue>> = Vec::with_capacity(groups);
-    for g in 0..groups {
-        let mut row = st.reps[g].clone();
+    let keys = q.group_by.len();
+    // With a limit below the group count only the ORDER BY columns are computed for every
+    // group; the first `limit` groups are selected by index and only their rows are built.
+    let chosen: Vec<usize> = match q.limit {
+        Some(l) if l < groups => {
+            let mut ord: Vec<Option<Vec<PropertyValue>>> = vec![None; keys + st.accs.len()];
+            for &(c, _) in &q.order_by {
+                if c >= keys && ord[c].is_none() {
+                    let acc = st.accs.get(c - keys).ok_or_else(|| StorageError::invalid_value("order column out of range"))?;
+                    ord[c] = Some((0..groups).map(|g| agg_value(acc, g)).collect::<Result<_>>()?);
+                }
+            }
+            let value = |c: usize, g: usize| -> &PropertyValue {
+                match &ord[c] {
+                    Some(v) => &v[g],
+                    None => &st.reps[g][c],
+                }
+            };
+            let cmp = |&a: &usize, &b: &usize| {
+                for &(c, dir) in &q.order_by {
+                    let o = cmp_props(value(c, a), value(c, b));
+                    let o = if dir == Direction::Desc { o.reverse() } else { o };
+                    if o != core::cmp::Ordering::Equal {
+                        return o;
+                    }
+                }
+                for c in 0..keys {
+                    let o = cmp_props(&st.reps[a][c], &st.reps[b][c]);
+                    if o != core::cmp::Ordering::Equal {
+                        return o;
+                    }
+                }
+                core::cmp::Ordering::Equal
+            };
+            let mut idx: Vec<usize> = (0..groups).collect();
+            if l == 0 {
+                idx.clear();
+            } else {
+                idx.select_nth_unstable_by(l - 1, cmp);
+                idx.truncate(l);
+            }
+            idx
+        }
+        _ => (0..groups).collect(),
+    };
+    let mut rows: Vec<Vec<PropertyValue>> = Vec::with_capacity(chosen.len());
+    for g in chosen {
+        let mut row = Vec::with_capacity(keys + st.accs.len());
+        row.extend_from_slice(&st.reps[g]);
         for acc in &st.accs {
-            row.push(match acc {
-                Acc::Count(c) => PropertyValue::Int64(c[g] as i64),
-                Acc::Sum(s) => s[g].sum()?,
-                Acc::Avg(s, c) => s[g].avg(c[g])?,
-                Acc::Min(m) | Acc::Max(m) => m[g].value.clone().unwrap_or(PropertyValue::Null),
-                Acc::Distinct(d) => PropertyValue::Int64(d[g].len() as i64),
-                Acc::Approx(h) => PropertyValue::Int64(h[g].estimate() as i64),
-            });
+            row.push(agg_value(acc, g)?);
         }
         rows.push(row);
     }
@@ -1761,7 +2130,7 @@ fn sort_rows(q: &AggregateQuery, rows: &mut Vec<Vec<PropertyValue>>) {
         }
         core::cmp::Ordering::Equal
     };
-    rows.sort_by(|a, b| {
+    let cmp = |a: &Vec<PropertyValue>, b: &Vec<PropertyValue>| {
         for (i, dir) in &q.order_by {
             let o = cmp_props(&a[*i], &b[*i]);
             let o = if *dir == Direction::Desc { o.reverse() } else { o };
@@ -1770,8 +2139,18 @@ fn sort_rows(q: &AggregateQuery, rows: &mut Vec<Vec<PropertyValue>>) {
             }
         }
         by_keys(a, b)
-    });
+    };
+    // Top-K: select the first `limit` rows, then sort only those. Group keys are unique, so
+    // the order is total and the result is the same as a full sort.
     if let Some(l) = q.limit {
-        rows.truncate(l);
+        if l == 0 {
+            rows.clear();
+            return;
+        }
+        if l < rows.len() {
+            rows.select_nth_unstable_by(l - 1, cmp);
+            rows.truncate(l);
+        }
     }
+    rows.sort_by(cmp);
 }

@@ -1,7 +1,9 @@
-"""DuckDB side of the analytics benchmark (TASK-131): same lineitem rows, Q1 and Q6.
+"""DuckDB side of the analytics benchmark (TASK-131): the same lineitem rows (Q1, Q6) and the
+same ClickBench-shaped hits rows (h0 .. h15, numbered as in ClickBench).
 
-    python3 duckdb_bench.py <dir> load            # dir/lineitem.csv -> dir/lineitem.duckdb
-    python3 duckdb_bench.py <dir> <q1|q6> <reps>  # timings and result rows
+    python3 duckdb_bench.py <dir> load               # dir/lineitem.csv -> dir/lineitem.duckdb
+    python3 duckdb_bench.py <dir> load-hits          # dir/hits.csv -> the hits table
+    python3 duckdb_bench.py <dir> <q1|q6|hN> <reps>  # timings and result rows
 """
 import os
 import sys
@@ -24,6 +26,26 @@ Q6 = """SELECT sum(l_extendedprice * l_discount) FROM lineitem
  AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24"""
 
 
+HITS_SCHEMA = """CREATE TABLE hits (WatchID BIGINT, UserID BIGINT, CounterID BIGINT, EventDate DATE,
+ EventTime BIGINT, AdvEngineID BIGINT, ResolutionWidth BIGINT, RegionID BIGINT, SearchPhrase VARCHAR,
+ SearchEngineID BIGINT, IsRefresh BIGINT, URL VARCHAR)"""
+
+HITS = {
+    "h0": "SELECT COUNT(*) FROM hits",
+    "h1": "SELECT COUNT(*) FROM hits WHERE AdvEngineID <> 0",
+    "h2": "SELECT SUM(AdvEngineID), COUNT(*), AVG(ResolutionWidth) FROM hits",
+    "h3": "SELECT AVG(UserID) FROM hits",
+    "h4": "SELECT COUNT(DISTINCT UserID) FROM hits",
+    "h5": "SELECT COUNT(DISTINCT SearchPhrase) FROM hits",
+    "h6": "SELECT MIN(EventDate), MAX(EventDate) FROM hits",
+    "h7": "SELECT AdvEngineID, COUNT(*) FROM hits WHERE AdvEngineID <> 0 GROUP BY AdvEngineID ORDER BY COUNT(*) DESC, 1",
+    "h8": "SELECT RegionID, COUNT(DISTINCT UserID) AS u FROM hits GROUP BY RegionID ORDER BY u DESC, 1 LIMIT 10",
+    "h9": "SELECT RegionID, SUM(AdvEngineID), COUNT(*) AS c, AVG(ResolutionWidth), COUNT(DISTINCT UserID) FROM hits GROUP BY RegionID ORDER BY c DESC, 1 LIMIT 10",
+    "h12": "SELECT SearchPhrase, COUNT(*) AS c FROM hits WHERE SearchPhrase <> '' GROUP BY SearchPhrase ORDER BY c DESC, 1 LIMIT 10",
+    "h15": "SELECT UserID, COUNT(*) FROM hits GROUP BY UserID ORDER BY COUNT(*) DESC, 1 LIMIT 10",
+}
+
+
 def main():
     d, what = sys.argv[1], sys.argv[2]
     con = duckdb.connect(f"{d}/lineitem.duckdb")
@@ -34,10 +56,17 @@ def main():
         con.execute("CHECKPOINT")
         print(f"duckdb loaded in {time.time() - t:.1f} s")
         return
+    if what == "load-hits":
+        t = time.time()
+        con.execute(HITS_SCHEMA)
+        con.execute(f"COPY hits FROM '{d}/hits.csv' (DELIMITER '|', QUOTE '', ESCAPE '')")
+        con.execute("CHECKPOINT")
+        print(f"duckdb loaded hits in {time.time() - t:.1f} s")
+        return
     reps = int(sys.argv[3]) if len(sys.argv) > 3 else 5
     if os.environ.get("DUCKDB_THREADS"):
         con.execute(f"SET threads = {int(os.environ['DUCKDB_THREADS'])}")
-    q = {"q1": Q1, "q6": Q6}[what]
+    q = {"q1": Q1, "q6": Q6, **HITS}[what]
     times, rows = [], None
     for _ in range(reps):
         t = time.perf_counter()

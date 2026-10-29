@@ -522,6 +522,8 @@ pub fn compare_values(a: &PropertyValueRef<'_>, b: &PropertyValueRef<'_>) -> cor
         return ra.cmp(&rb);
     }
     match (a, b) {
+        // The common numeric case, without converting to decimals.
+        (PropertyValueRef::Int64(x), PropertyValueRef::Int64(y)) => x.cmp(y),
         (PropertyValueRef::Bool(x), PropertyValueRef::Bool(y)) => x.cmp(y),
         (PropertyValueRef::TimestampNs(x), PropertyValueRef::TimestampNs(y)) => x.cmp(y),
         (PropertyValueRef::Text(x), PropertyValueRef::Text(y)) => x.cmp(y),
