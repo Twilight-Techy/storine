@@ -18,7 +18,7 @@ use crate::document::{Direction, Document};
 
 use super::filter::{eval, RowGroupView};
 use super::spill::{Spill, DEFAULT_SPILL_BUDGET, PARTITIONS};
-use super::values::{cmp_props, pow10, put_u32, put_u64, GroupValue, Hll, MinMax, SumAcc, HLL_DENSE_BYTES};
+use super::values::{cmp_props, pow10, put_u32, put_u64, DistinctSet, GroupValue, Hll, MinMax, SumAcc, HLL_DENSE_BYTES};
 use super::{AggFunc, AggregateQuery, AggregateResult, Expr, GroupKey, DEFAULT_MEMORY_BUDGET, MAX_QUERY_ITEMS};
 
 // ── per-thread buffers ──
@@ -90,7 +90,7 @@ enum Acc {
     Avg(Vec<SumAcc>, Vec<u64>),
     Min(Vec<MinMax>),
     Max(Vec<MinMax>),
-    Distinct(Vec<FastHashSet<GroupValue>>),
+    Distinct(Vec<DistinctSet>),
     Approx(Vec<Hll>),
 }
 
@@ -127,7 +127,7 @@ impl Acc {
                 48
             }
             Self::Distinct(v) => {
-                v.push(FastHashSet::default());
+                v.push(DistinctSet::default());
                 48
             }
             Self::Approx(v) => {
@@ -372,7 +372,7 @@ impl<'b> State<'b> {
                     Acc::Min(m) | Acc::Max(m) => m[g].encode(&mut rec),
                     Acc::Distinct(d) => {
                         put_u32(&mut rec, d[g].len() as u32);
-                        for v in &d[g] {
+                        for v in d[g].values() {
                             v.encode(&mut rec);
                         }
                     }
@@ -522,10 +522,8 @@ impl<'b> State<'b> {
                 (Acc::Max(a), Acc::Max(b)) => b.into_iter().enumerate().for_each(|(i, x)| offer_mm(&mut a[map[i] as usize], x.value, true)),
                 (Acc::Distinct(a), Acc::Distinct(b)) => {
                     for (i, set) in b.into_iter().enumerate() {
-                        let target = &mut a[map[i] as usize];
-                        let before = target.len();
-                        target.extend(set);
-                        budget.take((target.len() - before) * 64)?;
+                        let added = a[map[i] as usize].extend(set);
+                        budget.take(added * 64)?;
                     }
                 }
                 (Acc::Approx(a), Acc::Approx(b)) => {
@@ -1374,6 +1372,40 @@ fn aggregate_row_group(q: &AggregateQuery, rg: &RowGroupView<'_>, sel: Vec<u64>,
         }
     }
     for (ai, a) in q.aggregates.iter().enumerate() {
+        // COUNT(DISTINCT field) over a dictionary chunk: each (group, entry) pair once, without
+        // decoding a value per row.
+        if let (AggFunc::CountDistinct, Some(Expr::Field(p))) = (a.func, &a.arg) {
+            if let KeyCol::Codes(codes, entries) = key_col(&GroupKey::Field(p.clone()), rg, &sel) {
+                if gids.is_none() && !q.group_by.is_empty() {
+                    let l = local.as_ref().ok_or_else(|| StorageError::invalid_value("internal: no groups"))?;
+                    let mut g = vec![0u32; n];
+                    for_each_set(&sel, |i| g[i] = l.gids[l.slot[i] as usize]);
+                    gids = Some(g);
+                }
+                let mut pairs: FastHashSet<(u32, u32)> = FastHashSet::default();
+                match &gids {
+                    Some(g) => for_each_set(&sel, |i| {
+                        pairs.insert((g[i], codes[i]));
+                    }),
+                    None => {
+                        let mut seen = vec![false; entries.len()];
+                        for_each_set(&sel, |i| seen[codes[i] as usize] = true);
+                        pairs.extend(seen.iter().enumerate().filter(|(_, s)| **s).map(|(e, _)| (0, e as u32)));
+                    }
+                }
+                if let Acc::Distinct(d) = &mut st.accs[ai] {
+                    let mut added = 0usize;
+                    for (g, e) in pairs {
+                        let gv = &entries[e as usize].0;
+                        if !matches!(gv, GroupValue::Null) && d[g as usize].insert(gv.clone()) {
+                            added += 1;
+                        }
+                    }
+                    st.budget.take(added * 64)?;
+                }
+                continue;
+            }
+        }
         let col = match &a.arg {
             Some(e) => Some(eval_expr(e, rg, &sel)?),
             None => None,
@@ -1625,11 +1657,27 @@ fn update(
             }
         }
         (Acc::Distinct(d), Some(col)) => {
-            for i in 0..n {
-                if bit(rows, i) && d[gid(i)].insert(group_value_at(&col.col, i)) {
-                    budget.take(64)?;
+            let mut added = 0usize;
+            match &col.col {
+                // Plain integers and timestamps go into the i64 sets. With groups, the row
+                // group's (group, value) pairs are sorted and deduplicated first: repeated values
+                // cost no probe, and each group's set is filled in one stretch.
+                Col::I64 { v, scale: 0, dec: false, .. } | Col::Ts(v) if gids.is_some() => {
+                    let ts = matches!(col.col, Col::Ts(_));
+                    let mut pairs: Vec<(u32, i64)> = Vec::with_capacity(simd::count_ones(rows) as usize);
+                    for_each_set(rows, |i| pairs.push((gid(i) as u32, v[i])));
+                    pairs.sort_unstable();
+                    pairs.dedup();
+                    for (g, x) in pairs {
+                        let set = &mut d[g as usize];
+                        added += usize::from(if ts { set.insert_stamp(x) } else { set.insert_int(x) });
+                    }
                 }
+                Col::I64 { v, scale: 0, dec: false, .. } => for_each_set(rows, |i| added += usize::from(d[gid(i)].insert_int(v[i]))),
+                Col::Ts(v) => for_each_set(rows, |i| added += usize::from(d[gid(i)].insert_stamp(v[i]))),
+                c => for_each_set(rows, |i| added += usize::from(d[gid(i)].insert(group_value_at(c, i)))),
             }
+            budget.take(added * 64)?;
         }
         (Acc::Approx(h), Some(col)) => {
             for i in 0..n {

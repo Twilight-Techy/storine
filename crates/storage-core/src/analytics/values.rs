@@ -5,7 +5,7 @@ use core::cmp::Ordering;
 use storage_codec::types::{PropertyValue, PropertyValueRef};
 use storage_codec::xxh3_64;
 use storage_columnar::Val;
-use storage_types::{Decimal, Result, StorageError};
+use storage_types::{Decimal, FastHashSet, Result, StorageError};
 
 use crate::document::{compare_values, value_ref_of};
 
@@ -427,6 +427,68 @@ impl MinMax {
         if replace {
             self.value = Some(v);
         }
+    }
+}
+
+/// The distinct values of one group (`COUNT(DISTINCT ...)`). Integers and timestamps, the
+/// common cases, are kept as plain `i64`s; the three sets hold disjoint canonical values, so
+/// the count is exact.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DistinctSet {
+    ints: FastHashSet<i64>,
+    stamps: FastHashSet<i64>,
+    other: FastHashSet<GroupValue>,
+}
+
+impl DistinctSet {
+    pub fn insert(&mut self, v: GroupValue) -> bool {
+        match v {
+            GroupValue::Exact(m, 0) => match i64::try_from(m) {
+                Ok(x) => self.ints.insert(x),
+                Err(_) => self.other.insert(GroupValue::Exact(m, 0)),
+            },
+            GroupValue::Timestamp(t) => self.stamps.insert(t),
+            other => self.other.insert(other),
+        }
+    }
+
+    #[inline]
+    pub fn insert_int(&mut self, x: i64) -> bool {
+        self.ints.insert(x)
+    }
+
+    #[inline]
+    pub fn insert_stamp(&mut self, t: i64) -> bool {
+        self.stamps.insert(t)
+    }
+
+    pub fn len(&self) -> usize {
+        self.ints.len() + self.stamps.len() + self.other.len()
+    }
+
+    /// Adds every value of `o`; returns how many were new.
+    pub fn extend(&mut self, o: DistinctSet) -> usize {
+        let before = self.len();
+        if self.len() < o.len() {
+            let mine = core::mem::replace(self, o);
+            self.ints.extend(mine.ints);
+            self.stamps.extend(mine.stamps);
+            self.other.extend(mine.other);
+            return self.len() - before;
+        }
+        self.ints.extend(o.ints);
+        self.stamps.extend(o.stamps);
+        self.other.extend(o.other);
+        self.len() - before
+    }
+
+    /// Every value, in canonical form.
+    pub fn values(&self) -> impl Iterator<Item = GroupValue> + '_ {
+        self.ints
+            .iter()
+            .map(|&x| GroupValue::Exact(i128::from(x), 0))
+            .chain(self.stamps.iter().map(|&t| GroupValue::Timestamp(t)))
+            .chain(self.other.iter().cloned())
     }
 }
 
