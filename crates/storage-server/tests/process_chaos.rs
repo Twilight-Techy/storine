@@ -27,6 +27,9 @@ use storage_server::StorageClient;
 use storage_types::testing::SweepRng;
 use storage_types::StorageError;
 
+/// Client operations per key index.
+type History = Vec<(usize, Event<RegisterOp>)>;
+
 const PASS: u8 = 0;
 const DROP: u8 = 1;
 const BLACKHOLE: u8 = 2;
@@ -222,7 +225,7 @@ fn linearizable_under_kills_pauses_and_partitions() {
     let addrs = cluster.lock().unwrap().addrs.clone();
     let t0 = Instant::now();
     let now = move || t0.elapsed().as_micros() as u64;
-    let history: Arc<Mutex<Vec<(usize, Event<RegisterOp>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let history: Arc<Mutex<History>> = Arc::new(Mutex::new(Vec::new()));
     let next_value = Arc::new(AtomicU64::new(1));
     let stop = Arc::new(AtomicBool::new(false));
     let counts = Arc::new(Mutex::new([0usize; 4])); // writes ok, writes unknown, reads ok, refusals

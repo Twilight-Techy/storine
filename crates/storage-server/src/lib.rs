@@ -3005,7 +3005,7 @@ mod tests {
         };
         let mut client = connect();
         let mut rng = SweepRng::new(41);
-        for _ in 0..3_000 {
+        for _ in 0..3_000 * storage_types::testing::fuzz_scale() {
             let (op, base) = &seeds[rng.below(seeds.len())];
             let op = if rng.below(50) == 0 { rng.next_u64() as u8 } else { *op };
             let body = rng.hostile_copy(base);

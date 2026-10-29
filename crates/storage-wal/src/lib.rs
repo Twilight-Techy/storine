@@ -1156,7 +1156,7 @@ mod tests {
 
         // 2. Forged frames with valid checksums and hostile fields (flags, lengths, kinds).
         let kinds = [WalOpKind::Upsert, WalOpKind::Delete, WalOpKind::TxnCommit, WalOpKind::Checkpoint];
-        for _ in 0..5_000 {
+        for _ in 0..5_000 * storage_types::testing::fuzz_scale() {
             let mut buf = Vec::new();
             for _ in 0..=rng.below(3) {
                 let body_len = rng.below(300);

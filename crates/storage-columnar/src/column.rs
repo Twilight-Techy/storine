@@ -750,7 +750,7 @@ impl<'a> Chunk<'a> {
         Ok(Self { n, validity, body })
     }
 
-    /// Whether row `i` holds a value.
+    /// Whether row `i` holds a value (`i < n`, the row count the chunk was parsed with).
     #[inline]
     pub fn is_present(&self, i: usize) -> bool {
         match (&self.body, &self.validity) {

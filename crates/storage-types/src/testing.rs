@@ -1,6 +1,12 @@
 //! Deterministic hostile-input generator shared by every crate's corruption / fuzz sweeps
 //! (`RULE-TEST-01`, `RULE-ERR-01`). Not part of the stable API; unused code is removed by LTO.
 
+/// Iteration multiplier for fuzz and hostile-input sweeps (`STORINE_FUZZ_ITERS`, default 1).
+/// The long runs (`TASK-135`) use 100+ in release with debug assertions on.
+pub fn fuzz_scale() -> usize {
+    std::env::var("STORINE_FUZZ_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(1)
+}
+
 /// Reproducible xorshift64* generator with mutation helpers for decoder sweeps.
 #[derive(Debug, Clone)]
 pub struct SweepRng(u64);
