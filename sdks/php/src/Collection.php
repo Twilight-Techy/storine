@@ -193,6 +193,87 @@ final class Collection
     }
 
     /**
+     * Filters, groups and aggregates on the server (exact, as of one snapshot):
+     *
+     *     $r = $sales->aggregate(
+     *         ['orders' => Agg::count(), 'revenue' => Agg::sum(Expr::field('price')->times('qty')), 'avgQty' => Agg::avg('qty')],
+     *         where: Filter::ge('day', 20), groupBy: 'region', orderBy: '-revenue', limit: 10);
+     *     $r->rows;  // [['region' => 'eu', 'orders' => 3, 'revenue' => Decimal, 'avgQty' => Decimal], ...]
+     *
+     * Rows hold the group-key columns (named by their field path) then the aggregates in the order
+     * given; without `groupBy` there is exactly one row. `orderBy` names output columns ('-revenue'
+     * descending). Fast on columnar collections (`enableColumnar`).
+     * @param array<string, Agg> $aggregates output name => aggregate
+     * @param string|Bucket|list<string|Bucket>|null $groupBy field paths and/or Agg::bucket(...)
+     */
+    public function aggregate(array $aggregates, Filter|array|null $where = null, string|Bucket|array|null $groupBy = null,
+        string|array|null $orderBy = null, ?int $limit = null, int $memoryBudget = 0, int $spillBudget = 0): AggregateResult
+    {
+        [$body, $columns] = Wire::encodeAggregate($this->name, $aggregates, Filter::from($where), $groupBy, $orderBy, $limit ?? 0, $memoryBudget, $spillBudget);
+        [$status, , $rbody] = $this->client->request(Wire::OP_DOC_AGGREGATE, $body, true);
+        if ($status !== Wire::ST_OK) {
+            $this->client->fail($status, $rbody);
+        }
+        $res = Wire::decodeAggregateResult($rbody);
+        if ($res['rows'] !== [] && $res['columns'] !== count($columns)) {
+            throw new InvalidException('expected ' . count($columns) . " columns, the server sent {$res['columns']}");
+        }
+        $rows = array_map(static fn (array $row) => array_combine($columns, $row), $res['rows']);
+        return new AggregateResult($rows, $columns, $res['matched'], $res['prunedRowGroups'], $res['spilledBytes']);
+    }
+
+    /**
+     * Only the given (dotted) field paths of every matching document, in key order, `$pageSize`
+     * rows per round trip (a missing field reads as null):
+     *
+     *     foreach ($sales->scanColumns(['qty', 'price'], where: ['region' => 'eu']) as $key => $fields) {
+     *         // $fields === ['qty' => ..., 'price' => ...]
+     *     }
+     *
+     * @param list<string> $fields
+     * @return \Generator<string, array<string, mixed>> document key => fields
+     */
+    public function scanColumns(array $fields, Filter|array|null $where = null, int $pageSize = 1000): \Generator
+    {
+        if ($pageSize < 1 || $pageSize > Wire::MAX_SCAN_PAGE) {
+            throw new InvalidException('pageSize must be between 1 and ' . Wire::MAX_SCAN_PAGE);
+        }
+        $fields = array_values($fields);
+        $filter = Filter::from($where);
+        $after = null;
+        do {
+            $body = Wire::encodeScanColumns($this->name, $filter, $fields, $after, $pageSize);
+            [$status, , $rbody] = $this->client->request(Wire::OP_DOC_SCAN_COLUMNS, $body, true);
+            if ($status !== Wire::ST_OK) {
+                $this->client->fail($status, $rbody);
+            }
+            $page = Wire::decodeScanPage($rbody);
+            if ($page['fields'] !== count($fields)) {
+                throw new InvalidException('expected ' . count($fields) . " fields, the server sent {$page['fields']}");
+            }
+            foreach ($page['rows'] as [$key, $values]) {
+                yield $key => $fields === [] ? [] : array_combine($fields, $values);
+            }
+            $after = $page['next'];
+        } while ($after !== null);
+    }
+
+    /**
+     * Also keeps the collection as column segments (built in the background) so `aggregate` and
+     * `scanColumns` run vectorized; results are exact either way.
+     */
+    public function enableColumnar(): void
+    {
+        $this->admin(Wire::OP_DOC_ADMIN, "\x0A");
+    }
+
+    /** Deletes the column segments (analytics then read the row store). */
+    public function disableColumnar(): void
+    {
+        $this->admin(Wire::OP_DOC_ADMIN, "\x0B");
+    }
+
+    /**
      * Indexes a top-level field holding `$dims` numbers for `nearest` (at most 4 per collection);
      * existing documents included. Writes of other values to that field are then refused.
      */

@@ -6,7 +6,7 @@ declare(strict_types=1);
 // The server binary is $STORINE_SERVER or <repo>/target/release/storage-server
 // (build it with `cargo build --release -p storage-server`); without it the tests are skipped.
 
-use Storine\{Bytes, ConflictException, Decimal, FieldOp, Filter, InvalidException, NotFoundException, Storine,
+use Storine\{Agg, Bytes, ConflictException, Decimal, Expr, FieldOp, Filter, InvalidException, NotFoundException, Storine,
     Transaction, UnavailableException, Uuid};
 
 function server_bin(): string
@@ -249,6 +249,122 @@ function testTtlAndErrors(): void
         check($s->get('short') === null, 'expired');
         throws(InvalidException::class, fn () => $s->put('bad', ['a.b' => 1]), 'dotted field name');
         throws(InvalidException::class, fn () => $db->collection('bad/name')->put('k', ['x' => 1]), 'bad collection name');
+    });
+}
+
+function testAnalytics(): void
+{
+    with_server(function (Storine $db) {
+        $sales = $db->collection('php_sales');
+        $regions = ['eu', 'us', 'apac'];
+        $data = []; // key => [region, qty, price in cents, day]
+        $insert = function (int $from, int $to) use ($db, $regions, &$data) {
+            for ($start = $from; $start < $to; $start += 100) {
+                $db->transaction(function (Transaction $tx) use ($start, $to, $regions, &$data) {
+                    for ($i = $start; $i < min($start + 100, $to); $i++) {
+                        $row = [$regions[$i % 3], ($i * 7) % 50 + 1, ($i * 37) % 10000 + 1, $i % 60];
+                        $key = sprintf('s%04d', $i);
+                        $data[$key] = $row;
+                        $tx->insert('php_sales', $key, ['region' => $row[0], 'qty' => $row[1], 'price' => Decimal::fromParts($row[2], 2), 'day' => $row[3]]);
+                    }
+                });
+            }
+        };
+        $insert(0, 3000);
+        $cents = fn (int $c) => Decimal::fromParts($c, 2);
+        $halfEven = function (int $num, int $den): int {
+            $q = intdiv($num, $den);
+            $twice = 2 * ($num % $den);
+            return $twice > $den || ($twice === $den && $q % 2 !== 0) ? $q + 1 : $q;
+        };
+        $isDec = function (mixed $v, Decimal $expected, string $what) {
+            check($v instanceof Decimal, "$what is a Decimal");
+            check($v->equals($expected), "$what: expected $expected, got $v");
+        };
+        $aggs = ['n' => Agg::count(), 'revenue' => Agg::sum(Expr::field('price')->times('qty')), 'avg_qty' => Agg::avg('qty'),
+            'min_price' => Agg::min('price'), 'max_price' => Agg::max('price'), 'days' => Agg::countDistinct('day')];
+
+        $checkGrouped = function () use ($sales, $aggs, &$data, $cents, $halfEven, $isDec) {
+            $g = [];
+            foreach ($data as [$region, $qty, $price, $day]) {
+                $x = $g[$region] ?? ['n' => 0, 'revenue' => 0, 'qty' => 0, 'min' => $price, 'max' => $price, 'days' => []];
+                $x['n']++;
+                $x['revenue'] += $price * $qty;
+                $x['qty'] += $qty;
+                $x['min'] = min($x['min'], $price);
+                $x['max'] = max($x['max'], $price);
+                $x['days'][$day] = true;
+                $g[$region] = $x;
+            }
+            uasort($g, fn ($a, $b) => $b['revenue'] <=> $a['revenue']);
+            $expected = array_slice($g, 0, 2, true);
+            $res = $sales->aggregate($aggs, groupBy: 'region', orderBy: '-revenue', limit: 2);
+            same(count($data), $res->matched, 'matched');
+            same(['region', 'n', 'revenue', 'avg_qty', 'min_price', 'max_price', 'days'], $res->columns, 'columns');
+            same(array_keys($expected), array_column($res->rows, 'region'), 'regions by revenue');
+            foreach ($res->rows as $i => $row) {
+                $x = $expected[$row['region']];
+                same($res->columns, array_keys($row), 'row columns');
+                same($x['n'], $row['n'], 'count');
+                $isDec($row['revenue'], $cents($x['revenue']), 'revenue');
+                same((string) Decimal::fromParts($halfEven($x['qty'] * 1_000_000, $x['n']), 6), (string) $row['avg_qty'], 'avg');
+                $isDec($row['min_price'], $cents($x['min']), 'min');
+                $isDec($row['max_price'], $cents($x['max']), 'max');
+                same(count($x['days']), $row['days'], 'count distinct');
+            }
+            return $res;
+        };
+        $checkBuckets = function () use ($sales, &$data) {
+            $w = [];
+            foreach ($data as [, $qty, , $day]) {
+                $b = intdiv($day, 7) * 7;
+                $w[$b] ??= ['day' => $b, 'n' => 0, 'qty' => 0];
+                $w[$b]['n']++;
+                $w[$b]['qty'] += $qty;
+            }
+            ksort($w);
+            same(array_values($w), $sales->aggregate(['n' => Agg::count(), 'qty' => Agg::sum('qty')], groupBy: Agg::bucket('day', 7), orderBy: 'day')->rows, 'weekly buckets');
+        };
+        $checkFiltered = function () use ($sales, &$data) {
+            $sel = array_filter($data, fn ($r) => $r[0] === 'us' && $r[3] >= 30);
+            $qty = array_sum(array_column($sel, 1));
+            $res = $sales->aggregate(['n' => Agg::count(), 'qty' => Agg::sum('qty'), 'qty_minus_1' => Agg::sum(Expr::field('qty')->minus(1))],
+                where: Filter::and(Filter::eq('region', 'us'), Filter::ge('day', 30)));
+            same([['n' => count($sel), 'qty' => $qty, 'qty_minus_1' => $qty - count($sel)]], $res->rows, 'filtered');
+            same(count($sel), $res->matched, 'filtered matched');
+        };
+
+        $checkGrouped();
+        $sales->enableColumnar();
+        $checkGrouped();
+        $checkBuckets();
+        $checkFiltered();
+        $insert(3000, 3030); // not-yet-merged writes are included too
+        same(0, $checkGrouped()->spilledBytes, 'no spill');
+        $checkBuckets();
+        $checkFiltered();
+
+        $eu = array_filter($data, fn ($r) => $r[0] === 'eu');
+        ksort($eu, SORT_STRING);
+        check(count($eu) > 1000, 'several pages');
+        $got = [];
+        foreach ($sales->scanColumns(['qty', 'price'], where: Filter::eq('region', 'eu'), pageSize: 500) as $key => $fields) {
+            $got[] = [$key, $fields];
+        }
+        same(array_keys($eu), array_column($got, 0), 'eu keys in key order');
+        foreach ($got as [$key, $fields]) {
+            same(['qty', 'price'], array_keys($fields), 'scan fields');
+            same($eu[$key][1], $fields['qty'], "qty of $key");
+            $isDec($fields['price'], $cents($eu[$key][2]), "price of $key");
+        }
+        $missing = iterator_to_array($sales->scanColumns(['nope'], where: ['region' => 'apac', 'day' => 2]));
+        check($missing !== [] && array_values(array_unique($missing, SORT_REGULAR)) === [['nope' => null]], 'missing field reads as null');
+
+        throws(InvalidException::class, fn () => $sales->aggregate(['n' => Agg::count()], orderBy: 'missing'), 'unknown order column');
+
+        $sales->disableColumnar();
+        $checkGrouped();
+        $checkFiltered();
     });
 }
 

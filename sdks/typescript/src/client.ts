@@ -9,6 +9,7 @@ import {
 } from "./errors";
 import { Fields, Reader, Value } from "./values";
 import * as w from "./wire";
+import * as an from "./analytics";
 
 const ZERO_KEY = new Uint8Array(24);
 const MAX_BODY = 256 * 1024 * 1024;
@@ -528,6 +529,64 @@ export class Collection<T extends Fields = Fields> {
     if (r.status !== w.ST.OK) throw Client.error(r);
     const page = w.decodePage(r.body);
     return { total: page.total, next: page.next, docs: page.docs.map((d) => ({ key: d.key, version: d.version, fields: d.fields as T })) };
+  }
+
+  /**
+   * Filters, groups and aggregates on the server (exact, as of one snapshot):
+   *
+   * ```ts
+   * const r = await sales.aggregate(
+   *   { orders: count(), revenue: sum(field("price").times("qty")), avgQty: avg("qty") },
+   *   { where: ge("day", 20), groupBy: "region", orderBy: "-revenue", limit: 10 },
+   * );
+   * r.rows; // [{ region: "eu", orders: 3, revenue: Decimal(...), avgQty: Decimal(...) }, ...]
+   * ```
+   *
+   * Rows hold the group-key columns (named by their field path) then the aggregates in the order
+   * given; without `groupBy` there is exactly one row. Fast on columnar collections (`enableColumnar`).
+   */
+  async aggregate(aggregates: an.Aggregates, options: an.AggregateOptions = {}): Promise<an.AggregateResult> {
+    const { body, columns } = an.encodeAggregate(this.name, aggregates, options);
+    const r = await this.client.request(an.OP_DOC_AGGREGATE, body);
+    if (r.status !== w.ST.OK) throw Client.error(r);
+    const res = an.decodeAggregateResult(r.body);
+    return { rows: an.namedRows(columns, res.rows), columns, matched: res.matched, prunedRowGroups: res.prunedRowGroups, spilledBytes: res.spilledBytes };
+  }
+
+  /**
+   * Yields `{ key, fields }` with only the given (dotted) field paths of every matching document,
+   * in key order, `pageSize` rows per round trip (a missing field reads as null):
+   * `for await (const row of sales.scanColumns(["qty", "price"], { where: { region: "eu" } })) ...`.
+   */
+  async *scanColumns(fields: readonly string[], options: an.ScanColumnsOptions = {}): AsyncGenerator<an.ScanRow> {
+    const pageSize = options.pageSize ?? 1000;
+    if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 100_000) throw new InvalidError("pageSize must be between 1 and 100,000");
+    const filter = w.toFilter(options.where);
+    const names = [...fields];
+    let after: string | undefined;
+    for (;;) {
+      const r = await this.client.request(an.OP_DOC_SCAN_COLUMNS, an.encodeScanColumns(this.name, filter, names, after, pageSize));
+      if (r.status !== w.ST.OK) throw Client.error(r);
+      const page = an.decodeScanPage(r.body);
+      if (page.fields !== names.length) throw new InvalidError(`expected ${names.length} fields, the server sent ${page.fields}`);
+      const rows = an.namedRows(names, page.rows.map((x) => x.values));
+      for (let i = 0; i < rows.length; i++) yield { key: page.rows[i].key, fields: rows[i] };
+      if (page.next === undefined) return;
+      after = page.next;
+    }
+  }
+
+  /**
+   * Also keeps the collection as column segments (built in the background) so `aggregate` and
+   * `scanColumns` run vectorized; results are exact either way.
+   */
+  async enableColumnar(): Promise<void> {
+    await this.admin(w.OP.DOC_ADMIN, concat(Uint8Array.of(10), w.str(this.name)));
+  }
+
+  /** Deletes the column segments (analytics then read the row store). */
+  async disableColumnar(): Promise<void> {
+    await this.admin(w.OP.DOC_ADMIN, concat(Uint8Array.of(11), w.str(this.name)));
   }
 
   /**

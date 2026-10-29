@@ -122,7 +122,7 @@ export function toFilter(where: Where): Filter | undefined {
   return parts.length === 1 ? parts[0] : and(...parts);
 }
 
-function encodeFilter(f: Filter, w: Writer, depth = 0): void {
+export function encodeFilter(f: Filter, w: Writer, depth = 0): void {
   if (depth > 32) throw new InvalidError("filter nesting is too deep (max 32)");
   w.u8(f.kind);
   const vals = f.values ?? [];

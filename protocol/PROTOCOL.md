@@ -258,7 +258,9 @@ row.
   is a HyperLogLog estimate (about 0.8 % standard error).
 - `pruned_row_groups` counts row groups skipped by zone maps without reading them;
   `spilled_bytes > 0` means the query outgrew its memory budget and spilled.
-- Errors: `Invalid` (bad request, a non-numeric value in `sum` / `avg` arithmetic, overflow, more
+- `sum` and `avg` skip values that are not numbers (text, booleans …), as they skip nulls; with
+  no number at all the result is null.
+- Errors: `Invalid` (bad request, overflow, more
   than 1,000,000 result rows or a response over 256 MiB, budgets exhausted), `Overloaded` (more than
   8 analytic queries running: retry with backoff).
 

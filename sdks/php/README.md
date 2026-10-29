@@ -50,6 +50,7 @@ foreach ($accounts->scan() as $d) {       // every document, any collection size
 | `$c->nearest($field, $vector, k: 10, where: null, exact: false)` | The `k` documents whose `$field` (a list of numbers) is most similar to `$vector` (cosine), best first; `$doc->score()` holds the similarity. `exact: true` scores every candidate instead of using the vector index. |
 | `$c->createVectorIndex($field, $dims)` / `$c->dropVectorIndex($field)` / `$c->vectorIndexes()` | Vector indexes for `nearest`; writes of other values to an indexed field are refused. |
 | `$c->createIndex($field)` / `$c->dropIndex($field)` / `$c->info()` / `$c->drop()` | Indexes (up to 16 per collection) and collection management. |
+| `$c->aggregate($aggregates, where:, groupBy:, orderBy:, limit:, memoryBudget:, spillBudget:)` / `$c->scanColumns($fields, where:, pageSize: 1000)` / `$c->enableColumnar()` / `$c->disableColumnar()` | Analytics (see *Analytics*). |
 | `$db->transaction(fn (Transaction $tx) => ...)` | Buffered writes committed atomically when the callable returns (or `$db->transaction()` then `->commit()`); `requireVersion` / `requireExists` add checks. |
 
 **Large values**: a document can hold a large `Bytes` field (a file) next to small metadata. Read the metadata alone
@@ -80,6 +81,39 @@ automatically; reads come from the leader unless `followerReads: true`.
 **Errors** (`Storine\StorineException` subclasses): `NotFoundException`, `ConflictException` (`writeIndex`,
 `currentVersion`), `InvalidException` (bad value, bound violated — don't retry), `UnauthorizedException`,
 `OverloadedException` / `RateLimitedException` (retry later), `UnavailableException`, `ServerException`.
+
+## Analytics
+
+Group and aggregate on the server, exactly (integer and decimal sums never round), as of one snapshot:
+
+```php
+use Storine\{Agg, Expr, Filter};
+
+$sales = $db->collection('sales');
+$sales->enableColumnar();                  // optional: column segments + vectorized execution
+$r = $sales->aggregate(
+    ['orders' => Agg::count(), 'revenue' => Agg::sum(Expr::field('price')->times('qty')),
+     'avgQty' => Agg::avg('qty'), 'customers' => Agg::countDistinct('customer')],
+    where: Filter::ge('day', 20), groupBy: 'region', orderBy: '-revenue', limit: 10);
+$r->rows;      // [['region' => 'eu', 'orders' => 1204, 'revenue' => Decimal, 'avgQty' => Decimal, 'customers' => 310], ...]
+$r->matched;   // rows that matched; also ->prunedRowGroups, ->spilledBytes, ->columns
+
+$sales->aggregate(['qty' => Agg::sum('qty')], groupBy: [Agg::bucket('day', 7), 'region']);  // weekly buckets
+foreach ($sales->scanColumns(['qty', 'price'], where: ['region' => 'eu'], pageSize: 500) as $key => $fields) {
+    // only those fields ($fields['qty'], $fields['price']), in key order, page by page
+}
+$sales->disableColumnar();
+```
+
+- Aggregates (`Agg::`): `count()` (rows), `count($x)` (non-null values), `sum`, `avg` (a `Decimal` for exact
+  inputs), `min`, `max`, `countDistinct`, `approxCountDistinct`, keyed by output name in output order.
+- An argument is a field path (`'qty'`) or an expression: `Expr::field($path)`, `Expr::lit($value)` (or a plain
+  number / `Decimal`), combined with `->plus($x)`, `->minus($x)`, `->times($x)`, `->neg()`; strings inside are
+  field paths.
+- `groupBy`: field paths and `Agg::bucket($field, $width, $offset = 0)`; rows hold the group keys (named by their
+  field path) then the aggregates. `orderBy` names output columns (`'-revenue'`).
+- `memoryBudget` / `spillBudget` (bytes, 0 = server default) bound the query; `OverloadedException` (too many
+  analytic queries) is retried with backoff automatically.
 
 ## Tests
 

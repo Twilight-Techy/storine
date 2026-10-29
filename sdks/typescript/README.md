@@ -46,6 +46,7 @@ db.close();
 | `c.nearest(field, vector, { k = 10, where, exact = false })` | The `k` documents whose `field` (a list of numbers) is most similar to `vector` (cosine), best first; similarity in `doc.score`. |
 | `c.createVectorIndex(field, dims)`, `c.dropVectorIndex(field)`, `c.vectorIndexes()` | Vector indexes for `nearest` (`[{ field, dims, ready }]`). |
 | `c.createIndex(field)`, `c.dropIndex(field)`, `c.info()`, `c.drop()` | Indexes (up to 16 per collection) and collection management. |
+| `c.aggregate(aggregates, { where, groupBy, orderBy, limit, memoryBudget, spillBudget })`, `c.scanColumns(fields, { where, pageSize })`, `c.enableColumnar()`, `c.disableColumnar()` | Analytics (below). |
 | `db.transaction(tx => ...)` | Buffered writes committed atomically; `tx.require(...)` adds a version check. |
 
 **Large values**: a bytes (or text) field can be read in pieces without fetching the document.
@@ -68,6 +69,38 @@ to the leader unless `followerReads: true`.
 
 **Errors**: `NotFoundError`, `ConflictError` (`writeIndex`, `currentVersion`), `InvalidError` (don't retry),
 `UnauthorizedError`, `OverloadedError` / `RateLimitedError` (retry later), `UnavailableError`, `ServerError`.
+
+## Analytics
+
+Group and aggregate on the server, exactly (integer and decimal sums never round), as of one snapshot:
+
+```ts
+import { avg, bucket, count, countDistinct, field, ge, max, min, sum } from "storine";
+
+const sales = db.collection("sales");
+await sales.enableColumnar();                       // optional: column segments + vectorized execution
+const r = await sales.aggregate(
+  { orders: count(), revenue: sum(field("price").times("qty")), avgQty: avg("qty"), customers: countDistinct("customer") },
+  { where: ge("day", 20), groupBy: "region", orderBy: "-revenue", limit: 10 },
+);
+r.rows;       // [{ region: "eu", orders: 1204, revenue: Decimal, avgQty: Decimal, customers: 310 }, ...]
+r.matched;    // rows that matched; also r.prunedRowGroups, r.spilledBytes, r.columns
+
+await sales.aggregate({ qty: sum("qty") }, { groupBy: [bucket("day", 7), "region"] }); // weekly buckets
+for await (const row of sales.scanColumns(["qty", "price"], { where: { region: "eu" }, pageSize: 500 })) {
+  row.key; row.fields.qty; row.fields.price;        // only those fields, in key order, page by page
+}
+await sales.disableColumnar();
+```
+
+- Aggregates: `count()` (rows), `count(x)` (non-null values), `sum`, `avg` (a `Decimal` for exact inputs),
+  `min`, `max`, `countDistinct`, `approxCountDistinct`. Give them as `{ name: agg }` or `[[name, agg], ...]`.
+- An argument is a field path (`"qty"`) or an expression: `field(path)`, `lit(value)` (or a plain number /
+  `Decimal`), combined with `.plus(x)`, `.minus(x)`, `.times(x)`, `.neg()`; strings inside are field paths.
+- `groupBy`: field paths and `bucket(field, width, offset = 0)`; rows hold the group keys (named by their
+  field path) then the aggregates in the order given. `orderBy` names output columns (`"-revenue"`).
+- `memoryBudget` / `spillBudget` (bytes) bound the query; `OverloadedError` (too many analytic queries) is
+  retried with backoff automatically.
 
 ## Tests
 

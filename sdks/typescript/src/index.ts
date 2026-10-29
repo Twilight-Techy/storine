@@ -16,6 +16,10 @@ export {
   add, and, append, between, contains, eq, exists, ge, gt, isIn, keyPrefix, le, lt, missing, ne, not, or, prefix, set, unset,
 } from "./wire";
 export type { CollectionInfo, ClusterInfo, FieldOp, Filter, NearestQuery, OrderBy, VectorIndexInfo, Where } from "./wire";
+export {
+  Aggregate, approxCountDistinct, avg, bucket, count, countDistinct, Expr, field, lit, max, min, sum,
+} from "./analytics";
+export type { AggregateOptions, AggregateResult, Aggregates, Bucket, ExprLike, GroupKey, ScanColumnsOptions, ScanRow } from "./analytics";
 export { Decimal, Float, float, Id, Timestamp, UInt64, Uuid } from "./values";
 export type { Fields, Value } from "./values";
 export {

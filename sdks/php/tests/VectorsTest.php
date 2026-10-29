@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 // Conformance: the SDK reproduces the server's encodings byte for byte (protocol/vectors).
 
-use Storine\{Bytes, Decimal, FieldOp, Filter, Id, Int128, InvalidException, Sve, Timestamp, UInt64, Uuid, Wire, Write};
+use Storine\{Agg, Bytes, Decimal, Expr, FieldOp, Filter, Id, Int128, InvalidException, Sve, Timestamp, UInt64, Uuid, Wire, Write};
 
 function vectors(): array
 {
@@ -106,6 +106,20 @@ function testRequests(): void
         'query: nearest neighbours with a filter' => Wire::encodeQuery('items', Filter::eq('kind', 'book'), [], 5, 0, null,
             ['embedding', [0.25, -1.5, 3.0], 5, false]),
         'query: nearest neighbours, exact' => Wire::encodeQuery('items', null, [], 0, 0, null, ['v', [1.0, 0.0], 1, true]),
+        // Analytics (TASK-129).
+        'aggregate: by region where day >= 20, count / sum(price * qty) / avg(qty), sum desc, limit 2' => Wire::encodeAggregate('sales',
+            ['n' => Agg::count(), 'revenue' => Agg::sum(Expr::field('price')->times('qty')), 'avg_qty' => Agg::avg('qty')],
+            Filter::ge('day', 20), 'region', '-revenue', 2)[0],
+        'aggregate: totals (count distinct, approx count distinct, min, max, count of field)' => Wire::encodeAggregate('sales', [
+            'regions' => Agg::countDistinct('region'), 'customers' => Agg::approxCountDistinct(Expr::field('customer')),
+            'cheapest' => Agg::min('price'), 'dearest' => Agg::max('price'), 'with_coupon' => Agg::count('coupon')])[0],
+        'aggregate: weekly buckets of day (width 7, offset 3) and region, sum(qty - 1) and sum(-price + 2.5), budgets' => Wire::encodeAggregate('sales',
+            ['a' => Agg::sum(Expr::field('qty')->minus(1)), 'b' => Agg::sum(Expr::field('price')->neg()->plus(Decimal::of('2.5')))],
+            groupBy: [Agg::bucket('day', 7, 3), 'region'], orderBy: ['day', '-region'], memoryBudget: 1 << 20, spillBudget: 1 << 30)[0],
+        'scan: qty, price where region = eu, limit 500' => Wire::encodeScanColumns('sales', Filter::eq('region', 'eu'), ['qty', 'price'], null, 500),
+        'scan: meta.size after s0099 (default limit)' => Wire::encodeScanColumns('sales', null, ['meta.size'], 's0099', 0),
+        'admin: enable columnar sales' => "\x0a" . pack('V', 5) . 'sales',
+        'admin: disable columnar sales' => "\x0b" . pack('V', 5) . 'sales',
     ];
     $seen = 0;
     foreach (vectors()['requests'] as $vec) {
@@ -125,6 +139,34 @@ function testResponses(): void
     $range = (string) hex2bin($r['byte range: total 5000, 4 bytes']['body_hex']);
     same([5000, "\xde\xad\xbe\xef"], Wire::decodeByteRange($range));
     throws(InvalidException::class, fn () => Wire::decodeByteRange(substr($range, 0, -1)), 'truncated byte range');
+}
+
+function testAnalyticsResponses(): void
+{
+    $r = array_column(vectors()['responses'], null, 'name');
+    $agg = Wire::decodeAggregateResult((string) hex2bin($r['aggregate: matched 4, pruned 2, rows [eu, 3, 12.50] [us, 1, null]']['body_hex']));
+    same(comparable([['eu', 3, Decimal::of('12.50')], ['us', 1, null]]), comparable($agg['rows']));
+    same('12.50', (string) $agg['rows'][0][2]);
+    same([4, 2, 0, 3], [$agg['matched'], $agg['prunedRowGroups'], $agg['spilledBytes'], $agg['columns']]);
+    $scan = (string) hex2bin($r['scan page: total 2, next s1, row s1 [7, 9.99]']['body_hex']);
+    $page = Wire::decodeScanPage($scan);
+    same([2, 's1', 2], [$page['total'], $page['next'], $page['fields']]);
+    same(comparable([['s1', [7, Decimal::of('9.99')]]]), comparable($page['rows']));
+    for ($cut = 0; $cut < strlen($scan); $cut++) {
+        throws(InvalidException::class, fn () => Wire::decodeScanPage(substr($scan, 0, $cut)), "scan page cut at $cut");
+    }
+}
+
+function testAnalyticsArgumentRules(): void
+{
+    throws(InvalidException::class, fn () => Wire::encodeAggregate('c', ['n' => Agg::count()], orderBy: 'nope'), 'unknown order column');
+    throws(InvalidException::class, fn () => Wire::encodeAggregate('c', ['region' => Agg::count()], groupBy: 'region'), 'duplicate column');
+    throws(InvalidException::class, fn () => Wire::encodeAggregate('c', ['n' => 'count']), 'not an Agg');
+    throws(InvalidException::class, fn () => Agg::bucket('day', 0), 'zero width');
+    throws(InvalidException::class, fn () => Wire::encodeScanColumns('c', null, ['a'], null, 100_001), 'page too large');
+    // Plain numbers are constants; strings are field paths.
+    same(bin2hex(Wire::encodeAggregate('c', ['x' => Agg::sum(Expr::lit(1)->plus(Expr::field('a')))])[0]),
+        bin2hex(Wire::encodeAggregate('c', ['x' => Agg::sum(Expr::of(1)->plus('a'))])[0]), 'shorthands');
 }
 
 function testHostileBytesNeverCrash(): void

@@ -176,6 +176,125 @@ test("large values: projection, byte ranges and streaming", { skip }, async () =
   }, s.ConflictError);
 });
 
+test("analytics: aggregate, columnar and column scans", { skip, timeout: 120000 }, async () => {
+  const sales = db.collection("ts_sales");
+  const regions = ["eu", "us", "apac"];
+  type Row = { key: string; region: string; qty: number; price: bigint; day: number }; // price in cents
+  const data: Row[] = [];
+  const insert = async (from: number, to: number) => {
+    for (let start = from; start < to; start += 100) {
+      await db.transaction((tx) => {
+        for (let i = start; i < Math.min(start + 100, to); i++) {
+          const row = { key: `s${String(i).padStart(4, "0")}`, region: regions[i % 3], qty: ((i * 7) % 50) + 1, price: BigInt(((i * 37) % 10000) + 1), day: i % 60 };
+          data.push(row);
+          tx.insert("ts_sales", row.key, { region: row.region, qty: row.qty, price: new s.Decimal(row.price, 2), day: row.day });
+        }
+      });
+    }
+  };
+  await insert(0, 3000);
+
+  const halfEven = (num: bigint, den: bigint): bigint => {
+    const q = num / den;
+    const twice = 2n * (num % den);
+    return twice > den || (twice === den && q % 2n !== 0n) ? q + 1n : q;
+  };
+  const dec = (v: s.Value): s.Decimal => {
+    assert.ok(v instanceof s.Decimal, `expected a Decimal, got ${String(v)}`);
+    return v;
+  };
+  const aggs = {
+    n: s.count(),
+    revenue: s.sum(s.field("price").times("qty")),
+    avg_qty: s.avg("qty"),
+    min_price: s.min("price"),
+    max_price: s.max("price"),
+    days: s.countDistinct("day"),
+  };
+  const checkGrouped = async () => {
+    const groups = new Map<string, { n: number; revenue: bigint; qty: bigint; min: bigint; max: bigint; days: Set<number> }>();
+    for (const d of data) {
+      const g = groups.get(d.region) ?? { n: 0, revenue: 0n, qty: 0n, min: d.price, max: d.price, days: new Set<number>() };
+      g.n++;
+      g.revenue += d.price * BigInt(d.qty);
+      g.qty += BigInt(d.qty);
+      if (d.price < g.min) g.min = d.price;
+      if (d.price > g.max) g.max = d.price;
+      g.days.add(d.day);
+      groups.set(d.region, g);
+    }
+    const expected = [...groups.entries()].sort((a, b) => (a[1].revenue > b[1].revenue ? -1 : a[1].revenue < b[1].revenue ? 1 : 0)).slice(0, 2);
+    const res = await sales.aggregate(aggs, { groupBy: "region", orderBy: "-revenue", limit: 2 });
+    assert.equal(res.matched, data.length);
+    assert.deepEqual(res.columns, ["region", "n", "revenue", "avg_qty", "min_price", "max_price", "days"]);
+    assert.equal(res.rows.length, 2);
+    res.rows.forEach((row, i) => {
+      const [region, g] = expected[i];
+      assert.deepEqual(Object.keys(row), res.columns);
+      assert.equal(row.region, region);
+      assert.equal(row.n, g.n);
+      assert.ok(dec(row.revenue).equals(new s.Decimal(g.revenue, 2)), `revenue ${row.revenue}`);
+      assert.equal(dec(row.avg_qty).toString(), new s.Decimal(halfEven(g.qty * 1_000_000n, BigInt(g.n)), 6).toString());
+      assert.ok(dec(row.min_price).equals(new s.Decimal(g.min, 2)));
+      assert.ok(dec(row.max_price).equals(new s.Decimal(g.max, 2)));
+      assert.equal(row.days, g.days.size);
+    });
+    return res;
+  };
+  const checkBuckets = async () => {
+    const byWeek = new Map<number, { n: number; qty: number }>();
+    for (const d of data) {
+      const b = Math.floor(d.day / 7) * 7;
+      const g = byWeek.get(b) ?? { n: 0, qty: 0 };
+      g.n++;
+      g.qty += d.qty;
+      byWeek.set(b, g);
+    }
+    const expected = [...byWeek.entries()].sort((a, b) => a[0] - b[0]).map(([day, g]) => ({ day, n: g.n, qty: g.qty }));
+    const res = await sales.aggregate([["n", s.count()], ["qty", s.sum("qty")]], { groupBy: s.bucket("day", 7) , orderBy: "day" });
+    assert.deepEqual(res.rows, expected);
+  };
+  const checkFiltered = async () => {
+    const sel = data.filter((d) => d.region === "us" && d.day >= 30);
+    const res = await sales.aggregate({ n: s.count(), qty: s.sum("qty"), qty_minus_1: s.sum(s.field("qty").minus(1)) }, { where: s.and(s.eq("region", "us"), s.ge("day", 30)) });
+    const qty = sel.reduce((a, d) => a + d.qty, 0);
+    assert.deepEqual(res.rows, [{ n: sel.length, qty, qty_minus_1: qty - sel.length }]);
+    assert.equal(res.matched, sel.length);
+  };
+
+  await checkGrouped();
+  await sales.enableColumnar();
+  await checkGrouped();
+  await checkBuckets();
+  await checkFiltered();
+  await insert(3000, 3030); // not-yet-merged writes are included too
+  const after = await checkGrouped();
+  assert.equal(after.spilledBytes, 0);
+  await checkBuckets();
+  await checkFiltered();
+
+  const eu = data.filter((d) => d.region === "eu").sort((a, b) => (a.key < b.key ? -1 : 1));
+  const got: s.ScanRow[] = [];
+  for await (const row of sales.scanColumns(["qty", "price"], { where: s.eq("region", "eu"), pageSize: 500 })) got.push(row);
+  assert.ok(eu.length > 1000, "several pages");
+  assert.equal(got.length, eu.length);
+  got.forEach((row, i) => {
+    assert.equal(row.key, eu[i].key);
+    assert.deepEqual(Object.keys(row.fields), ["qty", "price"]);
+    assert.equal(row.fields.qty, eu[i].qty);
+    assert.ok(dec(row.fields.price).equals(new s.Decimal(eu[i].price, 2)));
+  });
+  const missingField = [];
+  for await (const row of sales.scanColumns(["nope"], { where: { region: "apac", day: 2 } })) missingField.push(row);
+  assert.ok(missingField.length > 0 && missingField.every((r) => r.fields.nope === null));
+
+  await assert.rejects(sales.aggregate({ n: s.count() }, { orderBy: "missing" }), s.InvalidError);
+
+  await sales.disableColumnar();
+  await checkGrouped();
+  await checkFiltered();
+});
+
 test("three-node cluster: redirects and failover", { skip, timeout: 60000 }, async () => {
   const base = mkdtempSync(join(tmpdir(), "storine_ts_cluster_"));
   const ports = [await freePort(), await freePort(), await freePort()];

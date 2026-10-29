@@ -7,6 +7,7 @@ import { test } from "node:test";
 import * as s from "../src";
 import { decode, encode, encodeFields, Fields, Value, Writer } from "../src/values";
 import * as w from "../src/wire";
+import * as an from "../src/analytics";
 
 const VECTORS = JSON.parse(readFileSync(join(__dirname, "..", "..", "..", "..", "protocol", "vectors", "vectors.json"), "utf8"));
 
@@ -112,6 +113,28 @@ test("requests", () => {
     "query: multi-key sort": w.encodeQuery("items", undefined, w.parseOrderBy(["a", "-b"]), 5, 0),
     "query: nearest neighbours with a filter": w.encodeQuery("items", s.eq("kind", "book"), [], 5, 0, undefined, { field: "embedding", vector: [0.25, -1.5, 3.0], k: 5, exact: false }),
     "query: nearest neighbours, exact": w.encodeQuery("items", undefined, [], 0, 0, undefined, { field: "v", vector: [1.0, 0.0], k: 1, exact: true }),
+    // Analytics (TASK-129).
+    "aggregate: by region where day >= 20, count / sum(price * qty) / avg(qty), sum desc, limit 2": an.encodeAggregate(
+      "sales",
+      { n: s.count(), revenue: s.sum(s.field("price").times("qty")), avg_qty: s.avg("qty") },
+      { where: s.ge("day", 20), groupBy: "region", orderBy: "-revenue", limit: 2 },
+    ).body,
+    "aggregate: totals (count distinct, approx count distinct, min, max, count of field)": an.encodeAggregate("sales", [
+      ["regions", s.countDistinct("region")],
+      ["customers", s.approxCountDistinct(s.field("customer"))],
+      ["cheapest", s.min("price")],
+      ["dearest", s.max("price")],
+      ["with_coupon", s.count("coupon")],
+    ]).body,
+    "aggregate: weekly buckets of day (width 7, offset 3) and region, sum(qty - 1) and sum(-price + 2.5), budgets": an.encodeAggregate(
+      "sales",
+      { a: s.sum(s.field("qty").minus(1)), b: s.sum(s.field("price").neg().plus(new s.Decimal("2.5"))) },
+      { groupBy: [s.bucket("day", 7, 3), "region"], orderBy: ["day", "-region"], memoryBudget: 1 << 20, spillBudget: 1n << 30n },
+    ).body,
+    "scan: qty, price where region = eu, limit 500": an.encodeScanColumns("sales", s.eq("region", "eu"), ["qty", "price"], undefined, 500),
+    "scan: meta.size after s0099 (default limit)": an.encodeScanColumns("sales", undefined, ["meta.size"], "s0099", 0),
+    "admin: enable columnar sales": Uint8Array.from([10, ...w.str("sales")]),
+    "admin: disable columnar sales": Uint8Array.from([11, ...w.str("sales")]),
   };
   let seen = 0;
   for (const vec of VECTORS.requests) {
@@ -130,6 +153,33 @@ test("responses", () => {
   assert.deepEqual(page, { total: 42, next: "k1", docs: [{ key: "k1", version: 3n, fields: { n: 1 } }] });
   const range = w.decodeByteRange(unhex(r["byte range: total 5000, 4 bytes"].body_hex));
   assert.deepEqual(range, { total: 5000, data: unhex("deadbeef") });
+});
+
+test("analytics responses", () => {
+  const r = Object.fromEntries(VECTORS.responses.map((v: any) => [v.name, v]));
+  const agg = an.decodeAggregateResult(unhex(r["aggregate: matched 4, pruned 2, rows [eu, 3, 12.50] [us, 1, null]"].body_hex));
+  assert.deepEqual(norm(agg.rows as Value), norm([["eu", 3, new s.Decimal("12.50")], ["us", 1, null]]));
+  assert.deepEqual([agg.matched, agg.prunedRowGroups, agg.spilledBytes, agg.columns], [4, 2, 0, 3]);
+  assert.equal((agg.rows[0][2] as s.Decimal).toString(), "12.50");
+  const named = an.namedRows(["region", "n", "total"], agg.rows);
+  assert.deepEqual(norm(named as Value), norm([{ region: "eu", n: 3, total: new s.Decimal("12.50") }, { region: "us", n: 1, total: null }]));
+  const page = an.decodeScanPage(unhex(r["scan page: total 2, next s1, row s1 [7, 9.99]"].body_hex));
+  assert.equal(page.total, 2);
+  assert.equal(page.next, "s1");
+  assert.equal(page.fields, 2);
+  assert.deepEqual(norm(page.rows as unknown as Value), norm([{ key: "s1", values: [7, new s.Decimal("9.99")] }] as unknown as Value));
+  const bytes = unhex(r["scan page: total 2, next s1, row s1 [7, 9.99]"].body_hex);
+  for (let cut = 0; cut < bytes.length; cut++) assert.throws(() => an.decodeScanPage(bytes.subarray(0, cut)), s.InvalidError);
+});
+
+test("analytics argument rules", () => {
+  assert.throws(() => an.encodeAggregate("c", { n: s.count() }, { orderBy: "nope" }), s.InvalidError);
+  assert.throws(() => an.encodeAggregate("c", { region: s.count() }, { groupBy: "region" }), s.InvalidError);
+  assert.throws(() => an.encodeAggregate("c", { n: { func: 2 } as any }), s.InvalidError);
+  assert.throws(() => s.bucket("day", 0), s.InvalidError);
+  assert.throws(() => an.encodeScanColumns("c", undefined, ["a"], undefined, 100_001), s.InvalidError);
+  // Plain numbers are constants; strings are field paths.
+  assert.equal(hex(an.encodeAggregate("c", [["x", s.sum(s.field("a").plus(1))]]).body), hex(an.encodeAggregate("c", [["x", s.sum(s.field("a").plus(s.lit(1)))]]).body));
 });
 
 test("hostile bytes never crash and __proto__ stays data", () => {
