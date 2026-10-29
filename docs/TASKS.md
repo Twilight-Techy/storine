@@ -946,7 +946,13 @@ This document defines the strict chronological execution order for building the 
     - 500 seeds × 3 nodes and 500 seeds × 5 nodes pass. Together: 5,756 crashes (2,914 power cuts), 10,757 partitions, 3,953 snapshot installs, about 69,700 acknowledged writes and 66,800 linearizable reads.
     - The same seed gives the same run (`same_seed_same_run`).
     - `STORINE_SIM_SEED=s` replays one seed and `STORINE_SIM_SEEDS=n` widens the sweep.
-- [~] **TASK-134: Linearizability Checker & Process Chaos (`F-SIM-03`)** — P-compositional history checker; fault proxy (partitions, delays, half-open sockets) and `SIGKILL` / `SIGSTOP` of real binaries.
+- [x] **TASK-134: Linearizability Checker & Process Chaos (`F-SIM-03`)** — P-compositional history checker; fault proxy (partitions, delays, half-open sockets) and `SIGKILL` / `SIGSTOP` of real binaries.
+  - **Checker** (`storage-core/src/linearizability.rs`): Wing & Gong's search with Lowe's memoisation of (linearized set, state), applied per key (P-compositionality). Unknown outcomes (`CommitUnknown`, timeouts, crashed servers) return at infinity, so each may or may not take effect after its invocation. A step budget turns a search that is too concurrent to decide into `Inconclusive`, never a pass. Unit tests cover stale reads, reads going back in time, unknown writes, and random linearizable histories.
+  - **Process chaos** (`storage-server/tests/process_chaos.rs`):
+    - **Setup**: three real `storage-server` processes. Every directed Raft link goes through a fault proxy that can pass, drop (refuse and cut connections), black-hole (half-open: accept and swallow) or delay traffic.
+    - **Nemesis**: `SIGKILL` with restart from the data directory, `SIGSTOP` / `SIGCONT` (a paused leader must not serve a stale read when it wakes), isolation through the proxies.
+    - **Workload**: 4 clients write and read 3 keys throughout; the history must be linearizable.
+  - **Exit Criteria (met)**: a 120 s run had 3 kills, 19 pauses, 5 partitions, 16 half-open isolations and 9 delay episodes. It made 29,979 acknowledged writes (133 unknown) and 30,492 reads, and the history was linearizable. The default run is 20 s (`STORINE_CHAOS_SECS`).
 - [ ] **TASK-135: Structure-Aware Fuzzing (`F-SIM-04`)** — generators for every decoder and parser, millions of iterations, corpora from the conformance vectors.
 - [x] **TASK-136: Crash-Point Sweeps (`F-SIM-05`)** — kill at every `k`-th I/O call, recover, check acknowledged writes, torn state and index equality.
   - `tests/power_loss.rs::crash_at_every_io_call`: a fixed 40-operation workload (puts, deletes, 3-record transactions, checkpoints) is stopped at every I/O call `k = 1 ..= total + 1` in each of 4 layouts / index tiers, then recovered:
