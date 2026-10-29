@@ -644,11 +644,13 @@ pub const RAFT_SNAPSHOT_CHUNK: usize = 1 << 20;
 
 // Snapshot file: `magic | last_index u64 | last_term u64 | count u64 | header_check u64`, then
 // (version 2) the cluster configuration `config_index u64 | len u32 | Membership | check u64`
-// (`len` 0: none), then `count` x `[id 24B | frame_len u32 | check u64 | frame]` with
-// `check = checksum(frame) ^ checksum(id).rotate_left(29)`. Version 1 files (no configuration)
-// are still read.
+// (`len` 0: none), then (version 3) the key span `len u32 | KeySpan | check u64` the snapshot
+// covers (a learner adopts it: its log replays later splits from that span), then `count` x `[id 24B | frame_len u32 | check u64 | frame]` with
+// `check = checksum(frame) ^ checksum(id).rotate_left(29)`. Version 1 (no configuration) and 2
+// (no span) files are still read.
 const SNAPSHOT_MAGIC_V1: &[u8; 8] = b"STGESNP1";
-const SNAPSHOT_MAGIC: &[u8; 8] = b"STGESNP2";
+const SNAPSHOT_MAGIC_V2: &[u8; 8] = b"STGESNP2";
+const SNAPSHOT_MAGIC: &[u8; 8] = b"STGESNP3";
 const SNAPSHOT_HEADER_LEN: usize = 40;
 const SNAPSHOT_RECORD_HEADER: usize = 24 + 4 + 8;
 
@@ -657,8 +659,8 @@ struct SnapshotMeta {
     last_index: u64,
     last_term: u64,
     count: u64,
-    /// Version 2: a cluster configuration block follows the header.
-    v2: bool,
+    /// 2: a cluster configuration block follows the header; 3: then a key span block.
+    version: u8,
 }
 
 /// Upper bound of an encoded configuration block.
@@ -672,6 +674,39 @@ fn encode_config_block(config: Option<&(u64, Membership)>) -> Vec<u8> {
     let check = checksum_payload(&out);
     out.extend_from_slice(&check.to_le_bytes());
     out
+}
+
+fn encode_span_block(span: &KeySpan) -> Vec<u8> {
+    let mut body = Vec::new();
+    span.encode(&mut body);
+    let mut out = (body.len() as u32).to_le_bytes().to_vec();
+    out.extend_from_slice(&body);
+    let check = checksum_payload(&out);
+    out.extend_from_slice(&check.to_le_bytes());
+    out
+}
+
+fn read_span_block(r: &mut impl Read) -> Result<KeySpan> {
+    let io = |e| StorageError::io("read raft snapshot span", e);
+    let mut head = [0u8; 4];
+    r.read_exact(&mut head).map_err(io)?;
+    let len = read_u32_le(&head, 0) as usize;
+    if len > 256 {
+        return Err(StorageError::corrupted_header("raft snapshot span too large"));
+    }
+    let mut rest = vec![0u8; len + 8];
+    r.read_exact(&mut rest).map_err(io)?;
+    let mut covered = head.to_vec();
+    covered.extend_from_slice(&rest[..len]);
+    if checksum_payload(&covered) != read_u64_le(&rest, len) {
+        return Err(StorageError::corrupted_header("raft snapshot span checksum mismatch"));
+    }
+    let mut sr = storage_codec::value_wire::SveReader::new(&rest[..len]);
+    let span = KeySpan::decode(&mut sr)?;
+    if sr.remaining() != 0 {
+        return Err(StorageError::corrupted_header("trailing bytes after raft snapshot span"));
+    }
+    Ok(span)
 }
 
 fn read_config_block(r: &mut impl Read) -> Result<Option<(u64, Membership)>> {
@@ -711,16 +746,20 @@ impl SnapshotMeta {
         let hdr = bytes
             .get(..SNAPSHOT_HEADER_LEN)
             .ok_or_else(|| StorageError::corrupted_header("raft snapshot header truncated"))?;
-        if (&hdr[0..8] != SNAPSHOT_MAGIC && &hdr[0..8] != SNAPSHOT_MAGIC_V1)
-            || checksum_payload(&hdr[0..32]) != read_u64_le(hdr, 32)
-        {
+        let version = match &hdr[0..8] {
+            m if m == SNAPSHOT_MAGIC => 3,
+            m if m == SNAPSHOT_MAGIC_V2 => 2,
+            m if m == SNAPSHOT_MAGIC_V1 => 1,
+            _ => 0,
+        };
+        if version == 0 || checksum_payload(&hdr[0..32]) != read_u64_le(hdr, 32) {
             return Err(StorageError::corrupted_header("raft snapshot header invalid"));
         }
         Ok(Self {
             last_index: read_u64_le(hdr, 8),
             last_term: read_u64_le(hdr, 16),
             count: read_u64_le(hdr, 24),
-            v2: &hdr[0..8] == SNAPSHOT_MAGIC,
+            version,
         })
     }
 
@@ -748,16 +787,20 @@ fn snapshot_record_check(id: &[u8; 24], frame: &[u8]) -> u64 {
 /// Streams and verifies every record of the snapshot file at `path` (`O(largest frame)` memory),
 /// calling `f(id, frame)`; the frame is 64-byte aligned for zero-copy decoding. Fails on any
 /// truncation, checksum mismatch or trailing byte.
+/// A snapshot's header, configuration (version 2+) and span (version 3).
+type SnapshotContents = (SnapshotMeta, Option<(u64, Membership)>, Option<KeySpan>);
+
 fn for_each_snapshot_record(
     path: &Path,
     mut f: impl FnMut(InlineId, &AlignedBytes) -> Result<()>,
-) -> Result<(SnapshotMeta, Option<(u64, Membership)>)> {
+) -> Result<SnapshotContents> {
     let io = |e| StorageError::io("read raft snapshot", e);
     let mut r = BufReader::with_capacity(RAFT_SNAPSHOT_CHUNK, File::open(path).map_err(io)?);
     let mut hdr = [0u8; SNAPSHOT_HEADER_LEN];
     r.read_exact(&mut hdr).map_err(io)?;
     let meta = SnapshotMeta::decode(&hdr)?;
-    let config = if meta.v2 { read_config_block(&mut r)? } else { None };
+    let config = if meta.version >= 2 { read_config_block(&mut r)? } else { None };
+    let span = if meta.version >= 3 { Some(read_span_block(&mut r)?) } else { None };
     let mut frame = Vec::new();
     for _ in 0..meta.count {
         let mut rh = [0u8; SNAPSHOT_RECORD_HEADER];
@@ -781,7 +824,7 @@ fn for_each_snapshot_record(
     if r.read(&mut [0u8; 1]).map_err(io)? != 0 {
         return Err(StorageError::corrupted_header("trailing bytes after raft snapshot records"));
     }
-    Ok((meta, config))
+    Ok((meta, config, span))
 }
 
 // Entry layout: `term u64 | index u64 | id 24B | aux u64 | kind u8 | len u32 | payload`.
@@ -1395,6 +1438,36 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         Ok(out)
     }
 
+    /// Removes this replica from its node after it left the group (`TASK-138`): the span's
+    /// records are deleted from the shared engine first, then the group's files. A crash in
+    /// between leaves a replica that is not in its own configuration; its host removes it
+    /// again at the next start.
+    pub fn destroy(&self) -> Result<()> {
+        self.destroy_keeping(|_| false)
+    }
+
+    /// [`Self::destroy`], keeping the records `keep` says another local replica still holds
+    /// (spans of different groups on one node can overlap while one of them catches up).
+    pub fn destroy_keeping(&self, keep: impl Fn(InlineId) -> bool) -> Result<()> {
+        let _apply = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if self.group.is_none() {
+            return Err(StorageError::invalid_key("only range groups can be destroyed"));
+        }
+        for id in self.span_ids() {
+            if !keep(id) {
+                let _ = self.engine.delete_internal(id)?;
+            }
+        }
+        self.engine.sync_wal()?;
+        let st = &self.storage;
+        for p in [&st.span_path, &st.meta_path, &st.log_path, &st.members_path, &st.snapshot_path, &st.recv_path, &st.installing_path] {
+            if p.exists() {
+                storage_types::vfs::at(p).remove_file(p).map_err(|e| StorageError::io("remove raft group file", e))?;
+            }
+        }
+        sync_parent(&st.span_path).map_err(|e| StorageError::io("fsync raft group directory", e))
+    }
+
     /// Ids of live records in this group's span.
     fn span_ids(&self) -> Vec<InlineId> {
         let span = self.span();
@@ -1799,6 +1872,11 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     }
 
     /// The configuration in force and whether it is committed (no change in flight).
+    /// Log index of the configuration in force (0: the initial one).
+    pub fn config_index(&self) -> u64 {
+        self.lock_state().membership().0
+    }
+
     pub fn membership_state(&self) -> (Membership, bool) {
         let st = self.lock_state();
         let (index, m) = st.membership();
@@ -2116,12 +2194,18 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     /// Leader: chunk `[offset, offset + max_chunk)` of a snapshot covering at least the
     /// compaction point. The snapshot is (re)generated when none covers it.
     pub fn build_install_snapshot(&self, offset: u64, max_chunk: usize) -> Result<InstallSnapshotReq> {
+        self.build_install_snapshot_from(offset, max_chunk, 0)
+    }
+
+    /// [`Self::build_install_snapshot`] of a snapshot taken at or after log index `min_index`
+    /// (a new replica must start from a state that includes its own addition).
+    pub fn build_install_snapshot_from(&self, offset: u64, max_chunk: usize, min_index: u64) -> Result<InstallSnapshotReq> {
         let (term, needed) = {
             let st = self.lock_state();
             if st.role != RaftRole::Leader {
                 return Err(StorageError::invalid_key("node is not Raft Leader"));
             }
-            (st.current_term, st.snapshot_index)
+            (st.current_term, st.snapshot_index.max(min_index))
         };
         let _gen = self.snapshot_lock.lock().unwrap_or_else(|p| p.into_inner());
         let meta = match SnapshotMeta::read(&self.storage.snapshot_path) {
@@ -2158,7 +2242,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     ///
     /// Assumes the replicated engine is written only through Raft (as replication requires).
     fn generate_snapshot(&self) -> Result<SnapshotMeta> {
-        let (last_index, last_term, config, read, ids) = {
+        let (last_index, last_term, config, span, read, ids) = {
             let _apply = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
             let st = self.lock_state();
             let last_index = st.last_applied;
@@ -2167,7 +2251,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 .ok_or_else(|| StorageError::corrupted_header("raft snapshot point is missing"))?;
             let config = st.membership_at(last_index);
             drop(st);
-            (last_index, last_term, config, self.engine.begin_read_snapshot(), self.span_ids())
+            (last_index, last_term, config, self.span(), self.engine.begin_read_snapshot(), self.span_ids())
         };
         let mut tmp = self.storage.snapshot_path.as_os_str().to_os_string();
         tmp.push(".tmp");
@@ -2177,6 +2261,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         let mut w = BufWriter::with_capacity(RAFT_SNAPSHOT_CHUNK, vfs.open(&tmp, OpenOpts::create_truncate()).map_err(io)?);
         w.write_all(&[0u8; SNAPSHOT_HEADER_LEN]).map_err(io)?;
         w.write_all(&encode_config_block(config.as_ref())).map_err(io)?;
+        w.write_all(&encode_span_block(&span)).map_err(io)?;
         let mut count = 0u64;
         for id in ids {
             let Some((version, ttl, record)) = read.get_with_ttl(id)? else {
@@ -2194,7 +2279,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             count += 1;
         }
         drop(read);
-        let meta = SnapshotMeta { last_index, last_term, count, v2: true };
+        let meta = SnapshotMeta { last_index, last_term, count, version: 3 };
         let mut file = w.into_inner().map_err(|e| io(e.into_error()))?;
         file.seek(SeekFrom::Start(0))
             .and_then(|_| file.write_all(&meta.encode()))
@@ -2281,7 +2366,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         let recv = &self.storage.recv_path;
         // 1. Verify everything before touching the engine.
         let mut ids = FastHashSet::default();
-        let (meta, config) = for_each_snapshot_record(recv, |id, _| {
+        let (meta, config, snap_span) = for_each_snapshot_record(recv, |id, _| {
             ids.insert(id);
             Ok(())
         })?;
@@ -2290,7 +2375,15 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         }
         // 2. The engine is about to hold a mix of old and snapshot state until step 4.
         atomic_write_replace(&self.storage.installing_path, &last_index.to_le_bytes(), true)?;
-        // 3. Engine state := snapshot state.
+        // 3. Engine state := snapshot state. A group adopts the snapshot's span: the replica may
+        //    have been created with a later (narrower) one, and its log replays the splits after
+        //    the snapshot from the span in force at it.
+        if let (Some(sp), true) = (snap_span, self.group.is_some()) {
+            if sp != self.span() {
+                self.storage.save_span(&sp)?;
+                *self.span.write().unwrap_or_else(|p| p.into_inner()) = sp;
+            }
+        }
         let span = self.span();
         for_each_snapshot_record(recv, |id, frame| {
             if !span.contains_id(id) {
@@ -2393,7 +2486,12 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             };
             let dir = self.engine.base_dir().to_path_buf();
             let rs = RaftStorage::for_group(&dir, &self.stem, Some(right));
-            let members = self.lock_state().membership().1.clone();
+            // A replica of the right-hand range may already live here (added by a move before
+            // this replica replayed the split): never overwrite its state.
+            let exists = rs.load_span()?.is_some();
+            // The configuration in force at the split entry (a learner replaying an old split
+            // must not put itself into the right-hand range).
+            let members = self.lock_state().membership_at(entry.index).map(|(_, m)| m.clone()).unwrap_or_default();
             let mut st = RaftState::new();
             // Terms never decrease along a log: the right-hand group starts in the split
             // entry's term, so its first leader (term + 1 or later) appends after it.
@@ -2402,13 +2500,15 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             st.snapshot_term = entry.term;
             st.commit_index = entry.index;
             st.last_applied = entry.index;
-            if !members.is_empty() {
-                rs.save_members(&(entry.index, members.clone()))?;
-                st.base_config = Some((entry.index, members));
+            if !exists {
+                if !members.is_empty() {
+                    rs.save_members(&(entry.index, members.clone()))?;
+                    st.base_config = Some((entry.index, members));
+                }
+                rs.save_span(&right_span)?;
+                rs.rewrite_log(&[])?;
+                rs.save_hard_state(&st)?;
             }
-            rs.save_span(&right_span)?;
-            rs.rewrite_log(&[])?;
-            rs.save_hard_state(&st)?;
             let left = KeySpan::new(span.start.clone(), Some(at.to_vec()));
             if self.group.is_some() {
                 self.storage.save_span(&left)?;
@@ -2420,7 +2520,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             let dir = self.engine.base_dir().to_path_buf();
             RaftStorage::for_group(&dir, &self.stem, Some(right)).load_span().ok().flatten().and_then(|s| s.end)
         }));
-        let members = self.lock_state().membership().1.clone();
+        let members = self.lock_state().membership_at(entry.index).map(|(_, m)| m.clone()).unwrap_or_default();
         self.splits.lock().unwrap_or_else(|p| p.into_inner()).push(SplitEvent { index: entry.index, term: entry.term, right, right_span, members });
         Ok(())
     }

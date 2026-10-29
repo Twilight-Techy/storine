@@ -61,6 +61,16 @@ fn three_regions_with_region_outages() {
     sweep("regions", &cfg, 6);
 }
 
+#[test]
+fn replicas_move_and_leases_transfer_safely() {
+    let cfg = DistSimConfig { nodes: 5, regions: vec![0, 0, 0, 0, 0], replication: 3, moves: true, fault_every: 250_000, ..DistSimConfig::default() };
+    let reports = sweep("moves", &cfg, 10);
+    let moves: usize = reports.iter().map(|r| r.moves).sum();
+    let transfers: usize = reports.iter().map(|r| r.transfers).sum();
+    eprintln!("moves: {moves} replica moves, {transfers} lease transfers");
+    assert!(moves > 0 && transfers > 0);
+}
+
 /// Idle cost scales with nodes, not ranges: 3 nodes sharing 200 idle ranges exchange about
 /// one batch per node pair per heartbeat once the ranges quiesce.
 #[test]

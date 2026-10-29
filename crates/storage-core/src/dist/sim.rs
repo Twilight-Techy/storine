@@ -56,6 +56,10 @@ pub struct DistSimConfig {
     pub partitions: bool,
     pub region_outages: bool,
     pub splits: bool,
+    /// Replicas per range (`<= nodes`; placed round-robin).
+    pub replication: usize,
+    /// Move replicas between nodes and transfer leases while clients run.
+    pub moves: bool,
     pub tick_us: u64,
     pub client_timeout: u64,
     pub max_events: u64,
@@ -80,6 +84,8 @@ impl Default for DistSimConfig {
             partitions: true,
             region_outages: false,
             splits: true,
+            replication: 3,
+            moves: false,
             tick_us: 10_000,
             client_timeout: 1_500_000,
             max_events: 2_000_000,
@@ -104,6 +110,8 @@ pub struct DistSimReport {
     pub refused: usize,
     pub batches: u64,
     pub messages: u64,
+    pub moves: usize,
+    pub transfers: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -132,6 +140,8 @@ enum Ev {
     Fault,
     Restart { node: usize },
     Heal { epoch: u64 },
+    /// Replica move of `range` to `node`: 1 = promote once caught up, 2 = remove an old voter.
+    Move { range: RangeId, node: NodeId, phase: u8, tries: u8 },
 }
 
 struct SimNode {
@@ -170,7 +180,9 @@ struct Sim<'c> {
     next_value: i64,
     next_range: RangeId,
     leaders: BTreeMap<(RangeId, u64), NodeId>,
-    committed: BTreeMap<(RangeId, u64), u64>,
+    /// `(range, index) -> (entry term, upper bound of the term it was committed in)`: the
+    /// observer's term when the commit was first seen.
+    committed: BTreeMap<(RangeId, u64), (u64, u64)>,
     seen_applied: BTreeMap<(usize, RangeId), u64>,
     report: DistSimReport,
     trace: VecDeque<String>,
@@ -205,7 +217,7 @@ pub fn run(root: &Path, seed: u64, cfg: &DistSimConfig) -> Result<DistSimReport,
 impl<'c> Sim<'c> {
     fn new(root: &Path, seed: u64, cfg: &'c DistSimConfig) -> Result<Self, StorageError> {
         let mut rng = SweepRng::new(seed.wrapping_mul(0xA24B_AED4_963E_E407) | 1);
-        let members: Vec<NodeId> = (1..=cfg.nodes as NodeId).collect();
+        let repl = cfg.replication.clamp(1, cfg.nodes);
         // Initial ranges: split points spread over the key space.
         let mut bounds: Vec<Vec<u8>> = (1..cfg.initial_ranges).map(|i| key_id(i * cfg.keys / cfg.initial_ranges).as_bytes().to_vec()).collect();
         bounds.sort();
@@ -225,7 +237,10 @@ impl<'c> Sim<'c> {
             let engine = Arc::new(StorageEngine::<DocumentRecord>::open(&dir, engine_config())?);
             let mut d = NodeDriver::new((i + 1) as NodeId, engine, NodeConfig { seed: seed ^ (i as u64 + 1), ..cfg.node.clone() });
             for (r, span) in spans.iter().enumerate() {
-                d.open_range(r as RangeId + 1, span.clone(), &members)?;
+                let members: Vec<NodeId> = (0..repl).map(|j| ((r + j) % cfg.nodes + 1) as NodeId).collect();
+                if members.contains(&((i + 1) as NodeId)) {
+                    d.open_range(r as RangeId + 1, span.clone(), &members)?;
+                }
             }
             nodes.push(SimNode { dir, sim, _mount: mount, driver: Some(d) });
         }
@@ -278,6 +293,11 @@ impl<'c> Sim<'c> {
                     }
                 }
             }
+        }
+        for r in self.all_ranges() {
+            let hosts: Vec<NodeId> = self.nodes.iter().filter_map(|n| n.driver.as_ref()).filter(|d| d.replica(r).is_some()).map(|d| d.id()).collect();
+            let configs: Vec<String> = self.nodes.iter().filter_map(|n| n.driver.as_ref()).filter(|d| d.replica(r).is_some()).map(|d| format!("n{}:{:?}", d.id(), d.members_of(r))).collect();
+            trace.push(format!("r{r} hosted on {hosts:?}; configs {configs:?}"));
         }
         DistSimFailure { seed: self.seed, time: self.now, what: what.into(), trace }
     }
@@ -395,6 +415,7 @@ impl<'c> Sim<'c> {
                 }
             }
             Ev::Restart { node } => self.restart(node)?,
+            Ev::Move { range, node, phase, tries } => self.move_step(range, node, phase, tries),
             Ev::Heal { epoch } => {
                 if epoch == self.epoch {
                     self.cut.iter_mut().for_each(|r| r.iter_mut().for_each(|c| *c = false));
@@ -567,9 +588,9 @@ impl<'c> Sim<'c> {
                 for i in lo + 1..=v.commit_index {
                     let Some(t) = v.term_at(i) else { continue };
                     match self.committed.get(&(r, i)) {
-                        Some(&ct) if ct != t => return Err(self.fail(format!("state-machine safety: r{r} index {i} committed as term {ct} and {t}"))),
+                        Some(&(ct, _)) if ct != t => return Err(self.fail(format!("state-machine safety: r{r} index {i} committed as term {ct} and {t}"))),
                         None => {
-                            self.committed.insert((r, i), t);
+                            self.committed.insert((r, i), (t, v.current_term));
                         }
                         _ => {}
                     }
@@ -581,9 +602,10 @@ impl<'c> Sim<'c> {
             let Some(d) = &self.nodes[ni].driver else { continue };
             let Some(rep) = d.replica(r) else { continue };
             let v = rep.log_view();
-            for (&(cr, i), &t) in self.committed.range((r, 0)..=(r, u64::MAX)) {
+            // Raft promises a leader every entry committed in an earlier term only.
+            for (&(cr, i), &(t, by)) in self.committed.range((r, 0)..=(r, u64::MAX)) {
                 debug_assert_eq!(cr, r);
-                if i > v.snapshot_index && v.term_at(i) != Some(t) {
+                if term > by && i > v.snapshot_index && v.term_at(i) != Some(t) {
                     return Err(self.fail(format!("leader completeness: n{} leads r{r} term {term} without committed {i}", ni + 1)));
                 }
             }
@@ -653,6 +675,47 @@ impl<'c> Sim<'c> {
                     self.crash(node)?;
                 }
             }
+            8 if self.cfg.moves => {
+                // Move a replica of a random range to a node that lacks one.
+                let ranges = self.all_ranges();
+                if ranges.is_empty() {
+                    return Ok(());
+                }
+                let range = ranges[self.rng.below(ranges.len())];
+                if let Some(l) = self.leader_index(range) {
+                    let members: Vec<NodeId> = self.nodes[l].driver.as_ref().map(|d| d.members_of(range).into_iter().map(|(id, _)| id).collect()).unwrap_or_default();
+                    let candidates: Vec<NodeId> = (1..=n as NodeId).filter(|id| !members.contains(id) && self.nodes[usize::from(*id) - 1].driver.is_some()).collect();
+                    if !candidates.is_empty() && members.len() == self.cfg.replication {
+                        let target = candidates[self.rng.below(candidates.len())];
+                        if let Some(d) = self.nodes[l].driver.as_mut() {
+                            if d.add_learner(range, target).is_ok() {
+                                self.log(format!("move r{range}: add learner n{target}"));
+                                self.flush(l);
+                                self.schedule(300_000, Ev::Move { range, node: target, phase: 1, tries: 0 });
+                            }
+                        }
+                    }
+                }
+            }
+            9 if self.cfg.moves => {
+                // Transfer a random range's lease to a caught-up voter.
+                let ranges = self.all_ranges();
+                if ranges.is_empty() {
+                    return Ok(());
+                }
+                let range = ranges[self.rng.below(ranges.len())];
+                if let Some(l) = self.leader_index(range) {
+                    let voters: Vec<NodeId> = self.nodes[l].driver.as_ref().map(|d| d.members_of(range).into_iter().filter(|&(id, v)| v && usize::from(id) - 1 != l).map(|(id, _)| id).collect()).unwrap_or_default();
+                    if !voters.is_empty() {
+                        let to = voters[self.rng.below(voters.len())];
+                        if self.nodes[l].driver.as_mut().is_some_and(|d| d.transfer_lease(range, to).is_ok()) {
+                            self.report.transfers += 1;
+                            self.log(format!("transfer r{range} lease to n{to}"));
+                            self.flush(l);
+                        }
+                    }
+                }
+            }
             5..=7 if self.cfg.splits => {
                 // Split a random range at a key strictly inside it.
                 let k = 1 + self.rng.below(self.cfg.keys.saturating_sub(1).max(1));
@@ -673,6 +736,57 @@ impl<'c> Sim<'c> {
             _ => {}
         }
         Ok(())
+    }
+
+    fn all_ranges(&self) -> Vec<RangeId> {
+        let mut rs: Vec<RangeId> = self.nodes.iter().filter_map(|n| n.driver.as_ref()).flat_map(|d| d.ranges()).collect();
+        rs.sort_unstable();
+        rs.dedup();
+        rs
+    }
+
+    fn leader_index(&self, range: RangeId) -> Option<usize> {
+        self.nodes.iter().position(|n| n.driver.as_ref().is_some_and(|d| d.is_leader(range)))
+    }
+
+    fn move_step(&mut self, range: RangeId, node: NodeId, phase: u8, tries: u8) {
+        if !self.faults_on || tries > 20 {
+            return;
+        }
+        let retry = |s: &mut Self| s.schedule(200_000, Ev::Move { range, node, phase, tries: tries + 1 });
+        let Some(l) = self.leader_index(range) else { return retry(self) };
+        let d = self.nodes[l].driver.as_mut().expect("leader has a driver");
+        match phase {
+            1 => {
+                let is_learner = d.members_of(range).iter().any(|&(id, v)| id == node && !v);
+                if !is_learner {
+                    return; // the move was lost with a leader change
+                }
+                if d.caught_up(range, node) && d.promote(range, node).is_ok() {
+                    self.log(format!("move r{range}: promote n{node}"));
+                    self.flush(l);
+                    self.schedule(300_000, Ev::Move { range, node, phase: 2, tries: 0 });
+                } else {
+                    retry(self);
+                }
+            }
+            _ => {
+                let leader_id = d.id();
+                let voters: Vec<NodeId> = d.members_of(range).into_iter().filter(|&(id, v)| v && id != node && id != leader_id).map(|(id, _)| id).collect();
+                if voters.is_empty() || d.members_of(range).len() <= self.cfg.replication {
+                    return;
+                }
+                let victim = voters[self.rng.below(voters.len())];
+                let d = self.nodes[l].driver.as_mut().expect("leader has a driver");
+                if d.remove_member(range, victim).is_ok() {
+                    self.report.moves += 1;
+                    self.log(format!("move r{range}: remove n{victim}"));
+                    self.flush(l);
+                } else {
+                    retry(self);
+                }
+            }
+        }
     }
 
     fn crash(&mut self, node: usize) -> Result<(), DistSimFailure> {
@@ -724,15 +838,16 @@ impl<'c> Sim<'c> {
         if drivers.len() != self.nodes.len() {
             return false;
         }
-        let ranges = drivers[0].ranges();
-        for d in &drivers {
-            if d.ranges() != ranges {
+        for r in self.all_ranges() {
+            let hosts: Vec<&&NodeDriver> = drivers.iter().filter(|d| d.replica(r).is_some()).collect();
+            let leaders = hosts.iter().filter(|d| d.is_leader(r)).count();
+            let Some(leader) = hosts.iter().find(|d| d.is_leader(r)) else { return false };
+            // Every member of the leader's configuration hosts it, and no one else does.
+            let members: Vec<NodeId> = leader.members_of(r).into_iter().map(|(id, _)| id).collect();
+            if hosts.len() != members.len() || !hosts.iter().all(|d| members.contains(&d.id())) {
                 return false;
             }
-        }
-        for r in ranges {
-            let leaders = drivers.iter().filter(|d| d.is_leader(r)).count();
-            let views: Vec<_> = drivers.iter().filter_map(|d| d.replica(r).map(|x| x.log_view())).collect();
+            let views: Vec<_> = hosts.iter().filter_map(|d| d.replica(r).map(|x| x.log_view())).collect();
             let c = views[0].commit_index;
             if leaders != 1 || !views.iter().all(|v| v.commit_index == c && v.last_applied == c && v.last_index() == c) {
                 return false;
@@ -743,20 +858,25 @@ impl<'c> Sim<'c> {
 
     fn final_checks(&mut self) -> Result<(), DistSimFailure> {
         self.check_log_matching()?;
-        let mut states = Vec::new();
-        for n in &self.nodes {
-            let Some(d) = &n.driver else { continue };
-            let s: Vec<Option<i64>> = (0..self.cfg.keys)
-                .map(|k| d.engine().get_owned(key_id(k)).ok().and_then(|(_, r)| match r.fields.get("v") {
+        // Every key: the same value on every node hosting its range.
+        for k in 0..self.cfg.keys {
+            let id = key_id(k);
+            let mut seen: Option<(NodeId, Option<i64>)> = None;
+            for n in &self.nodes {
+                let Some(d) = &n.driver else { continue };
+                let hosts = d.ranges().into_iter().any(|r| d.replica(r).is_some_and(|x| x.span().contains_id(id)));
+                if !hosts {
+                    continue;
+                }
+                let v = d.engine().get_owned(id).ok().and_then(|(_, r)| match r.fields.get("v") {
                     Some(PropertyValue::Int64(v)) => Some(*v),
                     _ => None,
-                }))
-                .collect();
-            states.push((d.id(), s));
-        }
-        for w in states.windows(2) {
-            if w[0].1 != w[1].1 {
-                return Err(self.fail(format!("replicas diverged: n{} {:?} vs n{} {:?}", w[0].0, w[0].1, w[1].0, w[1].1)));
+                });
+                match seen {
+                    Some((other, ov)) if ov != v => return Err(self.fail(format!("replicas diverged on k{k}: n{other} {ov:?} vs n{} {v:?}", d.id()))),
+                    None => seen = Some((d.id(), v)),
+                    _ => {}
+                }
             }
         }
         match check_keyed(&self.history, 5_000_000) {

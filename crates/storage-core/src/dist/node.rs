@@ -82,6 +82,14 @@ pub enum RaftMsg {
     SnapResp { resp: InstallSnapshotResp, req_term: u64, last_included: u64 },
     /// The leader of `term` has nothing to send: stop the election timer while its node lives.
     Quiesce { term: u64, commit: u64 },
+    /// Create this range here as a learner (a replica being added): its span and the
+    /// configuration that includes it. A snapshot follows.
+    Init { span: crate::raft::KeySpan, members: Vec<(NodeId, bool)> },
+    /// Leadership transfer: campaign now, without pre-vote (the leader asked).
+    TimeoutNow { term: u64 },
+    /// From a leader whose committed configuration (at log index `config_index`) does not
+    /// include the receiver: its replica is gone (unless it knows a newer configuration).
+    Gone { config_index: u64 },
 }
 
 /// Everything one node sends another in one go.
@@ -100,6 +108,11 @@ struct Progress {
     next: u64,
     matched: u64,
     snapshot_offset: Option<u64>,
+    /// A new replica starts from a snapshot, never from replaying the log: old entries
+    /// (splits, configurations) describe a range it was not part of.
+    force_snapshot: bool,
+    /// The snapshot must be at or after this index (the configuration that added the replica).
+    snapshot_min: u64,
 }
 
 #[derive(Debug)]
@@ -134,6 +147,12 @@ struct ReplicaState {
     acks: BTreeMap<NodeId, u64>,
     last_heartbeat: u64,
     idle_beats: u32,
+    /// Leader: members being removed and the time the removal was proposed. They are kept
+    /// informed until they acknowledge the configuration that removed them (thesis §4.2.2), or
+    /// give up after 10 s (a vote request from them is then answered with `Gone`).
+    removing: Vec<(NodeId, u64)>,
+    /// Created by `Init` at this time and not yet initialized by a snapshot (orphan GC).
+    uninitialized_since: Option<u64>,
     /// Follower: quiesced by the leader on `leader_node`.
     quiescent: Option<NodeId>,
     /// Leader: this range is quiescent.
@@ -151,6 +170,8 @@ pub struct NodeStats {
     pub elections: u64,
     pub quiesced: u64,
     pub splits: u64,
+    pub replicas_added: u64,
+    pub replicas_removed: u64,
 }
 
 /// The multi-Raft driver of one node (see the module docs).
@@ -263,6 +284,8 @@ impl NodeDriver {
                 acks: BTreeMap::new(),
                 last_heartbeat: 0,
                 idle_beats: 0,
+                removing: Vec::new(),
+                uninitialized_since: None,
                 quiescent: None,
                 leader_quiet: false,
                 leader_contact: 0,
@@ -363,6 +386,14 @@ impl NodeDriver {
 
     fn tick_range(&mut self, range: RangeId) -> Result<()> {
         let now = self.now;
+        // An Init-created replica that never got its snapshot is an orphan (the move it was
+        // for was lost): remove it; a live move re-creates it.
+        if let Some(r) = self.replicas.get(&range) {
+            if r.uninitialized_since.is_some_and(|t| now.saturating_sub(t) > 10_000_000) && r.raft.snapshot_index() == 0 && r.raft.last_log_index() == 0 {
+                self.destroy_replica(range)?;
+                return Ok(());
+            }
+        }
         let hb = self.cfg.heartbeat_us;
         let quiesce_after = self.cfg.quiesce_after;
         let Some(r) = self.replicas.get_mut(&range) else { return Ok(()) };
@@ -379,7 +410,7 @@ impl NodeDriver {
                 } else {
                     r.idle_beats = 0;
                 }
-                if r.idle_beats > quiesce_after && !r.progress.is_empty() {
+                if r.idle_beats > quiesce_after && !r.progress.is_empty() && r.removing.is_empty() {
                     r.leader_quiet = true;
                     self.stats.quiesced += 1;
                     let (term, commit) = (raft.current_term(), raft.commit_index());
@@ -403,14 +434,29 @@ impl NodeDriver {
             r.election_deadline = now;
         }
         let r = self.replicas.get_mut(&range).ok_or_else(|| StorageError::invalid_key("range vanished"))?;
-        if now >= r.election_deadline && raft.membership().is_voter(self.id) {
-            self.campaign(range)?;
+        if now >= r.election_deadline {
+            let m = raft.membership();
+            if m.is_voter(self.id) {
+                self.campaign(range)?;
+            } else if !m.is_empty() && !m.contains(self.id) {
+                // Removed, but not sure the removal committed: ask the members (they answer
+                // `Gone` once it has).
+                self.reset_election(range);
+                let req = raft.pre_vote_request();
+                let me = self.id;
+                let targets: Vec<NodeId> = m.members().iter().map(|x| x.id).filter(|&p| p != me).collect();
+                for p in targets {
+                    self.push(p, range, RaftMsg::Vote(req));
+                }
+            }
         }
         Ok(())
     }
 
     fn peer_ids(&self, range: RangeId) -> Vec<NodeId> {
-        self.replicas.get(&range).map_or_else(Vec::new, |r| voters(&r.raft).into_iter().chain(r.raft.membership().members().iter().map(|m| m.id)).filter(|&v| v != self.id).collect::<BTreeSet<_>>().into_iter().collect())
+        self.replicas.get(&range).map_or_else(Vec::new, |r| {
+            r.raft.membership().members().iter().map(|m| m.id).chain(r.removing.iter().map(|&(n, _)| n)).filter(|&v| v != self.id).collect::<BTreeSet<_>>().into_iter().collect()
+        })
     }
 
     fn reset_election(&mut self, range: RangeId) {
@@ -460,7 +506,14 @@ impl NodeDriver {
         let Some(r) = self.replicas.get_mut(&range) else { return };
         let next = r.raft.last_log_index() + 1;
         r.lead_term = term;
-        r.progress = peers.iter().filter(|&&p| p != me).map(|&p| (p, Progress { next, matched: 0, snapshot_offset: None })).collect();
+        let learners: Vec<NodeId> = r.raft.membership().members().iter().filter(|m| !m.voter).map(|m| m.id).collect();
+        let min = next - 1;
+        // A learner's state is unknown to a new leader: start it from a fresh snapshot.
+        r.progress = peers
+            .iter()
+            .filter(|&&p| p != me)
+            .map(|&p| (p, Progress { next, matched: 0, snapshot_offset: None, force_snapshot: learners.contains(&p), snapshot_min: if learners.contains(&p) { min } else { 0 } }))
+            .collect();
         r.acks.clear();
         r.leader_quiet = false;
         r.idle_beats = 0;
@@ -481,11 +534,19 @@ impl NodeDriver {
         if !raft.is_leader() || raft.current_term() != r.lead_term {
             return;
         }
-        let pr = r.progress.get(&peer).copied().unwrap_or(Progress { next: raft.last_log_index() + 1, matched: 0, snapshot_offset: None });
-        if raft.needs_snapshot(pr.next) {
+        let pr = r.progress.get(&peer).copied().unwrap_or(Progress { next: raft.last_log_index() + 1, matched: 0, snapshot_offset: None, force_snapshot: false, snapshot_min: 0 });
+        if pr.force_snapshot && raft.last_applied() < pr.snapshot_min {
+            return; // the new replica's snapshot must include its own addition: wait for it
+        }
+        if pr.force_snapshot || raft.needs_snapshot(pr.next) {
             let offset = pr.snapshot_offset.unwrap_or(0);
-            if let Ok(req) = raft.build_install_snapshot(offset, self.cfg.snapshot_chunk) {
+            if let Ok(req) = raft.build_install_snapshot_from(offset, self.cfg.snapshot_chunk, pr.snapshot_min) {
                 r.progress.entry(peer).or_insert(pr).snapshot_offset = Some(offset);
+                if pr.force_snapshot && offset == 0 {
+                    // A new replica may not exist yet (lost Init): (re)create it first.
+                    let members = raft.membership().members().iter().map(|m| (m.id, m.voter)).collect();
+                    self.push(peer, range, RaftMsg::Init { span: raft.span(), members });
+                }
                 self.push(peer, range, RaftMsg::Snap(req));
             }
             return;
@@ -532,6 +593,12 @@ impl NodeDriver {
             }
         }
         for (range, msg) in batch.msgs {
+            if let RaftMsg::Init { span, members } = &msg {
+                if !self.replicas.contains_key(&range) {
+                    self.create_learner(range, span.clone(), members)?;
+                }
+                continue;
+            }
             if self.replicas.contains_key(&range) {
                 self.step_one(batch.from, range, msg)?;
             }
@@ -543,6 +610,13 @@ impl NodeDriver {
         let raft = Arc::clone(&self.replicas[&range].raft);
         match msg {
             RaftMsg::Vote(req) => {
+                let (m, committed) = raft.membership_state();
+                if committed && !m.is_empty() && !m.contains(from) {
+                    // A removed replica that never learned it (any replica whose committed
+                    // configuration excludes it knows): tell it.
+                    self.push(from, range, RaftMsg::Gone { config_index: raft.config_index() });
+                    return Ok(());
+                }
                 if self.replicas[&range].quiescent == Some(from) {
                     // The node we were quiescent on campaigns: it no longer leads.
                     if let Some(r) = self.replicas.get_mut(&range) {
@@ -619,6 +693,11 @@ impl NodeDriver {
                 let req_term = req.term;
                 let last_included = req.last_included_index;
                 let resp = raft.handle_install_snapshot(req)?;
+                if resp.installed {
+                    if let Some(r) = self.replicas.get_mut(&range) {
+                        r.uninitialized_since = None;
+                    }
+                }
                 if resp.term == req_term {
                     self.reset_election(range);
                 }
@@ -639,13 +718,35 @@ impl NodeDriver {
                     p.matched = p.matched.max(last_included);
                     p.next = p.matched + 1;
                     p.snapshot_offset = None;
+                    p.force_snapshot = false;
                     self.advance_commit(range)?;
                     self.replicate(range, from);
                 } else if p.snapshot_offset.is_some() {
                     p.snapshot_offset = Some(resp.next_offset);
-                    match raft.build_install_snapshot(resp.next_offset, chunk) {
+                    match raft.build_install_snapshot_from(resp.next_offset, chunk, p.snapshot_min) {
                         Ok(req) => self.push(from, range, RaftMsg::Snap(req)),
                         Err(_) => p.snapshot_offset = None,
+                    }
+                }
+            }
+            RaftMsg::Init { .. } => {}
+            RaftMsg::Gone { config_index } => {
+                if raft.config_index() <= config_index && !raft.is_leader() {
+                    self.destroy_replica(range)?;
+                }
+            }
+            RaftMsg::TimeoutNow { term } => {
+                if term == raft.current_term() && !raft.is_leader() && raft.membership().is_voter(self.id) {
+                    // Real election straight away (the leader stepped aside for us).
+                    self.wake(range);
+                    let real = raft.start_election()?;
+                    let me = self.id;
+                    if let Some(r) = self.replicas.get_mut(&range) {
+                        r.campaign = Some(Campaign::Real { term: real.term, votes: BTreeSet::from([me]) });
+                    }
+                    self.reset_election(range);
+                    for p in voters(&raft).into_iter().filter(|&v| v != me) {
+                        self.push(p, range, RaftMsg::Vote(real));
                     }
                 }
             }
@@ -741,6 +842,112 @@ impl NodeDriver {
         Ok(index)
     }
 
+    /// Removes a replica, deleting its records except those another local replica holds.
+    fn destroy_replica(&mut self, range: RangeId) -> Result<()> {
+        if let Some(r) = self.replicas.remove(&range) {
+            let others: Vec<crate::raft::KeySpan> = self.replicas.values().map(|o| o.raft.span()).collect();
+            r.raft.destroy_keeping(|id| others.iter().any(|sp| sp.contains_id(id)))?;
+            self.stats.replicas_removed += 1;
+        }
+        Ok(())
+    }
+
+    fn create_learner(&mut self, range: RangeId, span: crate::raft::KeySpan, members: &[(NodeId, bool)]) -> Result<()> {
+        let raft = Arc::new(RaftNode::open_group(self.id, Arc::clone(&self.engine), Some(range), span)?);
+        if raft.membership().is_empty() {
+            let m = Membership::new(members.iter().map(|&(id, voter)| crate::raft::Member { id, addr: String::new(), voter }).collect())?;
+            raft.initialize_membership(m)?;
+        }
+        self.stats.replicas_added += 1;
+        self.add_replica(range, raft);
+        let now = self.now;
+        if let Some(r) = self.replicas.get_mut(&range) {
+            r.uninitialized_since = Some(now);
+        }
+        Ok(())
+    }
+
+    /// The configuration of `range` as `(node, voter)` pairs.
+    pub fn members_of(&self, range: RangeId) -> Vec<(NodeId, bool)> {
+        self.replicas.get(&range).map_or_else(Vec::new, |r| r.raft.membership().members().iter().map(|m| (m.id, m.voter)).collect())
+    }
+
+    fn propose_config(&mut self, range: RangeId, next: Vec<(NodeId, bool)>) -> Result<u64> {
+        let r = self.replicas.get(&range).ok_or_else(|| StorageError::invalid_key("range not hosted on this node"))?;
+        if !(r.raft.is_leader() && r.lead_term == r.raft.current_term()) {
+            return Err(StorageError::NotLeader { leader: r.raft.leader_id().map(u64::from) });
+        }
+        let m = Membership::new(next.iter().map(|&(id, voter)| crate::raft::Member { id, addr: String::new(), voter }).collect())?;
+        let index = r.raft.propose_membership(m)?;
+        for &(id, _) in &next {
+            if id != self.id {
+                self.peers.insert(id);
+                if let Some(r) = self.replicas.get_mut(&range) {
+                    let next_index = r.raft.last_log_index();
+                    r.progress.entry(id).or_insert(Progress { next: next_index, matched: 0, snapshot_offset: None, force_snapshot: false, snapshot_min: 0 });
+                }
+            }
+        }
+        self.wake(range);
+        self.broadcast(range);
+        self.advance_commit(range)?;
+        Ok(index)
+    }
+
+    /// Adds `node` to `range` as a learner (it is created there and caught up by snapshot).
+    pub fn add_learner(&mut self, range: RangeId, node: NodeId) -> Result<u64> {
+        let mut next = self.members_of(range);
+        if next.iter().any(|&(id, _)| id == node) {
+            return Err(StorageError::invalid_value("already a member"));
+        }
+        next.push((node, false));
+        let index = self.propose_config(range, next.clone())?;
+        if let Some(r) = self.replicas.get_mut(&range) {
+            let p = r.progress.entry(node).or_default();
+            p.force_snapshot = true;
+            p.snapshot_offset = None;
+            p.snapshot_min = index;
+        }
+        let span = self.replicas.get(&range).map(|r| r.raft.span()).unwrap_or_default();
+        self.push(node, range, RaftMsg::Init { span, members: next });
+        Ok(index)
+    }
+
+    /// Makes learner `node` a voter (once it has caught up).
+    pub fn promote(&mut self, range: RangeId, node: NodeId) -> Result<u64> {
+        let next: Vec<(NodeId, bool)> = self.members_of(range).into_iter().map(|(id, v)| (id, v || id == node)).collect();
+        self.propose_config(range, next)
+    }
+
+    /// Removes `node` from `range` (it deletes its replica once it learns the change committed).
+    pub fn remove_member(&mut self, range: RangeId, node: NodeId) -> Result<u64> {
+        let next: Vec<(NodeId, bool)> = self.members_of(range).into_iter().filter(|&(id, _)| id != node).collect();
+        let index = self.propose_config(range, next)?;
+        let now = self.now;
+        if let Some(r) = self.replicas.get_mut(&range) {
+            r.removing.push((node, now));
+        }
+        Ok(index)
+    }
+
+    /// `true` once `node`'s replica of `range` has every entry the leader has.
+    pub fn caught_up(&self, range: RangeId, node: NodeId) -> bool {
+        self.replicas.get(&range).is_some_and(|r| r.progress.get(&node).is_some_and(|p| p.matched >= r.raft.last_log_index()))
+    }
+
+    /// Hands leadership of `range` to `to` (a caught-up voter).
+    pub fn transfer_lease(&mut self, range: RangeId, to: NodeId) -> Result<()> {
+        if !self.is_leader(range) {
+            return Err(StorageError::NotLeader { leader: self.leader_of(range).map(u64::from) });
+        }
+        if !self.caught_up(range, to) {
+            return Err(StorageError::invalid_value("transfer target has not caught up"));
+        }
+        let term = self.replicas.get(&range).map_or(0, |r| r.raft.current_term());
+        self.push(to, range, RaftMsg::TimeoutNow { term });
+        Ok(())
+    }
+
     /// Starts a linearizable read on the leaseholder of `range`.
     pub fn read_index(&mut self, range: RangeId) -> Result<ReadToken> {
         let r = self.replicas.get_mut(&range).ok_or_else(|| StorageError::invalid_key("range not hosted on this node"))?;
@@ -800,6 +1007,47 @@ impl NodeDriver {
                 }
             }
             r.reads = keep;
+        }
+        // Leaders: once a removal commits, tell the removed member (one last append carries
+        // the commit) and stop replicating to it.
+        let leading: Vec<RangeId> = self.replicas.iter().filter(|(_, r)| !r.removing.is_empty() && r.raft.is_leader()).map(|(&id, _)| id).collect();
+        let now = self.now;
+        for range in leading {
+            let Some(r) = self.replicas.get_mut(&range) else { continue };
+            if !r.raft.membership_state().1 {
+                continue;
+            }
+            let config_index = r.raft.config_index();
+            let mut done = Vec::new();
+            let mut pending = Vec::new();
+            for &(n, since) in &r.removing {
+                let acked = r.progress.get(&n).is_some_and(|p| p.matched >= config_index);
+                if acked || now.saturating_sub(since) > 10_000_000 {
+                    done.push(n);
+                } else {
+                    pending.push(n);
+                }
+            }
+            r.removing.retain(|(n, _)| !done.contains(n));
+            for n in &done {
+                r.progress.remove(n);
+            }
+            for n in pending {
+                self.replicate(range, n);
+            }
+        }
+        // Replicas whose committed configuration no longer includes this node go away.
+        let gone: Vec<RangeId> = self
+            .replicas
+            .iter()
+            .filter(|(_, r)| {
+                let (m, committed) = r.raft.membership_state();
+                committed && !m.is_empty() && !m.contains(self.id)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for range in gone {
+            self.destroy_replica(range)?;
         }
         for ev in splits {
             if self.replicas.contains_key(&ev.right) {

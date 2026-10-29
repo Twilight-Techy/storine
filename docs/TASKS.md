@@ -1007,7 +1007,13 @@ This document defines the strict chronological execution order for building the 
     - **3 nodes**: 300 seeds with splits during writes, crashes with power cuts and partitions, checked for per-range election safety, log matching, leader completeness, state-machine safety, convergence and linearizability across splits.
     - **3 regions**: 300 more seeds on 5 nodes with region latencies and outages.
     - **Totals**: 1,127 splits, 1,143 crashes and about 26,700 acknowledged writes; all pass.
-- [ ] **TASK-138: Meta Range, Routing & Rebalancing (`F-GEO-02`)** — replicated range descriptors; leaseholder routing in servers and SDKs; splits, merges and replica moves balanced by count, disk and load.
+- [~] **TASK-138: Meta Range, Routing & Rebalancing (`F-GEO-02`)** — replicated range descriptors; leaseholder routing in servers and SDKs; splits, merges and replica moves balanced by count, disk and load.
+  - **Done (replica moves and lease transfers)**: `NodeDriver::add_learner` / `promote` / `remove_member` / `transfer_lease` (`TimeoutNow`), simulated with 5 nodes, replication 3 and faults (`replicas_move_and_leases_transfer_safely`). Bugs found and fixed:
+    - a learner created after a split replayed it against the narrower current span: snapshots (format 3) now carry the span in force at their index, and installing one adopts it;
+    - destroying a replica deleted keys of an overlapping local replica (`destroy_keeping`);
+    - lost `Init` messages and orphan learners (`Init` resent with each forced snapshot; orphans collected after 10 s);
+    - removed replicas that never learned of their removal (`Gone`, sent by any replica whose committed configuration excludes the sender).
+  - The simulator's leader-completeness check now only demands entries committed in earlier terms (a legitimately elected lower-term leader may lack a later-term commit).
 - [x] **TASK-139: Hybrid Logical Clocks & Uncertainty (`F-GEO-03`)** — HLC timestamps, maximum-offset enforcement with self-fencing, uncertainty-interval reads, optional commit-wait.
   - `dist/hlc.rs`:
     - `Timestamp (wall ns, logical)`, which sorts as 12 big-endian bytes;
