@@ -15,4 +15,4 @@ pub mod int;
 pub mod segment;
 
 pub use column::{flatten, flatten_owned, Body, Chunk, ChunkMeta, Kind, Val, Zone};
-pub use segment::{Segment, SegmentRow, SegmentSummary, SegmentWriter, ROW_GROUP_ROWS};
+pub use segment::{DecodedRow, Segment, SegmentRow, SegmentSummary, SegmentWriter, ROW_GROUP_ROWS};

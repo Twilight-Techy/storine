@@ -142,8 +142,9 @@ impl Val {
     }
 }
 
-/// Flattens a document into `(path, value)` cells: nested maps become dotted paths, lists are
-/// stored whole (SVE-encoded).
+/// Flattens a document into `(path, value)` cells: nested maps become dotted paths; lists,
+/// explicit nulls and empty maps are stored whole (SVE-encoded `Nested`), so the document can be
+/// rebuilt exactly.
 pub fn flatten(fields: MapRef<'_>, out: &mut Vec<(String, Val)>) {
     flatten_into(fields, &mut String::new(), out, 0);
 }
@@ -156,7 +157,7 @@ fn flatten_into(map: MapRef<'_>, prefix: &mut String, out: &mut Vec<(String, Val
         }
         prefix.push_str(name);
         match v {
-            PropertyValueRef::Map(m) if depth < 32 => flatten_into(m, prefix, out, depth + 1),
+            PropertyValueRef::Map(m) if depth < 32 && !m.is_empty() => flatten_into(m, prefix, out, depth + 1),
             other => {
                 if let Some(val) = val_of_ref(other) {
                     out.push((prefix.clone(), val));
@@ -177,9 +178,8 @@ pub fn flatten_owned(fields: &BTreeMap<String, PropertyValue>, out: &mut Vec<(St
             }
             prefix.push_str(name);
             match v {
-                PropertyValue::Map(m) => go(m, prefix, out),
-                PropertyValue::Null => {}
-                PropertyValue::List(_) => {
+                PropertyValue::Map(m) if !m.is_empty() => go(m, prefix, out),
+                PropertyValue::Null | PropertyValue::Map(_) | PropertyValue::List(_) => {
                     let mut sve = Vec::new();
                     storage_codec::value_wire::encode_value(v, &mut sve);
                     out.push((prefix.clone(), Val::Nested(sve)));
@@ -215,7 +215,11 @@ fn val_of_owned(v: &PropertyValue) -> Option<Val> {
 
 fn val_of_ref(v: PropertyValueRef<'_>) -> Option<Val> {
     Some(match v {
-        PropertyValueRef::Null => return None,
+        PropertyValueRef::Null => {
+            let mut sve = Vec::with_capacity(1);
+            storage_codec::value_wire::encode_value(&PropertyValue::Null, &mut sve);
+            Val::Nested(sve)
+        }
         PropertyValueRef::Bool(b) => Val::Bool(b),
         PropertyValueRef::Int64(x) => Val::Int(x),
         PropertyValueRef::UInt64(x) => Val::UInt(x),

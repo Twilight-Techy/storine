@@ -5,7 +5,8 @@
 //!                | u64 footer offset | u32 footer len | u32 row-group rows | u64 footer checksum
 //!                | u64 stamp | u64 header checksum (of bytes 0..56)
 //! chunks:        each starting on a 64-byte boundary
-//! id index:      n x u64 id hash (ascending) | n x u32 row      (rows of an id, for deletes)
+//! id index:      n x u64 id hash (ascending) | n x u32 check hash | n x u32 row
+//!                (rows of an id, for deletes: the two hashes make a 96-bit fingerprint)
 //! footer:        u32 columns | columns x (u32 len, name, u8 flags (1 = hidden))
 //!                | u32 groups | groups x (u32 rows | columns x
 //!                    (u64 offset | u32 len | u64 checksum | u32 nulls | zone))
@@ -51,13 +52,18 @@ pub const VERSION_NAME: &str = "$version";
 const MAX_ROW_GROUP_ROWS: usize = 1 << 20;
 const MAX_COLUMNS: usize = 1 << 16;
 
+/// A row rebuilt from a segment: key, version and its cells (column name, value).
+pub type DecodedRow = (String, u64, Vec<(String, Val)>);
+
 /// A buffered row: key, version and its cells by column index.
 type PendingRow = (String, u64, Vec<(usize, Val)>);
 
-/// One document to write: its id hash (for delete lookups), key, version and flattened cells.
+/// One document to write: its id fingerprint (two independent hashes, for delete lookups),
+/// key, version and flattened cells.
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentRow<'a> {
     pub id_hash: u64,
+    pub id_check: u32,
     pub key: &'a str,
     pub version: u64,
     pub cells: &'a [(String, Val)],
@@ -78,7 +84,7 @@ pub struct SegmentWriter<'s> {
     /// Buffered rows of the current row group: `(key, version, cells by column)`.
     pending: Vec<PendingRow>,
     groups: Vec<(u32, Vec<ChunkLoc>)>,
-    ids: Vec<(u64, u32)>,
+    ids: Vec<(u64, u32, u32)>,
     rows: u64,
     stamp: u64,
 }
@@ -163,7 +169,7 @@ impl<'s> SegmentWriter<'s> {
             let c = self.column(name);
             cells.push((c, v.clone()));
         }
-        self.ids.push((row.id_hash, self.rows as u32));
+        self.ids.push((row.id_hash, row.id_check, self.rows as u32));
         self.pending.push((row.key.to_owned(), row.version, cells));
         self.rows += 1;
         if self.pending.len() >= self.rg_rows {
@@ -243,11 +249,14 @@ impl<'s> SegmentWriter<'s> {
         let ncols = self.columns.len();
         let mut ids = core::mem::take(&mut self.ids);
         ids.sort_unstable();
-        let mut index = Vec::with_capacity(ids.len() * 12);
-        for (h, _) in &ids {
+        let mut index = Vec::with_capacity(ids.len() * 16);
+        for (h, _, _) in &ids {
             put_u64(&mut index, *h);
         }
-        for (_, r) in &ids {
+        for (_, c, _) in &ids {
+            put_u32(&mut index, *c);
+        }
+        for (_, _, r) in &ids {
             put_u32(&mut index, *r);
         }
         let index_loc = self.write_unit(index)?;
@@ -555,8 +564,40 @@ impl Segment {
         }
     }
 
-    /// Rows (segment-wide numbers) whose id hash is `hash`.
-    pub fn rows_with_hash(&self, hash: u64, seal: &FileSeal<'_>) -> Result<Vec<u64>> {
+    /// The rows of row group `group` rebuilt as `(key, version, cells)`, in row order (cells in
+    /// column order). Used to rewrite live rows when segments are compacted.
+    pub fn decode_rows(&self, group: usize, seal: &FileSeal<'_>) -> Result<Vec<DecodedRow>> {
+        let rows = self.groups.get(group).map_or(0, |g| g.rows as usize);
+        let mut out: Vec<DecodedRow> = (0..rows).map(|_| (String::new(), 0, Vec::new())).collect();
+        for (c, meta) in self.columns.iter().enumerate() {
+            let vals = self.decode_column(group, c, seal)?;
+            for (r, v) in vals.into_iter().enumerate() {
+                let Some(v) = v else { continue };
+                let row = out.get_mut(r).ok_or_else(|| corrupt("row count"))?;
+                match (c, v) {
+                    (KEY_COLUMN, Val::Text(k)) => row.0 = k,
+                    (VERSION_COLUMN, Val::UInt(ver)) => row.1 = ver,
+                    (KEY_COLUMN | VERSION_COLUMN, _) => return Err(corrupt("hidden column kind")),
+                    (_, v) => row.2.push((meta.name.clone(), v)),
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Versions of every row of row group `group`.
+    pub fn versions(&self, group: usize, seal: &FileSeal<'_>) -> Result<Vec<u64>> {
+        self.decode_column(group, VERSION_COLUMN, seal)?
+            .into_iter()
+            .map(|v| match v {
+                Some(Val::UInt(x)) => Ok(x),
+                _ => Err(corrupt("version column")),
+            })
+            .collect()
+    }
+
+    /// Rows (segment-wide numbers) of the id whose fingerprint is `(hash, check)`.
+    pub fn rows_with_hash(&self, hash: u64, check: u32, seal: &FileSeal<'_>) -> Result<Vec<u64>> {
         let n = usize::try_from(self.rows).map_err(|_| corrupt("row count"))?;
         let index: &[u8] = if self.sealed {
             match self.sealed_index.get() {
@@ -573,7 +614,7 @@ impl Segment {
                 Cow::Owned(_) => return Err(corrupt("id index")),
             }
         };
-        if index.len() != n * 12 {
+        if index.len() != n * 16 {
             return Err(corrupt("id index length"));
         }
         let hash_at = |i: usize| {
@@ -581,10 +622,9 @@ impl Segment {
             a.copy_from_slice(&index[i * 8..i * 8 + 8]);
             u64::from_le_bytes(a)
         };
-        let row_at = |i: usize| {
-            let o = n * 8 + i * 4;
-            u64::from(u32::from_le_bytes([index[o], index[o + 1], index[o + 2], index[o + 3]]))
-        };
+        let u32_at = |o: usize| u32::from_le_bytes([index[o], index[o + 1], index[o + 2], index[o + 3]]);
+        let check_at = |i: usize| u32_at(n * 8 + i * 4);
+        let row_at = |i: usize| u64::from(u32_at(n * 12 + i * 4));
         let (mut lo, mut hi) = (0usize, n);
         while lo < hi {
             let mid = (lo + hi) / 2;
@@ -596,7 +636,9 @@ impl Segment {
         }
         let mut out = Vec::new();
         while lo < n && hash_at(lo) == hash {
-            out.push(row_at(lo));
+            if check_at(lo) == check {
+                out.push(row_at(lo));
+            }
             lo += 1;
         }
         Ok(out)
@@ -651,7 +693,7 @@ mod tests {
             let mut cells = Vec::new();
             flatten_owned(&doc(i), &mut cells);
             let key = format!("k{i:06}");
-            w.push(SegmentRow { id_hash: (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15), key: &key, version: i as u64 + 1, cells: &cells })
+            w.push(SegmentRow { id_hash: (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15), id_check: i as u32, key: &key, version: i as u64 + 1, cells: &cells })
                 .unwrap();
         }
         w.finish().unwrap()
@@ -687,9 +729,10 @@ mod tests {
         assert_eq!(row, n);
         for i in [0i64, 1, n / 2, n - 1] {
             let h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            assert_eq!(seg.rows_with_hash(h, seal).unwrap(), vec![i as u64]);
+            assert_eq!(seg.rows_with_hash(h, i as u32, seal).unwrap(), vec![i as u64]);
+            assert!(seg.rows_with_hash(h, i as u32 ^ 1, seal).unwrap().is_empty());
         }
-        assert!(seg.rows_with_hash(12345, seal).unwrap().is_empty());
+        assert!(seg.rows_with_hash(12345, 0, seal).unwrap().is_empty());
     }
 
     #[test]
@@ -752,7 +795,7 @@ mod tests {
                         failed |= seg.decode_column(g, c, &FileSeal::PLAIN).is_err();
                     }
                 }
-                failed |= seg.rows_with_hash(0, &FileSeal::PLAIN).is_err();
+                failed |= seg.rows_with_hash(0, 0, &FileSeal::PLAIN).is_err();
                 let covered = ranges.iter().any(|&(a, b)| (a..b).contains(&(pos as u64)));
                 assert!(failed || !covered, "flip at {pos} inside a checksummed unit went unnoticed");
             }
@@ -794,7 +837,7 @@ mod golden {
             let mut cells = Vec::new();
             flatten_owned(&m, &mut cells);
             let key = format!("{i}");
-            w.push(SegmentRow { id_hash: i as u64 * 31, key: &key, version: 1, cells: &cells }).unwrap();
+            w.push(SegmentRow { id_hash: i as u64 * 31, id_check: i as u32, key: &key, version: 1, cells: &cells }).unwrap();
         }
         w.finish().unwrap();
         let bytes = fs::read(&path).unwrap();
@@ -802,6 +845,6 @@ mod golden {
         assert_eq!((bytes.len(), checksum_payload(&bytes)), (GOLDEN_LEN, GOLDEN_SUM), "segment format changed");
     }
 
-    const GOLDEN_LEN: usize = 6654;
-    const GOLDEN_SUM: u64 = 14_933_485_550_944_926_364;
+    const GOLDEN_LEN: usize = 7678;
+    const GOLDEN_SUM: u64 = 5_671_029_601_970_640_754;
 }

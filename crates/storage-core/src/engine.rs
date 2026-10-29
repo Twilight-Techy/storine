@@ -109,7 +109,7 @@ pub struct EncryptionConfig {
 /// Index-file protection derived from the encryption settings (`TASK-088`): index files are
 /// sealed with the active key and, like record frames, plaintext ones are rejected unless
 /// `accept_unencrypted` (no downgrade).
-fn file_seal(enc: Option<&EncryptionConfig>) -> FileSeal<'_> {
+pub(crate) fn file_seal(enc: Option<&EncryptionConfig>) -> FileSeal<'_> {
     enc.map_or(FileSeal::PLAIN, |e| FileSeal {
         keys: Some(&e.keys),
         active_key: e.active_key,
@@ -389,6 +389,9 @@ struct SharedEngineInner<T: ZeroCopyRecord + Indexable> {
     /// One HNSW graph per named embedding (`Indexable::NAMED_EMBEDDINGS`, `TASK-122`), rebuilt
     /// from the records at open and maintained wherever `vector_index` is.
     named_vectors: RwLock<FastHashMap<u16, Arc<HnswVectorIndex>>>,
+    /// Active tag watches (`TASK-126`) and a fast-path flag for "any".
+    tag_watches: RwLock<Vec<Arc<TagWatch>>>,
+    watching: AtomicBool,
     mvcc: MvccManager,
     migrations: RwLock<SchemaRegistry<T>>,
     flush_queue: Mutex<CoalescingQueue>,
@@ -516,6 +519,37 @@ enum FastRead {
 }
 
 /// High-Performance Zero-Copy Memory-Mapped Object Storage Engine.
+/// Collects the ids of records that carry a given secondary-index tag before or after a write
+/// (`TASK-126`): a columnar collection watches its collection-membership tag to learn which
+/// documents changed since its column segments were built.
+///
+/// Ids are recorded under the MVCC writer guard, so every write visible to a snapshot has been
+/// recorded before that snapshot was registered. Recording costs one relaxed atomic load when
+/// nothing is watched.
+#[derive(Debug)]
+pub struct TagWatch {
+    pub field: u16,
+    pub tag: InlineId,
+    ids: Mutex<storage_types::FastHashSet<InlineId>>,
+}
+
+impl TagWatch {
+    /// Takes every id recorded so far.
+    pub fn drain(&self) -> Vec<InlineId> {
+        let mut ids = self.ids.lock().unwrap_or_else(|p| p.into_inner());
+        ids.drain().collect()
+    }
+
+    /// Ids recorded and not yet drained.
+    pub fn pending(&self) -> usize {
+        self.ids.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
+    fn record(&self, id: InlineId) {
+        self.ids.lock().unwrap_or_else(|p| p.into_inner()).insert(id);
+    }
+}
+
 pub struct StorageEngine<T: ZeroCopyRecord + Indexable> {
     inner: Arc<SharedEngineInner<T>>,
     flusher_handle: Mutex<Option<JoinHandle<()>>>,
@@ -661,6 +695,8 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             crypto_on: AtomicBool::new(config.encryption.is_some()),
             vector_index,
             named_vectors: RwLock::new(FastHashMap::default()),
+            tag_watches: RwLock::new(Vec::new()),
+            watching: AtomicBool::new(false),
             mvcc: MvccManager::new(),
             migrations: RwLock::new(SchemaRegistry::new()),
             flush_queue: Mutex::new(CoalescingQueue::default()),
@@ -943,6 +979,28 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
     #[inline]
     pub fn mvcc(&self) -> &MvccManager {
         &self.inner.mvcc
+    }
+
+    /// The installed encryption configuration (column segments are sealed with it).
+    pub(crate) fn encryption_config(&self) -> Option<Arc<EncryptionConfig>> {
+        self.inner.crypto()
+    }
+
+    /// Starts recording the ids of records that carry `(field, tag)` before or after any write
+    /// from now on (`TASK-126`).
+    pub fn watch_tag(&self, field: u16, tag: InlineId) -> Arc<TagWatch> {
+        let w = Arc::new(TagWatch { field, tag, ids: Mutex::new(Default::default()) });
+        let mut all = self.inner.tag_watches.write().unwrap_or_else(|p| p.into_inner());
+        all.push(Arc::clone(&w));
+        self.inner.watching.store(true, Ordering::Release);
+        w
+    }
+
+    /// Stops a watch started by [`Self::watch_tag`].
+    pub fn unwatch_tag(&self, watch: &Arc<TagWatch>) {
+        let mut all = self.inner.tag_watches.write().unwrap_or_else(|p| p.into_inner());
+        all.retain(|w| !Arc::ptr_eq(w, watch));
+        self.inner.watching.store(!all.is_empty(), Ordering::Release);
     }
 
     /// Opens a point-in-time Snapshot Isolation read guard (`TASK-039`, `F-CONC-08`).
@@ -2362,6 +2420,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                             .extract_snapshot_from_frame(aligned.as_slice(), false)
                             .unwrap_or_default();
                         self.apply_index_snapshot_diff(ord, &old_snap, &new_snap);
+                        self.notify_watches(entry.record_id, &old_snap, &new_snap);
                         if T::NAMED_EMBEDDINGS {
                             let named = self
                                 .decode_or_migrate_frame(aligned.as_slice())
@@ -2776,6 +2835,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         // Differential secondary index update without any global IndexSnapshot map (`TASK-016`, `F-INDX-05`, `RULE-MEM-02`)
         let new_snap = record.extract_index_snapshot();
         self.apply_index_snapshot_diff(ordinal, &old_snap, &new_snap);
+        self.notify_watches(id, &old_snap, &new_snap);
         if T::NAMED_EMBEDDINGS {
             self.sync_named_vectors(ordinal, record.named_embeddings());
         }
@@ -2988,12 +3048,27 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         }
     }
 
+    /// Records `id` in every watch whose tag the record carries before or after the write.
+    #[inline]
+    fn notify_watches(&self, id: InlineId, old: &IndexSnapshot, new: &IndexSnapshot) {
+        if !self.watching.load(Ordering::Relaxed) {
+            return;
+        }
+        for w in self.tag_watches.read().unwrap_or_else(|p| p.into_inner()).iter() {
+            let carries = |s: &IndexSnapshot| s.tags().any(|(f, t)| f == w.field && t == w.tag);
+            if carries(old) || carries(new) {
+                w.record(id);
+            }
+        }
+    }
+
     #[inline]
     fn remove_from_secondary_indexes(&self, removed: &PrimaryEntry) {
         if T::NAMED_EMBEDDINGS {
             self.remove_named_vectors(removed.ordinal);
         }
         if let Some(snap) = self.extract_snapshot_for_entry(removed) {
+            self.notify_watches(removed.id, &snap, &IndexSnapshot::new());
             for (field_id, val) in snap.numerics() {
                 self.range_index.remove(field_id, val, removed.ordinal);
             }

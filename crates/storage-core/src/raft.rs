@@ -254,7 +254,9 @@ pub fn encode_raft_ops<T: ZeroCopyRecord>(ops: &[WriteOp<T>], now_ns: u64) -> Re
 pub fn decode_raft_ops<T: ZeroCopyRecord>(bytes: &[u8]) -> Result<(u64, Vec<WriteOp<T>>)> {
     let mut r = storage_codec::value_wire::SveReader::new(bytes);
     let now_ns = r.u64()?;
-    let n = r.count(49)?;
+    // Smallest operation: id 24 | precondition 1 | version 8 | kind 1 | ttl 8 | len 4 (a
+    // delete or check has an empty payload).
+    let n = r.count(46)?;
     let mut ops = Vec::with_capacity(n);
     for _ in 0..n {
         let id = InlineId::from_raw_bytes(read_array_24(r.take(24)?, 0))?;
@@ -2350,6 +2352,29 @@ mod tests {
     use super::*;
     use crate::engine::EngineConfig;
     use crate::model::AgentObjectRecord;
+
+    #[test]
+    fn test_raft_ops_roundtrip_including_payload_free_operations() {
+        // Deletes and checks carry no payload (46 bytes each): batches of only those must
+        // decode (a document delete is a delete plus a check on `$meta`).
+        let id = |i: u32| InlineId::new(&format!("k{i}")).unwrap();
+        let ops: Vec<WriteOp<AgentObjectRecord>> = vec![
+            WriteOp { id: id(1), kind: WriteKind::Delete, precondition: Precondition::Exists },
+            WriteOp { id: id(2), kind: WriteKind::Check, precondition: Precondition::Version(Version(9)) },
+        ];
+        for n in 1..=ops.len() {
+            let bytes = encode_raft_ops(&ops[..n], 77).unwrap();
+            assert_eq!(bytes.as_slice().len(), 12 + 46 * n);
+            let (now, back) = decode_raft_ops::<AgentObjectRecord>(bytes.as_slice()).unwrap();
+            assert_eq!(now, 77);
+            assert_eq!(back.len(), n);
+            assert!(matches!(back[0].kind, WriteKind::Delete));
+            // Every truncation is refused.
+            for cut in 0..bytes.as_slice().len() {
+                assert!(decode_raft_ops::<AgentObjectRecord>(&bytes.as_slice()[..cut]).is_err());
+            }
+        }
+    }
 
     #[test]
     fn test_install_snapshot_catches_up_a_follower_behind_the_compacted_log() {

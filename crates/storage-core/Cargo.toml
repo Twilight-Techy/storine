@@ -13,6 +13,7 @@ storage-codec = { path = "../storage-codec" }
 storage-mmap = { path = "../storage-mmap" }
 storage-wal = { path = "../storage-wal" }
 storage-index = { path = "../storage-index" }
+storage-columnar = { path = "../storage-columnar" }
 storage-graph = { path = "../storage-graph" }
 
 [lints]

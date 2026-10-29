@@ -50,7 +50,7 @@ const EXACT_VECTOR_SCAN: usize = 2048;
 /// Pseudo-field carrying the similarity of each nearest-neighbour result.
 pub const SCORE_FIELD: &str = "$score";
 /// Index field id reserved for the collection-membership tag.
-const COLLECTION_FIELD_ID: u16 = u16::MAX;
+pub(crate) const COLLECTION_FIELD_ID: u16 = u16::MAX;
 /// Reserved collection holding collection metadata (index declarations, SQL schemas).
 pub const META_COLLECTION: &str = "$meta";
 
@@ -235,7 +235,7 @@ pub fn index_field_id(collection: &str, field: &str) -> u16 {
 }
 
 /// Collection-membership tag.
-fn collection_tag(collection: &str) -> InlineId {
+pub(crate) fn collection_tag(collection: &str) -> InlineId {
     hashed_tag(collection.as_bytes())
 }
 
@@ -797,6 +797,8 @@ pub struct CollectionInfo {
     pub extra: BTreeMap<String, PropertyValue>,
     /// Vector indexes (`TASK-122`).
     pub vectors: Vec<VectorIndexInfo>,
+    /// Kept as column segments for analytics too (`TASK-126`).
+    pub columnar: bool,
 }
 
 /// A vector index on a top-level field holding a list of `dims` numbers.
@@ -826,6 +828,8 @@ pub struct DocumentStore {
     /// Collection metadata cache, validated on every use against the version of the `$meta`
     /// document (so changes applied by replication or another node are always seen).
     meta: RwLock<FastHashMap<String, (Option<Version>, CollectionInfo)>>,
+    /// Columnar projections and their background merger (`TASK-126`).
+    columnar: Arc<crate::columnar::ColumnarRegistry>,
 }
 
 impl core::fmt::Debug for DocumentStore {
@@ -858,8 +862,10 @@ impl DocumentStore {
             engine,
             sink: RwLock::new(sink),
             meta: RwLock::new(FastHashMap::default()),
+            columnar: Arc::new(crate::columnar::ColumnarRegistry::default()),
         };
         store.reload_metadata()?;
+        store.sync_columnar()?;
         Ok(store)
     }
 
@@ -1393,6 +1399,9 @@ impl DocumentStore {
             PropertyValue::List(info.building.iter().map(|s| PropertyValue::Text(s.clone())).collect()),
         );
         fields.insert("extra".to_owned(), PropertyValue::Map(info.extra.clone()));
+        if info.columnar {
+            fields.insert("columnar".to_owned(), PropertyValue::Bool(true));
+        }
         if !info.vectors.is_empty() {
             fields.insert(
                 "vectors".to_owned(),
@@ -1695,7 +1704,75 @@ impl DocumentStore {
             true,
         )?;
         self.meta.write().unwrap_or_else(|p| p.into_inner()).remove(collection);
+        self.columnar.remove(collection);
         Ok(n)
+    }
+
+    // ── Columnar analytics (`TASK-126`) ──
+
+    /// Also keeps `collection` as column segments for analytic queries. Existing documents are
+    /// converted in the background; queries are exact from the first moment (documents not yet
+    /// in segments are read from the row store).
+    pub fn create_columnar(&self, collection: &str) -> Result<()> {
+        validate_collection_name(collection, false)?;
+        let mut info = self.collection_info(collection);
+        if !info.columnar {
+            info.name = collection.to_owned();
+            info.columnar = true;
+            self.save_info(&info)?;
+        }
+        self.columnar.ensure(&self.engine, collection)?;
+        Ok(())
+    }
+
+    /// Stops keeping `collection` as column segments and deletes them.
+    pub fn drop_columnar(&self, collection: &str) -> Result<()> {
+        let mut info = self.collection_info(collection);
+        if info.columnar {
+            info.name = collection.to_owned();
+            info.columnar = false;
+            self.save_info(&info)?;
+        }
+        self.columnar.remove(collection);
+        Ok(())
+    }
+
+    /// The columnar projection of `collection` (`None` if it is not columnar). Projections
+    /// declared by another node (through replication) are opened on first use.
+    pub fn columnar(&self, collection: &str) -> Result<Option<Arc<crate::columnar::ColumnarCollection>>> {
+        if let Some(c) = self.columnar.get(collection) {
+            if self.collection_info(collection).columnar {
+                return Ok(Some(c));
+            }
+            self.columnar.remove(collection);
+            return Ok(None);
+        }
+        if !self.collection_info(collection).columnar {
+            return Ok(None);
+        }
+        self.columnar.ensure(&self.engine, collection).map(Some)
+    }
+
+    /// Opens a projection for every collection declared columnar.
+    fn sync_columnar(&self) -> Result<()> {
+        let names: Vec<String> = self
+            .meta
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .filter(|(_, i)| i.columnar)
+            .map(|(_, i)| i.name.clone())
+            .collect();
+        for name in names {
+            self.columnar.ensure(&self.engine, &name)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DocumentStore {
+    fn drop(&mut self) {
+        self.columnar.shutdown();
     }
 }
 
@@ -1777,7 +1854,8 @@ fn info_from_fields(name: &str, fields: &BTreeMap<String, PropertyValue>) -> Col
             .collect(),
         _ => Vec::new(),
     };
-    CollectionInfo { name: name.to_owned(), indexes, building, extra, vectors }
+    let columnar = matches!(fields.get("columnar"), Some(PropertyValue::Bool(true)));
+    CollectionInfo { name: name.to_owned(), indexes, building, extra, vectors, columnar }
 }
 
 fn document_from_view(view: &RecordView<'_, DocumentRecord>, collection: &str, key: &str) -> Result<Option<Document>> {

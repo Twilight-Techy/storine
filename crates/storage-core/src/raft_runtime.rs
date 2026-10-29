@@ -1268,4 +1268,62 @@ mod tests {
             assert_eq!(c.engines[i].named_vector_count(crate::document::vector_field_id("v", "emb")), 50);
         }
     }
+
+    #[test]
+    fn test_columnar_views_follow_replicated_writes_on_every_replica() {
+        let c = Cluster::new("columnar", 3);
+        let l = c.leader(Duration::from_secs(5));
+        let stores: Vec<DocumentStore> = (0..3)
+            .map(|i| {
+                let st = DocumentStore::from_engine(Arc::clone(&c.engines[i])).unwrap();
+                st.set_commit_sink(Arc::clone(&c.runtimes[i]) as Arc<dyn crate::document::CommitSink>);
+                st
+            })
+            .collect();
+        let doc = |i: i64, rev: i64| {
+            let mut f = BTreeMap::new();
+            f.insert("n".to_string(), PropertyValue::Int64(i));
+            f.insert("rev".to_string(), PropertyValue::Int64(rev));
+            f.insert("city".to_string(), PropertyValue::Text(["a", "b", "c"][i as usize % 3].into()));
+            f
+        };
+        stores[l].create_columnar("t").unwrap();
+        for i in 0..300 {
+            stores[l].put("t", &format!("k{i:03}"), doc(i, 0)).unwrap();
+        }
+        c.wait_converged(&[0, 1, 2]);
+        // Followers open the projection from the replicated metadata and build it.
+        for st in &stores {
+            st.columnar("t").unwrap().expect("columnar on every replica").merge().unwrap();
+        }
+        // Later writes reach followers only through Raft apply.
+        for i in (0..300).step_by(3) {
+            stores[l].put("t", &format!("k{i:03}"), doc(i, 1)).unwrap();
+        }
+        for i in (1..300).step_by(5) {
+            stores[l].delete("t", &format!("k{i:03}")).unwrap();
+        }
+        c.wait_converged(&[0, 1, 2]);
+        let expected = stores[l].scan_collection("t").unwrap();
+        for (i, st) in stores.iter().enumerate() {
+            let col = st.columnar("t").unwrap().unwrap();
+            let view = col.snapshot().unwrap().documents().unwrap();
+            assert_eq!(view, st.scan_collection("t").unwrap(), "replica {i}: view vs its row store");
+            assert_eq!(view, expected, "replica {i}: view vs the leader");
+            col.merge().unwrap();
+            assert_eq!(col.snapshot().unwrap().documents().unwrap(), expected, "replica {i} after merge");
+        }
+    }
+
+    #[test]
+    fn test_replicated_document_deletes() {
+        let c = Cluster::new("docdel", 3);
+        let l = c.leader(Duration::from_secs(5));
+        let st = DocumentStore::from_engine(Arc::clone(&c.engines[l])).unwrap();
+        st.set_commit_sink(Arc::clone(&c.runtimes[l]) as Arc<dyn crate::document::CommitSink>);
+        let mut f = BTreeMap::new();
+        f.insert("n".to_string(), PropertyValue::Int64(1));
+        st.put("t", "a", f).unwrap();
+        st.delete("t", "a").unwrap();
+    }
 }

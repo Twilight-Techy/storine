@@ -14,6 +14,7 @@
 
 pub mod backup;
 pub mod catalog;
+pub mod columnar;
 mod decrypt_cache;
 pub mod document;
 pub mod document_wire;

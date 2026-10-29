@@ -61,7 +61,7 @@ fn lineitem_footprint_and_decode_speed() {
         let mut cells = Vec::new();
         flatten_owned(&doc, &mut cells);
         let key = format!("{:010}", i);
-        w.push(SegmentRow { id_hash: i.wrapping_mul(0x9E37_79B9_7F4A_7C15), key: &key, version: 1, cells: &cells }).unwrap();
+        w.push(SegmentRow { id_hash: i.wrapping_mul(0x9E37_79B9_7F4A_7C15), id_check: i as u32, key: &key, version: 1, cells: &cells }).unwrap();
     }
     let s = w.finish().unwrap();
     let build = t.elapsed();
