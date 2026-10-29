@@ -489,6 +489,75 @@ module Storine
       end
     end
 
+    # ── analytics ──
+
+    # Also keeps the collection as column segments for #aggregate / #scan_columns (built in the
+    # background; results are exact either way).
+    def enable_columnar
+      admin_body(Wire.encode_columnar(name, true))
+      nil
+    end
+
+    # Deletes the column segments (analytics then read the row store).
+    def disable_columnar
+      admin_body(Wire.encode_columnar(name, false))
+      nil
+    end
+
+    # Filters, groups and aggregates on the server, exactly and as of one snapshot; returns an
+    # AggregateResult (Enumerable over row Hashes).
+    #
+    # `aggregates` maps output names to Storine.count, count(x), sum(x), avg(x), min(x), max(x),
+    # count_distinct(x) or approx_count_distinct(x), where x is a field path or an expression
+    # (`Storine.field("price") * "qty"`). `group_by:` takes field paths and Storine.bucket(field,
+    # width, offset); `order_by:` names output columns ("-revenue" descending). Each row Hash has
+    # the group-key columns (named by their path) first, then the aggregates. Budgets are bytes
+    # (0 = server default).
+    def aggregate(aggregates, where = nil, group_by: nil, order_by: nil, limit: nil, memory_budget: 0, spill_budget: 0)
+      q = Wire.build_aggregate(aggregates, group_by, order_by)
+      unless limit.nil? || (limit.is_a?(Integer) && limit.positive?)
+        raise InvalidError, "limit must be a positive Integer (or nil for every group)"
+      end
+
+      body = Wire.encode_aggregate(name, Wire.where_to_filter(where), q.group_by, q.aggregates, q.order, limit || 0,
+                                   memory_budget, spill_budget)
+      status, _v, rbody = client.request(Wire::OP_DOC_AGGREGATE, body, idempotent: true)
+      client.raise_for(status, rbody) unless status == Wire::ST_OK
+      Wire.aggregate_result(q.columns, rbody)
+    end
+
+    # Yields `key, { field => value }` for every matching document in key order, reading only
+    # `fields` (dotted paths; a missing field reads as nil), `page_size:` rows per request.
+    # Returns an Enumerator of [key, values] pairs without a block.
+    def scan_columns(fields, where = nil, page_size: 1000)
+      return enum_for(:scan_columns, fields, where, page_size: page_size) unless block_given?
+      unless fields.is_a?(Array) && fields.length <= Wire::MAX_ANALYTIC_ITEMS
+        raise InvalidError, "fields is an Array of at most #{Wire::MAX_ANALYTIC_ITEMS} field paths"
+      end
+      unless page_size.is_a?(Integer) && page_size.between?(1, Wire::MAX_SCAN_PAGE)
+        raise InvalidError, "page_size must be between 1 and #{Wire::MAX_SCAN_PAGE}"
+      end
+
+      fields = fields.map(&:to_s)
+      filter = Wire.where_to_filter(where)
+      after = nil
+      loop do
+        body = Wire.encode_scan(name, filter, fields, after, page_size)
+        status, _v, rbody = client.request(Wire::OP_DOC_SCAN_COLUMNS, body, idempotent: true)
+        client.raise_for(status, rbody) unless status == Wire::ST_OK
+        _total, nxt, nf, rows = Wire.decode_scan_page(rbody)
+        if !rows.empty? && nf != fields.length
+          raise InvalidError, "the server returned #{nf} fields, expected #{fields.length}"
+        end
+
+        rows.each { |key, values| yield key, fields.zip(values).to_h }
+        break if nxt.nil?
+
+        after = nxt
+      end
+      nil
+    end
+
     # Indexes a top-level field (at most 16 per collection); existing documents included.
     def create_index(field) = admin(Wire::OP_DOC_ADMIN, "\x01", field)
     def drop_index(field) = admin(Wire::OP_DOC_ADMIN, "\x02", field)
@@ -508,6 +577,12 @@ module Storine
       client.raise_for(status, rbody) unless status == Wire::ST_OK
       total, nxt, docs = Wire.decode_page(rbody)
       [total, nxt, docs.map { |k, v, f| Document.new(k, v, f) }]
+    end
+
+    def admin_body(body)
+      status, version, rbody = client.request(Wire::OP_DOC_ADMIN, body, idempotent: true)
+      client.raise_for(status, rbody) unless status == Wire::ST_OK
+      [version, rbody]
     end
 
     def admin(op, code, field = nil, tail = "")

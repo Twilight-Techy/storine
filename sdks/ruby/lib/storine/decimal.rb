@@ -61,10 +61,13 @@ module Storine
       [mantissa, digits.length - exponent]
     end
 
-    def +(other) = combine(other) { |a, b| a + b }
-    def -(other) = combine(other) { |a, b| a - b }
+    # A Storine::Expr on the right builds an analytics expression (`Storine::Decimal("2.5") + field`).
+    def +(other) = other.is_a?(Expr) ? Storine.lit(self) + other : combine(other) { |a, b| a + b }
+    def -(other) = other.is_a?(Expr) ? Storine.lit(self) - other : combine(other) { |a, b| a - b }
 
     def *(other)
+      return Storine.lit(self) * other if other.is_a?(Expr)
+
       o = Decimal.from(other)
       Decimal.new(mantissa * o.mantissa, scale + o.scale)
     end

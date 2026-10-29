@@ -201,6 +201,89 @@ class SingleNodeTest < Minitest::Test
     assert_raises(Storine::InvalidError) { s.put("bad", { "a.b" => 1 }) }
     assert_raises(Storine::InvalidError) { @db.collection("bad/name").put("k", {}) }
   end
+
+  def test_analytics
+    sales = @db.collection("rb_sales")
+    regions = %w[eu us apac]
+    docs = {}
+    3000.times do |i|
+      d = { "region" => regions[i % 3], "qty" => (i % 17) + 1, "price" => Storine::Decimal.new((i % 997) + 1, 2),
+            "day" => i % 30 }
+      d["coupon"] = "C#{i % 5}" if (i % 7).zero?
+      docs[format("s%05d", i)] = d
+    end
+    keys = docs.keys.sort
+    keys.each_slice(250) do |slice|
+      @db.transaction { |tx| slice.each { |k| tx.put("rb_sales", k, docs[k]) } }
+    end
+
+    avg6 = lambda do |total, n|
+      r = Rational(total, n).round(6, half: :even)
+      Storine::Decimal.new((r * 1_000_000).to_i, 6)
+    end
+    expect_by_region = lambda do |rows|
+      regions.filter_map do |reg|
+        ds = rows.select { |d| d["region"] == reg }
+        next if ds.empty?
+
+        { "region" => reg, "n" => ds.length, "revenue" => ds.sum(D.("0")) { |d| d["price"] * d["qty"] },
+          "avg_qty" => avg6.(ds.sum { |d| d["qty"] }, ds.length), "cheapest" => ds.map { |d| d["price"] }.min,
+          "dearest" => ds.map { |d| d["price"] }.max, "qtys" => ds.map { |d| d["qty"] }.uniq.size,
+          "coupons" => ds.count { |d| d.key?("coupon") } }
+      end.sort_by { |x| -x["revenue"] }
+    end
+
+    aggs = { "n" => Storine.count, "revenue" => Storine.sum(Storine.field("price") * "qty"), "avg_qty" => Storine.avg("qty"),
+             "cheapest" => Storine.min("price"), "dearest" => Storine.max("price"), "qtys" => Storine.count_distinct("qty"),
+             "coupons" => Storine.count("coupon") }
+    expected = expect_by_region.(docs.values)
+    check_main = lambda do
+      res = sales.aggregate(aggs, group_by: ["region"], order_by: "-revenue", limit: 2)
+      assert_equal 3000, res.matched
+      assert_equal expected.first(2), res.rows
+      assert_equal ["region", *aggs.keys], res.first.keys # column order
+      full = sales.aggregate(aggs, group_by: "region", order_by: "region")
+      assert_equal expected.sort_by { |x| x["region"] }, full.to_a
+    end
+
+    check_main.()
+    assert_raises(Storine::InvalidError) { sales.aggregate(aggs, group_by: ["region"], order_by: "-nope") }
+    total = sales.aggregate({ n: Storine.count, q: Storine.sum("qty"), neg: Storine.sum(-Storine.field("qty") + 1) })
+    assert_equal [{ "n" => 3000, "q" => docs.values.sum { |d| d["qty"] }, "neg" => docs.values.sum { |d| 1 - d["qty"] } }],
+                 total.rows
+
+    sales.enable_columnar
+    check_main.() # segments are built in the background: exact either way
+    deadline = Time.now + 15
+    while sales.aggregate({ "n" => Storine.count }, Storine.gt("qty", 1000)).pruned_row_groups.zero? # zone maps skip it
+      flunk "column segments were never built" if Time.now > deadline
+      sleep 0.05
+    end
+    check_main.()
+    # Weekly buckets of day (offset 2): key = 2 + floor((day - 2) / 7) * 7.
+    weeks = docs.values.group_by { |d| 2 + ((d["day"] - 2).div(7) * 7) }.sort
+    res = sales.aggregate({ "n" => Storine.count, "q" => Storine.sum("qty") }, group_by: [Storine.bucket("day", 7, 2)],
+                                                                             order_by: "day")
+    assert_equal(weeks.map { |b, ds| [b, ds.length, ds.sum { |d| d["qty"] }] }, res.map { |r| [r["day"], r["n"], r["q"]] })
+    late = docs.values.select { |d| d["day"] >= 20 }
+    res = sales.aggregate(aggs, Storine.ge("day", 20), group_by: ["region"], order_by: "-revenue")
+    assert_equal late.length, res.matched
+    assert_equal expect_by_region.(late), res.rows
+
+    eu_keys = keys.select { |k| docs[k]["region"] == "eu" }
+    got = sales.scan_columns(%w[qty price], Storine.eq("region", "eu"), page_size: 300).to_a
+    assert_equal eu_keys, got.map(&:first)
+    assert_equal(eu_keys.map { |k| { "qty" => docs[k]["qty"], "price" => docs[k]["price"] } }, got.map(&:last))
+    seen = 0
+    sales.scan_columns(%w[qty absent], page_size: 500) do |key, values|
+      assert_equal [docs[key]["qty"], nil], values.values_at("qty", "absent")
+      seen += 1
+    end
+    assert_equal 3000, seen
+
+    sales.disable_columnar
+    check_main.()
+  end
 end
 
 class ClusterTest < Minitest::Test

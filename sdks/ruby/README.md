@@ -48,6 +48,7 @@ accounts.scan { |d| ... }                # every document, any collection size (
 | `c.nearest(field, vector, k: 10, where: nil, exact: false)` | The `k` documents whose `field` (a list of numbers) is most similar to `vector` (cosine), best first; `doc.score` holds the similarity. `exact: true` scores every candidate instead of using the vector index. |
 | `c.create_vector_index(field, dims)` / `c.drop_vector_index(field)` / `c.vector_indexes` | Vector indexes for `nearest`; writes of other values to an indexed field are refused. |
 | `c.create_index(field)` / `c.drop_index(field)` / `c.info` / `c.drop` | Indexes (up to 16 per collection) and collection management. |
+| `c.aggregate(aggregates, where = nil, group_by:, order_by:, limit:, memory_budget: 0, spill_budget: 0)` / `c.scan_columns(fields, where = nil, page_size: 1000)` / `c.enable_columnar` / `c.disable_columnar` | Analytics (see below). |
 | `db.transaction { \|tx\| ... }` | Buffered writes committed atomically when the block returns (or `tx.commit`); `tx.require(...)` adds a version check. |
 
 **Large values**: a document can hold a large binary field (a file) next to small metadata. Read the metadata alone
@@ -61,6 +62,40 @@ meta = files.get("f1", fields: ["name", "meta.size"])
 head = files.read_bytes("f1", "data", 0, 4096).data
 File.open("cat.png", "wb") { |f| files.stream_bytes("f1", "data") { |chunk| f.write(chunk) } }
 ```
+
+## Analytics
+
+Server-side grouping and aggregation, exact (integer and decimal sums never round) and as of one snapshot.
+`enable_columnar` also keeps the collection as column segments (built in the background) for vectorized,
+parallel execution; results are the same either way.
+
+```ruby
+f = Storine.method(:field)
+sales = db.collection("sales")
+sales.enable_columnar                                      # optional; disable_columnar drops the segments
+
+res = sales.aggregate(
+  { "orders" => Storine.count, "revenue" => Storine.sum(f.("price") * "qty"), "avg_qty" => Storine.avg("qty"),
+    "cheapest" => Storine.min("price"), "products" => Storine.count_distinct("sku") },
+  Storine.ge("day", 20),                                   # where: a filter or { field => value }
+  group_by: ["region"],                                    # field paths and/or Storine.bucket("day", 7, 0)
+  order_by: "-revenue", limit: 10                          # output column names; "-" = descending
+)
+res.each { |row| puts row["region"], row["revenue"] }      # Hashes: group keys first, then aggregates in order
+puts res.matched, res.pruned_row_groups, res.spilled_bytes
+
+sales.scan_columns(%w[qty price], Storine.eq("region", "eu"), page_size: 5000) do |key, values|
+  # key order; values == { "qty" => 3, "price" => Storine::Decimal("9.99") }
+end
+```
+
+Aggregates: `Storine.count` (rows), `count(x)` (non-null values), `sum`, `avg` (a decimal with 6 more fractional
+digits for exact inputs), `min`, `max`, `count_distinct`, `approx_count_distinct` (HyperLogLog). An argument is a
+field path or an expression built from `Storine.field(path)`, `Storine.lit(value)` and numbers with `+`, `-`, `*`
+and unary `-` (`2 * f.("qty") - 1` works, numbers on either side). `scan_columns` follows the server's pages and
+returns an Enumerator of `[key, values]` without a block. `memory_budget:` / `spill_budget:` (bytes, 0 = server
+default) bound the group tables before they spill to disk. `OverloadedError` (too many analytic queries running)
+is retried with backoff automatically.
 
 **Values**: `nil`, `true` / `false`, `Integer` (64- or 128-bit), `Float`, `Storine::Decimal` (exact, up to 38
 digits, keeps its scale — use it for money; `BigDecimal` is accepted too and `#to_d` converts back), `String`

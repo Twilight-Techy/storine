@@ -111,7 +111,7 @@ class VectorTest < Minitest::Test
         "items", Storine.eq("kind", "book"), [], 5, 0, nil, ["embedding", [0.25, -1.5, 3.0], 5, false]
       ),
       "query: nearest neighbours, exact" => wire.encode_query("items", nil, [], 0, 0, nil, ["v", [1.0, 0.0], 1, true])
-    }
+    }.merge(analytics_requests)
     seen = 0
     VECTORS["requests"].each do |vec|
       next unless built.key?(vec["name"])
@@ -120,6 +120,56 @@ class VectorTest < Minitest::Test
       seen += 1
     end
     assert_equal built.length, seen
+  end
+
+  # Built through the same path as Collection#aggregate / #scan_columns (minus the socket).
+  def analytics_requests
+    wire = Storine::Wire
+    agg = lambda do |aggregates, where: nil, group_by: nil, order_by: nil, limit: nil, memory_budget: 0, spill_budget: 0|
+      q = wire.build_aggregate(aggregates, group_by, order_by)
+      wire.encode_aggregate("sales", wire.where_to_filter(where), q.group_by, q.aggregates, q.order, limit || 0,
+                            memory_budget, spill_budget)
+    end
+    f = Storine.method(:field)
+    {
+      "aggregate: by region where day >= 20, count / sum(price * qty) / avg(qty), sum desc, limit 2" => agg.(
+        { "n" => Storine.count, "revenue" => Storine.sum(f.("price") * "qty"), avg_qty: Storine.avg("qty") },
+        where: Storine.ge("day", 20), group_by: ["region"], order_by: "-revenue", limit: 2
+      ),
+      "aggregate: totals (count distinct, approx count distinct, min, max, count of field)" => agg.(
+        { "regions" => Storine.count_distinct("region"), "customers" => Storine.approx_count_distinct("customer"),
+          "cheapest" => Storine.min("price"), "dearest" => Storine.max(f.("price")), "coupons" => Storine.count("coupon") }
+      ),
+      "aggregate: weekly buckets of day (width 7, offset 3) and region, sum(qty - 1) and sum(-price + 2.5), budgets" => agg.(
+        { "q" => Storine.sum(f.("qty") - 1), "p" => Storine.sum(-f.("price") + Storine::Decimal("2.5")) },
+        group_by: [Storine.bucket("day", 7, 3), "region"], order_by: ["day", "-region"],
+        memory_budget: 1 << 20, spill_budget: 1 << 30
+      ),
+      "scan: qty, price where region = eu, limit 500" =>
+        wire.encode_scan("sales", wire.where_to_filter({ "region" => "eu" }), %w[qty price], nil, 500),
+      "scan: meta.size after s0099 (default limit)" => wire.encode_scan("sales", nil, ["meta.size"], "s0099", 0),
+      "admin: enable columnar sales" => wire.encode_columnar("sales", true),
+      "admin: disable columnar sales" => wire.encode_columnar("sales", false)
+    }
+  end
+
+  def test_expressions
+    f = Storine.method(:field)
+    lit = Storine.method(:lit)
+    assert_equal Storine::Expr.new(5, children: [lit.(2), f.("a")]), 2 * f.("a")
+    assert_equal Storine::Expr.new(4, children: [lit.(1), f.("a")]), 1 - f.("a")
+    assert_equal Storine::Expr.new(3, children: [lit.(1.5), f.("a")]), 1.5 + f.("a")
+    d = Storine::Decimal("1.5")
+    assert_equal Storine::Expr.new(5, children: [lit.(d), f.("a")]), d * f.("a")
+    assert_equal Storine::Expr.new(5, children: [f.("a"), f.("b")]), f.("a") * "b"
+    assert_equal Storine::Expr.new(6, children: [f.("a")]), -f.("a")
+    assert_equal Storine::Aggregate.new(2, f.("a")), Storine.sum("a")
+    assert_equal Storine::Aggregate.new(1, nil), Storine.count
+    assert_raises(Storine::InvalidError) { f.("a") + nil }
+    assert_raises(Storine::InvalidError) { Storine::Wire.build_aggregate({ "n" => Storine.count }, ["region"], "-nope") }
+    assert_raises(Storine::InvalidError) { Storine::Wire.build_aggregate({ "region" => Storine.count }, ["region"], nil) }
+    assert_raises(Storine::InvalidError) { Storine::Wire.build_aggregate({ "n" => "count" }, nil, nil) }
+    assert_raises(Storine::InvalidError) { Storine.bucket("day", 1 << 64) }
   end
 
   def test_responses
@@ -131,6 +181,14 @@ class VectorTest < Minitest::Test
     range = unhex(r["byte range: total 5000, 4 bytes"]["body_hex"])
     assert_equal [5000, "\xDE\xAD\xBE\xEF".b], Storine::Wire.decode_byte_range(range)
     assert_raises(Storine::InvalidError) { Storine::Wire.decode_byte_range(range.byteslice(0...-1)) }
+    agg = Storine::Wire.aggregate_result(%w[region n revenue],
+                                         unhex(r["aggregate: matched 4, pruned 2, rows [eu, 3, 12.50] [us, 1, null]"]["body_hex"]))
+    assert_equal [4, 2, 0], [agg.matched, agg.pruned_row_groups, agg.spilled_bytes]
+    assert_equal comparable([["eu", 3, Storine::Decimal("12.50")], ["us", 1, nil]]), comparable(agg.map(&:values))
+    assert_equal({ "region" => "us", "n" => 1, "revenue" => nil }, agg[1])
+    total, nxt, nf, rows = Storine::Wire.decode_scan_page(unhex(r["scan page: total 2, next s1, row s1 [7, 9.99]"]["body_hex"]))
+    assert_equal [2, "s1", 2], [total, nxt, nf]
+    assert_equal comparable([["s1", [7, Storine::Decimal("9.99")]]]), comparable(rows)
   end
 
   def test_hostile_bytes_never_crash

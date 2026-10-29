@@ -16,12 +16,12 @@ import time
 import unittest
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import storine  # noqa: E402
-from storine import add, append, between, eq, gt, set_, unset  # noqa: E402
+from storine import add, append, avg, between, bucket, count, count_distinct, eq, field, ge, gt, set_, unset  # noqa: E402
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 SERVER = os.environ.get("STORINE_SERVER", str(REPO / "target" / "release" / "storage-server"))
@@ -201,6 +201,92 @@ class SingleNode(unittest.TestCase):
             s.put("bad", {"a.b": 1})
         with self.assertRaises(storine.InvalidError):
             self.db.collection("bad/name").put("k", {})
+
+    def test_analytics(self):
+        sales = self.db.collection("py_sales")
+        regions = ("eu", "us", "apac")
+        docs = {}
+        for i in range(3000):
+            d = {"region": regions[i % 3], "qty": i % 17 + 1, "price": Decimal(i % 997 + 1).scaleb(-2), "day": i % 30}
+            if i % 7 == 0:
+                d["coupon"] = "C" + str(i % 5)
+            docs[f"s{i:05d}"] = d
+        keys = sorted(docs)
+        for start in range(0, len(keys), 250):
+            with self.db.transaction() as tx:
+                for k in keys[start:start + 250]:
+                    tx.put("py_sales", k, docs[k])
+
+        def avg6(total, n):
+            return (Decimal(total) / n).quantize(Decimal("0.000001"), rounding=ROUND_HALF_EVEN)
+
+        def expect_by_region(rows):
+            out = {}
+            for r in regions:
+                ds = [d for d in rows if d["region"] == r]
+                if not ds:
+                    continue
+                out[r] = {"region": r, "n": len(ds), "revenue": sum(d["price"] * d["qty"] for d in ds),
+                          "avg_qty": avg6(sum(d["qty"] for d in ds), len(ds)),
+                          "cheapest": min(d["price"] for d in ds),
+                          "dearest": max(d["price"] for d in ds),
+                          "qtys": len({d["qty"] for d in ds}), "coupons": len([d for d in ds if "coupon" in d])}
+            return sorted(out.values(), key=lambda x: x["revenue"], reverse=True)
+
+        aggs = {"n": count(), "revenue": storine.sum(field("price") * "qty"), "avg_qty": avg("qty"),
+                "cheapest": storine.min("price"), "dearest": storine.max("price"), "qtys": count_distinct("qty"),
+                "coupons": count("coupon")}
+        expected = expect_by_region(list(docs.values()))
+
+        def check_main():
+            res = sales.aggregate(aggs, group_by=["region"], order_by="-revenue", limit=2)
+            self.assertEqual(res.matched, 3000)
+            self.assertEqual(res.rows, expected[:2])
+            self.assertEqual(list(res.rows[0]), ["region"] + list(aggs))  # column order
+            full = sales.aggregate(aggs, group_by="region", order_by="region")
+            self.assertEqual(full.rows, sorted(expected, key=lambda x: x["region"]))
+            return res
+
+        check_main()
+        with self.assertRaises(storine.InvalidError):
+            sales.aggregate(aggs, group_by=["region"], order_by="-nope")
+        total = sales.aggregate({"n": count(), "q": storine.sum("qty"), "neg": storine.sum(-field("qty") + 1)})
+        self.assertEqual(total.rows, [{"n": 3000, "q": sum(d["qty"] for d in docs.values()),
+                                       "neg": sum(1 - d["qty"] for d in docs.values())}])
+
+        sales.enable_columnar()
+        check_main()  # segments are built in the background: exact either way
+        deadline = time.time() + 15
+        while sales.aggregate({"n": count()}, gt("qty", 1000)).pruned_row_groups == 0:  # zone maps skip it
+            self.assertLess(time.time(), deadline, "column segments were never built")
+            time.sleep(0.05)
+        check_main()
+        # Weekly buckets of day (offset 2): key = 2 + floor((day - 2) / 7) * 7.
+        weeks = {}
+        for d in docs.values():
+            b = 2 + ((d["day"] - 2) // 7) * 7
+            weeks.setdefault(b, []).append(d["qty"])
+        res = sales.aggregate({"n": count(), "q": storine.sum("qty")}, group_by=[bucket("day", 7, 2)], order_by="day")
+        self.assertEqual([(r["day"], r["n"], r["q"]) for r in res],
+                         [(b, len(v), sum(v)) for b, v in sorted(weeks.items())])
+        late = [d for d in docs.values() if d["day"] >= 20]
+        res = sales.aggregate(aggs, ge("day", 20), group_by=["region"], order_by="-revenue")
+        self.assertEqual(res.matched, len(late))
+        self.assertEqual(res.rows, expect_by_region(late))
+
+        eu_keys = [k for k in keys if docs[k]["region"] == "eu"]
+        scan = sales.scan_columns(["qty", "price"], where=eq("region", "eu"), page_size=300)
+        got = list(scan)
+        self.assertEqual(scan.total, len(eu_keys))
+        self.assertEqual([r.key for r in got], eu_keys)
+        self.assertEqual([r.values for r in got], [{"qty": docs[k]["qty"], "price": docs[k]["price"]} for k in eu_keys])
+        key, values = got[0]
+        self.assertEqual((key, values["qty"]), (eu_keys[0], docs[eu_keys[0]]["qty"]))
+        self.assertEqual(len(list(sales.scan_columns(["qty", "absent"], page_size=500))), 3000)
+        self.assertEqual(next(iter(sales.scan_columns(["absent"]))).values, {"absent": None})
+
+        sales.disable_columnar()
+        check_main()
 
 
 @unittest.skipUnless(os.path.exists(SERVER), "storage-server binary not built")

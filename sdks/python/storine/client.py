@@ -11,6 +11,7 @@ import time
 from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
+from . import _analytics as an
 from . import _wire as w
 from ._sve import Reader, put_str
 from .errors import (ConflictError, InvalidError, NotFoundError, OverloadedError, RateLimitedError,
@@ -500,6 +501,52 @@ class Collection(_Writer):
             result.append({"field": field, "dims": dims, "ready": r.u8() == 1})
         return result
 
+    # ── analytics ──
+
+    def enable_columnar(self) -> None:
+        """Also keeps the collection as column segments for `aggregate` / `scan_columns`
+        (built in the background; results are exact either way)."""
+        self._admin(w.OP_DOC_ADMIN, an.encode_columnar(self.name, True))
+
+    def disable_columnar(self) -> None:
+        """Deletes the column segments (analytics then read the row store)."""
+        self._admin(w.OP_DOC_ADMIN, an.encode_columnar(self.name, False))
+
+    def aggregate(self, aggregates: Dict[str, an.Aggregate], where: Any = None, *, group_by: Any = None,
+                  order_by: Any = None, limit: Optional[int] = None, memory_budget: int = 0,
+                  spill_budget: int = 0) -> an.AggregateResult:
+        """Filters, groups and aggregates on the server, exactly and as of one snapshot.
+
+        `aggregates` maps output names to `count()`, `count(x)`, `sum(x)`, `avg(x)`, `min(x)`,
+        `max(x)`, `count_distinct(x)` or `approx_count_distinct(x)`, where `x` is a field path or an
+        expression (`field("price") * "qty"`). `group_by` takes field paths and
+        `bucket(field, width, offset)`; `order_by` names output columns (`"-revenue"` descending).
+        Rows are dicts: group-key columns (named by their path) first, then the aggregates.
+        Budgets are in bytes (0 = server default).
+        """
+        q = an.build_aggregate(aggregates, group_by, order_by)
+        if limit is not None and (not isinstance(limit, int) or limit <= 0):
+            raise InvalidError("limit must be a positive integer (or None for every group)")
+        body = an.encode_aggregate(self.name, w.where_to_filter(where), q.group_by, q.aggregates, q.order,
+                                   limit or 0, memory_budget, spill_budget)
+        status, _v, rbody = self.client._request(an.OP_DOC_AGGREGATE, body, idempotent=True)
+        if status != w.ST_OK:
+            self.client._raise(status, rbody)
+        return an.aggregate_result(q.columns, rbody)
+
+    def scan_columns(self, fields: Sequence[str], where: Any = None, *, page_size: int = 1000) -> "ColumnScan":
+        """Iterates over `ColumnRow(key, {field: value})` for every matching document in key
+        order, reading only `fields` (dotted paths; missing fields are None), page by page.
+        The returned iterator's `.total` is the number of matches once the first page is read."""
+        if isinstance(fields, str):
+            raise InvalidError("fields is a list of field paths")
+        fields = list(fields)
+        if len(fields) > an.MAX_ITEMS or not all(isinstance(f, str) for f in fields):
+            raise InvalidError(f"fields is a list of at most {an.MAX_ITEMS} field paths")
+        if not isinstance(page_size, int) or not 1 <= page_size <= an.MAX_SCAN_PAGE:
+            raise InvalidError(f"page_size must be between 1 and {an.MAX_SCAN_PAGE}")
+        return ColumnScan(self, fields, w.where_to_filter(where), page_size)
+
     def _query(self, where: Any, order_by: Any, limit: int, offset: int, after: Optional[str],
                nearest: Optional[Tuple[str, Sequence[float], int, bool]] = None) -> Tuple[int, Optional[str], List[Document]]:
         body = w.encode_query(self.name, w.where_to_filter(where), w.parse_order_by(order_by), limit, offset, after, nearest)
@@ -540,6 +587,51 @@ class Collection(_Writer):
         if status != w.ST_OK:
             self.client._raise(status, rbody)
         return version, rbody
+
+
+class ColumnScan:
+    """Iterator of `Collection.scan_columns`: yields `ColumnRow(key, values)`, fetching pages
+    lazily by `next_after_key`. `total` is None until the first page has been read."""
+
+    def __init__(self, collection: Collection, fields: List[str], flt: Optional[w.Filter], page_size: int) -> None:
+        self._collection = collection
+        self._fields = fields
+        self._filter = flt
+        self._page_size = page_size
+        self._rows: List[an.ColumnRow] = []
+        self._pos = 0
+        self._after: Optional[str] = None
+        self._done = False
+        self.total: Optional[int] = None
+
+    def __iter__(self) -> "ColumnScan":
+        return self
+
+    def __next__(self) -> an.ColumnRow:
+        while self._pos >= len(self._rows):
+            if self._done:
+                raise StopIteration
+            self._fetch()
+        row = self._rows[self._pos]
+        self._pos += 1
+        return row
+
+    def _fetch(self) -> None:
+        c = self._collection
+        body = an.encode_scan(c.name, self._filter, self._fields, self._after, self._page_size)
+        status, _v, rbody = c.client._request(an.OP_DOC_SCAN_COLUMNS, body, idempotent=True)
+        if status != w.ST_OK:
+            c.client._raise(status, rbody)
+        total, nxt, nf, rows = an.decode_scan_page(rbody)
+        if rows and nf != len(self._fields):
+            raise InvalidError(f"the server returned {nf} fields, expected {len(self._fields)}")
+        self.total = total
+        self._rows = [an.ColumnRow(k, dict(zip(self._fields, vals))) for k, vals in rows]
+        self._pos = 0
+        if nxt is None:
+            self._done = True
+        else:
+            self._after = nxt
 
 
 class Transaction(_Writer):
