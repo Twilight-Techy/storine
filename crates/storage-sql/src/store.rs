@@ -185,6 +185,27 @@ impl Store {
             .aggregate(query)?)
     }
 
+    /// Only `fields` of every document matching `filter`, in key order (`TASK-130`): read from
+    /// column segments on a columnar collection, and never the whole documents.
+    pub fn scan_columns(
+        &self,
+        collection: &str,
+        fields: &[String],
+        filter: Option<Filter>,
+    ) -> SqlResult<Vec<(String, Doc)>> {
+        let names: Vec<&str> = fields.iter().map(String::as_str).collect();
+        let mut out = Vec::new();
+        for row in self
+            .client
+            .collection(&self.c(collection))
+            .scan_columns(&names, filter, 10_000)
+        {
+            let row = row?;
+            out.push((row.key, row.fields));
+        }
+        Ok(out)
+    }
+
     /// Turns columnar storage on or off for `collection`.
     pub fn set_columnar(&self, collection: &str, on: bool) -> SqlResult<()> {
         let c = self.client.collection(&self.c(collection));

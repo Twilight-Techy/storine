@@ -1310,7 +1310,46 @@ impl Exec<'_> {
                 }
                 docs
             }
-            None => store.scan(&table.collection, filter)?,
+            None => {
+                // Only the columns the query reads (validated reads need whole rows and versions).
+                let cols = if reads.is_some() {
+                    None
+                } else {
+                    self.projected(table, qual)
+                };
+                match cols {
+                    Some(cols) => {
+                        let fields: Vec<String> = cols
+                            .iter()
+                            .map(|&ci| table.columns[ci].field.clone())
+                            .collect();
+                        let mut out = Vec::new();
+                        for (key, fields) in
+                            store.scan_columns(&table.collection, &fields, filter)?
+                        {
+                            if overlay.contains_key(key.as_str()) {
+                                continue;
+                            }
+                            out.push(TableRow {
+                                row: table.from_doc(&fields),
+                                key,
+                                version: None,
+                            });
+                        }
+                        for (k, doc) in overlay {
+                            if let Some(doc) = doc {
+                                out.push(TableRow {
+                                    key: k.to_owned(),
+                                    version: None,
+                                    row: table.from_doc(doc),
+                                });
+                            }
+                        }
+                        return Ok(out);
+                    }
+                    None => store.scan(&table.collection, filter)?,
+                }
+            }
         };
         for d in docs {
             if overlay.contains_key(d.key.as_str()) {
@@ -1333,6 +1372,138 @@ impl Exec<'_> {
             }
         }
         Ok(out)
+    }
+
+    /// The columns of `table` the running select reads, when fewer than all.
+    fn projected(&self, table: &Table, qual: Option<&str>) -> Option<Vec<usize>> {
+        let p = self.projection.borrow();
+        let q = qual.unwrap_or(&table.name).to_ascii_lowercase();
+        let cols = p.as_ref()?.iter().find(|(n, _)| *n == q)?.1.clone();
+        // A column scan reads a missing field as null; columns that fill missing fields with a
+        // default (added by ALTER TABLE) need the whole document to tell the two apart.
+        let defaulted = cols.iter().any(|&ci| table.columns[ci].missing.is_some());
+        (cols.len() < table.columns.len() && !defaulted).then_some(cols)
+    }
+
+    /// Columns every FROM table needs for `sel`, or `None` when that cannot be known safely:
+    /// wildcards, subqueries (correlated ones may read any outer column), NATURAL / USING
+    /// joins, window functions.
+    fn projection_for(
+        &self,
+        sel: &Select,
+        order_by: &[OrderBy],
+    ) -> SqlResult<Option<crate::exec::eval::Projection>> {
+        fn from_tables<'e>(
+            this: &Exec<'_>,
+            t: &'e TableRef,
+            out: &mut Vec<(String, std::sync::Arc<Table>)>,
+            exprs: &mut Vec<&'e Expr>,
+        ) -> SqlResult<bool> {
+            match t {
+                TableRef::Named {
+                    schema: None,
+                    name,
+                    alias,
+                } => {
+                    if this.cte(name).is_none() && !name.starts_with('@') {
+                        if let Some(table) = this.s.engine.find_table(name)? {
+                            let q = alias
+                                .as_ref()
+                                .map_or(name.as_str(), |a| a.name.as_str())
+                                .to_ascii_lowercase();
+                            out.push((q, table));
+                        }
+                    }
+                    Ok(true)
+                }
+                TableRef::Named { .. } => Ok(true),
+                // A table function's arguments may read columns of the tables before it.
+                TableRef::Function { args, .. } => {
+                    exprs.extend(args.iter());
+                    Ok(true)
+                }
+                // LATERAL subqueries read outer columns this walk does not see.
+                TableRef::Derived { lateral, .. } => Ok(!*lateral),
+                TableRef::Join {
+                    left,
+                    right,
+                    constraint,
+                    ..
+                } => {
+                    match constraint {
+                        JoinConstraint::On(e) => exprs.push(e),
+                        JoinConstraint::None => {}
+                        _ => return Ok(false),
+                    }
+                    Ok(from_tables(this, left, out, exprs)?
+                        && from_tables(this, right, out, exprs)?)
+                }
+            }
+        }
+        if !self.pushdown_enabled()
+            || sel
+                .items
+                .iter()
+                .any(|i| matches!(i, SelectItem::Wildcard(_)))
+        {
+            return Ok(None);
+        }
+        let mut exprs: Vec<&Expr> = Vec::new();
+        for it in &sel.items {
+            if let SelectItem::Expr { expr, .. } = it {
+                exprs.push(expr);
+            }
+        }
+        exprs.extend(sel.where_.iter());
+        exprs.extend(sel.group_by.iter());
+        exprs.extend(sel.having.iter());
+        exprs.extend(sel.distinct_on.iter());
+        exprs.extend(order_by.iter().map(|o| &o.expr));
+        let mut tables: Vec<(String, std::sync::Arc<Table>)> = Vec::new();
+        for t in &sel.from {
+            if !from_tables(self, t, &mut tables, &mut exprs)? {
+                return Ok(None);
+            }
+        }
+        if tables.is_empty() {
+            return Ok(None);
+        }
+        let mut refs: Vec<Vec<String>> = Vec::new();
+        let mut opaque = false;
+        for e in &exprs {
+            if has_subquery(e) {
+                return Ok(None);
+            }
+            walk(e, &mut |x| match x {
+                Expr::Column(p) => refs.push(p.clone()),
+                Expr::Function { over: Some(_), .. } => opaque = true,
+                _ => {}
+            });
+        }
+        if opaque {
+            return Ok(None);
+        }
+        let mut out = Vec::new();
+        for (q, t) in &tables {
+            let mut cols: Vec<usize> = Vec::new();
+            for p in &refs {
+                let Some(name) = p.last() else { continue };
+                let here = p.len() < 2 || {
+                    let pq = &p[p.len() - 2];
+                    pq.eq_ignore_ascii_case(q) || pq.eq_ignore_ascii_case(&t.name)
+                };
+                if here {
+                    if let Some(ci) = t.column_index(name) {
+                        if !cols.contains(&ci) {
+                            cols.push(ci);
+                        }
+                    }
+                }
+            }
+            cols.sort_unstable();
+            out.push((q.clone(), cols));
+        }
+        Ok(Some(out))
     }
 
     /// Keys when the conjuncts pin the whole primary key to constants (`id = 5`, `id IN (1, 2)`).
@@ -1619,6 +1790,13 @@ impl Exec<'_> {
             }
             Ok((src.cols, rows))
         };
+        // Scans read only the columns this select uses (nested selects set and restore their own).
+        let projection = if pushed_cols.is_some() {
+            None
+        } else {
+            self.projection_for(sel, order_by)?
+        };
+        let saved = self.projection.replace(projection);
         let src = match pushed_cols {
             Some(cols) => Ok(Rel {
                 cols,
@@ -1626,6 +1804,7 @@ impl Exec<'_> {
             }),
             None => self.eval_from(&sel.from, &pushable, outer),
         };
+        *self.projection.borrow_mut() = saved;
         *self.vector_hint.borrow_mut() = None;
         let used = self.vector_hint_used.replace(false);
         let (mut cols, mut rows) = filtered(src?)?;

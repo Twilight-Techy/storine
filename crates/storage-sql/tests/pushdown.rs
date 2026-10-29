@@ -240,6 +240,58 @@ fn pushed_down_aggregates_equal_local_execution_in_every_dialect() {
     }
 }
 
+/// Scans read only the columns a query uses (`TASK-130`): joins, filters, ordering, grouping
+/// by expressions, DISTINCT, views and subqueries give the same rows as whole-row scans.
+#[test]
+fn projected_scans_equal_whole_row_scans() {
+    let db = setup("proj");
+    let mut s = db.engine.new_session(Dialect::Postgres, "app", None);
+    ok(&mut s, "CREATE TABLE sales (id INT PRIMARY KEY, region VARCHAR(10), qty INT, price NUMERIC(10,2), disc NUMERIC, day DATE, flag BOOLEAN, note TEXT, score DOUBLE PRECISION)");
+    ok(&mut s, "CREATE TABLE regions (code VARCHAR(10) PRIMARY KEY, name TEXT, manager TEXT, budget NUMERIC(12,2))");
+    ok(&mut s, "INSERT INTO regions VALUES ('eu', 'Europe', 'Ann', 100.00), ('us', 'America', 'Bob', 200.00), ('apac', 'Asia', NULL, 50.50)");
+    load(&mut s, "sales", 0, 2000);
+    ok(
+        &mut s,
+        "CREATE VIEW big AS SELECT id, region, qty FROM sales WHERE qty > 40",
+    );
+    let queries = [
+        "SELECT id, qty FROM sales WHERE region = 'eu' ORDER BY id LIMIT 20",
+        "SELECT s.id, r.name, s.price * s.qty AS v FROM sales s JOIN regions r ON s.region = r.code WHERE s.qty < 5 ORDER BY v DESC, s.id LIMIT 15",
+        "SELECT r.name, count(*), sum(s.qty) FROM sales s LEFT JOIN regions r ON r.code = s.region GROUP BY r.name ORDER BY 1",
+        "SELECT DISTINCT region, flag FROM sales ORDER BY 1, 2",
+        "SELECT qty % 7 AS m, max(note) FROM sales GROUP BY qty % 7 ORDER BY 1",
+        "SELECT id FROM sales WHERE note LIKE '%3' AND score > 100 ORDER BY id",
+        "SELECT id, region FROM big WHERE region <> 'us' ORDER BY id LIMIT 10",
+        "SELECT id, (SELECT name FROM regions WHERE code = sales.region) FROM sales WHERE id < 30 ORDER BY id",
+        "SELECT id, sum(qty) OVER (PARTITION BY region ORDER BY id) FROM sales WHERE id < 50 ORDER BY id",
+        "SELECT x.id, x.r FROM (SELECT id, region AS r FROM sales WHERE flag) x ORDER BY x.id DESC LIMIT 7",
+        "SELECT * FROM regions ORDER BY code",
+        "SELECT name FROM regions WHERE code IN (SELECT region FROM sales WHERE qty = 49) ORDER BY name",
+    ];
+    for q in queries {
+        same(&mut s, q);
+    }
+    ok(&mut s, "ALTER TABLE sales SET (columnar = on)");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    ok(&mut s, "UPDATE sales SET note = 'changed' WHERE id % 9 = 0");
+    for q in queries {
+        same(&mut s, q);
+    }
+    // Inside a transaction its own writes are seen.
+    ok(&mut s, "BEGIN");
+    ok(&mut s, "UPDATE sales SET qty = 1000 WHERE id = 5");
+    let r = rows(
+        &mut s,
+        "SELECT qty FROM sales WHERE region = 'us' AND id < 10 ORDER BY id",
+    );
+    assert!(
+        r.rows.iter().any(|row| row[0].as_text() == "1000"),
+        "{:?}",
+        r.rows
+    );
+    ok(&mut s, "ROLLBACK");
+}
+
 #[test]
 fn pushdown_reads_no_rows_into_the_gateway() {
     let db = setup("speed");

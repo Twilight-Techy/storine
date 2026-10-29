@@ -36,7 +36,13 @@ pub struct Exec<'a> {
     /// for `ORDER BY col <=> vector LIMIT k`, consumed by `scan_rows`).
     pub(crate) vector_hint: RefCell<Option<VectorHint>>,
     pub(crate) vector_hint_used: std::cell::Cell<bool>,
+    /// Columns each FROM table of the running `select` needs, by qualifier (lowercase): its
+    /// scans read only those (`TASK-130`). `None`: whole rows.
+    pub(crate) projection: RefCell<Option<Projection>>,
 }
+
+/// `(table qualifier, columns read)` of each FROM table of a select.
+pub(crate) type Projection = Vec<(String, Vec<usize>)>;
 
 /// Candidates for `ORDER BY field <=> vector LIMIT k` from the storage vector index.
 #[derive(Debug, Clone)]
@@ -200,6 +206,7 @@ impl<'a> Exec<'a> {
             view_depth: std::cell::Cell::new(0),
             vector_hint: RefCell::new(None),
             vector_hint_used: std::cell::Cell::new(false),
+            projection: RefCell::new(None),
         }
     }
 

@@ -80,7 +80,7 @@ fn text_type(t: &DataType) -> bool {
 
 impl Exec<'_> {
     /// Whether this session allows push-down (`SET storine_pushdown = off` disables it).
-    fn pushdown_enabled(&self) -> bool {
+    pub(crate) fn pushdown_enabled(&self) -> bool {
         !self.s.vars.get("storine_pushdown").is_some_and(|v| {
             matches!(
                 v.trim().to_ascii_lowercase().as_str(),
