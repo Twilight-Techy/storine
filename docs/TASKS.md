@@ -871,9 +871,36 @@ This document defines the strict chronological execution order for building the 
     | Q6 | 2.5–2.9 ms | 2.9–3.5 ms | 6.3–6.8 ms | 5.5–6.0 ms |
 
     Single-threaded, DuckDB is still ahead. Columnar storage is 51.8 MB versus DuckDB's 26 MB.
-- [ ] **TASK-129: Aggregation & Columnar Scan Protocol (`F-OLAP-05`)** — `OP_DOC_AGGREGATE`, `OP_DOC_SCAN_COLUMNS`, `PROTOCOL.md`, conformance vectors, `aggregate(...)` in all 8 SDKs.
-- [ ] **TASK-130: SQL Push-Down (`F-OLAP-06`)** — single-table aggregation, filters, projections and `ORDER BY ... LIMIT` pushed down from all three dialects; joins over columnar scans with hash joins; `EXPLAIN` shows the push-down.
-- [ ] **TASK-131: Analytics Benchmarks vs DuckDB (`F-OLAP-07`)** — TPC-H Q1 / Q6 and a ClickBench subset, interleaved A/B/A/B on this machine, plus storage footprint; results published in `BENCHMARK_REPORT.md`.
+- [x] **TASK-129: Aggregation & Columnar Scan Protocol (`F-OLAP-05`)** — `OP_DOC_AGGREGATE`, `OP_DOC_SCAN_COLUMNS`, `PROTOCOL.md`, conformance vectors, `aggregate(...)` in all 8 SDKs.
+  - **Protocol:**
+    - `OP_DOC_AGGREGATE` (`0x29`, §5.5) carries a filter, group keys (fields / buckets), aggregates over arithmetic expressions, ordering by output column, a limit, and memory and spill budgets. It returns typed rows plus matched / pruned / spilled counters.
+    - `OP_DOC_SCAN_COLUMNS` (`0x2A`, §5.6) returns chosen fields of the matching documents in key-ordered pages. It is read from column segments plus the delta, with pruning and vectorized filters, and only the page's rows are materialized.
+    - Admin commands `10` / `11` enable and disable columnar storage.
+    - Collections without segments answer from the row store.
+  - **Never on the reactor**: analytic requests run on their own job threads, at most 8 at a time (then `Overloaded`). In the TCP test, 145k point reads were served alongside 790 concurrent aggregates, worst case 3.5 ms.
+  - **SDKs**: Python, TypeScript, Go, Java, C#, Rust, PHP and Ruby share one vocabulary: `aggregate`, `count` / `sum` / `avg` / `min` / `max` / `count_distinct` / `approx_count_distinct`, `field` / `lit` expressions, `bucket`, `order_by` by output name, `scan_columns`, and `enable_columnar` / `disable_columnar`.
+  - **Exit Criteria**:
+    - Every SDK reproduces the 7 new request vectors byte for byte and decodes the 2 response vectors.
+    - Every SDK passes an end-to-end test against the real server with expectations computed from its own data, before and after columnar storage.
+    - Server tests: wire round-trips, scans equal to document scans across pages, hostile bodies refused, and OLTP latency under concurrent analytics.
+- [~] **TASK-130: SQL Push-Down (`F-OLAP-06`)** — single-table aggregation, filters, projections and `ORDER BY ... LIMIT` pushed down from all three dialects; joins over columnar scans with hash joins; `EXPLAIN` shows the push-down.
+  - **Done: aggregation push-down** (`storage-sql/src/exec/pushdown.rs`). A single-table `GROUP BY` runs as one `OP_DOC_AGGREGATE` when the store's result provably equals the gateway's:
+    - WHERE translates to an equivalent filter (not a wider one). Constant conversions must be exact; `<>` adds an exists check; `IN` skips NULLs; `LIKE 'prefix%'`.
+    - Keys and arguments are plain columns of types compared alike on both sides, with no default filled in for missing fields.
+    - Aggregates are COUNT / COUNT(DISTINCT) / SUM (columns, or NUMERIC arithmetic) / AVG (finished in the gateway with each dialect's scale rule) / MIN / MAX.
+    - Floats, an open transaction's own writes, validated reads, window functions, subqueries, and anything the store refuses stay local.
+    - HAVING, projection, ORDER BY, DISTINCT and LIMIT run as before.
+  - **Done: columnar storage from SQL**: PostgreSQL `WITH (columnar = on)` / `ALTER TABLE ... SET (columnar = on|off)`, MySQL `ENGINE = COLUMNAR`, SQL Server `CREATE / DROP CLUSTERED COLUMNSTORE INDEX`. `EXPLAIN` reports the push-down and whether it reads column segments; `SET storine_pushdown = off` disables it per session.
+  - **Exit Criteria (met for the aggregation part)**:
+    - 15 queries in PostgreSQL, MySQL and SQL Server sessions return identical rows and column types with push-down on and off.
+    - This holds over the row store, over column segments, and with a delta of inserts, updates and deletes.
+    - 12 of the 15 push down; the 3 that must not stay local.
+    - 20k rows: 1.0 ms pushed against 230 ms local.
+  - **Open**: non-aggregate `ORDER BY ... LIMIT` / projection push-down through `OP_DOC_SCAN_COLUMNS`, and hash joins over columnar scans.
+- [x] **TASK-131: Analytics Benchmarks vs DuckDB (`F-OLAP-07`)** — TPC-H Q1 / Q6 and a ClickBench subset, interleaved A/B/A/B on this machine, plus storage footprint; results published in `BENCHMARK_REPORT.md`.
+  - Published in `BENCHMARK_REPORT.md` §6, with a TPC-H-shaped `lineitem` and a ClickBench-shaped `hits`. Both are synthetic data with the same columns and skew, not the official datasets, and the report says so.
+  - Storine is at parity or ahead on scans, filters and low-cardinality aggregation.
+  - It is 6–10× behind DuckDB on high-cardinality grouping and grouped distinct counts. That is recorded as open work, not claimed.
 
 ## Stage 29: Deterministic Simulation & Fault Injection (`TASK-132` – `TASK-136`)
 

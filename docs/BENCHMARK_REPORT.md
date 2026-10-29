@@ -104,3 +104,53 @@ Two regressions found by this gate were fixed before sign-off: the per-call `is_
 After Stage 21 (encryption key ring, index-file sealing, SIMD crypto, Raft InstallSnapshot, cold primary tier): `storage-server` `903.0 KiB`, `storage-cli` `830.5 KiB`. On 2026-10-27 the `RULE-MEM-03` budget was raised to `< 1 MiB` (`TASK-091`); both binaries are within it.
 
 The earlier `370.5 KiB` figure was stale; the baseline already exceeded the `RULE-MEM-03` budget (`< 500 KiB`). Linker-map attribution of the `+59 KiB` `.text` growth: `storage-server` `+32 KiB` (header-stage admission, admin job pool, Raft RPC wiring, environment security config), `std` `+15 KiB` (threads and mpsc channels for the admin pool), WAL `+3.5 KiB`, mmap `+7 KiB`, index `+5 KiB`. Size is still minimized wherever it costs no hot-path speed (`opt-level` stays `3`).
+
+## 6. Analytics Against DuckDB (`TASK-131`, 2026-10-29)
+
+**Setup.** 4-core Xeon @ 2.1 GHz (2 MiB L2 per core). Storine release build (`target-cpu=native`), queries through `DocumentStore::aggregate` over column segments (`olap-bench`). DuckDB 2.0.0 Python, 4 threads, the same rows loaded from the CSV the generator writes (`benches/olap/duckdb_bench.py`). Each cell is the median of 7 runs, and the two systems alternate three times (A/B/A/B/A/B, `RULE-PERF-01`).
+
+**Results are identical.** On Q1 and Q6 the result rows match DuckDB's exactly. Storine's averages are exact decimals where DuckDB's are doubles.
+
+- **TPC-H-shaped `lineitem`, 1M rows:**
+  - Q1 and Q6 come from TPC-H.
+  - The data is TPC-H-shaped (same columns, distributions and selectivities), generated deterministically. It is not `dbgen` output.
+- **ClickBench-shaped `hits`, 1M rows:**
+  - The hN numbering follows ClickBench.
+  - These are not the ClickBench dataset (14 GB). They are synthetic rows with its column kinds and skew: Zipf-like counters, regions and phrases, 80 % empty search phrases, and about 175k users.
+
+| Query | Storine (ms) | DuckDB (ms) | |
+|---|---|---|---|
+| Q1 (grouped exact sums, 4 groups) | 8.3 / 8.1 / 8.8 | 7.9 / 7.5 / 10.2 | tie |
+| Q6 (selective filter, exact sum) | 2.9 / 3.0 / 2.6 | 3.3 / 3.4 / 2.7 | Storine ≈ 1.1× |
+| h0 `COUNT(*)` | 0.3 / 0.4 / 0.4 | 0.8 / 0.8 / 0.7 | Storine 2× |
+| h1 `COUNT(*) WHERE AdvEngineID <> 0` | 1.4 / 1.1 / 1.1 | 1.2 / 1.3 / 1.5 | tie |
+| h2 `SUM, COUNT, AVG` | 1.1 / 1.2 / 1.3 | 2.1 / 1.9 / 2.0 | Storine 1.7× |
+| h3 `AVG(UserID)` | 0.9 / 0.8 / 0.8 | 1.8 / 1.4 / 1.4 | Storine 1.8× |
+| h4 `COUNT(DISTINCT UserID)` | 20.2 / 20.4 / 20.4 | 17.0 / 11.9 / 14.7 | DuckDB 1.4× |
+| h5 `COUNT(DISTINCT SearchPhrase)` | 18.8 / 17.2 / 19.2 | 3.7 / 4.8 / 4.5 | DuckDB 4× |
+| h6 `MIN / MAX(EventDate)` | 2.1 / 2.1 / 1.9 | 0.9 / 1.0 / 1.1 | DuckDB 2× |
+| h7 group by AdvEngineID, filtered | 1.9 / 1.7 / 2.0 | 2.1 / 1.9 / 2.4 | tie |
+| h8 distinct users per region, top 10 | 207.9 / 201.3 / 205.8 | 20.7 / 21.0 / 20.7 | **DuckDB 10×** |
+| h9 h8 plus sum, count, avg | 218.6 / 221.4 / 217.8 | 29.6 / 29.3 / 30.7 | **DuckDB 7×** |
+| h12 top search phrases | 40.5 / 40.2 / 40.4 | 7.7 / 7.4 / 6.0 | **DuckDB 6×** |
+| h15 top users (175k groups) | 109.1 / 112.4 / 113.6 | 17.2 / 14.8 / 16.7 | **DuckDB 7×** |
+
+Single-threaded (`STORINE_THREADS=1` against `SET threads = 1`): Q1 22.4 ms against 18.8–19.7 ms, and Q6 6.3–6.8 ms against 5.5–6.0 ms.
+
+**Where Storine stands.**
+- It is at parity or ahead on scans, filters and low-cardinality aggregation (TPC-H Q1/Q6, h0–h3, h7).
+- It is behind on high-cardinality grouping and on grouped distinct counts (h8, h9, h12, h15: 6–10×). Its group tables are general: canonical cross-kind keys, a representative value per group, and exact accumulators. Workers build them separately and merge them through hash partitions.
+- Closing that gap needs radix-partitioned group tables from the first row, and a shared `(group, value)` table for grouped distinct counts. This is open work under `TASK-128`; nothing here is claimed as a win.
+
+**Storage.** Column segments are 51.8 MB for `lineitem` and 52.8 MB for `hits`; DuckDB's files are 26.2 MB and 33.0 MB. Segments use per-chunk lightweight encodings with no general-purpose compression of numeric chunks, against DuckDB's compression.
+
+**SQL push-down (`TASK-130`).** The PostgreSQL gateway, embedded, with 20k rows and a grouped, filtered query: 1.0 ms pushed down against 230 ms local, where every row is streamed to the gateway. Results are identical in all three dialects.
+
+Reproduce:
+
+```text
+olap-bench gen <dir> 1000000 && python3 benches/olap/duckdb_bench.py <dir> load
+olap-bench gen-hits <dir> 1000000 && python3 benches/olap/duckdb_bench.py <dir> load-hits
+olap-bench query <dir> <q1|q6|h0..h15> 7    and    python3 benches/olap/duckdb_bench.py <dir> <same> 7
+```
+

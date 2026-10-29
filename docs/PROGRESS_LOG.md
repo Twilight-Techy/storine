@@ -609,3 +609,21 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Zone-map pruning**: the footer zone maps existed but were unused. Pruning is now conservative: each comparison leaf is judged by the document engine's own matcher at the needed bound. Equivalence is checked by a randomized test across row-group boundaries.
 - **Also**: the document store defaults to the adaptive arena layout. One file per record had cost 4.2 GB and 10k docs/s per million documents; the arena brings this to 978 MB, a 7× faster load and 6× faster columnar builds. An existing store keeps its layout (migration test).
 
+### Stage 28 (continued): analytics protocol, SDKs, SQL push-down, benchmarks (`TASK-129` – `TASK-131`) — 2026-10-29
+
+- **Protocol and SDKs**: `OP_DOC_AGGREGATE` and `OP_DOC_SCAN_COLUMNS`, with conformance vectors, run on job threads off the reactor. All 8 SDKs gained `aggregate`, `scan_columns` and the columnar switches; four parallel agents worked from one API brief. Writing the SDK tests found a wrong sentence in the spec: `sum` / `avg` skip non-numeric values (the server never returned `Invalid` for them). The doc was corrected.
+- **SQL push-down**: aggregation pushes down only where the result provably equals local execution, and a differential test runs every query both ways in all three dialects.
+  - Things that had to be excluded to keep results identical:
+    - float sums (the store's are correctly rounded, the gateway's are sequential);
+    - integer-only arithmetic (it overflows in the gateway but not in the store);
+    - columns whose missing fields read as a default;
+    - constants that convert inexactly (`price = 10.005` on `NUMERIC(10,2)`);
+    - `<>`, which is not true for NULL in SQL but matches missing fields in the store.
+  - Speedup: 230× on a grouped query over 20k rows, because no rows reach the gateway.
+- **The ClickBench-shaped run found real weaknesses**, and some were fixed:
+  - min / max of timestamps went through per-value decoding: 39 → 1.8 ms;
+  - distinct counts hashed a 32-byte key per row and cloned strings: 34 → 20 ms and 56 → 19 ms;
+  - high-cardinality grouping built and hashed a key vector per row, merged serially, sorted every group for a top-10, and contended on one shared budget counter: h15 454 → 110 ms.
+  - Still 6–10× behind DuckDB on h8, h9, h12 and h15. Recorded in `BENCHMARK_REPORT.md` §6, not claimed as wins.
+- **Binary size**: `storage-server` is 2.9 MB on Linux. It was already 2.16 MB before Stage 28, against the `< 1 MiB` rule (`RULE-MEM-03`), so the breach predates this stage. This stage removed 135 KiB of duplicate unpack kernels; the analytics code adds about 0.7 MB. This needs its own task.
+
