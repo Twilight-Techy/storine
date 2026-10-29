@@ -228,3 +228,143 @@ fn columnar_aggregates_equal_document_aggregates_for_random_filters() {
     assert_eq!(checked, 300);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Zone-map pruning (`TASK-128`) never changes a result: clustered columns over several row
+/// groups, comparison filters with probes of every numeric kind around the zone bounds, nulls,
+/// signed zeros and a mixed-kind row group.
+#[test]
+fn zone_map_pruning_is_exact() {
+    use storage_core::{DocOp, DocWrite, Precondition};
+    let d = dir("zones");
+    let s = DocumentStore::open(&d, EngineConfig::default()).unwrap();
+    let rows = 3 * storage_columnar::ROW_GROUP_ROWS as u64 + 500;
+    let mut batch = Vec::new();
+    for i in 0..rows {
+        let mut m = BTreeMap::new();
+        m.insert("seq".to_owned(), P::Int64(i as i64 - 20_000));
+        m.insert("ts".to_owned(), P::TimestampNs(i as i64 * 1000));
+        m.insert("d".to_owned(), dec(i128::from(i), 2));
+        m.insert("f".to_owned(), P::Float64(if i % 97 == 0 { -0.0 } else { i as f64 / 4.0 - 3000.0 }));
+        // The last row group's `g` mixes kinds; the second has a null.
+        let g = match i {
+            _ if i >= 3 * storage_columnar::ROW_GROUP_ROWS as u64 && i % 2 == 0 => P::Text("x".into()),
+            20_000 => P::Null,
+            _ => P::Int64((i / 1000) as i64),
+        };
+        m.insert("g".to_owned(), g);
+        batch.push(DocWrite { collection: "z".into(), key: format!("k{i:06}"), op: DocOp::Put(m), precondition: Precondition::None });
+        if batch.len() == 2000 {
+            s.write(std::mem::take(&mut batch), None).unwrap();
+        }
+    }
+    s.write(batch, None).unwrap();
+    s.create_columnar("z").unwrap();
+    s.columnar("z").unwrap().unwrap().merge().unwrap();
+    let docs = columnar::snapshot_documents(s.engine(), "z").unwrap();
+    let mut r = Rng(0xFEED_5EED_0123_4567);
+    let bound = |r: &mut Rng| -> i64 { [0i64, 16_383, 16_384, 32_767, 32_768, 49_152, 49_651, 60_000][r.next(8) as usize] + r.next(3) as i64 - 1 };
+    let mut pruned = 0;
+    for _ in 0..400 {
+        let p = ["seq", "ts", "d", "f", "g", "missing"][r.next(6) as usize];
+        let x = bound(&mut r);
+        let v = match r.next(6) {
+            0 => P::Int64(x - 20_000),
+            1 => P::TimestampNs(x * 1000),
+            2 => dec(i128::from(x), 2),
+            3 => P::Float64(x as f64 / 4.0 - 3000.0),
+            4 => P::Float64(-0.0),
+            _ => P::Int64(x / 1000),
+        };
+        let leaf = match r.next(8) {
+            0 => Filter::Lt(p.into(), v),
+            1 => Filter::Le(p.into(), v),
+            2 => Filter::Gt(p.into(), v),
+            3 => Filter::Ge(p.into(), v),
+            4 => Filter::Eq(p.into(), v),
+            5 => Filter::In(p.into(), vec![v, P::Int64(r.next(70) as i64)]),
+            6 => Filter::Between(p.into(), v.clone(), P::Int64(r.next(70_000) as i64 - 20_000)),
+            _ => Filter::Not(Box::new(Filter::Lt(p.into(), v))),
+        };
+        let f = match r.next(3) {
+            0 => leaf,
+            1 => Filter::And(vec![leaf, Filter::Ge("seq".into(), P::Int64(r.next(60_000) as i64 - 20_000))]),
+            _ => Filter::Or(vec![leaf, Filter::Lt("ts".into(), P::TimestampNs(r.next(60_000) as i64 * 1000))]),
+        };
+        let q = AggregateQuery {
+            collection: "z".into(),
+            filter: Some(f.clone()),
+            group_by: vec![GroupKey::Bucket { field: "seq".into(), width: 10_000, offset: 0 }],
+            aggregates: vec![Aggregate { func: AggFunc::Count, arg: None }, Aggregate { func: AggFunc::Sum, arg: field("d") }],
+            ..Default::default()
+        };
+        let got = s.aggregate(&q).unwrap();
+        let want = run_documents(&q, &docs).unwrap();
+        assert_eq!(got.matched, want.matched, "matched rows for {f:?}");
+        assert_eq!(got.rows, want.rows, "rows for {f:?}");
+        pruned += got.pruned_row_groups;
+    }
+    assert!(pruned > 100, "zone maps pruned only {pruned} row groups");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Group tables beyond the memory budget spill (`RULE-OLAP-04`): the result equals the
+/// in-memory one exactly, for every aggregate and with ordering and limits; spill runs are
+/// encrypted and removed; without a spill directory the budget fails cleanly.
+#[test]
+fn spilled_group_by_equals_in_memory() {
+    use storage_core::{DocOp, DocWrite, Precondition};
+    let d = dir("spill");
+    let s = DocumentStore::open(&d, EngineConfig::default()).unwrap();
+    let mut r = Rng(0x0BAD_5EED_7777_1234);
+    let mut batch = Vec::new();
+    for i in 0..40_000u64 {
+        let mut m = doc(&mut r, i);
+        m.insert("key".into(), P::Int64((i * 7919 % 25_000) as i64));
+        m.insert("label".into(), P::Text(format!("label-{}", i % 9_000)));
+        batch.push(DocWrite { collection: "s".into(), key: format!("k{i:06}"), op: DocOp::Put(m), precondition: Precondition::None });
+        if batch.len() == 2000 {
+            s.write(std::mem::take(&mut batch), None).unwrap();
+        }
+    }
+    s.create_columnar("s").unwrap();
+    s.columnar("s").unwrap().unwrap().merge().unwrap();
+    // Some delta on top.
+    for i in 0..500u64 {
+        let mut m = doc(&mut r, i);
+        m.insert("key".into(), P::Int64(30_000 + i as i64));
+        m.insert("label".into(), P::Text(format!("late-{i}")));
+        s.put("s", &format!("k{i:06}"), m).unwrap();
+    }
+    let docs = columnar::snapshot_documents(s.engine(), "s").unwrap();
+    let spill_dir = d.join("columnar").join("spill");
+    type Case = (Vec<GroupKey>, Vec<(usize, storage_core::Direction)>, Option<usize>);
+    let cases: Vec<Case> = vec![
+        (vec![GroupKey::Field("key".into())], vec![], None),
+        (vec![GroupKey::Field("label".into()), GroupKey::Field("flag".into())], vec![], None),
+        (vec![GroupKey::Field("key".into())], vec![(3, storage_core::Direction::Desc)], Some(25)),
+        (vec![], vec![], None),
+    ];
+    for (group_by, order_by, limit) in cases {
+        let mut q = AggregateQuery { collection: "s".into(), group_by, aggregates: aggregates(), order_by, limit, ..Default::default() };
+        // The distinct-only case needs a budget below its sets' size.
+        q.aggregates.push(Aggregate { func: AggFunc::CountDistinct, arg: field("key") });
+        let want = run_documents(&q, &docs).unwrap();
+        q.memory_budget = 256 << 10;
+        let got = s.aggregate(&q).unwrap();
+        assert!(got.spilled_bytes > 0, "the query should have spilled for {:?}", q.group_by);
+        assert_eq!(got.matched, want.matched);
+        assert_eq!(got.rows.len(), want.rows.len(), "groups for {:?}", q.group_by);
+        for (g, w) in got.rows.iter().zip(&want.rows) {
+            for (i, (a, b)) in g.iter().zip(w).enumerate() {
+                assert!(same(a, b), "column {i} differs for {:?}: {a:?} vs {b:?}", q.group_by);
+            }
+        }
+        // Runs are gone once the query returns.
+        let left: Vec<_> = std::fs::read_dir(&spill_dir).map(|e| e.flatten().collect()).unwrap_or_default();
+        assert!(left.is_empty(), "spill runs left behind: {left:?}");
+        // Without a spill directory the same budget is a clean error.
+        let err = run_documents(&q, &docs).unwrap_err();
+        assert!(format!("{err:?}").contains("memory"), "{err:?}");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}

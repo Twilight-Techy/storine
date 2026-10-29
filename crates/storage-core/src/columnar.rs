@@ -477,7 +477,8 @@ impl ColumnarCollection {
         docs.sort_by(|a, b| a.key.cmp(&b.key));
         let segs = if built { segs } else { Arc::new(Vec::new()) };
         let hidden = if built { hidden } else { Vec::new() };
-        Ok(ColumnarSnapshot { read, segments: segs, hidden, delta: docs, enc: self.encryption() })
+        let spill_dir = self.dir.parent().map(|p| p.join("spill"));
+        Ok(ColumnarSnapshot { read, segments: segs, hidden, delta: docs, enc: self.encryption(), spill_dir })
     }
 
     // ── maintenance ──
@@ -703,6 +704,8 @@ pub struct ColumnarSnapshot<'e> {
     /// Documents read from the row store as of the snapshot (in key order).
     pub delta: Vec<Document>,
     enc: Option<Arc<EncryptionConfig>>,
+    /// Where analytic queries over this snapshot spill (`RULE-OLAP-04`).
+    pub spill_dir: Option<PathBuf>,
 }
 
 impl core::fmt::Debug for ColumnarSnapshot<'_> {

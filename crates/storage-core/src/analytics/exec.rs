@@ -10,14 +10,15 @@ use storage_codec::simd;
 use storage_codec::types::PropertyValue;
 use storage_columnar::column::I128Body;
 use storage_columnar::int::IntChunk;
-use storage_columnar::{Body, Chunk, Kind, Val};
+use storage_columnar::{Body, Chunk, Kind, Val, ROW_GROUP_ROWS};
 use storage_types::{Decimal, FastHashMap, FastHashSet, Result, StorageError};
 
 use crate::columnar::ColumnarSnapshot;
 use crate::document::{Direction, Document};
 
 use super::filter::{eval, RowGroupView};
-use super::values::{cmp_props, pow10, GroupValue, Hll, MinMax, SumAcc};
+use super::spill::{Spill, DEFAULT_SPILL_BUDGET, PARTITIONS};
+use super::values::{cmp_props, pow10, put_u32, put_u64, GroupValue, Hll, MinMax, SumAcc, HLL_DENSE_BYTES};
 use super::{AggFunc, AggregateQuery, AggregateResult, Expr, GroupKey, DEFAULT_MEMORY_BUDGET, MAX_QUERY_ITEMS};
 
 // ── per-thread buffers ──
@@ -131,7 +132,8 @@ impl Acc {
             }
             Self::Approx(v) => {
                 v.push(Hll::default());
-                1 << 14
+                // A sparse sketch; turning dense charges `HLL_DENSE_BYTES` more.
+                1024
             }
         }
     }
@@ -143,24 +145,88 @@ struct State<'b> {
     reps: Vec<Vec<PropertyValue>>,
     accs: Vec<Acc>,
     matched: u64,
+    /// Row groups skipped by zone maps.
+    pruned: u64,
+    /// Bytes charged to the budget for groups (distinct sets are counted from their sizes).
+    charged: usize,
     budget: &'b Budget,
 }
 
-#[derive(Debug)]
+/// Memory accounting of one query. With a spill directory the limit is soft: workers spill
+/// their partial groups between row groups once usage passes three quarters of it (one row
+/// group can add at most its rows' worth of groups), and only a hard ceiling of twice the
+/// limit fails. Without one, the limit fails at once.
 struct Budget {
     used: AtomicUsize,
     limit: usize,
+    spill_dir: Option<std::path::PathBuf>,
+    spill_limit: u64,
+    spill: std::sync::OnceLock<Result<Spill>>,
+    /// What workers may add between two pressure checks (one row group each).
+    slack: usize,
+}
+
+/// Upper bound of the bytes one row adds to a group table: a new group with every
+/// accumulator, plus a distinct insert or a sketch's share of turning dense.
+fn row_bytes(q: &AggregateQuery) -> usize {
+    let per_agg: usize = q
+        .aggregates
+        .iter()
+        .map(|a| match a.func {
+            AggFunc::Count => 8,
+            AggFunc::Sum => 64,
+            AggFunc::Avg => 72,
+            AggFunc::Min | AggFunc::Max => 48,
+            AggFunc::CountDistinct => 48 + 64,
+            AggFunc::ApproxCountDistinct => 1024 + 64,
+        })
+        .sum();
+    128 + 64 * q.group_by.len() + per_agg
 }
 
 impl Budget {
+    fn new(q: &AggregateQuery, spill_dir: Option<&std::path::Path>) -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            limit: if q.memory_budget == 0 { DEFAULT_MEMORY_BUDGET } else { q.memory_budget },
+            spill_dir: spill_dir.map(std::path::Path::to_path_buf),
+            spill_limit: if q.spill_budget == 0 { DEFAULT_SPILL_BUDGET } else { q.spill_budget },
+            spill: std::sync::OnceLock::new(),
+            slack: 0,
+        }
+    }
+
     fn take(&self, n: usize) -> Result<()> {
         let now = self.used.fetch_add(n, Ordering::Relaxed) + n;
-        if now > self.limit {
+        let ceiling = if self.spill_dir.is_some() { self.limit.saturating_add(self.slack) } else { self.limit };
+        if now > ceiling {
             return Err(StorageError::invalid_value(
                 "the query needs more memory than its budget: narrow it with a filter, group by fewer values, or raise memory_budget",
             ));
         }
         Ok(())
+    }
+
+    fn release(&self, n: usize) {
+        let _ = self.used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| Some(u.saturating_sub(n)));
+    }
+
+    /// Usage calls for spilling (only when spilling is possible).
+    fn pressed(&self) -> bool {
+        self.spill_dir.is_some() && self.used.load(Ordering::Relaxed) > self.limit / 4 * 3
+    }
+
+    /// The query's spill runs, created on first use.
+    fn spill(&self) -> Result<&Spill> {
+        let dir = self.spill_dir.as_deref().ok_or_else(|| StorageError::invalid_value("internal: no spill directory"))?;
+        self.spill.get_or_init(|| Spill::new(dir, self.spill_limit)).as_ref().map_err(Clone::clone)
+    }
+
+    fn spilled(&self) -> Option<&Spill> {
+        match self.spill.get() {
+            Some(Ok(s)) if s.used() => Some(s),
+            _ => None,
+        }
     }
 }
 
@@ -171,12 +237,110 @@ impl<'b> State<'b> {
             reps: Vec::new(),
             accs: q.aggregates.iter().map(|a| Acc::new(a.func)).collect(),
             matched: 0,
+            pruned: 0,
+            charged: 0,
             budget,
         };
         if q.group_by.is_empty() {
             s.group(Vec::new(), Vec::new())?;
         }
         Ok(s)
+    }
+
+    /// Bytes this state holds against the budget.
+    fn footprint(&self) -> usize {
+        let distinct: usize = self
+            .accs
+            .iter()
+            .map(|a| match a {
+                Acc::Distinct(d) => d.iter().map(|s| s.len() * 64).sum(),
+                Acc::Approx(h) => h.iter().filter(|x| x.is_dense()).count() * HLL_DENSE_BYTES,
+                _ => 0,
+            })
+            .sum();
+        self.charged + distinct
+    }
+
+    /// Writes every group to its spill partition and starts over empty (counters kept).
+    fn spill_out(&mut self, q: &AggregateQuery) -> Result<()> {
+        let spill = self.budget.spill()?;
+        let mut rec = Vec::new();
+        for (key, &g) in &self.groups {
+            let g = g as usize;
+            rec.clear();
+            put_u32(&mut rec, key.len() as u32);
+            for k in key {
+                k.encode(&mut rec);
+            }
+            put_u32(&mut rec, self.reps[g].len() as u32);
+            for v in &self.reps[g] {
+                storage_codec::value_wire::encode_value(v, &mut rec);
+            }
+            for a in &self.accs {
+                match a {
+                    Acc::Count(c) => put_u64(&mut rec, c[g]),
+                    Acc::Sum(s) => s[g].encode(&mut rec),
+                    Acc::Avg(s, c) => {
+                        s[g].encode(&mut rec);
+                        put_u64(&mut rec, c[g]);
+                    }
+                    Acc::Min(m) | Acc::Max(m) => m[g].encode(&mut rec),
+                    Acc::Distinct(d) => {
+                        put_u32(&mut rec, d[g].len() as u32);
+                        for v in &d[g] {
+                            v.encode(&mut rec);
+                        }
+                    }
+                    Acc::Approx(h) => h[g].encode(&mut rec),
+                }
+            }
+            spill.append(partition_of(key), &rec)?;
+        }
+        self.budget.release(self.footprint());
+        self.groups = FastHashMap::default();
+        self.reps = Vec::new();
+        self.accs = q.aggregates.iter().map(|a| Acc::new(a.func)).collect();
+        self.charged = 0;
+        if q.group_by.is_empty() {
+            self.group(Vec::new(), Vec::new())?;
+        }
+        Ok(())
+    }
+
+    /// Merges one spilled group record.
+    fn load(&mut self, rec: &[u8]) -> Result<()> {
+        let mut r = storage_codec::value_wire::SveReader::new(rec);
+        let nk = r.count(1)?;
+        let key = (0..nk).map(|_| GroupValue::decode(&mut r)).collect::<Result<Vec<_>>>()?;
+        let nr = r.count(1)?;
+        let rep = (0..nr).map(|_| r.value()).collect::<Result<Vec<_>>>()?;
+        let g = self.group(key, rep)? as usize;
+        for a in &mut self.accs {
+            match a {
+                Acc::Count(c) => c[g] += r.u64()?,
+                Acc::Sum(s) => s[g].merge(&SumAcc::decode(&mut r)?),
+                Acc::Avg(s, c) => {
+                    s[g].merge(&SumAcc::decode(&mut r)?);
+                    c[g] += r.u64()?;
+                }
+                Acc::Min(m) => offer_mm(&mut m[g], MinMax::decode(&mut r)?.value, false),
+                Acc::Max(m) => offer_mm(&mut m[g], MinMax::decode(&mut r)?.value, true),
+                Acc::Distinct(d) => {
+                    let n = r.count(1)?;
+                    for _ in 0..n {
+                        if d[g].insert(GroupValue::decode(&mut r)?) {
+                            self.budget.take(64)?;
+                        }
+                    }
+                }
+                Acc::Approx(h) => {
+                    if h[g].merge(&Hll::decode(&mut r)?) {
+                        self.budget.take(HLL_DENSE_BYTES)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn group(&mut self, key: Vec<GroupValue>, rep: Vec<PropertyValue>) -> Result<u32> {
@@ -195,22 +359,28 @@ impl<'b> State<'b> {
             size += a.push();
         }
         self.budget.take(size)?;
+        self.charged += size;
         self.groups.insert(key, g);
         self.reps.push(rep);
         Ok(g)
     }
 
-    fn merge(&mut self, other: State<'_>) -> Result<()> {
+    fn merge(&mut self, mut other: State<'_>) -> Result<()> {
         self.matched += other.matched;
-        let mut order: Vec<(Vec<GroupValue>, u32)> = other.groups.into_iter().collect();
+        self.pruned += other.pruned;
+        // `other`'s memory moves here: what this state does not re-charge is released.
+        self.budget.release(other.footprint());
+        other.charged = 0;
+        let mut order: Vec<(Vec<GroupValue>, u32)> = core::mem::take(&mut other.groups).into_iter().collect();
         order.sort_by_key(|(_, g)| *g);
-        let mut other_reps = other.reps;
+        let mut other_reps = core::mem::take(&mut other.reps);
         let mut map = vec![0u32; other_reps.len()];
         for (key, og) in order {
             let rep = core::mem::take(&mut other_reps[og as usize]);
             map[og as usize] = self.group(key, rep)?;
         }
-        for (mine, theirs) in self.accs.iter_mut().zip(other.accs) {
+        let budget = self.budget;
+        for (mine, theirs) in self.accs.iter_mut().zip(core::mem::take(&mut other.accs)) {
             match (mine, theirs) {
                 (Acc::Count(a), Acc::Count(b)) => b.iter().enumerate().for_each(|(i, x)| a[map[i] as usize] += x),
                 (Acc::Sum(a), Acc::Sum(b)) => b.iter().enumerate().for_each(|(i, x)| a[map[i] as usize].merge(x)),
@@ -224,15 +394,36 @@ impl<'b> State<'b> {
                 (Acc::Max(a), Acc::Max(b)) => b.into_iter().enumerate().for_each(|(i, x)| offer_mm(&mut a[map[i] as usize], x.value, true)),
                 (Acc::Distinct(a), Acc::Distinct(b)) => {
                     for (i, set) in b.into_iter().enumerate() {
-                        a[map[i] as usize].extend(set);
+                        let target = &mut a[map[i] as usize];
+                        let before = target.len();
+                        target.extend(set);
+                        budget.take((target.len() - before) * 64)?;
                     }
                 }
-                (Acc::Approx(a), Acc::Approx(b)) => b.iter().enumerate().for_each(|(i, x)| a[map[i] as usize].merge(x)),
+                (Acc::Approx(a), Acc::Approx(b)) => {
+                    for (i, x) in b.iter().enumerate() {
+                        if a[map[i] as usize].merge(x) {
+                            budget.take(HLL_DENSE_BYTES)?;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
         Ok(())
     }
+}
+
+impl Drop for State<'_> {
+    fn drop(&mut self) {
+        self.budget.release(self.footprint());
+    }
+}
+
+/// Spill partition of a group key.
+fn partition_of(key: &[GroupValue]) -> usize {
+    let h = key.iter().fold(0x9E37_79B9_7F4A_7C15u64, |a, v| (a.rotate_left(23) ^ v.hash()).wrapping_mul(0xFF51_AFD7_ED55_8CCD));
+    ((h ^ (h >> 29)) % PARTITIONS as u64) as usize
 }
 
 /// `MinMax::offer` with a deterministic choice between equal values.
@@ -858,6 +1049,11 @@ fn run_row_group(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>, si: usize, g: 
     let seg = &snap.segments[si].segment;
     let seal = snap.seal();
     let n = seg.row_groups()[g].rows as usize;
+    // Zone maps rule out row groups before any chunk is read or decoded.
+    if q.filter.as_ref().is_some_and(|f| super::filter::prune(f, seg, g)) {
+        st.pruned += 1;
+        return Ok(());
+    }
     let mut sel = snap.live_mask(si, g);
     if sel.iter().all(|w| *w == 0) {
         return Ok(());
@@ -1186,8 +1382,8 @@ fn update(
         }
         (Acc::Approx(h), Some(col)) => {
             for i in 0..n {
-                if bit(rows, i) {
-                    h[gid(i)].add(&group_value_at(&col.col, i));
+                if bit(rows, i) && h[gid(i)].add(&group_value_at(&col.col, i)) {
+                    budget.take(HLL_DENSE_BYTES)?;
                 }
             }
         }
@@ -1305,7 +1501,11 @@ fn doc_matches(q: &AggregateQuery, d: &Document) -> bool {
 
 /// Adds documents (delta, or a collection without segments) to `st`.
 fn add_documents(q: &AggregateQuery, docs: &[Document], st: &mut State<'_>) -> Result<()> {
-    for d in docs {
+    for (i, d) in docs.iter().enumerate() {
+        // Between documents no group id is outstanding: spilling is safe.
+        if i % 1024 == 1023 && st.budget.pressed() {
+            st.spill_out(q)?;
+        }
         if !doc_matches(q, d) {
             continue;
         }
@@ -1349,7 +1549,11 @@ fn add_documents(q: &AggregateQuery, docs: &[Document], st: &mut State<'_>) -> R
                         budget.take(64)?;
                     }
                 }
-                Acc::Approx(h) => h[g].add(&GroupValue::of_val(Some(&v))),
+                Acc::Approx(h) => {
+                    if h[g].add(&GroupValue::of_val(Some(&v))) {
+                        budget.take(HLL_DENSE_BYTES)?;
+                    }
+                }
             }
         }
     }
@@ -1384,7 +1588,7 @@ fn validate(q: &AggregateQuery) -> Result<()> {
 /// Runs `q` over a columnar snapshot (segments in parallel, then the delta).
 pub fn run(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>) -> Result<AggregateResult> {
     validate(q)?;
-    let budget = Budget { used: AtomicUsize::new(0), limit: if q.memory_budget == 0 { DEFAULT_MEMORY_BUDGET } else { q.memory_budget } };
+    let mut budget = Budget::new(q, snap.spill_dir.as_deref());
     let needed = needed_columns(q);
     let morsels: Vec<(usize, usize)> = snap
         .segments
@@ -1396,7 +1600,16 @@ pub fn run(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>) -> Result<AggregateR
         .ok()
         .and_then(|t| t.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-    let threads = cores.min(morsels.len()).clamp(1, 16);
+    let mut threads = cores.min(morsels.len()).clamp(1, 16);
+    // Spilling happens between row groups, so each worker may add one row group's groups past
+    // the soft limit: fewer workers when that would exceed the budget, and the ceiling allows
+    // that much (memory stays below twice the budget, or one row group's worth).
+    let group_bytes = ROW_GROUP_ROWS.saturating_mul(row_bytes(q));
+    let grows = !q.group_by.is_empty() || q.aggregates.iter().any(|a| matches!(a.func, AggFunc::CountDistinct | AggFunc::ApproxCountDistinct));
+    if budget.spill_dir.is_some() && grows {
+        threads = threads.min((budget.limit / group_bytes.max(1)).max(1));
+    }
+    budget.slack = budget.limit.max(group_bytes.saturating_mul(threads));
     let profile = std::env::var_os("STORINE_PROFILE").is_some();
     let started = std::time::Instant::now();
     let next = AtomicUsize::new(0);
@@ -1415,6 +1628,9 @@ pub fn run(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>) -> Result<AggregateR
                             break;
                         }
                         run_row_group(q, snap, si, g, needed, &mut st)?;
+                        if budget.pressed() {
+                            st.spill_out(q)?;
+                        }
                     }
                     Ok(st)
                 };
@@ -1436,10 +1652,13 @@ pub fn run(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>) -> Result<AggregateR
     let mut total = State::new(q, &budget)?;
     for (_, st) in parts {
         total.merge(st)?;
+        if budget.pressed() {
+            total.spill_out(q)?;
+        }
     }
     let merged = started.elapsed();
     add_documents(q, &snap.delta, &mut total)?;
-    let out = finish(q, total);
+    let out = if budget.spilled().is_some() { finish_spilled(q, total, &budget) } else { finish(q, total) };
     if profile {
         eprintln!("[analytics] {} morsels on {threads} threads: scan {scanned:?}, merge {:?}, delta+finish {:?}", morsels.len(), merged - scanned, started.elapsed() - merged);
     }
@@ -1449,10 +1668,37 @@ pub fn run(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>) -> Result<AggregateR
 /// Runs `q` over documents only (a collection without column segments).
 pub fn run_documents(q: &AggregateQuery, docs: &[Document]) -> Result<AggregateResult> {
     validate(q)?;
-    let budget = Budget { used: AtomicUsize::new(0), limit: if q.memory_budget == 0 { DEFAULT_MEMORY_BUDGET } else { q.memory_budget } };
+    let budget = Budget::new(q, None);
     let mut st = State::new(q, &budget)?;
     add_documents(q, docs, &mut st)?;
     finish(q, st)
+}
+
+/// Finishes a query whose groups partly live in spill runs: every partition is merged and
+/// finished on its own (top-K per partition), then the rows are ordered as `finish` orders them.
+fn finish_spilled(q: &AggregateQuery, mut total: State<'_>, budget: &Budget) -> Result<AggregateResult> {
+    total.spill_out(q)?;
+    let spill = budget.spill()?;
+    let (matched, pruned) = (total.matched, total.pruned);
+    drop(total);
+    let mut rows = Vec::new();
+    for p in 0..PARTITIONS {
+        let mut part = State {
+            groups: FastHashMap::default(),
+            reps: Vec::new(),
+            accs: q.aggregates.iter().map(|a| Acc::new(a.func)).collect(),
+            matched: 0,
+            pruned: 0,
+            charged: 0,
+            budget,
+        };
+        spill.read(p, |rec| part.load(rec))?;
+        if !part.reps.is_empty() {
+            rows.extend(finish(q, part)?.rows);
+        }
+    }
+    sort_rows(q, &mut rows);
+    Ok(AggregateResult { rows, matched, pruned_row_groups: pruned, spilled_bytes: spill.bytes_written() })
 }
 
 fn finish(q: &AggregateQuery, st: State<'_>) -> Result<AggregateResult> {
@@ -1472,6 +1718,12 @@ fn finish(q: &AggregateQuery, st: State<'_>) -> Result<AggregateResult> {
         }
         rows.push(row);
     }
+    sort_rows(q, &mut rows);
+    Ok(AggregateResult { rows, matched: st.matched, pruned_row_groups: st.pruned, spilled_bytes: 0 })
+}
+
+/// Orders result rows by `order_by`, then by group keys, and applies the limit.
+fn sort_rows(q: &AggregateQuery, rows: &mut Vec<Vec<PropertyValue>>) {
     let keys = q.group_by.len();
     let by_keys = |a: &Vec<PropertyValue>, b: &Vec<PropertyValue>| {
         for i in 0..keys {
@@ -1495,5 +1747,4 @@ fn finish(q: &AggregateQuery, st: State<'_>) -> Result<AggregateResult> {
     if let Some(l) = q.limit {
         rows.truncate(l);
     }
-    Ok(AggregateResult { rows, matched: st.matched })
 }

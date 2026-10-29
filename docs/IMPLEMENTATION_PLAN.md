@@ -156,7 +156,7 @@ The rule for all four stages: nothing already built gets slower, bigger or less 
 ### 4.1 Stage 28: Columnar HTAP Analytics (`TASK-125` – `TASK-131`)
 
 - **Columnar projection, not a second database**:
-  - A collection opts in (`create_columnar(collection)`). Its documents are then also kept as immutable, memory-mapped **column segments**: up to 65,536 rows per row group, one column per field path, with a validity bitmap and a zone map (min, max, null count) per column chunk.
+  - A collection opts in (`create_columnar(collection)`). Its documents are then also kept as immutable, memory-mapped **column segments**: up to 16,384 rows per row group, one column per field path, with a validity bitmap and a zone map (min, max, null count) per column chunk.
   - Encodings are chosen per chunk by measured size: constant, bit-packed frame-of-reference, delta + frame-of-reference (sorted integers, timestamps), dictionary + bit-packed codes, run-length, bitmaps for booleans, and LZ4 blocks for long text.
   - Decimals are stored as `i128` mantissas at one scale per chunk, so sums stay exact.
   - Segments use the record checksums (`XXH3-64 + CRC32C`) and encryption-at-rest (sealed like index files), are validated once when mapped (`RULE-SAFE-04`), and have golden-format tests (`RULE-SAFE-05`).

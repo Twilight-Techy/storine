@@ -16,9 +16,11 @@
 
 mod exec;
 mod filter;
+mod spill;
 mod values;
 
 pub use exec::{run, run_documents};
+pub use spill::DEFAULT_SPILL_BUDGET;
 pub use values::{GroupValue, Hll};
 
 use storage_codec::types::PropertyValue;
@@ -85,8 +87,11 @@ pub struct AggregateQuery {
     /// group-key order.
     pub order_by: Vec<(usize, Direction)>,
     pub limit: Option<usize>,
-    /// Memory budget for group tables and distinct sets (`0`: the default, 256 MiB).
+    /// Memory budget for group tables and distinct sets (`0`: the default, 256 MiB). Beyond
+    /// it, partial groups spill to disk (`RULE-OLAP-04`).
     pub memory_budget: usize,
+    /// Disk budget for spilled partial groups (`0`: the default, 16 GiB).
+    pub spill_budget: u64,
 }
 
 /// Default per-query memory budget.
@@ -100,4 +105,8 @@ pub struct AggregateResult {
     pub rows: Vec<Vec<PropertyValue>>,
     /// Rows the filter selected (before grouping).
     pub matched: u64,
+    /// Row groups skipped by zone maps without reading them.
+    pub pruned_row_groups: u64,
+    /// Bytes of partial groups spilled to disk (`0`: the query ran in memory).
+    pub spilled_bytes: u64,
 }

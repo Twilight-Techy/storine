@@ -548,6 +548,75 @@ fn bytes_leaf(
     true
 }
 
+// ── zone-map pruning ──
+
+/// `true` when no row of row group `g` can match `f`, judged from the footer zone maps alone
+/// (no chunk is read). Conservative: only comparison leaves over columns whose every row holds
+/// a value are judged, each by `Filter::matches_value` itself at the zone bound the leaf would
+/// need, and a zone whose kind is ambiguous must be excluded under every kind it may hold.
+pub(crate) fn prune(f: &Filter, seg: &storage_columnar::Segment, g: usize) -> bool {
+    match f {
+        Filter::And(fs) => fs.iter().any(|x| prune(x, seg, g)),
+        Filter::Or(fs) => !fs.is_empty() && fs.iter().all(|x| prune(x, seg, g)),
+        Filter::Eq(p, _) | Filter::Lt(p, _) | Filter::Le(p, _) | Filter::Gt(p, _) | Filter::Ge(p, _) | Filter::Between(p, ..) | Filter::In(p, _) => {
+            let Some(group) = seg.row_groups().get(g) else { return false };
+            let Some(loc) = seg.column_index(p).and_then(|c| group.chunks.get(c)) else { return false };
+            if loc.len == 0 || loc.meta.null_count != 0 {
+                return false;
+            }
+            let bounds = zone_bounds(&loc.meta.zone);
+            !bounds.is_empty() && bounds.iter().all(|(min, max)| excluded(f, min, max))
+        }
+        _ => false,
+    }
+}
+
+/// `(min, max)` of a zone under each kind it may hold (empty: no usable summary).
+fn zone_bounds(z: &storage_columnar::Zone) -> Vec<(PropertyValue, PropertyValue)> {
+    use storage_columnar::Zone;
+    match z {
+        Zone::Int { min, max } if min <= max => vec![
+            (PropertyValue::Int64(*min), PropertyValue::Int64(*max)),
+            (PropertyValue::TimestampNs(*min), PropertyValue::TimestampNs(*max)),
+        ],
+        Zone::UInt { min, max } if min <= max => vec![(PropertyValue::UInt64(*min), PropertyValue::UInt64(*max))],
+        Zone::Int128 { min, max } if min <= max => vec![(PropertyValue::Int128(*min), PropertyValue::Int128(*max))],
+        // Signed zeros widen outward: `f64::min` may pick either zero, the total order does not.
+        Zone::Float { min, max, has_nan: false } if min <= max => {
+            let lo = if *min == 0.0 { -0.0 } else { *min };
+            let hi = if *max == 0.0 { 0.0 } else { *max };
+            vec![(PropertyValue::Float64(lo), PropertyValue::Float64(hi))]
+        }
+        Zone::Decimal { min, max } => match (Decimal::new(min.0, min.1), Decimal::new(max.0, max.1)) {
+            (Ok(a), Ok(b)) => vec![(PropertyValue::Decimal(a), PropertyValue::Decimal(b))],
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// No value in `[min, max]` (one kind, compare order) matches the comparison leaf `f`.
+fn excluded(f: &Filter, min: &PropertyValue, max: &PropertyValue) -> bool {
+    let at = |leaf: &Filter, v: &PropertyValue| with_ref(v, |r| leaf.matches_value(r));
+    // Ordered leaves are monotone in the compare order (and never match another rank), so the
+    // bound nearest to matching decides.
+    let outside = |v: &PropertyValue| {
+        use crate::document::{type_rank, value_ref_of};
+        let (vr, mr) = (value_ref_of(v), value_ref_of(min));
+        type_rank(&vr) == type_rank(&mr)
+            && with_ref(v, |r| with_ref(min, |a| compare_values(&r, &a)) == core::cmp::Ordering::Less || with_ref(max, |b| compare_values(&r, &b)) == core::cmp::Ordering::Greater)
+    };
+    match f {
+        Filter::Lt(..) | Filter::Le(..) => !at(f, min),
+        Filter::Gt(..) | Filter::Ge(..) => !at(f, max),
+        Filter::Between(p, lo, hi) => !at(&Filter::Ge(p.clone(), lo.clone()), max) || !at(&Filter::Le(p.clone(), hi.clone()), min),
+        // Equality may hold across kinds of one rank only through equal comparison.
+        Filter::Eq(_, v) => outside(v),
+        Filter::In(_, vs) => vs.iter().all(outside),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

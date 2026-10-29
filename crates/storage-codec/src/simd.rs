@@ -113,6 +113,7 @@ fn unpack64_bytes<const W: usize>(blk: &[u8], out: &mut [u64]) {
     for g in 0..8 {
         let gb = &blk[g * W..g * W + W + 8];
         let o = &mut out[g * 8..g * 8 + 8];
+        #[allow(clippy::needless_range_loop)] // `k` is the constant the offsets fold from
         for k in 0..8 {
             let bit = k * W;
             let at = bit >> 3;

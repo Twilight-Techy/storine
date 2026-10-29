@@ -112,7 +112,7 @@ impl GroupValue {
     }
 
     /// Bytes for hashing (HyperLogLog).
-    fn hash(&self) -> u64 {
+    pub(crate) fn hash(&self) -> u64 {
         let mut buf = Vec::with_capacity(32);
         match self {
             Self::Null => buf.push(0),
@@ -430,48 +430,291 @@ impl MinMax {
     }
 }
 
-/// HyperLogLog with 2^14 registers (standard error ~0.81 %).
-#[derive(Clone, Debug)]
+/// HyperLogLog with 2^14 registers (standard error ~0.81 %). Small sketches stay sparse (a
+/// few `(register, rank)` pairs) and become dense registers past `SPARSE_MAX` pairs; both
+/// forms give the same estimate, so grouping by many values costs little memory.
+#[derive(Clone, Debug, Default)]
 pub struct Hll {
+    /// Dense registers (empty while sparse).
     regs: Vec<u8>,
+    /// Sparse pairs `register << 8 | rank`, one per register.
+    sparse: Vec<u32>,
 }
 
 const HLL_P: u32 = 14;
-
-impl Default for Hll {
-    fn default() -> Self {
-        Self { regs: vec![0; 1 << HLL_P] }
-    }
-}
+/// Sparse pairs before a sketch turns dense (1 KiB against the 16 KiB of registers).
+const SPARSE_MAX: usize = 256;
+/// Bytes a dense sketch adds.
+pub(crate) const HLL_DENSE_BYTES: usize = 1 << HLL_P;
 
 impl Hll {
-    pub fn add(&mut self, v: &GroupValue) {
+    /// `true` when this call made the sketch dense (it grew by `HLL_DENSE_BYTES`).
+    pub fn add(&mut self, v: &GroupValue) -> bool {
         if matches!(v, GroupValue::Null) {
-            return;
+            return false;
         }
         let h = v.hash();
         let idx = (h >> (64 - HLL_P)) as usize;
         let rest = (h << HLL_P) | (1 << (HLL_P - 1));
         let rank = rest.leading_zeros() as u8 + 1;
-        if rank > self.regs[idx] {
-            self.regs[idx] = rank;
+        self.offer(idx, rank)
+    }
+
+    fn offer(&mut self, idx: usize, rank: u8) -> bool {
+        if !self.regs.is_empty() {
+            if rank > self.regs[idx] {
+                self.regs[idx] = rank;
+            }
+            return false;
+        }
+        match self.sparse.iter_mut().find(|p| (**p >> 8) as usize == idx) {
+            Some(p) => {
+                if rank > (*p & 0xFF) as u8 {
+                    *p = (idx as u32) << 8 | u32::from(rank);
+                }
+                false
+            }
+            None => {
+                self.sparse.push((idx as u32) << 8 | u32::from(rank));
+                if self.sparse.len() > SPARSE_MAX {
+                    self.regs = self.dense();
+                    self.sparse = Vec::new();
+                    return true;
+                }
+                false
+            }
         }
     }
 
-    pub fn merge(&mut self, o: &Hll) {
-        for (a, b) in self.regs.iter_mut().zip(&o.regs) {
-            *a = (*a).max(*b);
+    pub fn is_dense(&self) -> bool {
+        !self.regs.is_empty()
+    }
+
+    fn dense(&self) -> Vec<u8> {
+        if !self.regs.is_empty() {
+            return self.regs.clone();
         }
+        let mut regs = vec![0u8; 1 << HLL_P];
+        for p in &self.sparse {
+            let (i, r) = ((p >> 8) as usize, (p & 0xFF) as u8);
+            regs[i] = regs[i].max(r);
+        }
+        regs
+    }
+
+    /// `true` when this call made the sketch dense.
+    pub fn merge(&mut self, o: &Hll) -> bool {
+        let was = self.is_dense();
+        if o.is_dense() {
+            if !was {
+                self.regs = self.dense();
+                self.sparse = Vec::new();
+            }
+            for (a, b) in self.regs.iter_mut().zip(&o.regs) {
+                *a = (*a).max(*b);
+            }
+            return !was;
+        }
+        let mut grew = false;
+        for p in &o.sparse {
+            grew |= self.offer((p >> 8) as usize, (p & 0xFF) as u8);
+        }
+        grew
     }
 
     pub fn estimate(&self) -> u64 {
-        let m = self.regs.len() as f64;
-        let sum: f64 = self.regs.iter().map(|&r| 2f64.powi(-i32::from(r))).sum();
+        let regs = self.dense();
+        let m = regs.len() as f64;
+        let sum: f64 = regs.iter().map(|&r| 2f64.powi(-i32::from(r))).sum();
         let alpha = 0.7213 / (1.0 + 1.079 / m);
         let raw = alpha * m * m / sum;
-        let zeros = self.regs.iter().filter(|&&r| r == 0).count();
+        let zeros = regs.iter().filter(|&&r| r == 0).count();
         let e = if raw <= 2.5 * m && zeros > 0 { m * (m / zeros as f64).ln() } else { raw };
         e.round() as u64
+    }
+}
+
+// ── spill encoding (`RULE-OLAP-04`) ──
+//
+// Partial aggregates written to spill runs and read back by the same process: exact, so a
+// spilled query returns exactly what an in-memory one returns.
+
+use storage_codec::value_wire::{encode_value, SveReader};
+
+pub(crate) fn put_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+pub(crate) fn put_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_i128(out: &mut Vec<u8>, v: i128) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+    put_u32(out, b.len() as u32);
+    out.extend_from_slice(b);
+}
+
+fn get_i128(r: &mut SveReader<'_>) -> Result<i128> {
+    let b = r.take(16)?;
+    let mut a = [0u8; 16];
+    a.copy_from_slice(b);
+    Ok(i128::from_le_bytes(a))
+}
+
+fn get_bytes<'a>(r: &mut SveReader<'a>) -> Result<&'a [u8]> {
+    let n = r.u32()? as usize;
+    r.take(n)
+}
+
+fn bad(what: &'static str) -> StorageError {
+    StorageError::invalid_value(what)
+}
+
+impl GroupValue {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Null => out.push(0),
+            Self::Bool(b) => out.extend_from_slice(&[1, u8::from(*b)]),
+            Self::Exact(m, s) => {
+                out.push(2);
+                put_i128(out, *m);
+                out.push(*s);
+            }
+            Self::Float(b) => {
+                out.push(3);
+                put_u64(out, *b);
+            }
+            Self::Timestamp(t) => {
+                out.push(4);
+                put_u64(out, *t as u64);
+            }
+            Self::Text(s) => {
+                out.push(5);
+                put_bytes(out, s.as_bytes());
+            }
+            Self::Bytes(b) => {
+                out.push(6);
+                put_bytes(out, b);
+            }
+            Self::Uuid(u) => {
+                out.push(7);
+                out.extend_from_slice(u);
+            }
+            Self::Id(u) => {
+                out.push(8);
+                out.extend_from_slice(u);
+            }
+            Self::Nested(b) => {
+                out.push(9);
+                put_bytes(out, b);
+            }
+        }
+    }
+
+    pub(crate) fn decode(r: &mut SveReader<'_>) -> Result<Self> {
+        Ok(match r.u8()? {
+            0 => Self::Null,
+            1 => Self::Bool(r.u8()? != 0),
+            2 => {
+                let m = get_i128(r)?;
+                Self::Exact(m, r.u8()?)
+            }
+            3 => Self::Float(r.u64()?),
+            4 => Self::Timestamp(r.u64()? as i64),
+            5 => Self::Text(core::str::from_utf8(get_bytes(r)?).map_err(|_| bad("corrupt spill run: text"))?.to_owned()),
+            6 => Self::Bytes(get_bytes(r)?.to_vec()),
+            7 => Self::Uuid(r.take(16)?.try_into().map_err(|_| bad("corrupt spill run: uuid"))?),
+            8 => Self::Id(r.take(24)?.try_into().map_err(|_| bad("corrupt spill run: id"))?),
+            9 => Self::Nested(get_bytes(r)?.to_vec()),
+            _ => return Err(bad("corrupt spill run: group value tag")),
+        })
+    }
+}
+
+impl SumAcc {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        put_i128(out, self.exact);
+        out.push(self.scale);
+        let flags = u8::from(self.exact_seen)
+            | u8::from(self.decimal_seen) << 1
+            | u8::from(self.float_seen) << 2
+            | u8::from(self.overflow) << 3
+            | u8::from(self.float.has_special) << 4;
+        out.push(flags);
+        put_u64(out, self.float.special.to_bits());
+        put_u32(out, self.float.partials.len() as u32);
+        for p in &self.float.partials {
+            put_u64(out, p.to_bits());
+        }
+    }
+
+    pub(crate) fn decode(r: &mut SveReader<'_>) -> Result<Self> {
+        let exact = get_i128(r)?;
+        let scale = r.u8()?;
+        let flags = r.u8()?;
+        let special = f64::from_bits(r.u64()?);
+        let n = r.count(8)?;
+        let partials = (0..n).map(|_| r.u64().map(f64::from_bits)).collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            exact,
+            scale,
+            exact_seen: flags & 1 != 0,
+            decimal_seen: flags & 2 != 0,
+            float: FloatSum { partials, special, has_special: flags & 16 != 0 },
+            float_seen: flags & 4 != 0,
+            overflow: flags & 8 != 0,
+        })
+    }
+}
+
+impl MinMax {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        match &self.value {
+            None => out.push(0),
+            Some(v) => {
+                out.push(1);
+                encode_value(v, out);
+            }
+        }
+    }
+
+    pub(crate) fn decode(r: &mut SveReader<'_>) -> Result<Self> {
+        Ok(Self { value: if r.u8()? == 0 { None } else { Some(r.value()?) } })
+    }
+}
+
+impl Hll {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>) {
+        if self.is_dense() {
+            out.push(1);
+            put_bytes(out, &self.regs);
+        } else {
+            out.push(0);
+            put_u32(out, self.sparse.len() as u32);
+            for p in &self.sparse {
+                put_u32(out, *p);
+            }
+        }
+    }
+
+    pub(crate) fn decode(r: &mut SveReader<'_>) -> Result<Self> {
+        if r.u8()? == 1 {
+            let regs = get_bytes(r)?;
+            if regs.len() != 1 << HLL_P {
+                return Err(bad("corrupt spill run: sketch size"));
+            }
+            return Ok(Self { regs: regs.to_vec(), sparse: Vec::new() });
+        }
+        let n = r.count(4)?;
+        let sparse = (0..n).map(|_| r.u32()).collect::<Result<Vec<_>>>()?;
+        if n > SPARSE_MAX || sparse.iter().any(|p| (p >> 8) as usize >= 1 << HLL_P) {
+            return Err(bad("corrupt spill run: sparse sketch"));
+        }
+        Ok(Self { regs: Vec::new(), sparse })
     }
 }
 

@@ -594,3 +594,18 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - **Verified**: about 9,000 snapshots taken while transfers and merges ran concurrently all summed to the exact constant total. A seeded random model run and restart and crash-leftover cases are also covered.
 - **Bug found on the way (present since `TASK-099`)**: replicated document deletes always failed. The Raft command decoder rejected any batch whose operations were all payload-free (a delete plus its `$meta` check), because its size check assumed 49 bytes per operation instead of 46. SDK deletes and SQL `DELETE` against a cluster failed as "truncated". Puts carry payloads, so the existing cluster tests, which only deposit, never noticed. Fixed, with a round-trip test of payload-free batches. Stage 29's decoder fuzzing is meant to catch this class of bug systematically.
 
+### Stage 28 (continued): kernels and bounded execution (`TASK-127`, `TASK-128`) — 2026-10-29
+
+- **Starting point**: Storine took 16.4 ms on Q1 against DuckDB's 7–9 ms (1M rows, 4 threads), and 7.0 ms on Q6 against 2.6 ms. Results were already exact.
+- **What closed the gap**, each step measured by instruction counts under callgrind and then by interleaved wall-clock runs:
+  - Per-width unpack, unrolled in byte-aligned groups of 8 values.
+  - Dictionary predicates as one code-range test instead of a per-row table lookup, and a binary search of sorted dictionaries instead of evaluating every one of the ~2,500 date entries per row group.
+  - Row-group-local group slots, which scatter into a few accumulators.
+  - Overflow bounds computed with bitwise folds. LLVM had turned the 8-lane array versions into strided scalar loads, and AVX2 has no 64-bit arithmetic shift.
+  - Fewer zeroed buffers.
+  - The largest single step: 16k-row row groups (from 64k), so decoded columns stay in the 2 MiB per-core L2. That took Q1 single-threaded from 27.8 to 22.4 ms for 5% more storage.
+- **Result**: Q1 6.3 ms against DuckDB's 7.8–9.6 ms and Q6 2.5 ms against 2.9–3.3 ms at 4 threads, with identical results. Single-threaded, DuckDB still leads (Q1 22.4 vs 19 ms, Q6 6.5 vs 5.8 ms); the remaining cost is bit unpacking and per-aggregate scatter passes.
+- **Bounded memory** (`RULE-OLAP-04`): the budget used to be a hard failure. Now group tables spill hash-partitioned, encrypted runs between row groups and finish one partition at a time. Spilled and in-memory results are identical by test. Per-group HyperLogLog sketches became sparse, since 16 KiB per group made high-cardinality approximate counts impossible under any budget.
+- **Zone-map pruning**: the footer zone maps existed but were unused. Pruning is now conservative: each comparison leaf is judged by the document engine's own matcher at the needed bound. Equivalence is checked by a randomized test across row-group boundaries.
+- **Also**: the document store defaults to the adaptive arena layout. One file per record had cost 4.2 GB and 10k docs/s per million documents; the arena brings this to 978 MB, a 7× faster load and 6× faster columnar builds. An existing store keeps its layout (migration test).
+
