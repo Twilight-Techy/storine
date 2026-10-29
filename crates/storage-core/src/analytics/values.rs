@@ -430,13 +430,63 @@ impl MinMax {
     }
 }
 
+/// Hasher for integer keys in analytics tables: the full 64-bit finalizer of MurmurHash3, so
+/// small or arithmetic-progression integers spread over every bucket. (`FastHasher` keeps
+/// integer bits nearly as they are, which suits its record-id users but piles small integer
+/// keys into a few buckets.)
+#[derive(Default, Clone, Copy)]
+pub(crate) struct IntHasher(u64);
+
+impl core::hash::Hasher for IntHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        let mut h = self.0;
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        h ^= h >> 33;
+        h = h.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+        h ^ (h >> 33)
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = (self.0.rotate_left(29) ^ i).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ i;
+    }
+
+    #[inline]
+    fn write_i64(&mut self, i: i64) {
+        self.write_u64(i as u64);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.write_u64(u64::from(i));
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.write_u64(u64::from(i));
+    }
+}
+
+pub(crate) type IntBuild = core::hash::BuildHasherDefault<IntHasher>;
+pub(crate) type IntMap<K, V> = std::collections::HashMap<K, V, IntBuild>;
+pub(crate) type IntSet<K> = std::collections::HashSet<K, IntBuild>;
+
 /// The distinct values of one group (`COUNT(DISTINCT ...)`). Integers and timestamps, the
 /// common cases, are kept as plain `i64`s; the three sets hold disjoint canonical values, so
 /// the count is exact.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DistinctSet {
-    ints: FastHashSet<i64>,
-    stamps: FastHashSet<i64>,
+    ints: IntSet<i64>,
+    stamps: IntSet<i64>,
     other: FastHashSet<GroupValue>,
 }
 

@@ -11,14 +11,14 @@ use storage_codec::types::PropertyValue;
 use storage_columnar::column::I128Body;
 use storage_columnar::int::IntChunk;
 use storage_columnar::{Body, Chunk, Kind, Val, ROW_GROUP_ROWS};
-use storage_types::{Decimal, FastHashMap, FastHashSet, Result, StorageError};
+use storage_types::{Decimal, FastHashMap, Result, StorageError};
 
 use crate::columnar::ColumnarSnapshot;
 use crate::document::{Direction, Document};
 
 use super::filter::{eval, RowGroupView};
 use super::spill::{Spill, DEFAULT_SPILL_BUDGET, PARTITIONS};
-use super::values::{cmp_props, pow10, put_u32, put_u64, DistinctSet, GroupValue, Hll, MinMax, SumAcc, HLL_DENSE_BYTES};
+use super::values::{cmp_props, pow10, put_u32, put_u64, DistinctSet, GroupValue, Hll, IntMap, IntSet, MinMax, SumAcc, HLL_DENSE_BYTES};
 use super::{AggFunc, AggregateQuery, AggregateResult, Expr, GroupKey, DEFAULT_MEMORY_BUDGET, MAX_QUERY_ITEMS};
 
 // ── per-thread buffers ──
@@ -139,10 +139,65 @@ impl Acc {
     }
 }
 
+/// The representative key values of every group, `stride` (the key count) per group in one
+/// vector: no allocation per group.
+struct Reps {
+    vals: Vec<PropertyValue>,
+    stride: usize,
+    n: usize,
+}
+
+impl Reps {
+    fn new(stride: usize) -> Self {
+        Self { vals: Vec::new(), stride, n: 0 }
+    }
+
+    fn len(&self) -> usize {
+        self.n
+    }
+
+    fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    fn get(&self, g: usize) -> &[PropertyValue] {
+        &self.vals[g * self.stride..(g + 1) * self.stride]
+    }
+
+    fn get_mut(&mut self, g: usize) -> &mut [PropertyValue] {
+        &mut self.vals[g * self.stride..(g + 1) * self.stride]
+    }
+
+    fn push(&mut self, rep: impl IntoIterator<Item = PropertyValue>) {
+        let start = self.vals.len();
+        self.vals.extend(rep.into_iter().take(self.stride));
+        self.vals.resize(start + self.stride, PropertyValue::Null);
+        self.n += 1;
+    }
+
+    /// Moves group `g`'s values out (leaving nulls).
+    fn take(&mut self, g: usize) -> Vec<PropertyValue> {
+        self.get_mut(g).iter_mut().map(|v| core::mem::replace(v, PropertyValue::Null)).collect()
+    }
+
+    fn take_one(&mut self, g: usize) -> PropertyValue {
+        self.get_mut(g).first_mut().map_or(PropertyValue::Null, |v| core::mem::replace(v, PropertyValue::Null))
+    }
+
+    /// Replaces each representative that differs from `rep` by the deterministic choice.
+    fn offer(&mut self, g: usize, rep: impl IntoIterator<Item = PropertyValue>) {
+        for (c, r) in self.get_mut(g).iter_mut().zip(rep) {
+            if *c != r {
+                *c = det_pick(core::mem::replace(c, PropertyValue::Null), r);
+            }
+        }
+    }
+}
+
 /// Group table and accumulators of one worker (or of the final result).
 struct State<'b> {
     groups: FastHashMap<Vec<GroupValue>, u32>,
-    reps: Vec<Vec<PropertyValue>>,
+    reps: Reps,
     accs: Vec<Acc>,
     matched: u64,
     /// Row groups skipped by zone maps.
@@ -151,7 +206,7 @@ struct State<'b> {
     charged: usize,
     /// Group of each plain integer / timestamp key seen (`true`: timestamp), so a high-cardinality
     /// integer key costs one probe per row instead of building and hashing a key vector.
-    ints: FastHashMap<(bool, i64), u32>,
+    ints: IntMap<(bool, i64), u32>,
     budget: &'b Budget,
 }
 
@@ -259,12 +314,12 @@ impl<'b> State<'b> {
     fn new(q: &AggregateQuery, budget: &'b Budget) -> Result<Self> {
         let mut s = Self {
             groups: FastHashMap::default(),
-            reps: Vec::new(),
+            reps: Reps::new(q.group_by.len()),
             accs: q.aggregates.iter().map(|a| Acc::new(a.func)).collect(),
             matched: 0,
             pruned: 0,
             charged: 0,
-            ints: FastHashMap::default(),
+            ints: IntMap::default(),
             budget,
         };
         if q.group_by.is_empty() {
@@ -277,12 +332,12 @@ impl<'b> State<'b> {
     fn empty(q: &AggregateQuery, budget: &'b Budget) -> Self {
         Self {
             groups: FastHashMap::default(),
-            reps: Vec::new(),
+            reps: Reps::new(q.group_by.len()),
             accs: q.aggregates.iter().map(|a| Acc::new(a.func)).collect(),
             matched: 0,
             pruned: 0,
             charged: 0,
-            ints: FastHashMap::default(),
+            ints: IntMap::default(),
             budget,
         }
     }
@@ -293,27 +348,19 @@ impl<'b> State<'b> {
         self.budget.release(self.footprint());
         self.charged = 0;
         let mut out: Vec<State<'b>> = (0..PARTITIONS).map(|_| State::empty(q, self.budget)).collect();
-        let groups = self.take_keys();
-        let mut reps = core::mem::take(&mut self.reps);
+        let generic: Vec<(Vec<GroupValue>, u32)> = core::mem::take(&mut self.groups).into_iter().collect();
+        let ints: Vec<((bool, i64), u32)> = core::mem::take(&mut self.ints).into_iter().collect();
+        let mut reps = core::mem::replace(&mut self.reps, Reps::new(0));
         let mut accs = core::mem::take(&mut self.accs);
-        for (key, g) in groups {
-            let g = g as usize;
+        for (key, g) in generic {
             let part = &mut out[partition_of(&key)];
-            let ng = part.group(key, core::mem::take(&mut reps[g]))? as usize;
-            for (src, dst) in accs.iter_mut().zip(part.accs.iter_mut()) {
-                match (src, dst) {
-                    (Acc::Count(a), Acc::Count(b)) => b[ng] = a[g],
-                    (Acc::Sum(a), Acc::Sum(b)) => b[ng] = core::mem::take(&mut a[g]),
-                    (Acc::Avg(a, ac), Acc::Avg(b, bc)) => {
-                        b[ng] = core::mem::take(&mut a[g]);
-                        bc[ng] = ac[g];
-                    }
-                    (Acc::Min(a), Acc::Min(b)) | (Acc::Max(a), Acc::Max(b)) => b[ng] = core::mem::take(&mut a[g]),
-                    (Acc::Distinct(a), Acc::Distinct(b)) => b[ng] = core::mem::take(&mut a[g]),
-                    (Acc::Approx(a), Acc::Approx(b)) => b[ng] = core::mem::take(&mut a[g]),
-                    _ => {}
-                }
-            }
+            let ng = part.group(key, reps.take(g as usize))? as usize;
+            move_accs(&mut accs, g as usize, &mut part.accs, ng);
+        }
+        for (ik, g) in ints {
+            let part = &mut out[partition_of(core::slice::from_ref(&int_gv(ik)))];
+            let ng = part.int_group_rep(ik, reps.take_one(g as usize))? as usize;
+            move_accs(&mut accs, g as usize, &mut part.accs, ng);
         }
         Ok(out)
     }
@@ -322,13 +369,13 @@ impl<'b> State<'b> {
     fn int_group(&mut self, x: i64, ts: bool) -> Result<u32> {
         if let Some(&g) = self.ints.get(&(ts, x)) {
             // The representative is the plain value unless another kind (`1.0`) came first.
-            let canonical = matches!((&self.reps[g as usize][..], ts), ([PropertyValue::Int64(y)], false) | ([PropertyValue::TimestampNs(y)], true) if *y == x);
+            let canonical = matches!((self.reps.get(g as usize), ts), ([PropertyValue::Int64(y)], false) | ([PropertyValue::TimestampNs(y)], true) if *y == x);
             if canonical {
                 return Ok(g);
             }
         }
         let rep = if ts { PropertyValue::TimestampNs(x) } else { PropertyValue::Int64(x) };
-        self.int_group_rep((ts, x), vec![rep])
+        self.int_group_rep((ts, x), rep)
     }
 
     /// Bytes this state holds against the budget.
@@ -357,8 +404,8 @@ impl<'b> State<'b> {
             for k in key {
                 k.encode(&mut rec);
             }
-            put_u32(&mut rec, self.reps[g].len() as u32);
-            for v in &self.reps[g] {
+            put_u32(&mut rec, self.reps.get(g).len() as u32);
+            for v in self.reps.get(g) {
                 storage_codec::value_wire::encode_value(v, &mut rec);
             }
             for a in &self.accs {
@@ -383,9 +430,9 @@ impl<'b> State<'b> {
         }
         self.budget.release(self.footprint());
         self.groups = FastHashMap::default();
-        self.reps = Vec::new();
+        self.reps = Reps::new(q.group_by.len());
         self.accs = q.aggregates.iter().map(|a| Acc::new(a.func)).collect();
-        self.ints = FastHashMap::default();
+        self.ints = IntMap::default();
         self.charged = 0;
         if q.group_by.is_empty() {
             self.group(Vec::new(), Vec::new())?;
@@ -434,16 +481,11 @@ impl<'b> State<'b> {
         // them: `1`, `1.0` and `1.00` are all `Exact(1, 0)`), so every path finds one group.
         if let [k] = key.as_slice() {
             if let Some(ik) = int_key(k) {
-                return self.int_group_rep(ik, rep);
+                return self.int_group_rep(ik, rep.into_iter().next().unwrap_or(PropertyValue::Null));
             }
         }
         if let Some(&g) = self.groups.get(&key) {
-            let cur = &mut self.reps[g as usize];
-            for (c, r) in cur.iter_mut().zip(rep) {
-                if *c != r {
-                    *c = det_pick(core::mem::replace(c, PropertyValue::Null), r);
-                }
-            }
+            self.reps.offer(g as usize, rep);
             return Ok(g);
         }
         let mut size = key.iter().map(GroupValue::size).sum::<usize>() + 64;
@@ -452,7 +494,7 @@ impl<'b> State<'b> {
         Ok(g)
     }
 
-    fn new_group(&mut self, rep: Vec<PropertyValue>, size: &mut usize) -> Result<u32> {
+    fn new_group(&mut self, rep: impl IntoIterator<Item = PropertyValue>, size: &mut usize) -> Result<u32> {
         let g = self.reps.len() as u32;
         for a in &mut self.accs {
             *size += a.push();
@@ -464,18 +506,13 @@ impl<'b> State<'b> {
     }
 
     /// The group of single key `(timestamp?, value)`, keeping its representative deterministic.
-    fn int_group_rep(&mut self, ik: (bool, i64), rep: Vec<PropertyValue>) -> Result<u32> {
+    fn int_group_rep(&mut self, ik: (bool, i64), rep: PropertyValue) -> Result<u32> {
         if let Some(&g) = self.ints.get(&ik) {
-            let cur = &mut self.reps[g as usize];
-            for (c, r) in cur.iter_mut().zip(rep) {
-                if *c != r {
-                    *c = det_pick(core::mem::replace(c, PropertyValue::Null), r);
-                }
-            }
+            self.reps.offer(g as usize, [rep]);
             return Ok(g);
         }
         let mut size = 48;
-        let g = self.new_group(rep, &mut size)?;
+        let g = self.new_group([rep], &mut size)?;
         self.ints.insert(ik, g);
         Ok(g)
     }
@@ -497,15 +534,13 @@ impl<'b> State<'b> {
         // order-independent.
         let generic: Vec<(Vec<GroupValue>, u32)> = core::mem::take(&mut other.groups).into_iter().collect();
         let ints: Vec<((bool, i64), u32)> = core::mem::take(&mut other.ints).into_iter().collect();
-        let mut other_reps = core::mem::take(&mut other.reps);
+        let mut other_reps = core::mem::replace(&mut other.reps, Reps::new(0));
         let mut map = vec![0u32; other_reps.len()];
         for (key, og) in generic {
-            let rep = core::mem::take(&mut other_reps[og as usize]);
-            map[og as usize] = self.group(key, rep)?;
+            map[og as usize] = self.group(key, other_reps.take(og as usize))?;
         }
         for (ik, og) in ints {
-            let rep = core::mem::take(&mut other_reps[og as usize]);
-            map[og as usize] = self.int_group_rep(ik, rep)?;
+            map[og as usize] = self.int_group_rep(ik, other_reps.take_one(og as usize))?;
         }
         let budget = self.budget;
         for (mine, theirs) in self.accs.iter_mut().zip(core::mem::take(&mut other.accs)) {
@@ -543,6 +578,24 @@ impl<'b> State<'b> {
 impl Drop for State<'_> {
     fn drop(&mut self) {
         self.budget.release(self.footprint());
+    }
+}
+
+/// Moves group `g`'s accumulator entries to entry `ng` of `dst`.
+fn move_accs(src: &mut [Acc], g: usize, dst: &mut [Acc], ng: usize) {
+    for (a, b) in src.iter_mut().zip(dst.iter_mut()) {
+        match (a, b) {
+            (Acc::Count(a), Acc::Count(b)) => b[ng] = a[g],
+            (Acc::Sum(a), Acc::Sum(b)) => b[ng] = core::mem::take(&mut a[g]),
+            (Acc::Avg(a, ac), Acc::Avg(b, bc)) => {
+                b[ng] = core::mem::take(&mut a[g]);
+                bc[ng] = ac[g];
+            }
+            (Acc::Min(a), Acc::Min(b)) | (Acc::Max(a), Acc::Max(b)) => b[ng] = core::mem::take(&mut a[g]),
+            (Acc::Distinct(a), Acc::Distinct(b)) => b[ng] = core::mem::take(&mut a[g]),
+            (Acc::Approx(a), Acc::Approx(b)) => b[ng] = core::mem::take(&mut a[g]),
+            _ => {}
+        }
     }
 }
 
@@ -1382,7 +1435,7 @@ fn aggregate_row_group(q: &AggregateQuery, rg: &RowGroupView<'_>, sel: Vec<u64>,
                     for_each_set(&sel, |i| g[i] = l.gids[l.slot[i] as usize]);
                     gids = Some(g);
                 }
-                let mut pairs: FastHashSet<(u32, u32)> = FastHashSet::default();
+                let mut pairs: IntSet<(u32, u32)> = IntSet::default();
                 match &gids {
                     Some(g) => for_each_set(&sel, |i| {
                         pairs.insert((g[i], codes[i]));
@@ -1992,6 +2045,9 @@ pub fn run_documents(q: &AggregateQuery, docs: &[Document]) -> Result<AggregateR
     finish(q, st)
 }
 
+static MERGE_NS: AtomicUsize = AtomicUsize::new(0);
+static FINISH_NS: AtomicUsize = AtomicUsize::new(0);
+
 /// Group count from which worker states merge in parallel hash partitions.
 const PARALLEL_MERGE_GROUPS: usize = 16_384;
 
@@ -2050,10 +2106,15 @@ fn merge_partitioned<'b>(q: &AggregateQuery, parts: Vec<State<'b>>, threads: usi
                 let mut it = states.into_iter();
                 let Some(mut total) = it.next() else { continue };
                 let done = (|| -> Result<Vec<Vec<PropertyValue>>> {
+                    let t = std::time::Instant::now();
                     for st in it {
                         total.merge(st)?;
                     }
-                    Ok(finish(q, total)?.rows)
+                    MERGE_NS.fetch_add(t.elapsed().as_nanos() as usize, Ordering::Relaxed);
+                    let t = std::time::Instant::now();
+                    let r = finish(q, total)?.rows;
+                    FINISH_NS.fetch_add(t.elapsed().as_nanos() as usize, Ordering::Relaxed);
+                    Ok(r)
                 })();
                 match done {
                     Ok(r) => *rows[p].lock().unwrap_or_else(|e| e.into_inner()) = r,
@@ -2066,7 +2127,12 @@ fn merge_partitioned<'b>(q: &AggregateQuery, parts: Vec<State<'b>>, threads: usi
         return Err(e);
     }
     if std::env::var_os("STORINE_PROFILE").is_some() {
-        eprintln!("[analytics] split {t_split:?}, merge+finish {:?}", t0.elapsed() - t_split);
+        eprintln!(
+            "[analytics] split {t_split:?}, merge+finish {:?} (thread time: merge {} ms, finish {} ms)",
+            t0.elapsed() - t_split,
+            MERGE_NS.swap(0, Ordering::Relaxed) / 1_000_000,
+            FINISH_NS.swap(0, Ordering::Relaxed) / 1_000_000
+        );
     }
     let mut out: Vec<Vec<PropertyValue>> = Vec::new();
     for r in rows {
@@ -2123,7 +2189,7 @@ fn finish(q: &AggregateQuery, st: State<'_>) -> Result<AggregateResult> {
             let value = |c: usize, g: usize| -> &PropertyValue {
                 match &ord[c] {
                     Some(v) => &v[g],
-                    None => &st.reps[g][c],
+                    None => &st.reps.get(g)[c],
                 }
             };
             let cmp = |&a: &usize, &b: &usize| {
@@ -2135,7 +2201,7 @@ fn finish(q: &AggregateQuery, st: State<'_>) -> Result<AggregateResult> {
                     }
                 }
                 for c in 0..keys {
-                    let o = cmp_props(&st.reps[a][c], &st.reps[b][c]);
+                    let o = cmp_props(&st.reps.get(a)[c], &st.reps.get(b)[c]);
                     if o != core::cmp::Ordering::Equal {
                         return o;
                     }
@@ -2156,7 +2222,7 @@ fn finish(q: &AggregateQuery, st: State<'_>) -> Result<AggregateResult> {
     let mut rows: Vec<Vec<PropertyValue>> = Vec::with_capacity(chosen.len());
     for g in chosen {
         let mut row = Vec::with_capacity(keys + st.accs.len());
-        row.extend_from_slice(&st.reps[g]);
+        row.extend_from_slice(st.reps.get(g));
         for acc in &st.accs {
             row.push(agg_value(acc, g)?);
         }

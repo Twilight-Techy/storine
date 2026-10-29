@@ -826,11 +826,13 @@ mod tests {
     use storage_types::{InlineId, Version};
 
     fn fast() -> RaftConfig {
+        // Heartbeats stay fast; elections wait long enough that a test machine busy with other
+        // tests' fsyncs does not depose a healthy leader mid-test.
         RaftConfig {
-            election_timeout_min: Duration::from_millis(150),
-            election_timeout_max: Duration::from_millis(300),
+            election_timeout_min: Duration::from_millis(400),
+            election_timeout_max: Duration::from_millis(800),
             heartbeat_interval: Duration::from_millis(25),
-            commit_timeout: Duration::from_millis(800),
+            commit_timeout: Duration::from_secs(3),
             sweep_interval: Duration::from_millis(100),
             ..RaftConfig::default()
         }
