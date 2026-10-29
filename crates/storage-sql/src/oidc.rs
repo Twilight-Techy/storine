@@ -375,4 +375,37 @@ mod tests {
         assert!(o.verify_at(&token(&key, h, c), 1000.0).is_err());
         let _ = std::fs::remove_file(&o.jwks);
     }
+
+    /// Hostile access tokens and key sets (`TASK-135`): mutated tokens, and hostile headers
+    /// and claims under a valid signature, so the parsing after verification sees them too.
+    #[test]
+    fn fuzz_tokens_and_key_sets() {
+        use crate::fuzz_support as fz;
+        let (o, key) = setup("fuzz");
+        let mut rng = fz::rng(0x4f49_0001);
+        let h = r#"{"alg":"EdDSA","kid":"k1","typ":"JWT"}"#;
+        let claims = r#"{"iss":"https://id.example/realms/r","aud":["x","storine"],"exp":2000,"nbf":1,"preferred_username":"ann","sub":"123","nested":[[{"a":[1e999,-0.0,"é\ud800"]}]]}"#;
+        let jwks = std::fs::read_to_string(&o.jwks).unwrap();
+        let valid = token(&key, h, claims);
+        assert_eq!(o.verify_at(&valid, 1000.0), Ok("ann".into()));
+        let text = |rng: &mut fz::SweepRng, s: &str| {
+            String::from_utf8_lossy(&fz::variant(rng, s.as_bytes())).into_owned()
+        };
+        for _ in 0..fz::iters(20_000) {
+            let t = text(&mut rng, &valid);
+            fz::bounded(&t, || {
+                let _ = o.verify_at(&t, 1000.0);
+            });
+            let (hh, cc) = (text(&mut rng, h), text(&mut rng, claims));
+            let t = token(&key, &hh, &cc);
+            fz::bounded(&t, || {
+                let _ = o.verify_at(&t, 1000.0);
+            });
+            let j = text(&mut rng, &jwks);
+            fz::bounded(&j, || {
+                let _ = parse_jwks(&j);
+            });
+        }
+        let _ = std::fs::remove_file(&o.jwks);
+    }
 }

@@ -1106,4 +1106,96 @@ mod tests {
         assert_eq!(octets(&long).map(<[u8]>::len), Some(300));
         assert!(Der::new(&long[..long.len() - 1]).next().is_none());
     }
+
+    /// Hostile security tokens (`TASK-135`): mutated framing, and hostile ticket and
+    /// authenticator plaintexts encrypted under the right keys, so the parsing after
+    /// decryption sees them too. Errors only, never panics.
+    #[test]
+    fn fuzz_security_tokens() {
+        use crate::fuzz_support as fz;
+        let now = 1_800_000_000;
+        let service_key = vec![0x42u8; 32];
+        let path =
+            std::env::temp_dir().join(format!("storine-krb5-fuzz-{}.keytab", std::process::id()));
+        let tab = keytab(&[(
+            "MSSQLSvc/db.storine.test:1433",
+            Etype::Aes256Sha1,
+            &service_key,
+        )]);
+        std::fs::write(&path, &tab).unwrap();
+        let k = Kerberos::new(path.clone(), false).unwrap();
+        let mut rng = fz::rng(0x4b52_0001);
+        let c = Client {
+            etype: Etype::Aes256Sha1,
+            service_key: service_key.clone(),
+            session_key: vec![0x17u8; 32],
+            start: now - 100,
+            end: now + 3600,
+            ctime: now - 1,
+            cusec: 1,
+            mutual: true,
+            service: vec!["MSSQLSvc", "db.storine.test:1433"],
+        };
+        let valid = [ap_req(&c, false), ap_req(&c, true)];
+        for i in 0..fz::iters(20_000) {
+            // Framing and outer structure.
+            let pick = rng.below(valid.len());
+            let token = fz::variant(&mut rng, &valid[pick]);
+            fz::bounded(&token, || {
+                let _ = k.accept_at(&token, now);
+                let _ = (
+                    app_fields(&token, Some(14)),
+                    fields(&token),
+                    principal(&token),
+                );
+                let _ = (time(&token), int(&token), string(&token), encrypted(&token));
+            });
+            // Hostile plaintexts under valid encryption.
+            let mut etp = ctx(0, &tlv(0x03, &[0, 0x40, 0x81, 0, 0]));
+            etp.extend(ctx(
+                1,
+                &tlv(
+                    0x30,
+                    &[
+                        ctx(0, &der_int(c.etype.id())),
+                        ctx(1, &tlv(0x04, &c.session_key)),
+                    ]
+                    .concat(),
+                ),
+            ));
+            etp.extend(ctx(2, &tlv(0x1b, b"STORINE.TEST")));
+            etp.extend(ctx(3, &name(&["ann"])));
+            etp.extend(ctx(5, &gtime(c.start)));
+            etp.extend(ctx(7, &gtime(c.end)));
+            let ticket_plain = fz::variant(&mut rng, &tlv(0x63, &tlv(0x30, &etp)));
+            let enc_ticket = c.etype.encrypt(&service_key, 2, &ticket_plain).unwrap();
+            let mut ticket = ctx(0, &der_int(5));
+            ticket.extend(ctx(1, &tlv(0x1b, b"STORINE.TEST")));
+            ticket.extend(ctx(2, &name(&c.service)));
+            ticket.extend(ctx(3, &enc_data(c.etype, Some(2), &enc_ticket)));
+            let mut auth = ctx(0, &der_int(5));
+            auth.extend(ctx(1, &tlv(0x1b, b"STORINE.TEST")));
+            auth.extend(ctx(2, &name(&["ann"])));
+            auth.extend(ctx(4, &der_int(i as i64)));
+            auth.extend(ctx(5, &gtime(c.ctime)));
+            let auth_plain = fz::variant(&mut rng, &tlv(0x62, &tlv(0x30, &auth)));
+            let enc_auth = c.etype.encrypt(&c.session_key, 11, &auth_plain).unwrap();
+            let mut req = ctx(0, &der_int(5));
+            req.extend(ctx(1, &der_int(14)));
+            req.extend(ctx(2, &tlv(0x03, &[0, 0x20, 0, 0, 0])));
+            req.extend(ctx(3, &tlv(0x61, &tlv(0x30, &ticket))));
+            req.extend(ctx(4, &enc_data(c.etype, None, &enc_auth)));
+            let mut inner = vec![0x01, 0x00];
+            inner.extend(tlv(0x6e, &tlv(0x30, &req)));
+            let token = gss_frame(OID_KRB5, &inner);
+            fz::bounded(&token, || {
+                let _ = k.accept_at(&token, now);
+            });
+            let tab = fz::variant(&mut rng, &tab);
+            fz::bounded(&tab, || {
+                let _ = parse_keytab(&tab);
+            });
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }
