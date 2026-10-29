@@ -196,7 +196,8 @@ impl Reps {
 
 /// Group table and accumulators of one worker (or of the final result).
 struct State<'b> {
-    groups: FastHashMap<Vec<GroupValue>, u32>,
+    /// Generic group keys, hash-partitioned (`partition_of`) so a split moves whole maps.
+    groups: Vec<FastHashMap<Vec<GroupValue>, u32>>,
     reps: Reps,
     accs: Vec<Acc>,
     matched: u64,
@@ -206,7 +207,7 @@ struct State<'b> {
     charged: usize,
     /// Group of each plain integer / timestamp key seen (`true`: timestamp), so a high-cardinality
     /// integer key costs one probe per row instead of building and hashing a key vector.
-    ints: IntMap<(bool, i64), u32>,
+    ints: Vec<IntMap<(bool, i64), u32>>,
     budget: &'b Budget,
 }
 
@@ -313,13 +314,13 @@ impl Budget {
 impl<'b> State<'b> {
     fn new(q: &AggregateQuery, budget: &'b Budget) -> Result<Self> {
         let mut s = Self {
-            groups: FastHashMap::default(),
+            groups: empty_maps(),
             reps: Reps::new(q.group_by.len()),
             accs: q.aggregates.iter().map(|a| Acc::new(a.func)).collect(),
             matched: 0,
             pruned: 0,
             charged: 0,
-            ints: IntMap::default(),
+            ints: empty_maps(),
             budget,
         };
         if q.group_by.is_empty() {
@@ -331,13 +332,13 @@ impl<'b> State<'b> {
     /// A state without any group (not even the single group of an ungrouped query).
     fn empty(q: &AggregateQuery, budget: &'b Budget) -> Self {
         Self {
-            groups: FastHashMap::default(),
+            groups: empty_maps(),
             reps: Reps::new(q.group_by.len()),
             accs: q.aggregates.iter().map(|a| Acc::new(a.func)).collect(),
             matched: 0,
             pruned: 0,
             charged: 0,
-            ints: IntMap::default(),
+            ints: empty_maps(),
             budget,
         }
     }
@@ -348,26 +349,28 @@ impl<'b> State<'b> {
         self.budget.release(self.footprint());
         self.charged = 0;
         let mut out: Vec<State<'b>> = (0..PARTITIONS).map(|_| State::empty(q, self.budget)).collect();
-        let generic: Vec<(Vec<GroupValue>, u32)> = core::mem::take(&mut self.groups).into_iter().collect();
-        let ints: Vec<((bool, i64), u32)> = core::mem::take(&mut self.ints).into_iter().collect();
         let mut reps = core::mem::replace(&mut self.reps, Reps::new(0));
         let mut accs = core::mem::take(&mut self.accs);
-        for (key, g) in generic {
-            let part = &mut out[partition_of(&key)];
-            let ng = part.group(key, reps.take(g as usize))? as usize;
-            move_accs(&mut accs, g as usize, &mut part.accs, ng);
-        }
-        for (ik, g) in ints {
-            let part = &mut out[partition_of(core::slice::from_ref(&int_gv(ik)))];
-            let ng = part.int_group_rep(ik, reps.take_one(g as usize))? as usize;
-            move_accs(&mut accs, g as usize, &mut part.accs, ng);
+        // Each partition's maps move whole; only their group ids are renumbered (no re-hashing).
+        let groups = core::mem::take(&mut self.groups);
+        let ints = core::mem::take(&mut self.ints);
+        for (p, (mut generic, mut int)) in groups.into_iter().zip(ints).enumerate() {
+            let part = &mut out[p];
+            for g in generic.values_mut().chain(int.values_mut()) {
+                let mut size = 48;
+                let ng = part.new_group(reps.get_mut(*g as usize).iter_mut().map(|v| core::mem::replace(v, PropertyValue::Null)), &mut size)? as usize;
+                move_accs(&mut accs, *g as usize, &mut part.accs, ng);
+                *g = ng as u32;
+            }
+            part.groups[p] = generic;
+            part.ints[p] = int;
         }
         Ok(out)
     }
 
     /// The group of a single integer (or timestamp) key: the same group `group` gives it.
     fn int_group(&mut self, x: i64, ts: bool) -> Result<u32> {
-        if let Some(&g) = self.ints.get(&(ts, x)) {
+        if let Some(&g) = self.ints[int_partition((ts, x))].get(&(ts, x)) {
             // The representative is the plain value unless another kind (`1.0`) came first.
             let canonical = matches!((self.reps.get(g as usize), ts), ([PropertyValue::Int64(y)], false) | ([PropertyValue::TimestampNs(y)], true) if *y == x);
             if canonical {
@@ -429,10 +432,10 @@ impl<'b> State<'b> {
             spill.append(partition_of(key), &rec)?;
         }
         self.budget.release(self.footprint());
-        self.groups = FastHashMap::default();
+        self.groups = empty_maps();
         self.reps = Reps::new(q.group_by.len());
         self.accs = q.aggregates.iter().map(|a| Acc::new(a.func)).collect();
-        self.ints = IntMap::default();
+        self.ints = empty_maps();
         self.charged = 0;
         if q.group_by.is_empty() {
             self.group(Vec::new(), Vec::new())?;
@@ -484,13 +487,14 @@ impl<'b> State<'b> {
                 return self.int_group_rep(ik, rep.into_iter().next().unwrap_or(PropertyValue::Null));
             }
         }
-        if let Some(&g) = self.groups.get(&key) {
+        let p = partition_of(&key);
+        if let Some(&g) = self.groups[p].get(&key) {
             self.reps.offer(g as usize, rep);
             return Ok(g);
         }
         let mut size = key.iter().map(GroupValue::size).sum::<usize>() + 64;
         let g = self.new_group(rep, &mut size)?;
-        self.groups.insert(key, g);
+        self.groups[p].insert(key, g);
         Ok(g)
     }
 
@@ -507,20 +511,23 @@ impl<'b> State<'b> {
 
     /// The group of single key `(timestamp?, value)`, keeping its representative deterministic.
     fn int_group_rep(&mut self, ik: (bool, i64), rep: PropertyValue) -> Result<u32> {
-        if let Some(&g) = self.ints.get(&ik) {
+        let p = int_partition(ik);
+        if let Some(&g) = self.ints[p].get(&ik) {
             self.reps.offer(g as usize, [rep]);
             return Ok(g);
         }
         let mut size = 48;
         let g = self.new_group([rep], &mut size)?;
-        self.ints.insert(ik, g);
+        self.ints[p].insert(ik, g);
         Ok(g)
     }
 
     /// Every group's key (generic keys, then integer keys) with its id.
     fn take_keys(&mut self) -> Vec<(Vec<GroupValue>, u32)> {
-        let mut out: Vec<(Vec<GroupValue>, u32)> = core::mem::take(&mut self.groups).into_iter().collect();
-        out.extend(core::mem::take(&mut self.ints).into_iter().map(|(k, g)| (vec![int_gv(k)], g)));
+        let mut out: Vec<(Vec<GroupValue>, u32)> = core::mem::take(&mut self.groups).into_iter().flatten().collect();
+        out.extend(core::mem::take(&mut self.ints).into_iter().flatten().map(|(k, g)| (vec![int_gv(k)], g)));
+        self.groups = empty_maps();
+        self.ints = empty_maps();
         out
     }
 
@@ -532,8 +539,8 @@ impl<'b> State<'b> {
         other.charged = 0;
         // Merge order does not matter: every accumulator merge and representative choice is
         // order-independent.
-        let generic: Vec<(Vec<GroupValue>, u32)> = core::mem::take(&mut other.groups).into_iter().collect();
-        let ints: Vec<((bool, i64), u32)> = core::mem::take(&mut other.ints).into_iter().collect();
+        let generic: Vec<(Vec<GroupValue>, u32)> = core::mem::take(&mut other.groups).into_iter().flatten().collect();
+        let ints: Vec<((bool, i64), u32)> = core::mem::take(&mut other.ints).into_iter().flatten().collect();
         let mut other_reps = core::mem::replace(&mut other.reps, Reps::new(0));
         let mut map = vec![0u32; other_reps.len()];
         for (key, og) in generic {
@@ -579,6 +586,20 @@ impl Drop for State<'_> {
     fn drop(&mut self) {
         self.budget.release(self.footprint());
     }
+}
+
+fn empty_maps<M: Default>() -> Vec<M> {
+    (0..PARTITIONS).map(|_| M::default()).collect()
+}
+
+/// Partition of an integer / timestamp key (the generic keys' `partition_of` counterpart).
+#[inline]
+fn int_partition((ts, x): (bool, i64)) -> usize {
+    let mut h = (x as u64) ^ u64::from(ts).rotate_right(1);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^= h >> 33;
+    (h % PARTITIONS as u64) as usize
 }
 
 /// Moves group `g`'s accumulator entries to entry `ng` of `dst`.
