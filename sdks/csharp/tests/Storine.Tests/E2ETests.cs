@@ -9,6 +9,7 @@ using System.Numerics;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
+using static Storine.Agg;
 using static Storine.FieldOp;
 using static Storine.Filter;
 
@@ -266,6 +267,105 @@ public class E2ETests : IClassFixture<SingleNodeFixture>
         Assert.True(await chunks.MoveNextAsync());
         await c.UpdateAsync("f1", Set("name", "dog.png"));
         await Assert.ThrowsAsync<ConflictException>(async () => { while (await chunks.MoveNextAsync()) { } });
+    }
+
+    /// <summary>Value and scale: 12.50 differs from 12.5.</summary>
+    private static string Exact(IEnumerable<ResultRow> rows) =>
+        string.Join("\n", rows.Select(r => string.Join(" | ", r.Select(c => $"{c.Key}={c.Value?.GetType().Name}:{c.Value}"))));
+
+    private static string Exact(IEnumerable<IEnumerable<KeyValuePair<string, object?>>> rows) =>
+        string.Join("\n", rows.Select(r => string.Join(" | ", r.Select(c => $"{c.Key}={c.Value?.GetType().Name}:{c.Value}"))));
+
+    [Fact]
+    public async Task Analytics()
+    {
+        if (!Server.Built) return;
+        var sales = Db.Collection("cs_sales");
+        string[] regions = { "eu", "us", "apac" };
+        const int n = 3000;
+        var docs = Enumerable.Range(0, n).Select(i => new Doc
+        {
+            ["region"] = regions[i % 3],
+            ["qty"] = (long)((i * 7) % 13 + 1),
+            ["price"] = ((i * 37L) % 5000 + 100) / 100.00m, // scale 2
+            ["day"] = (long)(i % 30),
+        }).ToList();
+        for (int b = 0; b < n; b += 100)
+        {
+            int from = b;
+            await Db.TransactionAsync(tx =>
+            {
+                for (int i = from; i < from + 100; i++) tx.Put("cs_sales", $"s{i:00000}", docs[i]);
+            });
+        }
+
+        // Expected grouped totals, computed from the inserted data.
+        static decimal Avg6(long sum, long count)
+        {
+            // The server's avg of exact inputs: 6 more fractional digits, half-even.
+            var scaled = (BigInteger)sum * 1_000_000;
+            var q = BigInteger.DivRem(scaled, count, out var rem);
+            var twice = BigInteger.Abs(rem) * 2;
+            if (twice > count || (twice == count && !q.IsEven)) q += scaled.Sign;
+            return new BigDecimal(q, 6).ToDecimalExact()!.Value;
+        }
+        var expected = docs.GroupBy(d => (string)d["region"]!).Select(g => new List<KeyValuePair<string, object?>>
+        {
+            new("region", g.Key),
+            new("orders", (long)g.Count()),
+            new("revenue", g.Sum(d => (decimal)d["price"]! * (long)d["qty"]!)), // scale 2
+            new("avg_qty", Avg6(g.Sum(d => (long)d["qty"]!), g.Count())),
+            new("min_price", g.Min(d => (decimal)d["price"]!)),
+            new("max_price", g.Max(d => (decimal)d["price"]!)),
+            new("days", (long)g.Select(d => (long)d["day"]!).Distinct().Count()),
+        }).OrderByDescending(r => (decimal)r[2].Value!).Take(2).ToList();
+
+        var grouped = new Aggregation()
+            .Agg("orders", Count())
+            .Agg("revenue", Sum(Field("price") * Field("qty")))
+            .Agg("avg_qty", Avg("qty"))
+            .Agg("min_price", Min("price"))
+            .Agg("max_price", Max("price"))
+            .Agg("days", CountDistinct("day"))
+            .GroupBy("region").OrderBy("-revenue").Limit(2);
+        var res = await sales.AggregateAsync(grouped);
+        Assert.Equal((ulong)n, res.Matched);
+        Assert.Equal(Exact(expected), Exact(res.Rows));
+        await Assert.ThrowsAsync<InvalidException>(() => sales.AggregateAsync(grouped.OrderBy("-nope")));
+
+        await sales.EnableColumnarAsync();
+        Assert.Equal(Exact(expected), Exact((await sales.AggregateAsync(grouped)).Rows));
+
+        // Weekly buckets of day: offset + floor((day - offset) / width) * width.
+        var weeks = docs.GroupBy(d => 3 + (long)Math.Floor(((long)d["day"]! - 3) / 7.0) * 7).OrderBy(g => g.Key)
+            .Select(g => new List<KeyValuePair<string, object?>>
+            {
+                new("day", g.Key), new("n", (long)g.Count()), new("qty", g.Sum(d => (long)d["qty"]!)),
+            });
+        var byWeek = await sales.AggregateAsync(new Aggregation().Agg("n", Count()).Agg("qty", Sum("qty")).GroupBy(Bucket("day", 7, 3)));
+        Assert.Equal(Exact(weeks), Exact(byWeek.Rows));
+
+        // Filtered, ungrouped: exactly one row.
+        var us = docs.Where(d => (string)d["region"]! == "us" && (long)d["qty"]! >= 5).ToList();
+        var filtered = await sales.AggregateAsync(new Aggregation().Agg("n", Count()).Agg("qty", Sum("qty"))
+            .Where(Eq("region", "us") & Ge("qty", 5)));
+        Assert.Equal((ulong)us.Count, filtered.Matched);
+        Assert.Equal(Exact(new[] { new List<KeyValuePair<string, object?>> { new("n", (long)us.Count), new("qty", us.Sum(d => (long)d["qty"]!)) } }),
+            Exact(filtered.Rows));
+
+        // Column scan across pages, in key order.
+        var eu = new List<ColumnRow>();
+        await foreach (var row in sales.ScanColumnsAsync(new[] { "qty", "price" }, Eq("region", "eu"), pageSize: 500)) eu.Add(row);
+        Assert.Equal(Enumerable.Range(0, n).Where(i => i % 3 == 0).Select(i => $"s{i:00000}"), eu.Select(r => r.Key));
+        foreach (var row in eu)
+        {
+            var d = docs[int.Parse(row.Key[1..])];
+            Assert.Equal(d["qty"], row["qty"]);
+            Assert.Equal(d["price"]!.ToString(), row["price"]!.ToString());
+        }
+
+        await sales.DisableColumnarAsync();
+        Assert.Equal(Exact(expected), Exact((await sales.AggregateAsync(grouped)).Rows));
     }
 
     [Fact]

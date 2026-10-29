@@ -623,6 +623,56 @@ public sealed class Collection
     public async Task<IReadOnlyList<VectorIndex>> VectorIndexesAsync(CancellationToken ct = default) =>
         Wire.VectorIndexes((await client.CallAsync(Wire.OpDocInfo, Wire.Admin(9, Name), ct).ConfigureAwait(false)).Body);
 
+    /// <summary>
+    /// Groups and aggregates the collection on the server, exactly and as of one snapshot (vectorized when columnar is
+    /// enabled, see <see cref="EnableColumnarAsync"/>):
+    /// <code>
+    /// var r = await sales.AggregateAsync(new Aggregation()
+    ///     .Agg("orders", Count()).Agg("revenue", Sum(Field("price") * Field("qty")))
+    ///     .Where(Ge("day", 20)).GroupBy("region").OrderBy("-revenue").Limit(10));
+    /// var top = r.Rows[0]["revenue"];
+    /// </code>
+    /// Sum/Avg skip non-numeric values (all non-numeric: null). <see cref="InvalidException"/> for an unknown order-by column or a
+    /// numeric overflow. Inside expressions a string is always a field path; use <see cref="Agg.Lit"/> for a text constant.
+    /// </summary>
+    public async Task<AggregateResult> AggregateAsync(Aggregation aggregation, CancellationToken ct = default)
+    {
+        byte[] req = Wire.Aggregate(Name, aggregation);
+        var r = await client.CallAsync(Wire.OpDocAggregate, req, ct).ConfigureAwait(false);
+        return Wire.ReadAggregateResult(r.Body, aggregation.Columns);
+    }
+
+    /// <summary>
+    /// The given (dotted) field paths (at most 64) of every document matching <paramref name="where"/> (null: all), in
+    /// key order, fetched <paramref name="pageSize"/> rows (at most 100,000) at a time. A missing field reads as null.
+    /// </summary>
+    public async IAsyncEnumerable<ColumnRow> ScanColumnsAsync(IEnumerable<string> fields, Filter? where = null, int pageSize = 1000,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        if (pageSize <= 0 || pageSize > 100_000) throw new InvalidException("pageSize must be between 1 and 100000");
+        var fs = fields.ToList();
+        string? after = null;
+        do
+        {
+            var r = await client.CallAsync(Wire.OpDocScanColumns, Wire.ScanColumns(Name, where, fs, after, (uint)pageSize), ct)
+                .ConfigureAwait(false);
+            var page = Wire.ReadScanPage(r.Body, fs);
+            foreach (var row in page.Rows) yield return row;
+            after = page.NextKey;
+        } while (after is not null);
+    }
+
+    /// <summary>
+    /// Also keeps the collection as column segments (built in the background) so <see cref="AggregateAsync"/> and
+    /// <see cref="ScanColumnsAsync"/> run vectorized; results are the same either way.
+    /// </summary>
+    public Task EnableColumnarAsync(CancellationToken ct = default) =>
+        client.CallAsync(Wire.OpDocAdmin, Wire.Admin(10, Name), ct);
+
+    /// <summary>Deletes the column segments; analytics then read the row store.</summary>
+    public Task DisableColumnarAsync(CancellationToken ct = default) =>
+        client.CallAsync(Wire.OpDocAdmin, Wire.Admin(11, Name), ct);
+
     /// <summary>Indexes a top-level field (at most 16 per collection); existing documents included.</summary>
     public Task CreateIndexAsync(string field, CancellationToken ct = default) =>
         client.CallAsync(Wire.OpDocAdmin, Wire.Admin(1, Name, field), ct);

@@ -6,6 +6,7 @@ using System.Linq;
 using System.Numerics;
 using System.Text.Json;
 using Xunit;
+using static Storine.Agg;
 using static Storine.FieldOp;
 using static Storine.Filter;
 
@@ -133,6 +134,19 @@ public class VectorsTests
             ["admin: create index items.price"] = Wire.Admin(1, "items", "price"),
             ["info: collection items"] = Wire.Admin(6, "items"),
             ["info: list collections"] = new byte[] { 3 },
+            ["aggregate: by region where day >= 20, count / sum(price * qty) / avg(qty), sum desc, limit 2"] = Wire.Aggregate("sales",
+                new Aggregation().Agg("orders", Count()).Agg("revenue", Sum(Field("price") * Field("qty"))).Agg("avg_qty", Avg("qty"))
+                    .Where(Ge("day", 20)).GroupBy("region").OrderBy("-revenue").Limit(2)),
+            ["aggregate: totals (count distinct, approx count distinct, min, max, count of field)"] = Wire.Aggregate("sales",
+                new Aggregation().Agg("regions", CountDistinct("region")).Agg("customers", ApproxCountDistinct("customer"))
+                    .Agg("lo", Min("price")).Agg("hi", Max("price")).Agg("coupons", Count("coupon"))),
+            ["aggregate: weekly buckets of day (width 7, offset 3) and region, sum(qty - 1) and sum(-price + 2.5), budgets"] = Wire.Aggregate("sales",
+                new Aggregation().Agg("q", Sum(Field("qty") - 1)).Agg("p", Sum(-Field("price") + 2.5m))
+                    .GroupBy(Bucket("day", 7, 3), "region").OrderBy("day", "-region").MemoryBudget(1 << 20).SpillBudget(1UL << 30)),
+            ["scan: qty, price where region = eu, limit 500"] = Wire.ScanColumns("sales", Eq("region", "eu"), new[] { "qty", "price" }, null, 500),
+            ["scan: meta.size after s0099 (default limit)"] = Wire.ScanColumns("sales", null, new[] { "meta.size" }, "s0099", 0),
+            ["admin: enable columnar sales"] = Wire.Admin(10, "sales"),
+            ["admin: disable columnar sales"] = Wire.Admin(11, "sales"),
         };
         int seen = 0;
         foreach (var vec in V.GetProperty("requests").EnumerateArray())
@@ -158,6 +172,34 @@ public class VectorsTests
         var (total, data) = Wire.ReadByteRange(r["byte range: total 5000, 4 bytes"]);
         Assert.Equal(5000ul, total);
         Assert.Equal(new byte[] { 0xde, 0xad, 0xbe, 0xef }, data);
+        byte[] ab = r["aggregate: matched 4, pruned 2, rows [eu, 3, 12.50] [us, 1, null]"];
+        var agg = Wire.ReadAggregateResult(ab, new[] { "region", "orders", "revenue" });
+        Assert.Equal((4ul, 2ul, 0ul), (agg.Matched, agg.PrunedRowGroups, agg.SpilledBytes));
+        Assert.Equal(2, agg.Rows.Count);
+        Assert.Equal(new[] { "region", "orders", "revenue" }, agg.Rows[0].Keys);
+        Assert.Equal(new object?[] { "eu", 3L, 12.50m }, agg.Rows[0].Values);
+        Assert.Equal("12.50", agg.Rows[0]["revenue"]!.ToString());
+        Assert.Equal(new object?[] { "us", 1L, null }, agg.Rows[1].Values);
+        Assert.Throws<InvalidException>(() => Wire.ReadAggregateResult(ab, new[] { "region", "orders" }));
+        var sp = Wire.ReadScanPage(r["scan page: total 2, next s1, row s1 [7, 9.99]"], new[] { "qty", "price" });
+        Assert.Equal((2ul, "s1", 1), (sp.Total, sp.NextKey, sp.Rows.Count));
+        Assert.Equal("s1", sp.Rows[0].Key);
+        Assert.Equal(7L, sp.Rows[0]["qty"]);
+        Assert.Equal(9.99m, sp.Rows[0]["price"]);
+    }
+
+    [Fact]
+    public void AggregateArgumentChecks()
+    {
+        var a = new Aggregation().Agg("n", Count()).GroupBy("region");
+        Assert.Throws<InvalidException>(() => Wire.Aggregate("sales", a.OrderBy("-nope")));
+        Assert.Throws<InvalidException>(() => a.Agg("n", Sum("qty")));
+        Assert.Throws<InvalidException>(() => Wire.Aggregate("sales", a.Agg("region", Sum("qty"))));
+        Assert.Throws<InvalidException>(() => Bucket("day", 0));
+        Assert.Equal(new[] { "region", "n" }, a.Columns);
+        // Methods and operators encode the same expression.
+        Assert.Equal(Hex(Wire.Aggregate("s", new Aggregation().Agg("x", Sum(Field("a").Times(Field("b")).Minus(Lit(1)).Neg())))),
+            Hex(Wire.Aggregate("s", new Aggregation().Agg("x", Sum(-(Field("a") * "b" - 1))))));
     }
 
     [Fact]

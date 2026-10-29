@@ -53,6 +53,7 @@ await foreach (var d in accounts.ScanAsync()) { /* every document, any collectio
 | `c.CreateIndexAsync` / `c.DropIndexAsync` / `c.InfoAsync` / `c.DropAsync` | Indexes (up to 16 per collection) and collection management. |
 | `c.NearestAsync(field, vector, k: 10, where: null, exact: false)` | The `k` documents whose `field` is most similar to `vector` (cosine), best first; `doc.Score` is the similarity. |
 | `c.CreateVectorIndexAsync(field, dims)` / `c.DropVectorIndexAsync(field)` / `c.VectorIndexesAsync()` | Vector indexes for `NearestAsync` (`VectorIndex(Field, Dims, Ready)`). |
+| `c.AggregateAsync(aggregation)` / `c.ScanColumnsAsync(fields, where, pageSize: 1000)` / `c.EnableColumnarAsync()` / `c.DisableColumnarAsync()` | Analytics (below). |
 | `db.TransactionAsync(tx => ...)` | Writes committed atomically when the lambda returns; `tx.RequireVersion` / `tx.RequireExists` add checks. |
 | `db.CollectionsAsync()` / `db.ClusterInfoAsync()` | Introspection. |
 
@@ -81,6 +82,36 @@ automatically; reads come from the leader unless `FollowerReads = true`.
 **Errors** (all `StorineException`): `NotFoundException`, `ConflictException` (`WriteIndex`, `CurrentVersion`),
 `InvalidException` (bad value, bound violated — don't retry), `UnauthorizedException`, `OverloadedException` /
 `RateLimitedException` (retry later), `UnavailableException`, `ServerException`.
+
+## Analytics
+
+`c.AggregateAsync(Aggregation)` filters, groups and aggregates on the server, exactly (integer and decimal sums never
+round; `Avg` of exact inputs is a decimal with 6 more fractional digits). `c.EnableColumnarAsync()` additionally
+keeps the collection as column segments so aggregates and column scans run vectorized; `c.DisableColumnarAsync()`
+drops them. Results are the same either way.
+
+```csharp
+using static Storine.Agg;
+
+var r = await sales.AggregateAsync(new Aggregation()
+    .Agg("orders", Count())                                // rows; Count("coupon") counts non-null values
+    .Agg("revenue", Sum(Field("price") * Field("qty")))    // Expr: Field, Lit, + - * and unary -, numbers convert
+    .Agg("avg_qty", Avg("qty"))                            // also Min, Max, CountDistinct, ApproxCountDistinct
+    .Where(Ge("day", 20))
+    .GroupBy("region", Bucket("day", 7, 0))                // field paths and/or buckets; columns named by path
+    .OrderBy("-revenue")                                   // output column names, "-" = descending
+    .Limit(10));                                           // also MemoryBudget(bytes), SpillBudget(bytes)
+foreach (var row in r.Rows) Console.WriteLine($"{row["region"]} {row["day"]} {row["revenue"]}"); // ordered columns
+Console.WriteLine($"{r.Matched} {r.PrunedRowGroups} {r.SpilledBytes}");
+
+// Chosen fields of matching documents in key order, fetched lazily page by page.
+await foreach (var row in sales.ScanColumnsAsync(new[] { "qty", "price" }, Eq("region", "eu"), pageSize: 500))
+    Console.WriteLine($"{row.Key} {row["qty"]} {row["price"]}");
+```
+
+Rows are `ResultRow`s: read-only dictionaries that enumerate in column order (group keys, then aggregates) and can
+also be indexed by position. An unknown `OrderBy` column throws `InvalidException` before anything is sent; more
+than 8 concurrent analytic queries on the server answer `Overloaded`, which the client retries with backoff.
 
 ## Tests
 

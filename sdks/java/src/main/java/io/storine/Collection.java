@@ -287,6 +287,76 @@ public final class Collection {
         return Wire.vectorIndexes(client.call(Wire.OP_DOC_INFO, Wire.admin(9, name, null)).body());
     }
 
+    /**
+     * Groups and aggregates the collection on the server, exactly and as of one snapshot (vectorized when columnar is
+     * enabled, see {@link #enableColumnar}):
+     *
+     * <pre>{@code
+     * AggregateResult r = sales.aggregate(new Aggregation()
+     *         .agg("orders", count()).agg("revenue", sum(field("price").times(field("qty"))))
+     *         .where(ge("day", 20)).groupBy("region").orderBy("-revenue").limit(10));
+     * r.rows().get(0).get("revenue");
+     * }</pre>
+     *
+     * Sum/avg skip non-numeric values (all non-numeric: null). {@link InvalidException} for an unknown order-by column or a
+     * numeric overflow. Inside expressions a {@code String} is always a field path; use {@link Agg#lit} for a text constant.
+     */
+    public AggregateResult aggregate(Aggregation aggregation) {
+        byte[] req = Wire.aggregate(name, aggregation);
+        return Wire.aggregateResult(client.call(Wire.OP_DOC_AGGREGATE, req).body(), aggregation.columns());
+    }
+
+    /** {@link #scanColumns(List, Filter, int)} in pages of 1,000. */
+    public Stream<ColumnRow> scanColumns(List<String> fields, Filter where) {
+        return scanColumns(fields, where, 1000);
+    }
+
+    /**
+     * The given (dotted) field paths (at most 64) of every document matching {@code where} ({@code null}: all), in key
+     * order, fetched lazily {@code pageSize} rows (at most 100,000) at a time. A missing field reads as {@code null}.
+     */
+    public Stream<ColumnRow> scanColumns(List<String> fields, Filter where, int pageSize) {
+        if (pageSize <= 0 || pageSize > 100_000) throw new InvalidException("pageSize must be between 1 and 100000");
+        List<String> fs = List.copyOf(fields);
+        Iterator<ColumnRow> it = new Iterator<>() {
+            private Iterator<ColumnRow> page = List.<ColumnRow>of().iterator();
+            private String after;
+            private boolean done;
+
+            @Override
+            public boolean hasNext() {
+                while (!page.hasNext() && !done) {
+                    byte[] req = Wire.scanColumns(name, where, fs, after, pageSize);
+                    Wire.ScanPage p = Wire.scanPage(client.call(Wire.OP_DOC_SCAN_COLUMNS, req).body(), fs);
+                    page = p.rows().iterator();
+                    after = p.nextKey();
+                    done = after == null;
+                }
+                return page.hasNext();
+            }
+
+            @Override
+            public ColumnRow next() {
+                if (!hasNext()) throw new NoSuchElementException();
+                return page.next();
+            }
+        };
+        return StreamSupport.stream(Spliterators.spliteratorUnknownSize(it, Spliterator.ORDERED | Spliterator.NONNULL), false);
+    }
+
+    /**
+     * Also keeps the collection as column segments (built in the background) so {@link #aggregate} and
+     * {@link #scanColumns} run vectorized; results are the same either way.
+     */
+    public void enableColumnar() {
+        client.call(Wire.OP_DOC_ADMIN, Wire.admin(10, name, null));
+    }
+
+    /** Deletes the column segments; analytics then read the row store. */
+    public void disableColumnar() {
+        client.call(Wire.OP_DOC_ADMIN, Wire.admin(11, name, null));
+    }
+
     /** Indexes a top-level field (at most 16 per collection); existing documents included. */
     public void createIndex(String field) {
         client.call(Wire.OP_DOC_ADMIN, Wire.admin(1, name, field));

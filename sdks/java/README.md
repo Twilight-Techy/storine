@@ -60,6 +60,7 @@ try (Storine db = Storine.connect("storine://127.0.0.1:7878")) {   // or "storin
 | `c.createIndex` / `c.dropIndex` / `c.info` / `c.drop` | Indexes (up to 16 per collection) and collection management. |
 | `c.nearest(field, vector, k[, where, exact])` | The `k` documents whose `field` is most similar to `vector` (cosine), best first; `doc.score()` is the similarity. |
 | `c.createVectorIndex(field, dims)` / `c.dropVectorIndex(field)` / `c.vectorIndexes()` | Vector indexes for `nearest` (`VectorIndex(field, dims, ready)`). |
+| `c.aggregate(aggregation)` / `c.scanColumns(fields, where[, pageSize])` / `c.enableColumnar()` / `c.disableColumnar()` | Analytics (below). |
 | `db.transaction(tx -> ...)` | Writes committed atomically when the lambda returns; `tx.requireVersion` / `tx.requireExists` add checks. |
 | `db.collections()` / `db.clusterInfo()` | Introspection. |
 
@@ -86,6 +87,35 @@ automatically; reads come from the leader unless `followerReads(true)`.
 **Errors** (unchecked, all `StorineException`): `NotFoundException`, `ConflictException` (`writeIndex()`, `currentVersion()`),
 `InvalidException` (bad value, bound violated — don't retry), `UnauthorizedException`, `OverloadedException` /
 `RateLimitedException` (retry later), `UnavailableException`, `ServerException`.
+
+## Analytics
+
+`c.aggregate(Aggregation)` filters, groups and aggregates on the server, exactly (integer and decimal sums never
+round; `avg` of exact inputs is a decimal with 6 more fractional digits). `c.enableColumnar()` additionally keeps
+the collection as column segments so aggregates and column scans run vectorized; `c.disableColumnar()` drops them.
+Results are the same either way.
+
+```java
+import static io.storine.Agg.*;
+
+AggregateResult r = sales.aggregate(new Aggregation()
+        .agg("orders", count())                                   // rows; count("coupon") counts non-null values
+        .agg("revenue", sum(field("price").times(field("qty"))))  // expressions: field, lit, plus, minus, times, neg
+        .agg("avg_qty", avg("qty"))                               // also min, max, countDistinct, approxCountDistinct
+        .where(ge("day", 20))
+        .groupBy("region", bucket("day", 7, 0))                   // field paths and/or buckets; columns named by path
+        .orderBy("-revenue")                                      // output column names, "-" = descending
+        .limit(10));                                              // also memoryBudget(bytes), spillBudget(bytes)
+for (LinkedHashMap<String, Object> row : r.rows()) { /* region, day, orders, revenue, avg_qty in that order */ }
+r.matched(); r.prunedRowGroups(); r.spilledBytes();
+
+// Chosen fields of matching documents in key order, fetched lazily page by page.
+sales.scanColumns(List.of("qty", "price"), eq("region", "eu"), 500)
+        .forEach(row -> System.out.println(row.key() + " " + row.get("qty") + " " + row.get("price")));
+```
+
+An unknown `orderBy` column throws `InvalidException` before anything is sent; more than 8 concurrent analytic
+queries on the server answer `Overloaded`, which the client retries with backoff.
 
 ## Tests
 

@@ -1,5 +1,13 @@
 package io.storine;
 
+import static io.storine.Agg.avg;
+import static io.storine.Agg.bucket;
+import static io.storine.Agg.count;
+import static io.storine.Agg.countDistinct;
+import static io.storine.Agg.field;
+import static io.storine.Agg.max;
+import static io.storine.Agg.min;
+import static io.storine.Agg.sum;
 import static io.storine.FieldOp.add;
 import static io.storine.FieldOp.append;
 import static io.storine.FieldOp.set;
@@ -20,6 +28,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.math.RoundingMode;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -32,6 +41,7 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -243,6 +253,125 @@ class E2ETest {
         assertEquals(1 << 20, chunks.readNBytes(1 << 20).length);
         c.update("f1", set("name", "dog.png"));
         assertThrows(ConflictException.class, chunks::readAllBytes);
+    }
+
+    @Test
+    void analytics() {
+        Collection sales = db.collection("java_sales");
+        String[] regions = {"eu", "us", "apac"};
+        List<Map<String, Object>> docs = new ArrayList<>();
+        int n = 3000;
+        for (int i = 0; i < n; i++) {
+            Map<String, Object> d = new LinkedHashMap<>();
+            d.put("region", regions[i % 3]);
+            d.put("qty", (long) ((i * 7) % 13 + 1));
+            d.put("price", BigDecimal.valueOf((i * 37L) % 5000 + 100, 2));
+            d.put("day", (long) (i % 30));
+            docs.add(d);
+        }
+        for (int b = 0; b < n; b += 100) {
+            int from = b;
+            db.transaction(tx -> {
+                for (int i = from; i < from + 100; i++) tx.put("java_sales", String.format("s%05d", i), docs.get(i));
+            });
+        }
+
+        // Expected grouped totals, computed from the inserted data.
+        Map<String, long[]> cnt = new TreeMap<>(); // count, sum qty
+        Map<String, BigDecimal> rev = new TreeMap<>(), lo = new TreeMap<>(), hi = new TreeMap<>();
+        Map<String, java.util.Set<Long>> days = new TreeMap<>();
+        for (Map<String, Object> d : docs) {
+            String r = (String) d.get("region");
+            BigDecimal price = (BigDecimal) d.get("price");
+            long qty = (Long) d.get("qty");
+            long[] c = cnt.computeIfAbsent(r, k -> new long[2]);
+            c[0]++;
+            c[1] += qty;
+            rev.merge(r, price.multiply(BigDecimal.valueOf(qty)), BigDecimal::add);
+            lo.merge(r, price, BigDecimal::min);
+            hi.merge(r, price, BigDecimal::max);
+            days.computeIfAbsent(r, k -> new java.util.HashSet<>()).add((Long) d.get("day"));
+        }
+        List<Map<String, Object>> expected = new ArrayList<>();
+        for (String r : cnt.keySet()) {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("region", r);
+            row.put("orders", cnt.get(r)[0]);
+            row.put("revenue", rev.get(r)); // decimal, scale 2 (price scale x qty scale 0)
+            // avg of exact inputs: a decimal with 6 more fractional digits, half-even.
+            row.put("avg_qty", BigDecimal.valueOf(cnt.get(r)[1]).divide(BigDecimal.valueOf(cnt.get(r)[0]), 6, RoundingMode.HALF_EVEN));
+            row.put("min_price", lo.get(r));
+            row.put("max_price", hi.get(r));
+            row.put("days", (long) days.get(r).size());
+            expected.add(row);
+        }
+        expected.sort((a, b) -> ((BigDecimal) b.get("revenue")).compareTo((BigDecimal) a.get("revenue")));
+        List<Map<String, Object>> top2 = expected.subList(0, 2);
+
+        Aggregation grouped = new Aggregation()
+                .agg("orders", count())
+                .agg("revenue", sum(field("price").times(field("qty"))))
+                .agg("avg_qty", avg("qty"))
+                .agg("min_price", min("price"))
+                .agg("max_price", max("price"))
+                .agg("days", countDistinct("day"))
+                .groupBy("region").orderBy("-revenue").limit(2);
+        AggregateResult res = sales.aggregate(grouped);
+        assertEquals(n, res.matched());
+        assertEquals(top2, res.rows()); // BigDecimal.equals: value and scale
+        assertEquals(List.of("region", "orders", "revenue", "avg_qty", "min_price", "max_price", "days"),
+                List.copyOf(res.rows().get(0).keySet()));
+        assertThrows(InvalidException.class, () -> sales.aggregate(grouped.orderBy("-nope")));
+
+        sales.enableColumnar();
+        assertEquals(top2, sales.aggregate(grouped).rows());
+
+        // Weekly buckets of day: offset + floor((day - offset) / width) * width.
+        Map<Long, long[]> weeks = new TreeMap<>();
+        for (Map<String, Object> d : docs) {
+            long day = (Long) d.get("day");
+            long key = 3 + Math.floorDiv(day - 3, 7) * 7;
+            long[] w = weeks.computeIfAbsent(key, k -> new long[2]);
+            w[0]++;
+            w[1] += (Long) d.get("qty");
+        }
+        List<Map<String, Object>> wantWeeks = new ArrayList<>();
+        weeks.forEach((k, w) -> {
+            Map<String, Object> row = new LinkedHashMap<>();
+            row.put("day", k);
+            row.put("n", w[0]);
+            row.put("qty", w[1]);
+            wantWeeks.add(row);
+        });
+        assertEquals(wantWeeks, sales.aggregate(new Aggregation().agg("n", count()).agg("qty", sum("qty"))
+                .groupBy(bucket("day", 7, 3))).rows());
+
+        // Filtered, ungrouped: exactly one row.
+        long fc = 0, fq = 0;
+        for (Map<String, Object> d : docs) {
+            if (d.get("region").equals("us") && (Long) d.get("qty") >= 5) {
+                fc++;
+                fq += (Long) d.get("qty");
+            }
+        }
+        AggregateResult filtered = sales.aggregate(new Aggregation().agg("n", count()).agg("qty", sum("qty"))
+                .where(and(eq("region", "us"), Filter.ge("qty", 5))));
+        assertEquals(fc, filtered.matched());
+        assertEquals(List.of(Map.of("n", fc, "qty", fq)), filtered.rows());
+
+        // Column scan across pages, in key order.
+        List<ColumnRow> eu = sales.scanColumns(List.of("qty", "price"), eq("region", "eu"), 500).toList();
+        List<String> wantKeys = new ArrayList<>();
+        for (int i = 0; i < n; i += 3) wantKeys.add(String.format("s%05d", i));
+        assertEquals(wantKeys, eu.stream().map(ColumnRow::key).toList());
+        for (ColumnRow row : eu) {
+            Map<String, Object> d = docs.get(Integer.parseInt(row.key().substring(1)));
+            assertEquals(d.get("qty"), row.get("qty"));
+            assertEquals(d.get("price"), row.get("price"));
+        }
+
+        sales.disableColumnar();
+        assertEquals(top2, sales.aggregate(grouped).rows());
     }
 
     @Test

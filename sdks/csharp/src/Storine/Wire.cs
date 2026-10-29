@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 
 namespace Storine;
@@ -35,7 +36,7 @@ public sealed record ClusterInfo(ulong NodeId, bool IsLeader, ulong? LeaderId, s
 internal static class Wire
 {
     internal const byte OpAuth = 0x0C, OpDocGet = 0x20, OpDocWrite = 0x21, OpDocQuery = 0x22, OpDocAdmin = 0x23,
-        OpDocInfo = 0x25, OpSetOptions = 0x26, OpClusterInfo = 0x27;
+        OpDocInfo = 0x25, OpSetOptions = 0x26, OpClusterInfo = 0x27, OpDocAggregate = 0x29, OpDocScanColumns = 0x2A;
     internal const int StOk = 0, StNotFound = 1, StError = 2, StOverloaded = 3, StConflict = 4, StUnauthorized = 5,
         StRateLimited = 6, StNotLeader = 7, StInvalid = 8, StCommitUnknown = 9;
 
@@ -207,6 +208,112 @@ internal static class Wire
             list.Add(new VectorIndex(field, dims, r.U8() == 1));
         }
         return list;
+    }
+
+    private static void FilterOpt(Filter? where, Values.Writer w)
+    {
+        if (where is null)
+        {
+            w.U8(0);
+        }
+        else
+        {
+            w.U8(1);
+            where.Encode(w, 0);
+        }
+    }
+
+    /// <summary><c>OP_DOC_AGGREGATE</c> (§5.5); order-by names are resolved to output column indexes.</summary>
+    internal static byte[] Aggregate(string collection, Aggregation a)
+    {
+        var cols = a.Columns;
+        if (cols.Distinct(StringComparer.Ordinal).Count() != cols.Count)
+            throw new InvalidException("output column names must be unique: " + string.Join(", ", cols));
+        var w = new Values.Writer();
+        w.Str(collection);
+        FilterOpt(a.Filter, w);
+        w.U32(a.Keys.Count);
+        foreach (var k in a.Keys) k.Encode(w);
+        w.U32(a.Aggs.Count);
+        foreach (var (_, g) in a.Aggs) g.Encode(w);
+        w.U32(a.Order.Count);
+        foreach (string o in a.Order)
+        {
+            bool desc = o.StartsWith('-');
+            string name = desc ? o[1..] : o;
+            int idx = cols.ToList().IndexOf(name);
+            if (idx < 0) throw new InvalidException($"OrderBy names an unknown column '{name}' (columns: {string.Join(", ", cols)})");
+            w.U32(idx);
+            w.U8(desc ? 1 : 0);
+        }
+        w.U32(a.LimitValue);
+        w.U64(a.MemoryBudgetValue);
+        w.U64(a.SpillBudgetValue);
+        return w.ToArray();
+    }
+
+    /// <summary><c>u64 matched | u64 pruned | u64 spilled | u32 columns | u32 rows | rows x columns x value</c>.</summary>
+    internal static AggregateResult ReadAggregateResult(byte[] body, IReadOnlyList<string> columns)
+    {
+        var r = new Values.Reader(body);
+        ulong matched = r.U64(), pruned = r.U64(), spilled = r.U64();
+        uint cols = r.U32();
+        int n = r.Count((int)Math.Min(cols, int.MaxValue));
+        if (n > 0 && cols != columns.Count)
+            throw new InvalidException($"aggregate response has {cols} columns, expected {columns.Count}");
+        var rows = new List<ResultRow>(n);
+        for (int i = 0; i < n; i++)
+        {
+            var cells = new List<KeyValuePair<string, object?>>(columns.Count);
+            foreach (string c in columns) cells.Add(new(c, r.Value(0)));
+            rows.Add(new ResultRow(cells));
+        }
+        if (r.Remaining != 0) throw new InvalidException("trailing bytes after aggregate result");
+        return new AggregateResult(rows, matched, pruned, spilled);
+    }
+
+    /// <summary><c>OP_DOC_SCAN_COLUMNS</c> (§5.6).</summary>
+    internal static byte[] ScanColumns(string collection, Filter? where, IReadOnlyList<string> fields, string? afterKey, uint limit)
+    {
+        var w = new Values.Writer();
+        w.Str(collection);
+        FilterOpt(where, w);
+        w.U32(fields.Count);
+        foreach (string f in fields) w.Str(f);
+        if (afterKey is null)
+        {
+            w.U8(0);
+        }
+        else
+        {
+            w.U8(1);
+            w.Str(afterKey);
+        }
+        w.U32(limit);
+        return w.ToArray();
+    }
+
+    internal sealed record ScanPage(ulong Total, string? NextKey, List<ColumnRow> Rows);
+
+    /// <summary><c>u64 total | u8 has_next | str next? | u32 fields | u32 rows | rows x (str key | fields x value)</c>.</summary>
+    internal static ScanPage ReadScanPage(byte[] body, IReadOnlyList<string> fields)
+    {
+        var r = new Values.Reader(body);
+        ulong total = r.U64();
+        string? next = r.U8() != 0 ? r.Str() : null;
+        uint nf = r.U32();
+        if (nf != fields.Count) throw new InvalidException($"scan response has {nf} fields, expected {fields.Count}");
+        int n = r.Count(4 + fields.Count);
+        var rows = new List<ColumnRow>(n);
+        for (int i = 0; i < n; i++)
+        {
+            string key = r.Str();
+            var cells = new List<KeyValuePair<string, object?>>(fields.Count);
+            foreach (string f in fields) cells.Add(new(f, r.Value(0)));
+            rows.Add(new ColumnRow(key, new ResultRow(cells)));
+        }
+        if (r.Remaining != 0) throw new InvalidException("trailing bytes after scan page");
+        return new ScanPage(total, next, rows);
     }
 
     internal static byte[] Admin(int sub, string collection, string? field = null)

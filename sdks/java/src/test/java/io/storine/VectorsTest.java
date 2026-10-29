@@ -1,5 +1,15 @@
 package io.storine;
 
+import static io.storine.Agg.approxCountDistinct;
+import static io.storine.Agg.avg;
+import static io.storine.Agg.bucket;
+import static io.storine.Agg.count;
+import static io.storine.Agg.countDistinct;
+import static io.storine.Agg.field;
+import static io.storine.Agg.lit;
+import static io.storine.Agg.max;
+import static io.storine.Agg.min;
+import static io.storine.Agg.sum;
 import static io.storine.FieldOp.add;
 import static io.storine.FieldOp.append;
 import static io.storine.FieldOp.set;
@@ -170,6 +180,23 @@ class VectorsTest {
         built.put("admin: create index items.price", Wire.admin(1, "items", "price"));
         built.put("info: collection items", Wire.admin(6, "items", null));
         built.put("info: list collections", new byte[] {3});
+        built.put("aggregate: by region where day >= 20, count / sum(price * qty) / avg(qty), sum desc, limit 2",
+                Wire.aggregate("sales", new Aggregation().agg("orders", count())
+                        .agg("revenue", sum(field("price").times(field("qty")))).agg("avg_qty", avg("qty"))
+                        .where(ge("day", 20)).groupBy("region").orderBy("-revenue").limit(2)));
+        built.put("aggregate: totals (count distinct, approx count distinct, min, max, count of field)",
+                Wire.aggregate("sales", new Aggregation().agg("regions", countDistinct("region"))
+                        .agg("customers", approxCountDistinct("customer")).agg("lo", min("price")).agg("hi", max("price"))
+                        .agg("coupons", count("coupon"))));
+        built.put("aggregate: weekly buckets of day (width 7, offset 3) and region, sum(qty - 1) and sum(-price + 2.5), budgets",
+                Wire.aggregate("sales", new Aggregation().agg("q", sum(field("qty").minus(1)))
+                        .agg("p", sum(field("price").neg().plus(lit(new BigDecimal("2.5")))))
+                        .groupBy(bucket("day", 7, 3), "region").orderBy("day", "-region")
+                        .memoryBudget(1 << 20).spillBudget(1L << 30)));
+        built.put("scan: qty, price where region = eu, limit 500", Wire.scanColumns("sales", eq("region", "eu"), List.of("qty", "price"), null, 500));
+        built.put("scan: meta.size after s0099 (default limit)", Wire.scanColumns("sales", null, List.of("meta.size"), "s0099", 0));
+        built.put("admin: enable columnar sales", Wire.admin(10, "sales", null));
+        built.put("admin: disable columnar sales", Wire.admin(11, "sales", null));
         int seen = 0;
         for (Map<String, Object> vec : list(vectors().get("requests"))) {
             byte[] b = built.get((String) vec.get("name"));
@@ -192,6 +219,34 @@ class VectorsTest {
         Wire.Range range = Wire.byteRange(r.get("byte range: total 5000, 4 bytes"));
         assertEquals(5000, range.total());
         assertArrayEquals(new byte[] {(byte) 0xde, (byte) 0xad, (byte) 0xbe, (byte) 0xef}, range.data());
+        AggregateResult agg = Wire.aggregateResult(r.get("aggregate: matched 4, pruned 2, rows [eu, 3, 12.50] [us, 1, null]"),
+                List.of("region", "orders", "revenue"));
+        assertEquals(4, agg.matched());
+        assertEquals(2, agg.prunedRowGroups());
+        assertEquals(0, agg.spilledBytes());
+        assertEquals(2, agg.rows().size());
+        assertEquals(List.of("region", "orders", "revenue"), List.copyOf(agg.rows().get(0).keySet()));
+        assertEquals(Arrays.asList("eu", 3L, new BigDecimal("12.50")), List.copyOf(agg.rows().get(0).values()));
+        assertEquals(Arrays.asList("us", 1L, null), new ArrayList<>(agg.rows().get(1).values()));
+        assertThrows(InvalidException.class, () -> Wire.aggregateResult(r.get("aggregate: matched 4, pruned 2, rows [eu, 3, 12.50] [us, 1, null]"),
+                List.of("region", "orders")));
+        Wire.ScanPage sp = Wire.scanPage(r.get("scan page: total 2, next s1, row s1 [7, 9.99]"), List.of("qty", "price"));
+        assertEquals(2, sp.total());
+        assertEquals("s1", sp.nextKey());
+        assertEquals(1, sp.rows().size());
+        assertEquals("s1", sp.rows().get(0).key());
+        assertEquals(7L, sp.rows().get(0).get("qty"));
+        assertEquals(new BigDecimal("9.99"), sp.rows().get(0).get("price"));
+    }
+
+    @Test
+    void aggregateArgumentChecks() {
+        Aggregation a = new Aggregation().agg("n", count()).groupBy("region");
+        assertThrows(InvalidException.class, () -> Wire.aggregate("sales", a.orderBy("-nope")));
+        assertThrows(InvalidException.class, () -> a.agg("n", sum("qty")));
+        assertThrows(InvalidException.class, () -> Wire.aggregate("sales", a.agg("region", sum("qty"))));
+        assertThrows(InvalidException.class, () -> bucket("day", 0, 0));
+        assertEquals(List.of("region", "n"), a.columns());
     }
 
     @Test

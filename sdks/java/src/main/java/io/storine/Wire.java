@@ -11,7 +11,8 @@ final class Wire {
     private Wire() {}
 
     static final int OP_AUTH = 0x0C, OP_DOC_GET = 0x20, OP_DOC_WRITE = 0x21, OP_DOC_QUERY = 0x22,
-            OP_DOC_ADMIN = 0x23, OP_DOC_INFO = 0x25, OP_SET_OPTIONS = 0x26, OP_CLUSTER_INFO = 0x27;
+            OP_DOC_ADMIN = 0x23, OP_DOC_INFO = 0x25, OP_SET_OPTIONS = 0x26, OP_CLUSTER_INFO = 0x27,
+            OP_DOC_AGGREGATE = 0x29, OP_DOC_SCAN_COLUMNS = 0x2A;
     static final int ST_OK = 0, ST_NOT_FOUND = 1, ST_ERROR = 2, ST_OVERLOADED = 3, ST_CONFLICT = 4,
             ST_UNAUTHORIZED = 5, ST_RATE_LIMITED = 6, ST_NOT_LEADER = 7, ST_INVALID = 8, ST_COMMIT_UNKNOWN = 9;
 
@@ -149,6 +150,98 @@ final class Wire {
             for (float f : nearest.vector()) out.u32(Float.floatToRawIntBits(f) & 0xFFFFFFFFL);
         }
         return out.toByteArray();
+    }
+
+    private static void filterOpt(Filter where, Values.Out out) {
+        if (where == null) {
+            out.u8(0);
+        } else {
+            out.u8(1);
+            where.encode(out, 0);
+        }
+    }
+
+    /** {@code OP_DOC_AGGREGATE} (§5.5); order-by names are resolved to output column indexes. */
+    static byte[] aggregate(String collection, Aggregation a) {
+        List<String> cols = a.columns();
+        if (new java.util.HashSet<>(cols).size() != cols.size())
+            throw new InvalidException("output column names must be unique: " + cols);
+        Values.Out out = new Values.Out();
+        out.str(collection);
+        filterOpt(a.where, out);
+        out.u32(a.groupBy.size());
+        for (GroupKey k : a.groupBy) k.encode(out);
+        out.u32(a.aggs.size());
+        for (Agg g : a.aggs.values()) g.encode(out);
+        out.u32(a.orderBy.size());
+        for (String o : a.orderBy) {
+            boolean desc = o.startsWith("-");
+            String name = desc ? o.substring(1) : o;
+            int idx = cols.indexOf(name);
+            if (idx < 0) throw new InvalidException("orderBy names an unknown column '" + name + "' (columns: " + cols + ")");
+            out.u32(idx);
+            out.u8(desc ? 1 : 0);
+        }
+        out.u32(a.limit);
+        out.u64(a.memoryBudget);
+        out.u64(a.spillBudget);
+        return out.toByteArray();
+    }
+
+    /** {@code u64 matched | u64 pruned | u64 spilled | u32 columns | u32 rows | rows x columns x value}. */
+    static AggregateResult aggregateResult(byte[] body, List<String> columns) {
+        Values.Reader r = new Values.Reader(body);
+        long matched = r.u64(), pruned = r.u64(), spilled = r.u64();
+        long cols = r.u32();
+        int n = r.count((int) Math.min(cols, Integer.MAX_VALUE));
+        if (n > 0 && cols != columns.size())
+            throw new InvalidException("aggregate response has " + cols + " columns, expected " + columns.size());
+        List<LinkedHashMap<String, Object>> rows = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) {
+            LinkedHashMap<String, Object> row = new LinkedHashMap<>();
+            for (String c : columns) row.put(c, r.value(0));
+            rows.add(row);
+        }
+        if (r.remaining() != 0) throw new InvalidException("trailing bytes after aggregate result");
+        return new AggregateResult(rows, matched, pruned, spilled);
+    }
+
+    /** {@code OP_DOC_SCAN_COLUMNS} (§5.6). */
+    static byte[] scanColumns(String collection, Filter where, List<String> fields, String afterKey, int limit) {
+        Values.Out out = new Values.Out();
+        out.str(collection);
+        filterOpt(where, out);
+        out.u32(fields.size());
+        for (String f : fields) out.str(f);
+        if (afterKey == null) {
+            out.u8(0);
+        } else {
+            out.u8(1);
+            out.str(afterKey);
+        }
+        out.u32(limit);
+        return out.toByteArray();
+    }
+
+    record ScanPage(long total, String nextKey, List<ColumnRow> rows) {}
+
+    /** {@code u64 total | u8 has_next | str next? | u32 fields | u32 rows | rows x (str key | fields x value)}. */
+    static ScanPage scanPage(byte[] body, List<String> fields) {
+        Values.Reader r = new Values.Reader(body);
+        long total = r.u64();
+        String next = r.u8() != 0 ? r.str() : null;
+        long nf = r.u32();
+        if (nf != fields.size()) throw new InvalidException("scan response has " + nf + " fields, expected " + fields.size());
+        int n = r.count(4 + fields.size());
+        List<ColumnRow> rows = new ArrayList<>(n);
+        for (int i = 0; i < n; i++) {
+            String key = r.str();
+            Map<String, Object> values = new LinkedHashMap<>();
+            for (String f : fields) values.put(f, r.value(0));
+            rows.add(new ColumnRow(key, values));
+        }
+        if (r.remaining() != 0) throw new InvalidException("trailing bytes after scan page");
+        return new ScanPage(total, next, rows);
     }
 
     static byte[] admin(int sub, String collection, String field) {
