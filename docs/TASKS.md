@@ -883,7 +883,7 @@ This document defines the strict chronological execution order for building the 
     - Every SDK reproduces the 7 new request vectors byte for byte and decodes the 2 response vectors.
     - Every SDK passes an end-to-end test against the real server with expectations computed from its own data, before and after columnar storage.
     - Server tests: wire round-trips, scans equal to document scans across pages, hostile bodies refused, and OLTP latency under concurrent analytics.
-- [~] **TASK-130: SQL Push-Down (`F-OLAP-06`)** — single-table aggregation, filters, projections and `ORDER BY ... LIMIT` pushed down from all three dialects; joins over columnar scans with hash joins; `EXPLAIN` shows the push-down.
+- [x] **TASK-130: SQL Push-Down (`F-OLAP-06`)** — single-table aggregation, filters, projections and `ORDER BY ... LIMIT` pushed down from all three dialects; joins over columnar scans with hash joins; `EXPLAIN` shows the push-down.
   - **Done: aggregation push-down** (`storage-sql/src/exec/pushdown.rs`). A single-table `GROUP BY` runs as one `OP_DOC_AGGREGATE` when the store's result provably equals the gateway's:
     - WHERE translates to an equivalent filter (not a wider one). Constant conversions must be exact; `<>` adds an exists check; `IN` skips NULLs; `LIKE 'prefix%'`.
     - Keys and arguments are plain columns of types compared alike on both sides, with no default filled in for missing fields.
@@ -896,7 +896,8 @@ This document defines the strict chronological execution order for building the 
     - This holds over the row store, over column segments, and with a delta of inserts, updates and deletes.
     - 12 of the 15 push down; the 3 that must not stay local.
     - 20k rows: 1.0 ms pushed against 230 ms local.
-  - **Open**: non-aggregate `ORDER BY ... LIMIT` / projection push-down through `OP_DOC_SCAN_COLUMNS`, and hash joins over columnar scans.
+  - **Done: projection push-down** (`select.rs` `projection_for` / `projected`). Scans read only the columns a query uses, through `OP_DOC_SCAN_COLUMNS` (column segments when the collection is columnar). Joins use the existing hash join over the projected rows, and `ORDER BY ... LIMIT` runs on the narrow rows. Projection stays off for wildcards, subqueries, LATERAL, NATURAL / USING joins, window functions, validated reads, and columns with a filled-in default.
+  - **Exit Criteria (projection)**: 12 query shapes (joins, `ORDER BY ... LIMIT`, filters, table functions) return identical rows with projection on and off, over the row store and over column segments, and inside a transaction.
 - [x] **TASK-131: Analytics Benchmarks vs DuckDB (`F-OLAP-07`)** — TPC-H Q1 / Q6 and a ClickBench subset, interleaved A/B/A/B on this machine, plus storage footprint; results published in `BENCHMARK_REPORT.md`.
   - Published in `BENCHMARK_REPORT.md` §6, with a TPC-H-shaped `lineitem` and a ClickBench-shaped `hits`. Both are synthetic data with the same columns and skew, not the official datasets, and the report says so.
   - Storine is at parity or ahead on scans, filters and low-cardinality aggregation.
