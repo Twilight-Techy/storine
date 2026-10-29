@@ -43,7 +43,9 @@ const KEYWORDS: &[&str] = &[
     "user",
     "value",
     "binary",
+    "all",
     "any",
+    "distinct",
     "some",
 ];
 
@@ -180,7 +182,15 @@ impl Display for Expr {
                 distinct,
                 ..
             } => {
-                write!(f, "{name}(")?;
+                // Names that are not plain words (a quoted identifier) stay quoted.
+                if name
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'.')
+                {
+                    write!(f, "{name}(")?;
+                } else {
+                    write!(f, "\"{}\"(", name.replace('"', "\"\""))?;
+                }
                 if *star {
                     f.write_str("*")?;
                 } else {
