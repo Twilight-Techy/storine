@@ -1454,20 +1454,7 @@ pub fn finish_aggregate(
                     .checked_add(d)
                     .map_err(|_| SqlError::numeric_out_of_range("avg overflow"))?;
             }
-            let n = Decimal::from_i64(values.len() as i64);
-            let target = if ex.dialect() == Dialect::MySql {
-                scale + 4
-            } else {
-                (scale + 16).min(20)
-            };
-            let q = acc
-                .checked_div(n, target.min(38), RoundingMode::HalfUp)
-                .map_err(|_| SqlError::numeric_out_of_range("avg overflow"))?;
-            Datum::Numeric(if ex.dialect() == Dialect::MySql {
-                q
-            } else {
-                trim_avg(q)
-            })
+            avg_exact(ex, acc, scale, values.len() as i64)?
         }
         "min" | "max" => {
             let mut it = values.into_iter();
@@ -1577,6 +1564,24 @@ pub fn finish_aggregate(
 
 /// PostgreSQL shows averages with the significant digits only (`2.5000000000000000` → `2.5`)
 /// unless the inputs had a scale, which is kept.
+/// `AVG` of exact values from their sum (`scale`: the largest input scale) and count, as each
+/// dialect reports it. Shared by local aggregation and aggregate push-down (`TASK-130`).
+pub fn avg_exact(ex: &Exec<'_>, sum: Decimal, scale: u8, n: i64) -> SqlResult<Datum> {
+    let target = if ex.dialect() == Dialect::MySql {
+        scale + 4
+    } else {
+        (scale + 16).min(20)
+    };
+    let q = sum
+        .checked_div(Decimal::from_i64(n), target.min(38), RoundingMode::HalfUp)
+        .map_err(|_| SqlError::numeric_out_of_range("avg overflow"))?;
+    Ok(Datum::Numeric(if ex.dialect() == Dialect::MySql {
+        q
+    } else {
+        trim_avg(q)
+    }))
+}
+
 fn trim_avg(d: Decimal) -> Decimal {
     d.normalize()
 }

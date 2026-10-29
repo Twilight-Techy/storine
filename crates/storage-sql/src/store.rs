@@ -172,6 +172,30 @@ impl Store {
         Ok(self.client.collection(&self.c(collection)).find(query)?)
     }
 
+    /// Server-side aggregation (`TASK-130`): exact, as of one snapshot, over column segments when
+    /// the collection is columnar.
+    pub fn aggregate(
+        &self,
+        collection: &str,
+        query: storine::AggregateQuery,
+    ) -> SqlResult<storine::AggregateResult> {
+        Ok(self
+            .client
+            .collection(&self.c(collection))
+            .aggregate(query)?)
+    }
+
+    /// Turns columnar storage on or off for `collection`.
+    pub fn set_columnar(&self, collection: &str, on: bool) -> SqlResult<()> {
+        let c = self.client.collection(&self.c(collection));
+        if on {
+            c.enable_columnar()?;
+        } else {
+            c.disable_columnar()?;
+        }
+        Ok(())
+    }
+
     pub fn count(&self, collection: &str, filter: Option<Filter>) -> SqlResult<u64> {
         Ok(self.client.collection(&self.c(collection)).count(filter)?)
     }

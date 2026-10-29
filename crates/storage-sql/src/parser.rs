@@ -489,6 +489,48 @@ impl Parser {
     }
 
     /// Skips tokens up to the end of the statement (table options we ignore).
+    /// Skips table options to the end of the statement, returning the columnar storage they
+    /// ask for: `ENGINE = COLUMNAR` (MySQL: any other engine means off) or a `columnar = on |
+    /// off` storage parameter inside `WITH (...)` / `SET (...)` (PostgreSQL).
+    fn columnar_option(&mut self) -> Option<bool> {
+        let mut found = None;
+        let truthy = |t: &Token| match t {
+            Token::Word { text, .. } => {
+                matches!(text.to_ascii_lowercase().as_str(), "on" | "true" | "yes")
+            }
+            Token::Number(n) => n == "1",
+            Token::Str(s) => matches!(s.to_ascii_lowercase().as_str(), "on" | "true" | "yes" | "1"),
+            _ => false,
+        };
+        let mut depth = 0i32;
+        while let Some(t) = self.peek() {
+            match t {
+                Token::Op("(") => depth += 1,
+                Token::Op(")") => depth -= 1,
+                Token::Op(";") if depth <= 0 => break,
+                _ => {}
+            }
+            if depth == 0 && self.is_kw("engine") {
+                self.pos += 1;
+                let _ = self.eat_op("=");
+                if let Some(Token::Word { text, .. }) = self.peek() {
+                    found = Some(text.eq_ignore_ascii_case("columnar"));
+                }
+                self.pos += 1;
+                continue;
+            }
+            if self.is_kw("columnar") && matches!(self.peek_at(1), Some(Token::Op("="))) {
+                if let Some(v) = self.peek_at(2) {
+                    found = Some(truthy(v));
+                }
+                self.pos += 3;
+                continue;
+            }
+            self.pos += 1;
+        }
+        found
+    }
+
     fn skip_to_end(&mut self) {
         let mut depth = 0i32;
         while let Some(t) = self.peek() {
@@ -1132,6 +1174,18 @@ impl Parser {
         self.pos = start;
         let unique = self.eat_kw("unique");
         let _ = self.eat_kw("clustered") || self.eat_kw("nonclustered");
+        // SQL Server: a columnstore index makes the table columnar (`TASK-130`).
+        if self.eat_kws(&["columnstore", "index"]) {
+            let index = Some(self.ident()?);
+            self.expect_kw("on")?;
+            let table = self.table_name()?;
+            self.skip_to_end();
+            return Ok(Statement::AlterTable {
+                table,
+                if_exists: false,
+                ops: vec![AlterOp::SetColumnar { on: true, index }],
+            });
+        }
         if self.eat_kw("index") {
             let _ = self.eat_kw("concurrently");
             let if_not_exists = self.eat_kws(&["if", "not", "exists"]);
@@ -1283,6 +1337,7 @@ impl Parser {
             columns: Vec::new(),
             constraints: Vec::new(),
             as_query: None,
+            columnar: false,
         };
         if self.eat_kw("as") {
             ct.as_query = Some(Box::new(self.query()?));
@@ -1315,7 +1370,9 @@ impl Parser {
             }
         }
         self.expect_op(")")?;
-        self.skip_to_end(); // ENGINE=..., WITHOUT ROWID, WITH (...), INHERITS ...
+        // Table options (ENGINE=..., WITHOUT ROWID, WITH (...), INHERITS ...): only columnar
+        // storage has a meaning here.
+        ct.columnar = self.columnar_option() == Some(true);
         Ok(Statement::CreateTable(Box::new(ct)))
     }
 
@@ -2083,6 +2140,17 @@ impl Parser {
     fn alter_op(&mut self) -> SqlResult<AlterOp> {
         if self.eat_kw("add") {
             return self.add_item();
+        }
+        // PostgreSQL `SET (columnar = on)`, MySQL `ENGINE = COLUMNAR` (`TASK-130`).
+        if (self.is_kw("set")
+            && matches!(self.peek_at(1), Some(Token::Op("(")))
+            && self.is_kw_at(2, "columnar"))
+            || self.is_kw("engine")
+        {
+            let on = self.columnar_option();
+            return on
+                .map(|on| AlterOp::SetColumnar { on, index: None })
+                .ok_or_else(|| SqlError::unsupported("this ALTER TABLE option"));
         }
         if self.eat_kw("drop") {
             if self.eat_kw("constraint")

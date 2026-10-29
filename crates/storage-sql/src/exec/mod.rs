@@ -16,6 +16,7 @@ mod eval;
 pub(crate) mod func;
 mod merge;
 pub mod mssql;
+mod pushdown;
 mod regex;
 mod select;
 pub mod system;
@@ -1223,7 +1224,18 @@ impl Session {
                 Ok(Outcome::command("USE"))
             }
             Statement::Explain(inner) => {
-                let text = format!("Storine SQL plan: {}", explain_text(inner));
+                // A pushed-down aggregation says so (`TASK-130`).
+                let pushed = match &**inner {
+                    Statement::Query(q) if q.ctes.is_empty() => match &q.body {
+                        crate::ast::SetExpr::Select(sel) => {
+                            let ex = eval::Exec::new(self, params);
+                            ex.plan_pushdown(sel, &q.order_by, None)?.map(|p| eval::Exec::explain_pushdown(&p))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let text = format!("Storine SQL plan: {}", pushed.unwrap_or_else(|| explain_text(inner)));
                 Ok(Outcome::Rows(ResultSet {
                     columns: vec![OutCol {
                         name: "QUERY PLAN".into(),

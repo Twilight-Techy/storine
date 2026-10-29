@@ -293,6 +293,7 @@ pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlR
             columns: defs,
             constraints: Vec::new(),
             as_query: None,
+            columnar: ct.columnar,
         };
         create_table(s, &inner, params)?;
         let n = rs.rows.len();
@@ -330,6 +331,7 @@ pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlR
         foreign_keys: Vec::new(),
         checks: Vec::new(),
         pk_name: None,
+        columnar: ct.columnar.then(String::new),
         version: 0,
     };
     {
@@ -397,6 +399,9 @@ pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlR
     }
     save_schema(s, &t, Pre::Absent)?;
     sync_storage_indexes(s, &t)?;
+    if t.columnar.is_some() {
+        s.engine.store.set_columnar(&t.collection, true)?;
+    }
     Ok(Outcome::command("CREATE TABLE"))
 }
 
@@ -643,6 +648,27 @@ pub fn drop_indexes(
                     || t.uniques.iter().any(|u| u.name.eq_ignore_ascii_case(n))
             }),
         };
+        // SQL Server: dropping the columnstore index turns columnar storage off.
+        let columnstore = match table {
+            Some(t) => Some(s.engine.table(t)?).filter(|t| {
+                t.columnar
+                    .as_deref()
+                    .is_some_and(|c| !c.is_empty() && c.eq_ignore_ascii_case(n))
+            }),
+            None => s.engine.catalog.all().into_iter().find(|t| {
+                t.columnar
+                    .as_deref()
+                    .is_some_and(|c| !c.is_empty() && c.eq_ignore_ascii_case(n))
+            }),
+        };
+        if let Some(t) = columnstore {
+            let mut t = (*t).clone();
+            let version = t.version;
+            s.engine.store.set_columnar(&t.collection, false)?;
+            t.columnar = None;
+            save_schema(s, &t, Pre::Version(version))?;
+            continue;
+        }
         let Some(owner) = owner else {
             if if_exists {
                 continue;
@@ -689,6 +715,12 @@ pub fn alter_table(s: &mut Session, table: &str, ops: &[AlterOp]) -> SqlResult<O
         let mut t = (*current).clone();
         let version = t.version;
         match op {
+            AlterOp::SetColumnar { on, index } => {
+                // Analytics storage (`TASK-130`): the store keeps column segments; the schema
+                // remembers it (and a SQL Server columnstore index name for DROP INDEX).
+                s.engine.store.set_columnar(&t.collection, *on)?;
+                t.columnar = on.then(|| index.clone().unwrap_or_default());
+            }
             AlterOp::AddColumn {
                 column,
                 if_not_exists,

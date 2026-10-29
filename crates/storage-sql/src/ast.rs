@@ -378,6 +378,9 @@ pub struct CreateTable {
     pub columns: Vec<ColumnDef>,
     pub constraints: Vec<TableConstraint>,
     pub as_query: Option<Box<Query>>,
+    /// Kept as column segments for analytics (`TASK-130`): PostgreSQL `WITH (columnar = on)`,
+    /// MySQL `ENGINE = COLUMNAR`.
+    pub columnar: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -474,6 +477,13 @@ pub enum AlterOp {
     DropConstraint {
         name: String,
         if_exists: bool,
+    },
+    /// Columnar storage on or off (`TASK-130`): PostgreSQL `SET (columnar = on | off)`, MySQL
+    /// `ENGINE = COLUMNAR | InnoDB`, SQL Server `CREATE CLUSTERED COLUMNSTORE INDEX name` (the
+    /// name, so `DROP INDEX name` turns it off again).
+    SetColumnar {
+        on: bool,
+        index: Option<String>,
     },
 }
 

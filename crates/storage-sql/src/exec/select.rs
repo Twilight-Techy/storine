@@ -51,7 +51,11 @@ pub struct Rel {
 }
 
 impl Rel {
-    fn requalify(mut self, alias: &Option<TableAlias>, default: Option<&str>) -> SqlResult<Rel> {
+    pub(super) fn requalify(
+        mut self,
+        alias: &Option<TableAlias>,
+        default: Option<&str>,
+    ) -> SqlResult<Rel> {
         let qual = alias
             .as_ref()
             .map(|a| a.name.clone())
@@ -114,7 +118,7 @@ fn column_refs(e: &Expr) -> Vec<Vec<String>> {
     out
 }
 
-fn has_subquery(e: &Expr) -> bool {
+pub(super) fn has_subquery(e: &Expr) -> bool {
     let mut found = false;
     walk(e, &mut |x| {
         if matches!(
@@ -475,7 +479,7 @@ impl Exec<'_> {
 
     // ── FROM ──
 
-    fn cte(&self, name: &str) -> Option<Rc<Rel>> {
+    pub(super) fn cte(&self, name: &str) -> Option<Rc<Rel>> {
         let lower = name.to_ascii_lowercase();
         self.ctes
             .borrow()
@@ -1432,7 +1436,7 @@ impl Exec<'_> {
     }
 
     /// The table column `e` names, if it is a reference to one of `table`'s columns.
-    fn own_column(&self, table: &Table, qual: Option<&str>, e: &Expr) -> Option<usize> {
+    pub(super) fn own_column(&self, table: &Table, qual: Option<&str>, e: &Expr) -> Option<usize> {
         let Expr::Column(p) = e else { return None };
         if p.len() > 1 {
             let q = &p[p.len() - 2];
@@ -1446,7 +1450,7 @@ impl Exec<'_> {
     }
 
     /// The value of `e` if it does not depend on the current row.
-    fn constant(&self, e: &Expr, outer: Option<&Env<'_>>) -> Option<Datum> {
+    pub(super) fn constant(&self, e: &Expr, outer: Option<&Env<'_>>) -> Option<Datum> {
         if has_subquery(e) || has_aggregate(e) {
             return None;
         }
@@ -1574,9 +1578,22 @@ impl Exec<'_> {
             .copied()
             .filter(|c| !has_subquery(c) && !has_aggregate(c))
             .collect();
+        // Aggregations the store computes exactly run there (`TASK-130`): no rows are read here.
+        let pushed = match self.plan_pushdown(sel, order_by, outer)? {
+            Some(plan) => self.run_pushdown(plan)?,
+            None => None,
+        };
+        let (pushed_cols, mut pushed_work) = match pushed {
+            Some((c, w)) => (Some(c), Some(w)),
+            None => (None, None),
+        };
         // pgvector: `ORDER BY col <=> vector LIMIT k` over an hnsw / ivfflat index reads only
         // the index's nearest candidates (exact distances are still computed and sorted below).
-        let hint = self.vector_hint_for(sel, order_by, limit, offset)?;
+        let hint = if pushed_cols.is_some() {
+            None
+        } else {
+            self.vector_hint_for(sel, order_by, limit, offset)?
+        };
         let wanted = hint.as_ref().map_or(0, |h| h.k);
         *self.vector_hint.borrow_mut() = hint;
         self.vector_hint_used.set(false);
@@ -1602,7 +1619,13 @@ impl Exec<'_> {
             }
             Ok((src.cols, rows))
         };
-        let src = self.eval_from(&sel.from, &pushable, outer);
+        let src = match pushed_cols {
+            Some(cols) => Ok(Rel {
+                cols,
+                rows: Vec::new(),
+            }),
+            None => self.eval_from(&sel.from, &pushable, outer),
+        };
         *self.vector_hint.borrow_mut() = None;
         let used = self.vector_hint_used.replace(false);
         let (mut cols, mut rows) = filtered(src?)?;
@@ -1720,7 +1743,22 @@ impl Exec<'_> {
         // Rows to project, each with the aggregate (and window) values it sees.
         type Work = (Row, Vec<(Expr, Datum)>);
         let mut work: Vec<Work> = Vec::new();
-        if aggregated {
+        if let Some(groups) = pushed_work.take() {
+            for (rep, aggs) in groups {
+                if let Some(h) = &sel.having {
+                    let env = Env {
+                        cols: &cols,
+                        row: &rep,
+                        outer,
+                        aggs: Some(&aggs),
+                    };
+                    if !self.eval_bool(h, &env)? {
+                        continue;
+                    }
+                }
+                work.push((rep, aggs));
+            }
+        } else if aggregated {
             // Collect every aggregate call (window functions are computed separately).
             let mut agg_exprs: Vec<Expr> = Vec::new();
             let mut collect = |e: &Expr| {

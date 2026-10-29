@@ -142,6 +142,9 @@ pub struct Table {
     pub checks: Vec<CheckDef>,
     /// Name of the primary key constraint, when one was given.
     pub pk_name: Option<String>,
+    /// Kept as column segments for analytics (`TASK-130`): `Some` with the SQL Server
+    /// columnstore index name (empty in the other dialects).
+    pub columnar: Option<String>,
     /// Version of the schema document.
     pub version: u64,
 }
@@ -290,6 +293,9 @@ impl Table {
         if let Some(n) = &self.pk_name {
             d.insert("pk_name".into(), Value::Text(n.clone()));
         }
+        if let Some(n) = &self.columnar {
+            d.insert("columnar".into(), Value::Text(n.clone()));
+        }
         let keys = |ks: Vec<(&String, &Vec<usize>)>| {
             Value::List(
                 ks.into_iter()
@@ -422,6 +428,10 @@ impl Table {
             checks: Vec::new(),
             pk_name: doc
                 .get("pk_name")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            columnar: doc
+                .get("columnar")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             version,
@@ -722,6 +732,7 @@ mod tests {
                 expr: parse_expr("balance >= 0", Dialect::Postgres).unwrap(),
             }],
             pk_name: Some("PK_accounts".into()),
+            columnar: Some("cci".into()),
             version: 3,
         }
     }
