@@ -929,8 +929,24 @@ This document defines the strict chronological execution order for building the 
       - no torn records;
       - the score index equal to the records;
       - no file written around the seam.
-- [ ] **TASK-133: Deterministic Cluster Simulator (`F-SIM-02`)** — seeded scheduler, simulated network and clocks; Raft safety invariants checked every run; failing seeds reproduce bit for bit.
-- [ ] **TASK-134: Linearizability Checker & Process Chaos (`F-SIM-03`)** — P-compositional history checker; fault proxy (partitions, delays, half-open sockets) and `SIGKILL` / `SIGSTOP` of real binaries.
+- [x] **TASK-133: Deterministic Cluster Simulator (`F-SIM-02`)** — seeded scheduler, simulated network and clocks; Raft safety invariants checked every run; failing seeds reproduce bit for bit.
+  - **Driver** (`storage-core/src/raft_sim.rs`): real `RaftNode`s, each with an engine on its own `SimVfs` disk, run from one seeded event queue, with no threads and no real clocks. It drives elections with pre-vote, pipelined replication with varied batch sizes, quorum commit, chunked snapshot installs and read-index reads.
+  - **Faults**:
+    - message delay, loss, duplication, reordering and very late delivery;
+    - partitions (one node isolated, random splits, one-way links), healed later;
+    - crashes with power cuts or process kills, then restart from disk;
+    - per-node clock skew and timer jumps;
+    - random log compaction.
+  - **Checked after every event**: election safety, log matching, leader completeness, state-machine safety (no index commits or applies twice with different terms, including after recovery), and applied ≤ committed. **At the end**: convergence to identical engine contents, and a linearizable client history (`TASK-134` checker).
+  - **Bugs found and fixed**:
+    - **Wrong success after a leader change.** A proposal replaced after a leader change was reported as committed with the replacement's outcome; `RaftRuntime::commit` could return success for a write that never happened. Outcomes are now keyed by index and term, and a replaced proposal returns `CommitUnknown`.
+    - **Stale suffix committed.** A follower holding a stale suffix committed and reported as matching entries that a (late or partial) AppendEntries never covered, which could apply an entry the cluster never committed. It now commits up to `min(leader_commit, last new entry)` (Raft Figure 2).
+  - **Regression**: both bugs have unit tests that fail without the fix. With the stale-suffix fix reverted, the simulator finds a state-machine safety violation within 65 seeds.
+  - **Exit Criteria (met)**:
+    - 500 seeds × 3 nodes and 500 seeds × 5 nodes pass. Together: 5,756 crashes (2,914 power cuts), 10,757 partitions, 3,953 snapshot installs, about 69,700 acknowledged writes and 66,800 linearizable reads.
+    - The same seed gives the same run (`same_seed_same_run`).
+    - `STORINE_SIM_SEED=s` replays one seed and `STORINE_SIM_SEEDS=n` widens the sweep.
+- [~] **TASK-134: Linearizability Checker & Process Chaos (`F-SIM-03`)** — P-compositional history checker; fault proxy (partitions, delays, half-open sockets) and `SIGKILL` / `SIGSTOP` of real binaries.
 - [ ] **TASK-135: Structure-Aware Fuzzing (`F-SIM-04`)** — generators for every decoder and parser, millions of iterations, corpora from the conformance vectors.
 - [x] **TASK-136: Crash-Point Sweeps (`F-SIM-05`)** — kill at every `k`-th I/O call, recover, check acknowledged writes, torn state and index equality.
   - `tests/power_loss.rs::crash_at_every_io_call`: a fixed 40-operation workload (puts, deletes, 3-record transactions, checkpoints) is stopped at every I/O call `k = 1 ..= total + 1` in each of 4 layouts / index tiers, then recovered:

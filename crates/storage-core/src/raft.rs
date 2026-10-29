@@ -298,6 +298,34 @@ pub fn decode_raft_ops<T: ZeroCopyRecord>(bytes: &[u8]) -> Result<(u64, Vec<Writ
     Ok((now_ns, ops))
 }
 
+/// A replica's log and indexes as seen by [`RaftNode::log_view`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RaftLogView {
+    pub snapshot_index: u64,
+    pub snapshot_term: u64,
+    pub terms: Vec<u64>,
+    pub commit_index: u64,
+    pub last_applied: u64,
+    pub current_term: u64,
+    pub role: RaftRole,
+}
+
+impl RaftLogView {
+    pub fn last_index(&self) -> u64 {
+        self.snapshot_index + self.terms.len() as u64
+    }
+
+    /// Term of the entry at `index` (`None` if compacted or past the end; the snapshot point
+    /// itself answers with the snapshot term).
+    pub fn term_at(&self, index: u64) -> Option<u64> {
+        if index == self.snapshot_index {
+            return Some(self.snapshot_term);
+        }
+        let pos = index.checked_sub(self.snapshot_index + 1)?;
+        self.terms.get(usize::try_from(pos).ok()?).copied()
+    }
+}
+
 /// Raft `RequestVote` RPC request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RequestVoteReq {
@@ -1104,7 +1132,9 @@ pub struct RaftNode<T: ZeroCopyRecord + Indexable> {
 
 #[derive(Debug, Default)]
 struct Outcomes {
-    awaited: FastHashSet<u64>,
+    /// Index -> term of the entry the local proposer appended there. An entry applied at that
+    /// index with another term replaced the proposal (leader change): its outcome is not ours.
+    awaited: FastHashMap<u64, u64>,
     done: FastHashMap<u64, ApplyOutcome>,
 }
 
@@ -1329,12 +1359,13 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         let (prev, _) = st.last_log_index_and_term();
         let entry = RaftLogEntry { term: st.current_term, index: prev + 1, command };
         self.storage.append_log(core::slice::from_ref(&entry))?;
+        let term = entry.term;
         st.push_entry(entry);
         self.outcomes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .awaited
-            .insert(prev + 1);
+            .insert(prev + 1, term);
         Ok(prev + 1)
     }
 
@@ -1344,6 +1375,11 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         let now_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        self.propose_ops_at(ops, now_ns)
+    }
+
+    /// [`Self::propose_ops`] stamped with `now_ns` (the simulator passes its own clock).
+    pub fn propose_ops_at(&self, ops: &[WriteOp<T>], now_ns: u64) -> Result<u64> {
         self.propose(RaftCommand::Ops(encode_raft_ops(ops, now_ns)?))
     }
 
@@ -1398,6 +1434,21 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         self.last_contact.lock().unwrap_or_else(|p| p.into_inner()).elapsed()
     }
 
+    /// The log as terms, for invariant checks (`F-SIM-02`): entry `snapshot_index + 1 + i`
+    /// has term `terms[i]`.
+    pub fn log_view(&self) -> RaftLogView {
+        let st = self.lock_state();
+        RaftLogView {
+            snapshot_index: st.snapshot_index,
+            snapshot_term: st.snapshot_term,
+            terms: st.log.iter().map(|e| e.term).collect(),
+            commit_index: st.commit_index,
+            last_applied: st.last_applied,
+            current_term: st.current_term,
+            role: st.role,
+        }
+    }
+
     /// Current leader known to this node.
     pub fn leader_id(&self) -> Option<NodeId> {
         self.lock_state().leader_id
@@ -1436,7 +1487,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         let entry = RaftLogEntry::record(st.current_term, next_idx, id, frame);
         self.storage.append_log(core::slice::from_ref(&entry))?;
         st.push_entry(entry.clone());
-        self.outcomes.lock().unwrap_or_else(|p| p.into_inner()).awaited.insert(next_idx);
+        self.outcomes.lock().unwrap_or_else(|p| p.into_inner()).awaited.insert(next_idx, entry.term);
         Ok((entry, prev_idx, prev_term))
     }
 
@@ -1612,6 +1663,9 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 });
             }
 
+            // The last index this request vouches for. Entries past it (a stale suffix from an
+            // older term) are unverified: they may neither commit nor count as matching.
+            let last_new = (req.prev_log_index + req.entries.len() as u64).max(st.snapshot_index);
             // Entries at or below our compaction point are committed, hence identical to ours
             // (Log Matching): skip them and match from the snapshot point instead.
             let (prev_log_index, prev_log_term, entries) = if req.prev_log_index < st.snapshot_index {
@@ -1666,8 +1720,8 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 self.storage.append_log(&st.log[from..])?;
             }
 
-            let match_index = st.last_log_index();
-            if req.leader_commit > st.commit_index {
+            let match_index = last_new.min(st.last_log_index());
+            if req.leader_commit > st.commit_index && req.leader_commit.min(match_index) > st.commit_index {
                 st.commit_index = req.leader_commit.min(match_index);
                 self.storage.save_hard_state(&st)?;
             }
@@ -1736,7 +1790,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             // `state -> outcomes`; neither lock is held while taking the other here.
             {
                 let mut out = self.outcomes.lock().unwrap_or_else(|p| p.into_inner());
-                if out.awaited.contains(&entry.index) {
+                if out.awaited.get(&entry.index) == Some(&entry.term) {
                     out.done.insert(entry.index, outcome);
                 }
             }
@@ -2358,6 +2412,73 @@ mod tests {
     use super::*;
     use crate::engine::EngineConfig;
     use crate::model::AgentObjectRecord;
+
+    /// A follower may hold stale entries past the end of what an AppendEntries verified (a
+    /// delayed or duplicated request). It must commit only up to the last entry the request
+    /// covered, and report only that as matching: committing its own stale suffix would apply
+    /// an entry the cluster never committed.
+    #[test]
+    fn test_follower_never_commits_unverified_stale_suffix() {
+        let dir = std::env::temp_dir().join(format!("stge_raft_stale_suffix_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Arc::new(StorageEngine::<AgentObjectRecord>::open(&dir, EngineConfig::default()).unwrap());
+        let f = RaftNode::new(9, engine).unwrap();
+        let e = |term, index| RaftLogEntry { term, index, command: RaftCommand::Noop };
+        let ae = |term, leader_id, prev_log_index, prev_log_term, entries, leader_commit| AppendEntriesReq {
+            term,
+            leader_id,
+            prev_log_index,
+            prev_log_term,
+            entries,
+            leader_commit,
+        };
+        // Term 1 leader: entries 1..=3. Term 2 leader: stale entries 4, 5 (never committed).
+        assert!(f.handle_append_entries(ae(1, 1, 0, 0, vec![e(1, 1), e(1, 2), e(1, 3)], 0)).unwrap().success);
+        assert!(f.handle_append_entries(ae(2, 2, 3, 1, vec![e(2, 4), e(2, 5)], 0)).unwrap().success);
+        // Term 3 leader (its entry 4 has term 3, committed at 4) sends a late request covering
+        // only entry 3.
+        let resp = f.handle_append_entries(ae(3, 3, 2, 1, vec![e(1, 3)], 4)).unwrap();
+        assert!(resp.success);
+        assert_eq!(resp.match_index, 3, "only the verified prefix matches");
+        let v = f.log_view();
+        assert_eq!(v.commit_index, 3, "the stale entry 4 (term 2) must not commit");
+        assert_eq!(v.last_applied, 3);
+        // The next request truncates the stale suffix; then entry 4 (term 3) commits.
+        let resp = f.handle_append_entries(ae(3, 3, 3, 1, vec![e(3, 4)], 4)).unwrap();
+        assert!(resp.success);
+        let v = f.log_view();
+        assert_eq!((v.commit_index, v.last_index(), v.term_at(4)), (4, 4, Some(3)));
+        drop(f);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A proposal replaced after a leader change (another entry applied at its index) is
+    /// `CommitUnknown`, never the replacement's outcome reported as success.
+    #[test]
+    fn test_replaced_proposal_is_never_reported_as_committed() {
+        let dir = std::env::temp_dir().join(format!("stge_raft_replaced_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Arc::new(StorageEngine::<AgentObjectRecord>::open(&dir, EngineConfig::default()).unwrap());
+        let a = RaftNode::new(1, engine).unwrap();
+        let req = a.start_election().unwrap();
+        assert!(a.become_leader(req.term));
+        let mine = a.propose(RaftCommand::Noop).unwrap();
+        assert_eq!(mine, 2);
+        // A term-2 leader overwrites index 2 and commits it.
+        let ae = AppendEntriesReq {
+            term: 2,
+            leader_id: 2,
+            prev_log_index: 1,
+            prev_log_term: 1,
+            entries: vec![RaftLogEntry { term: 2, index: 2, command: RaftCommand::Noop }],
+            leader_commit: 2,
+        };
+        assert!(a.handle_append_entries(ae).unwrap().success);
+        assert_eq!(a.last_applied(), 2);
+        assert!(matches!(a.wait_applied(mine, Duration::ZERO), Err(StorageError::CommitUnknown { index: 2 })));
+        drop(a);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_raft_ops_roundtrip_including_payload_free_operations() {
