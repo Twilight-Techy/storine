@@ -3,3 +3,4 @@
 /data/
 *.pdb
 *.tmp
+/.claude/worktrees/
