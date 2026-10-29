@@ -28,8 +28,9 @@ use storage_types::StorageError;
 
 use crate::dist::hlc::{Hlc, ManualClock, Timestamp};
 use crate::dist::mvcc::{MvccKey, TxnId, TxnRecord, TxnStatus, Value, TXN_COLLECTION};
+use crate::dist::meta::RangeIndex;
 use crate::dist::node::{Batch, NodeConfig, NodeDriver, RangeId};
-use crate::dist::server::{Key, KvRequest, KvResponse, NodeServer};
+use crate::dist::server::{Key, KvRequest, KvResponse, MetaOp, NodeServer};
 use crate::dist::txn::{self, KvSender, TxnError};
 use crate::document::{document_id, DocumentRecord};
 use crate::engine::{EngineConfig, StorageEngine};
@@ -60,6 +61,9 @@ pub struct TxnSimConfig {
     pub max_offset_ns: u64,
     pub max_events: u64,
     pub node: NodeConfig,
+    /// Clients route through their own range caches, filled by meta-range lookups
+    /// (`TASK-138`), instead of the simulator's global view.
+    pub meta_routing: bool,
 }
 
 impl Default for TxnSimConfig {
@@ -84,6 +88,7 @@ impl Default for TxnSimConfig {
             max_offset_ns: 50_000_000,
             max_events: 5_000_000,
             node: NodeConfig { election_min_us: 300_000, election_max_us: 600_000, heartbeat_us: 50_000, snapshot_chunk: 2048, ..NodeConfig::default() },
+            meta_routing: false,
         }
     }
 }
@@ -104,6 +109,9 @@ pub struct TxnSimReport {
     pub first_error: Option<String>,
     /// Clock updates refused for exceeding the maximum offset.
     pub offset_refusals: usize,
+    /// Meta routing: lookups sent, and requests that reached a stale leaseholder or range.
+    pub meta_lookups: usize,
+    pub misroutes: usize,
 }
 
 /// A transaction with an unknown outcome: id, reads, writes.
@@ -148,6 +156,15 @@ struct ClientSlot {
     sleeping_until: Option<u64>,
     done: bool,
     started: bool,
+    /// Meta routing: this client's range cache, its outstanding lookups (the request ids
+    /// in `outstanding` that are lookups for the request stored there), and where the meta
+    /// range's leaseholder was last seen.
+    cache: RangeIndex,
+    lookups: std::collections::BTreeSet<u64>,
+    meta_node: Option<usize>,
+    /// Meta lookups sent, and requests that went to a stale leaseholder or range.
+    pub_lookups: usize,
+    misroutes: usize,
 }
 
 struct World {
@@ -266,7 +283,41 @@ impl World {
         }
     }
 
+    /// Meta routing: the node to send `key`'s request to, from the client's cache.
+    fn cached_route(&mut self, client: usize, key: &Key) -> Option<usize> {
+        let id = document_id(&key.0, &key.1).ok()?;
+        let d = self.slots[client].cache.lookup(id.as_bytes())?;
+        let n = *d.candidates().first()?;
+        Some(usize::from(n) - 1)
+    }
+
+    /// Meta routing: resolve `key` with a lookup (the reply re-submits request `idx`).
+    fn lookup(&mut self, client: usize, idx: usize, req: KvRequest, attempt: u32, delay: u64) {
+        self.next_req += 1;
+        let id = self.next_req;
+        let key = document_id(&req.key().0, &req.key().1).map(|i| i.as_bytes().to_vec()).unwrap_or_default();
+        self.slots[client].outstanding.insert(id, (idx, req, attempt));
+        self.slots[client].lookups.insert(id);
+        self.slots[client].pub_lookups += 1;
+        let to = match self.slots[client].meta_node {
+            Some(n) => n,
+            None => self.rng.below(self.cfg.nodes),
+        };
+        let d = self.latency(0, to) + delay;
+        self.schedule(d, Ev::Request { to, id, client, req: KvRequest::Meta(MetaOp::Lookup { key, limit: 8 }) });
+    }
+
     fn submit(&mut self, client: usize, idx: usize, req: KvRequest, attempt: u32) {
+        if self.cfg.meta_routing {
+            let Some(node) = self.cached_route(client, &req.key()) else {
+                return self.lookup(client, idx, req, attempt, 0);
+            };
+            self.next_req += 1;
+            let id = self.next_req;
+            self.slots[client].outstanding.insert(id, (idx, req.clone(), attempt));
+            let d = self.latency(0, node);
+            return self.schedule(d, Ev::Request { to: node, id, client, req });
+        }
         self.next_req += 1;
         let id = self.next_req;
         let (_, node) = self.route(&req.key());
@@ -304,6 +355,9 @@ impl World {
             }
             Ev::Reply { client, id, resp } => {
                 let Some((idx, req, attempt)) = self.slots[client].outstanding.remove(&id) else { return };
+                if self.cfg.meta_routing {
+                    return self.meta_reply(client, id, idx, req, attempt, resp);
+                }
                 match resp {
                     KvResponse::NotLeader { leader } if self.now < self.slots[client].deadline => {
                         if let (Some(r), Some(l)) = (self.route(&req.key()).0, leader) {
@@ -363,6 +417,75 @@ impl World {
                 }
             }
             Ev::Wake { .. } => {}
+        }
+    }
+
+    /// Meta routing: a reply to a lookup, or to a request routed by the cache.
+    fn meta_reply(&mut self, client: usize, id: u64, idx: usize, req: KvRequest, attempt: u32, resp: KvResponse) {
+        let late = self.now >= self.slots[client].deadline;
+        let backoff = 5_000 + self.rng.below(20_000) as u64;
+        if self.slots[client].lookups.remove(&id) {
+            match resp {
+                KvResponse::Ranges(ds) => {
+                    for d in ds {
+                        self.slots[client].cache.learn(d);
+                    }
+                    if self.cached_route(client, &req.key()).is_some() {
+                        self.submit(client, idx, req, attempt);
+                    } else if late {
+                        self.slots[client].replies[idx] = Some(Err("no route".into()));
+                    } else {
+                        // Not published yet (a split just happened): ask again shortly.
+                        self.lookup(client, idx, req, attempt + 1, 50_000);
+                    }
+                }
+                _ if late => self.slots[client].replies[idx] = Some(Err("meta range unavailable".into())),
+                KvResponse::NotLeader { leader } => {
+                    self.slots[client].meta_node = Some(match leader {
+                        Some(l) => usize::from(l) - 1,
+                        None => self.rng.below(self.cfg.nodes),
+                    });
+                    self.lookup(client, idx, req, attempt + 1, backoff);
+                }
+                _ => {
+                    self.slots[client].meta_node = None;
+                    self.lookup(client, idx, req, attempt + 1, backoff);
+                }
+            }
+            return;
+        }
+        let range = document_id(&req.key().0, &req.key().1).ok().and_then(|k| self.slots[client].cache.lookup(k.as_bytes()).map(|d| d.range));
+        match resp {
+            KvResponse::NotLeader { leader } if !late => {
+                self.slots[client].misroutes += 1;
+                match (range, leader) {
+                    (Some(r), Some(l)) => self.slots[client].cache.set_lease(r, l),
+                    // No leader known there: try the range's next replica.
+                    (Some(r), None) => {
+                        let next = self.slots[client].cache.get(r).map(|d| d.candidates()).and_then(|c| c.get((1 + attempt as usize) % c.len().max(1)).copied());
+                        if let Some(n) = next {
+                            self.slots[client].cache.set_lease(r, n);
+                        }
+                    }
+                    _ => {}
+                }
+                self.next_req += 1;
+                let nid = self.next_req;
+                self.slots[client].outstanding.insert(nid, (idx, req.clone(), attempt + 1));
+                let node = self.cached_route(client, &req.key()).unwrap_or_else(|| self.rng.below(self.cfg.nodes));
+                self.schedule(backoff, Ev::Request { to: node, id: nid, client, req });
+            }
+            KvResponse::WrongRange if !late => {
+                // The range split, merged or moved: forget it and look it up again.
+                self.slots[client].misroutes += 1;
+                if let Some(r) = range {
+                    self.slots[client].cache.evict(r);
+                }
+                self.lookup(client, idx, req, attempt + 1, 10_000);
+            }
+            KvResponse::NotLeader { .. } | KvResponse::WrongRange => self.slots[client].replies[idx] = Some(Err("no leaseholder found".into())),
+            KvResponse::Error(e) => self.slots[client].replies[idx] = Some(Err(e)),
+            resp => self.slots[client].replies[idx] = Some(Ok(resp)),
         }
     }
 
@@ -789,14 +912,24 @@ pub fn run(root: &Path, seed: u64, cfg: &TxnSimConfig) -> Result<TxnSimReport, S
 /// Settles unknown outcomes, then checks audits and serializability.
 fn check(w: &mut World) -> Result<(), String> {
     w.report.events = w.processed;
+    w.report.meta_lookups = w.slots.iter().map(|s| s.pub_lookups).sum();
+    w.report.misroutes = w.slots.iter().map(|s| s.misroutes).sum();
     w.report.end_time = w.now;
-    let srv = w.nodes.iter().find_map(|n| n.server.as_ref()).ok_or("no live node")?;
-    let engine = srv.driver.engine();
+    w.nodes.iter().find_map(|n| n.server.as_ref()).ok_or("no live node")?;
+    // Each key is read from the leaseholder of its range (replicas are not on every node).
+    let nodes: Vec<&NodeServer> = w.nodes.iter().filter_map(|n| n.server.as_ref()).collect();
+    let get = |id: storage_types::InlineId| -> Option<DocumentRecord> {
+        let hosts = |lead: bool| {
+            nodes.iter().find(|s| s.driver.ranges().into_iter().any(|r| s.driver.replica(r).is_some_and(|x| !x.is_frozen() && x.span().contains_id(id)) && (!lead || s.driver.is_leader(r))))
+        };
+        let srv = hosts(true).or_else(|| hosts(false))?;
+        srv.driver.engine().get_owned(id).ok().map(|(_, r)| r)
+    };
     // Unknown commits: the record decides (staging records are decided by their intents).
     let unknown = std::mem::take(&mut w.unknown);
     for (id, reads, writes) in unknown {
         let rid = document_id(TXN_COLLECTION, &crate::dist::mvcc::record_key(&id)).map_err(|e| e.to_string())?;
-        let rec = engine.get_owned(rid).ok().map(|(_, r)| TxnRecord::from_record(id, &r)).transpose().map_err(|e| e.to_string())?;
+        let rec = get(rid).map(|r| TxnRecord::from_record(id, &r)).transpose().map_err(|e| e.to_string())?;
         let committed_at = match rec {
             Some(r) if r.status == TxnStatus::Committed => Some(r.ts),
             Some(TxnRecord { status: TxnStatus::Staging { in_flight }, ts, .. }) => {
@@ -804,7 +937,7 @@ fn check(w: &mut World) -> Result<(), String> {
                 // timestamp (or the intent was already resolved into a version at it).
                 let all = in_flight.iter().all(|k| {
                     let kid = document_id(&k.0, &k.1).unwrap_or_default();
-                    let mk = engine.get_owned(kid).ok().and_then(|(_, r)| MvccKey::from_record(Some(&r)).ok()).unwrap_or_default();
+                    let mk = get(kid).and_then(|r| MvccKey::from_record(Some(&r)).ok()).unwrap_or_default();
                     mk.intent.as_ref().is_some_and(|i| i.txn.id == id && i.ts <= ts) || mk.versions.iter().any(|(t, _)| *t == ts)
                 });
                 all.then_some(ts)
@@ -868,7 +1001,7 @@ fn check(w: &mut World) -> Result<(), String> {
     for i in 0..w.cfg.accounts {
         let k = account(i);
         let id = document_id(&k.0, &k.1).map_err(|e| e.to_string())?;
-        let mk = engine.get_owned(id).ok().and_then(|(_, r)| MvccKey::from_record(Some(&r)).ok()).unwrap_or_default();
+        let mk = get(id).and_then(|r| MvccKey::from_record(Some(&r)).ok()).unwrap_or_default();
         let committed = mk.versions.first().and_then(|(_, v)| v.clone());
         // An unresolved intent of a committed transaction counts as its value.
         let want = model.get(&k).cloned().flatten();

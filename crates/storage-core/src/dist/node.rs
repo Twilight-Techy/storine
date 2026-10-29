@@ -108,6 +108,8 @@ pub enum RaftMsg {
     /// The receiver of a leader's message hosts no replica of the range (it caught up past a
     /// split by snapshot, so never created the right-hand range): a member is created anew.
     Missing,
+    /// For the host's request layer (range descriptors on their way to the meta range).
+    App(Vec<u8>),
 }
 
 /// `Gone` for a range absorbed by a merge.
@@ -123,6 +125,8 @@ pub struct Batch {
     pub ts: Timestamp,
     /// The sender's store load (allocator gossip).
     pub load: StoreLoad,
+    /// The sender leads the meta range (holds `crate::dist::meta::META_START`).
+    pub meta_leader: bool,
     pub msgs: Vec<(RangeId, RaftMsg)>,
 }
 
@@ -237,6 +241,11 @@ pub struct NodeDriver {
     last_alloc: u64,
     /// When the allocator last changed something.
     last_action: u64,
+    /// The meta range's leaseholder, as last gossiped.
+    meta_hint: Option<NodeId>,
+    app_inbox: Vec<(NodeId, Vec<u8>)>,
+    /// Ranges absorbed by merges into each local range (until its descriptor is published).
+    absorbed: BTreeMap<RangeId, Vec<RangeId>>,
 }
 
 impl core::fmt::Debug for NodeDriver {
@@ -283,6 +292,9 @@ impl NodeDriver {
             load: StoreLoad::default(),
             last_alloc: 0,
             last_action: 0,
+            meta_hint: None,
+            app_inbox: Vec::new(),
+            absorbed: BTreeMap::new(),
         }
     }
 
@@ -434,6 +446,7 @@ impl NodeDriver {
     pub fn drain_outbox(&mut self) -> Vec<(NodeId, Batch)> {
         let now = self.now;
         let hb = self.cfg.heartbeat_us;
+        let meta_leader = self.meta_range().is_some_and(|r| self.is_leader(r));
         let peers: Vec<NodeId> = self.peers.iter().copied().collect();
         for p in peers {
             if !self.outbox.contains_key(&p) && now.saturating_sub(self.sent.get(&p).copied().unwrap_or(0)) >= hb {
@@ -442,7 +455,7 @@ impl NodeDriver {
         }
         let out: Vec<(NodeId, Batch)> = std::mem::take(&mut self.outbox)
             .into_iter()
-            .map(|(to, msgs)| (to, Batch { from: self.id, incarnation: self.cfg.incarnation, ts: self.clock, load: self.load, msgs }))
+            .map(|(to, msgs)| (to, Batch { from: self.id, incarnation: self.cfg.incarnation, ts: self.clock, load: self.load, meta_leader, msgs }))
             .collect();
         for (to, b) in &out {
             self.sent.insert(*to, now);
@@ -566,6 +579,55 @@ impl NodeDriver {
             .filter(|r| r.raft.is_leader() && r.lead_term == r.raft.current_term())
             .filter(|r| r.planned_removal.is_some() || !r.removing.is_empty() || !r.raft.membership_state().1 || r.raft.membership().members().iter().any(|m| !m.voter))
             .count() as u32
+    }
+
+    /// The local replica of the meta range (the range holding the `_meta/` prefix).
+    pub fn meta_range(&self) -> Option<RangeId> {
+        self.replicas.iter().find(|(_, r)| !r.raft.is_frozen() && r.raft.span().contains(crate::dist::meta::META_START)).map(|(&id, _)| id)
+    }
+
+    /// The meta range's leaseholder: this node, the local replica's leader, or the gossiped hint.
+    pub fn meta_leaseholder(&self) -> Option<NodeId> {
+        match self.meta_range() {
+            Some(r) if self.is_leader(r) => Some(self.id),
+            Some(r) => self.leader_of(r).or(self.meta_hint),
+            None => self.meta_hint,
+        }
+    }
+
+    /// Sends `bytes` to the request layer of `node`.
+    pub fn send_app(&mut self, node: NodeId, bytes: Vec<u8>) {
+        if node != self.id {
+            self.peers.insert(node);
+            self.push(node, 0, RaftMsg::App(bytes));
+        }
+    }
+
+    /// Request-layer messages received since the last call.
+    pub fn take_app_inbox(&mut self) -> Vec<(NodeId, Vec<u8>)> {
+        std::mem::take(&mut self.app_inbox)
+    }
+
+    /// Ranges merged into `range` here, not yet acknowledged by the meta range.
+    pub fn absorbed_into(&self, range: RangeId) -> Vec<RangeId> {
+        self.absorbed.get(&range).cloned().unwrap_or_default()
+    }
+
+    /// The meta range recorded `range`'s descriptor (with these absorbed ranges).
+    pub fn absorbed_published(&mut self, range: RangeId, done: &[RangeId]) {
+        if let Some(v) = self.absorbed.get_mut(&range) {
+            v.retain(|r| !done.contains(r));
+            if v.is_empty() {
+                self.absorbed.remove(&range);
+            }
+        }
+    }
+
+    /// `range`'s descriptor as this node knows it (leaseholders publish it).
+    pub fn descriptor(&self, range: RangeId) -> Option<crate::dist::meta::RangeDescriptor> {
+        let r = self.replicas.get(&range)?;
+        let lease = (r.raft.is_leader() && r.lead_term == r.raft.current_term()).then(|| (self.id, r.raft.current_term()));
+        Some(crate::dist::meta::RangeDescriptor { range, span: r.raft.span(), members: self.members_of(range), generation: r.raft.config_index().max(r.raft.span_index()), lease })
     }
 
     /// When the allocator last acted (0: never).
@@ -846,6 +908,9 @@ impl NodeDriver {
         self.now = self.now.max(now);
         self.heard.insert(batch.from, self.now);
         self.loads.insert(batch.from, batch.load);
+        if batch.meta_leader {
+            self.meta_hint = Some(batch.from);
+        }
         if self.incarnations.insert(batch.from, batch.incarnation).is_some_and(|old| old != batch.incarnation) {
             // The node restarted: it leads nothing now, so ranges quiescent on it wake up.
             for r in self.replicas.values_mut() {
@@ -856,6 +921,10 @@ impl NodeDriver {
             }
         }
         for (range, msg) in batch.msgs {
+            if let RaftMsg::App(bytes) = msg {
+                self.app_inbox.push((batch.from, bytes));
+                continue;
+            }
             if let RaftMsg::Init { span, members, config } = &msg {
                 if !self.replicas.contains_key(&range) {
                     self.create_learner(range, span.clone(), members, *config)?;
@@ -1001,7 +1070,7 @@ impl NodeDriver {
                     }
                 }
             }
-            RaftMsg::Init { .. } => {}
+            RaftMsg::Init { .. } | RaftMsg::App(_) => {}
             RaftMsg::Missing => {
                 // A member being removed that already dropped its replica: removal done.
                 if let Some(r) = self.replicas.get_mut(&range) {
@@ -1232,6 +1301,7 @@ impl NodeDriver {
         }
         for (left, leading, ev) in events {
             self.stats.merges += 1;
+            self.absorbed.entry(left).or_default().push(ev.right);
             self.trace(|| format!("merged r{} into r{left}", ev.right));
             self.merged.insert(ev.right);
             let left_members: Vec<NodeId> = self.members_of(left).into_iter().map(|(id, _)| id).collect();

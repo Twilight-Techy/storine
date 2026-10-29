@@ -28,6 +28,7 @@ use std::time::Duration;
 use storage_types::{InlineId, StorageError};
 
 use crate::dist::hlc::{Hlc, Timestamp};
+use crate::dist::meta::{meta_id, RangeDescriptor, RangeIndex, META_COLLECTION, META_START};
 use crate::dist::mvcc::{eval_read, eval_refresh, eval_resolve, eval_write, MvccKey, ReadOutcome, TxnId, TxnMeta, TxnRecord, TxnStatus, Value, WriteOutcome, TXN_COLLECTION};
 use crate::dist::node::{NodeDriver, RangeId, ReadToken};
 use crate::document::{document_id, DocumentRecord};
@@ -55,6 +56,16 @@ pub enum KvRequest {
     QueryIntent { key: Key, txn: TxnId, ts: Timestamp, prevent: bool },
     /// Transaction record writes.
     Record { id: TxnId, op: RecordOp },
+    /// The meta range (`TASK-138`): descriptor lookups and publications.
+    Meta(MetaOp),
+}
+
+#[derive(Clone, Debug)]
+pub enum MetaOp {
+    /// Descriptors from the range holding `key` (raw id bytes) on, at most `limit`.
+    Lookup { key: Vec<u8>, limit: u32 },
+    /// A leaseholder's descriptor of its range, and the ranges it absorbed by merges.
+    Publish { desc: RangeDescriptor, absorbed: Vec<RangeId> },
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +97,8 @@ pub enum KvResponse {
     Refreshed(bool),
     IntentFound(bool),
     Record(Option<TxnRecord>),
+    /// Range descriptors (meta lookups).
+    Ranges(Vec<RangeDescriptor>),
     /// Not the leaseholder here (try `leader`), or the key moved to another range.
     NotLeader { leader: Option<NodeId> },
     WrongRange,
@@ -133,6 +146,8 @@ struct ReadMark {
 #[derive(Debug, Default)]
 struct TsCache {
     term: u64,
+    /// The range's span change (split / merge) the cache was started under.
+    span_index: u64,
     low_water: Timestamp,
     keys: BTreeMap<Vec<u8>, ReadMark>,
 }
@@ -177,6 +192,65 @@ pub struct NodeServer {
     replies: VecDeque<Reply>,
     /// Evaluation log for debugging (`enable_trace`).
     trace: Option<Vec<String>>,
+    /// The meta range's descriptor index, while this node leads it: (range, term, index).
+    meta: Option<(RangeId, u64, RangeIndex)>,
+    /// Descriptors this node's leaseholders published: range -> (descriptor, acknowledged,
+    /// last sent, absorbed ranges sent with it).
+    published: BTreeMap<RangeId, (RangeDescriptor, bool, u64, Vec<RangeId>)>,
+    /// Publications received from other nodes, being written: request id -> sender.
+    meta_waiting: BTreeMap<u64, NodeId>,
+    next_internal: u64,
+}
+
+/// Client id of requests the server makes itself (descriptor publications).
+const INTERNAL: u64 = u64::MAX;
+
+/// Re-sent if not acknowledged after this long.
+const PUBLISH_RETRY_NS: u64 = 1_000_000_000;
+
+/// Server-to-server messages over the driver's batches.
+enum MetaMsg {
+    Publish(RangeDescriptor, Vec<RangeId>),
+    Ack { range: RangeId, generation: u64, term: u64 },
+}
+
+impl MetaMsg {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            Self::Publish(d, absorbed) => {
+                out.push(1);
+                let b = d.encode();
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(&b);
+                out.extend_from_slice(&(absorbed.len() as u32).to_le_bytes());
+                for a in absorbed {
+                    out.extend_from_slice(&a.to_le_bytes());
+                }
+            }
+            Self::Ack { range, generation, term } => {
+                out.push(2);
+                for v in [range, generation, term] {
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut r = storage_codec::value_wire::SveReader::new(bytes);
+        match r.u8().ok()? {
+            1 => {
+                let d = RangeDescriptor::decode(r.bytes().ok()?).ok()?;
+                let n = r.count(8).ok()?;
+                let absorbed = (0..n).map(|_| r.u64()).collect::<Result<Vec<_>, _>>().ok()?;
+                Some(Self::Publish(d, absorbed))
+            }
+            2 => Some(Self::Ack { range: r.u64().ok()?, generation: r.u64().ok()?, term: r.u64().ok()? }),
+            _ => None,
+        }
+    }
 }
 
 impl core::fmt::Debug for NodeServer {
@@ -198,11 +272,13 @@ impl KvRequest {
         match self {
             Self::Get { key, .. } | Self::Put { key, .. } | Self::Resolve { key, .. } | Self::Refresh { key, .. } | Self::QueryIntent { key, .. } => key.clone(),
             Self::Record { id, .. } => record_key_of(id),
+            // Serialized on one key inside the meta prefix.
+            Self::Meta(_) => (META_COLLECTION.to_string(), "index".to_string()),
         }
     }
 
     fn is_write(&self) -> bool {
-        !matches!(self, Self::Get { .. } | Self::Refresh { .. } | Self::Record { op: RecordOp::Get, .. })
+        !matches!(self, Self::Get { .. } | Self::Refresh { .. } | Self::Record { op: RecordOp::Get, .. } | Self::Meta(MetaOp::Lookup { .. }))
     }
 
     /// The timestamp the request carries (moves the server's clock forward: causality).
@@ -213,14 +289,14 @@ impl KvRequest {
             Self::Resolve { commit_ts, .. } => *commit_ts,
             Self::Record { op: RecordOp::Heartbeat { now, .. } | RecordOp::Push { now, .. }, .. } => Some(*now),
             Self::Record { op: RecordOp::Stage { ts, .. } | RecordOp::Commit { ts, .. }, .. } => Some(*ts),
-            Self::Record { .. } => None,
+            Self::Record { .. } | Self::Meta(_) => None,
         }
     }
 }
 
 impl NodeServer {
     pub fn new(driver: NodeDriver, hlc: Arc<Hlc>) -> Self {
-        Self { driver, hlc, pending: Vec::new(), latches: BTreeMap::new(), tscache: BTreeMap::new(), replies: VecDeque::new(), trace: None }
+        Self { driver, hlc, pending: Vec::new(), latches: BTreeMap::new(), tscache: BTreeMap::new(), replies: VecDeque::new(), trace: None, meta: None, published: BTreeMap::new(), meta_waiting: BTreeMap::new(), next_internal: 0 }
     }
 
     /// Records every evaluation (tests and debugging).
@@ -239,7 +315,8 @@ impl NodeServer {
     /// The range of this node holding `key`, if any.
     pub fn range_of(&self, key: &Key) -> Option<RangeId> {
         let id = key_id(key)?;
-        self.driver.ranges().into_iter().find(|&r| self.driver.replica(r).is_some_and(|x| x.span().contains_id(id)))
+        // A frozen range (being merged) serves nothing: the client re-routes.
+        self.driver.ranges().into_iter().find(|&r| self.driver.replica(r).is_some_and(|x| !x.is_frozen() && x.span().contains_id(id)))
     }
 
     /// Accepts request `id` from `client`.
@@ -252,7 +329,9 @@ impl NodeServer {
         }
         let key = req.key();
         let Some(range) = self.range_of(&key) else {
-            self.replies.push_back(Reply { id, client, resp: KvResponse::WrongRange });
+            // Meta requests to a node without the meta range: point at its leaseholder.
+            let resp = if matches!(req, KvRequest::Meta(_)) { KvResponse::NotLeader { leader: self.driver.meta_leaseholder() } } else { KvResponse::WrongRange };
+            self.replies.push_back(Reply { id, client, resp });
             return;
         };
         if !self.driver.is_leader(range) {
@@ -265,14 +344,111 @@ impl NodeServer {
 
     /// Replies ready to send.
     pub fn take_replies(&mut self) -> Vec<Reply> {
-        self.replies.drain(..).collect()
+        let mut out = Vec::new();
+        for r in self.replies.drain(..).collect::<Vec<_>>() {
+            if r.client != INTERNAL {
+                out.push(r);
+                continue;
+            }
+            // A publication finished: acknowledge it to its sender (or ourselves).
+            let from = self.meta_waiting.remove(&r.id);
+            if let KvResponse::Ranges(ds) = &r.resp {
+                if let Some(desc) = ds.first() {
+                    let (range, generation, term) = (desc.range, desc.generation, desc.lease.map_or(0, |l| l.1));
+                    match from {
+                        Some(n) => self.driver.send_app(n, MetaMsg::Ack { range, generation, term }.encode()),
+                        None => self.on_ack(range, generation, term),
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn on_ack(&mut self, range: RangeId, generation: u64, term: u64) {
+        if let Some(p) = self.published.get_mut(&range) {
+            if p.0.generation == generation && p.0.lease.map_or(0, |l| l.1) == term {
+                p.1 = true;
+                let done = std::mem::take(&mut p.3);
+                self.driver.absorbed_published(range, &done);
+            }
+        }
+    }
+
+    /// Publishes changed descriptors of the ranges led here and serves publications that
+    /// arrived from other nodes (`TASK-138`).
+    fn publish(&mut self, now_ns: u64) {
+        for (from, bytes) in self.driver.take_app_inbox() {
+            match MetaMsg::decode(&bytes) {
+                Some(MetaMsg::Publish(desc, absorbed)) => {
+                    self.next_internal += 1;
+                    let id = self.next_internal;
+                    self.meta_waiting.insert(id, from);
+                    self.submit(id, INTERNAL, KvRequest::Meta(MetaOp::Publish { desc, absorbed }));
+                }
+                Some(MetaMsg::Ack { range, generation, term }) => self.on_ack(range, generation, term),
+                None => {}
+            }
+        }
+        let led: Vec<RangeId> = self.driver.ranges().into_iter().filter(|&r| self.driver.is_leader(r) && self.driver.replica(r).is_some_and(|x| !x.is_frozen())).collect();
+        self.published.retain(|r, _| led.contains(r));
+        for range in led {
+            let Some(desc) = self.driver.descriptor(range) else { continue };
+            let changed = self.published.get(&range).is_none_or(|p| p.0 != desc);
+            if changed {
+                self.published.insert(range, (desc.clone(), false, 0, Vec::new()));
+            }
+            let Some(p) = self.published.get_mut(&range) else { continue };
+            if p.1 || (p.2 != 0 && now_ns.saturating_sub(p.2) < PUBLISH_RETRY_NS) {
+                continue;
+            }
+            p.2 = now_ns.max(1);
+            p.3 = self.driver.absorbed_into(range);
+            let absorbed = p.3.clone();
+            match self.driver.meta_leaseholder() {
+                Some(n) if n == self.driver.id() => {
+                    self.next_internal += 1;
+                    let id = self.next_internal;
+                    self.submit(id, INTERNAL, KvRequest::Meta(MetaOp::Publish { desc, absorbed }));
+                }
+                Some(n) => self.driver.send_app(n, MetaMsg::Publish(desc, absorbed).encode()),
+                None => {}
+            }
+        }
+    }
+
+    /// The meta index for `range` in the current term: rebuilt from the descriptor records on
+    /// a new lease (they are few: one per range).
+    fn meta_index(&mut self, range: RangeId) -> Result<&mut RangeIndex, StorageError> {
+        let term = self.driver.replica(range).map_or(0, |r| r.current_term());
+        if self.meta.as_ref().is_none_or(|(r, t, _)| *r != range || *t != term) {
+            let mut index = RangeIndex::new();
+            let engine = self.driver.engine();
+            for id in engine.live_ids() {
+                if !id.as_bytes().starts_with(META_START) {
+                    continue;
+                }
+                if let Ok((_, rec)) = engine.get_owned(id) {
+                    if let Some(storage_codec::PropertyValue::Bytes(b)) = rec.fields.get("d") {
+                        if let Ok(d) = RangeDescriptor::decode(b) {
+                            index.publish(d, &[]);
+                        }
+                    }
+                }
+            }
+            self.meta = Some((range, term, index));
+        }
+        Ok(&mut self.meta.as_mut().expect("just set").2)
     }
 
     fn cache(&mut self, range: RangeId) -> &mut TsCache {
         let term = self.driver.replica(range).map_or(0, |r| r.current_term());
         let now = self.hlc.now();
+        let span_index = self.driver.replica(range).map_or(0, |r| r.span_index());
         let c = self.tscache.entry(range).or_default();
-        if c.term != term {
+        // A split or merge also starts it over: merged-in keys carry reads served by another
+        // leaseholder, all at or below this node's clock now (the merge happened after them).
+        if c.term != term || c.span_index != span_index {
             // New leaseholder. Every read its predecessor can still serve has a timestamp at
             // or below this node's clock now:
             // - such a read is confirmed by a quorum acknowledging a heartbeat sent after the
@@ -282,7 +458,7 @@ impl NodeServer {
             //   and some acknowledging node voted for this leader afterwards;
             // - votes carry clocks too.
             // Writes land above this floor.
-            *c = TsCache { term, low_water: now, keys: BTreeMap::new() };
+            *c = TsCache { term, span_index, low_water: now, keys: BTreeMap::new() };
         }
         c
     }
@@ -308,6 +484,7 @@ impl NodeServer {
 
     /// Makes progress on pending requests (call after every `tick` / `step` of the driver).
     pub fn poll(&mut self, now_ns: u64) {
+        self.publish(now_ns);
         let ready_reads = self.driver.take_ready_reads();
         let pending = std::mem::take(&mut self.pending);
         let mut keep = Vec::new();
@@ -403,7 +580,7 @@ impl NodeServer {
         }
         match result {
             Ok(Eval::Done(resp)) => Some(resp),
-            Ok(Eval::Propose(op, resp)) => match self.driver.propose(p.range, &[op], now_ns) {
+            Ok(Eval::Propose(ops, resp)) => match self.driver.propose(p.range, &ops, now_ns) {
                 Ok(index) => {
                     p.state = PendingState::Proposed { index, resp };
                     None
@@ -450,7 +627,7 @@ impl NodeServer {
                         if nk == k {
                             Eval::Done(KvResponse::Written { ts })
                         } else {
-                            Eval::Propose(put(&nk, pre), KvResponse::Written { ts })
+                            Eval::Propose(vec![put(&nk, pre)], KvResponse::Written { ts })
                         }
                     }
                 }
@@ -458,7 +635,7 @@ impl NodeServer {
             KvRequest::Resolve { txn, commit_ts, .. } => {
                 let (k, pre) = self.load(&key)?;
                 match eval_resolve(&k, txn, *commit_ts) {
-                    Some(nk) => Eval::Propose(put(&nk, pre), KvResponse::Resolved),
+                    Some(nk) => Eval::Propose(vec![put(&nk, pre)], KvResponse::Resolved),
                     None => Eval::Done(KvResponse::Resolved),
                 }
             }
@@ -473,11 +650,35 @@ impl NodeServer {
                 }
                 Eval::Done(KvResponse::IntentFound(found))
             }
+            KvRequest::Meta(MetaOp::Lookup { key, limit }) => {
+                let index = self.meta_index(range)?;
+                Eval::Done(KvResponse::Ranges(index.scan_from(key, (*limit).clamp(1, 1024) as usize)))
+            }
+            KvRequest::Meta(MetaOp::Publish { desc, absorbed }) => {
+                let index = self.meta_index(range)?;
+                // Dry run: an older generation (or lease term) than recorded changes nothing.
+                let mut probe = index.clone();
+                if !probe.publish(desc.clone(), absorbed) {
+                    return Ok(Eval::Done(KvResponse::Ranges(vec![desc.clone()])));
+                }
+                let gone: Vec<RangeId> = absorbed.iter().copied().filter(|a| index.get(*a).is_some() && probe.get(*a).is_none()).collect();
+                *index = probe;
+                let mut rec = DocumentRecord::new(META_COLLECTION, crate::dist::meta::meta_key(desc.range));
+                rec = rec.with("d", storage_codec::PropertyValue::Bytes(desc.encode()));
+                let mut ops = vec![WriteOp::put(meta_id(desc.range)?, rec)];
+                for a in gone {
+                    let id = meta_id(a)?;
+                    if self.driver.engine().get_owned(id).is_ok() {
+                        ops.push(WriteOp::delete(id));
+                    }
+                }
+                Eval::Propose(ops, KvResponse::Ranges(vec![desc.clone()]))
+            }
             KvRequest::Record { id, op } => {
                 let (rec, pre) = self.load_record(id)?;
                 let hlc_now = self.hlc.now();
                 let write = |r: &TxnRecord, resp: KvResponse| -> Eval {
-                    Eval::Propose(WriteOp { id: kid, kind: crate::engine::WriteKind::Put(r.to_record()), precondition: pre }, resp)
+                    Eval::Propose(vec![WriteOp { id: kid, kind: crate::engine::WriteKind::Put(r.to_record()), precondition: pre }], resp)
                 };
                 match op {
                     RecordOp::Get => Eval::Done(KvResponse::Record(rec)),
@@ -574,6 +775,6 @@ impl NodeServer {
 
 enum Eval {
     Done(KvResponse),
-    Propose(WriteOp<DocumentRecord>, KvResponse),
+    Propose(Vec<WriteOp<DocumentRecord>>, KvResponse),
 }
 
