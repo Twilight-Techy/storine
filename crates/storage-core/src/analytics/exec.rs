@@ -20,6 +20,55 @@ use super::filter::{eval, RowGroupView};
 use super::values::{cmp_props, pow10, GroupValue, Hll, MinMax, SumAcc};
 use super::{AggFunc, AggregateQuery, AggregateResult, Expr, GroupKey, DEFAULT_MEMORY_BUDGET, MAX_QUERY_ITEMS};
 
+// ── per-thread buffers ──
+
+thread_local! {
+    /// Column buffers reused across row groups: no allocation (and no page faults on fresh
+    /// mappings) per column per row group.
+    static POOL: core::cell::RefCell<Vec<Vec<i64>>> = const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// A buffer of `n` values (contents unspecified: every caller overwrites it).
+fn take_i64(n: usize) -> Vec<i64> {
+    let mut v = POOL.with(|p| p.borrow_mut().pop()).unwrap_or_default();
+    if v.len() < n {
+        v.resize(n, 0);
+    } else {
+        v.truncate(n);
+    }
+    v
+}
+
+fn give_i64(v: Vec<i64>) {
+    if v.capacity() > 0 {
+        POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() < 64 {
+                p.push(v);
+            }
+        });
+    }
+}
+
+fn give_col(c: ColV) {
+    if let Col::I64 { v, .. } = c.col {
+        give_i64(v);
+    }
+}
+
+/// Calls `f(i)` for every set bit `i` (64 bits per word, lowest first).
+#[inline]
+fn for_each_set(words: &[u64], mut f: impl FnMut(usize)) {
+    for (w, &word) in words.iter().enumerate() {
+        let mut m = word;
+        while m != 0 {
+            let j = m.trailing_zeros() as usize;
+            f(w * 64 + j);
+            m &= m - 1;
+        }
+    }
+}
+
 // ── deterministic tie-breaks ──
 
 /// Of two values that compare equal (`1` and `1.0`), the one every run keeps.
@@ -269,7 +318,7 @@ fn vals_col(vals: Vec<Option<Val>>) -> ColV {
     ColV { col: Col::Vals(vals), valid }
 }
 
-fn field_col(rg: &RowGroupView<'_>, path: &str) -> ColV {
+fn field_col(rg: &RowGroupView<'_>, path: &str, sel: &[u64]) -> ColV {
     let n = rg.n;
     if rg.has_children(path) {
         let vals = (0..n).map(|i| Val::from_property(&rg.value_at(path, i))).collect();
@@ -278,10 +327,14 @@ fn field_col(rg: &RowGroupView<'_>, path: &str) -> ColV {
     let Some(chunk) = rg.chunks.get(path) else {
         return ColV { col: Col::Vals(vec![None; n]), valid: vec![0; n.div_ceil(64)] };
     };
-    let valid = validity_of(chunk, n);
+    let mut valid = validity_of(chunk, n);
+    // Late materialization: with few selected rows, decode only those (random access).
+    let sparse = (simd::count_ones(sel) as usize) * 8 < n;
     let ints = |ic: &IntChunk<'_>| {
-        let mut v = vec![0i64; n];
-        ic.decode_into(0, &mut v);
+        let mut v = take_i64(n);
+        if !(sparse && ic.gather(sel, &mut v)) {
+            ic.decode_into(0, &mut v);
+        }
         v
     };
     let col = match &chunk.body {
@@ -295,6 +348,10 @@ fn field_col(rg: &RowGroupView<'_>, path: &str) -> ColV {
         Body::Float(fb) => Col::F64(Body::float_values(fb, n)),
         _ => return vals_col(rg.vals(path).cloned().unwrap_or_else(|| vec![None; n])),
     };
+    if sparse {
+        // Rows outside the selection may hold stale buffer contents: never count them.
+        simd::and_words(&mut valid, sel);
+    }
     ColV { col, valid }
 }
 
@@ -433,8 +490,32 @@ fn binop(a: ColV, b: ColV, op: Op, n: usize) -> Result<ColV> {
         (Col::I64 { v: x, scale: sx, dec: dx, .. }, Col::I64 { v: y, scale: sy, dec: dy, .. }) => {
             let dec = dx || dy;
             match i64_op(&x, sx, &y, sy, op, &valid) {
-                Some((v, s)) => Col::I64 { v, scale: s, dec, kind: if dec { Kind::Decimal } else { Kind::Int } },
-                None => wide_op(Col::I64 { v: x, scale: sx, dec: dx, kind: Kind::Int }, Col::I64 { v: y, scale: sy, dec: dy, kind: Kind::Int }, op, &valid)?,
+                Some((v, s)) => {
+                    give_i64(x);
+                    give_i64(y);
+                    Col::I64 {
+                        v,
+                        scale: s,
+                        dec,
+                        kind: if dec { Kind::Decimal } else { Kind::Int },
+                    }
+                }
+                None => wide_op(
+                    Col::I64 {
+                        v: x,
+                        scale: sx,
+                        dec: dx,
+                        kind: Kind::Int,
+                    },
+                    Col::I64 {
+                        v: y,
+                        scale: sy,
+                        dec: dy,
+                        kind: Kind::Int,
+                    },
+                    op,
+                    &valid,
+                )?,
             }
         }
         (x, y) => wide_op(x, y, op, &valid)?,
@@ -483,12 +564,28 @@ fn apply_f(a: f64, b: f64, op: Op) -> f64 {
 }
 
 /// `i64` arithmetic; `None` on any overflow (the caller widens to `i128`).
+fn max_abs(v: &[i64]) -> u128 {
+    u128::from(v.iter().fold(0u64, |m, &x| m.max(x.unsigned_abs())))
+}
+
 fn i64_op(x: &[i64], sx: u8, y: &[i64], sy: u8, op: Op, valid: &[u64]) -> Option<(Vec<i64>, u8)> {
     let n = x.len();
-    let mut out = vec![0i64; n];
+    let mut out = take_i64(n);
+    // When the operands' magnitudes bound every result below 2^63, plain wrapping arithmetic
+    // is exact for every row (including rows without a value): one vectorizable loop.
+    let limit = i64::MAX as u128;
     match op {
         Op::Mul => {
             let s = sx.checked_add(sy).filter(|s| *s <= 18)?;
+            if max_abs(x)
+                .checked_mul(max_abs(y))
+                .is_some_and(|m| m <= limit)
+            {
+                for ((o, a), b) in out.iter_mut().zip(x).zip(y) {
+                    *o = a.wrapping_mul(*b);
+                }
+                return Some((out, s));
+            }
             for i in 0..n {
                 if bit(valid, i) {
                     out[i] = x[i].checked_mul(y[i])?;
@@ -500,6 +597,22 @@ fn i64_op(x: &[i64], sx: u8, y: &[i64], sy: u8, op: Op, valid: &[u64]) -> Option
             let s = sx.max(sy);
             let fx = 10i64.checked_pow(u32::from(s - sx))?;
             let fy = 10i64.checked_pow(u32::from(s - sy))?;
+            let bound = max_abs(x)
+                .checked_mul(fx as u128)
+                .zip(max_abs(y).checked_mul(fy as u128))
+                .and_then(|(a, b)| a.checked_add(b));
+            if bound.is_some_and(|b| b <= limit) {
+                let add = matches!(op, Op::Add);
+                for ((o, a), b) in out.iter_mut().zip(x).zip(y) {
+                    let (a, b) = (a.wrapping_mul(fx), b.wrapping_mul(fy));
+                    *o = if add {
+                        a.wrapping_add(b)
+                    } else {
+                        a.wrapping_sub(b)
+                    };
+                }
+                return Some((out, s));
+            }
             for i in 0..n {
                 if bit(valid, i) {
                     let a = x[i].checked_mul(fx)?;
@@ -535,15 +648,19 @@ fn wide_op(x: Col, y: Col, op: Op, valid: &[u64]) -> Result<Col> {
     Ok(Col::I128 { v: out, scale, dec: dx || dy, kind: Kind::Int })
 }
 
-fn eval_expr(e: &Expr, rg: &RowGroupView<'_>) -> Result<ColV> {
+fn eval_expr(e: &Expr, rg: &RowGroupView<'_>, sel: &[u64]) -> Result<ColV> {
     let n = rg.n;
     Ok(match e {
-        Expr::Field(p) => field_col(rg, p),
+        Expr::Field(p) => field_col(rg, p, sel),
         Expr::Const(v) => const_col(v, n),
-        Expr::Add(a, b) => binop(eval_expr(a, rg)?, eval_expr(b, rg)?, Op::Add, n)?,
-        Expr::Sub(a, b) => sub_op(eval_expr(a, rg)?, eval_expr(b, rg)?, n)?,
-        Expr::Mul(a, b) => binop(eval_expr(a, rg)?, eval_expr(b, rg)?, Op::Mul, n)?,
-        Expr::Neg(a) => sub_op(const_col(&PropertyValue::Int64(0), n), eval_expr(a, rg)?, n)?,
+        Expr::Add(a, b) => binop(eval_expr(a, rg, sel)?, eval_expr(b, rg, sel)?, Op::Add, n)?,
+        Expr::Sub(a, b) => sub_op(eval_expr(a, rg, sel)?, eval_expr(b, rg, sel)?, n)?,
+        Expr::Mul(a, b) => binop(eval_expr(a, rg, sel)?, eval_expr(b, rg, sel)?, Op::Mul, n)?,
+        Expr::Neg(a) => sub_op(
+            const_col(&PropertyValue::Int64(0), n),
+            eval_expr(a, rg, sel)?,
+            n,
+        )?,
     })
 }
 
@@ -630,7 +747,7 @@ fn gv_of_prop(v: &PropertyValue) -> GroupValue {
     GroupValue::of_val(Val::from_property(v).as_ref())
 }
 
-fn key_col(k: &GroupKey, rg: &RowGroupView<'_>) -> KeyCol {
+fn key_col(k: &GroupKey, rg: &RowGroupView<'_>, sel: &[u64]) -> KeyCol {
     let n = rg.n;
     let (path, bucket_by) = match k {
         GroupKey::Field(p) => (p.as_str(), None),
@@ -669,7 +786,7 @@ fn key_col(k: &GroupKey, rg: &RowGroupView<'_>) -> KeyCol {
             }
         }
     }
-    let col = field_col(rg, path);
+    let col = field_col(rg, path, sel);
     let rows = (0..n)
         .map(|i| {
             if bit(&col.valid, i) {
@@ -765,8 +882,8 @@ fn run_row_group(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>, si: usize, g: 
     let rg = RowGroupView { n, chunks, names: &names, decoded, keys: OnceCell::new() };
     if let Some(f) = &q.filter {
         let mut m = vec![0u64; sel.len()];
-        eval(f, &rg, &mut m);
-        simd::and_words(&mut sel, &m);
+        eval(f, &rg, &sel, &mut m);
+        sel = m;
     }
     let selected = simd::count_ones(&sel);
     if selected == 0 {
@@ -774,44 +891,21 @@ fn run_row_group(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>, si: usize, g: 
     }
     st.matched += selected;
     // Group id of every selected row.
-    let gids: Option<Vec<u32>> = if q.group_by.is_empty() {
-        None
-    } else {
-        let keys: Vec<KeyCol> = q.group_by.iter().map(|k| key_col(k, &rg)).collect();
-        let mut gids = vec![0u32; n];
+    // Groups. Dictionary-coded keys with a small combined code space get a local slot per row
+    // (`SINK` for rows outside the selection), so aggregates scatter into a few accumulators
+    // without per-row hashing; other keys fall back to one group lookup per row.
+    let keys: Vec<KeyCol> = q.group_by.iter().map(|k| key_col(k, &rg, &sel)).collect();
+    let mut local: Option<Local> = None;
+    let mut gids: Option<Vec<u32>> = None;
+    if !q.group_by.is_empty() {
         let all_codes = keys.iter().all(|k| matches!(k, KeyCol::Codes(..)));
         let space: usize = keys.iter().map(|k| if let KeyCol::Codes(_, e) = k { e.len().max(1) } else { 1 }).product();
         if all_codes && space <= 1 << 16 {
-            let mut table = vec![u32::MAX; space];
-            for i in 0..n {
-                if !bit(&sel, i) {
-                    continue;
-                }
-                let mut idx = 0usize;
-                for k in &keys {
-                    if let KeyCol::Codes(c, e) = k {
-                        idx = idx * e.len().max(1) + c[i] as usize;
-                    }
-                }
-                if table[idx] == u32::MAX {
-                    let mut key = Vec::with_capacity(keys.len());
-                    let mut rep = Vec::with_capacity(keys.len());
-                    for k in &keys {
-                        if let KeyCol::Codes(c, e) = k {
-                            let (gv, pv) = &e[c[i] as usize];
-                            key.push(gv.clone());
-                            rep.push(pv.clone());
-                        }
-                    }
-                    table[idx] = st.group(key, rep)?;
-                }
-                gids[i] = table[idx];
-            }
-        } else {
-            for i in 0..n {
-                if !bit(&sel, i) {
-                    continue;
-                }
+            local = local_slots(&keys, space, &sel, n, st)?;
+        }
+        if local.is_none() {
+            let mut g = vec![0u32; n];
+            for_each_set_try(&sel, |i| {
                 let mut key = Vec::with_capacity(keys.len());
                 let mut rep = Vec::with_capacity(keys.len());
                 for k in &keys {
@@ -822,14 +916,15 @@ fn run_row_group(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>, si: usize, g: 
                     key.push(gv);
                     rep.push(pv);
                 }
-                gids[i] = st.group(key, rep)?;
-            }
+                g[i] = st.group(key, rep)?;
+                Ok(())
+            })?;
+            gids = Some(g);
         }
-        Some(gids)
-    };
+    }
     for (ai, a) in q.aggregates.iter().enumerate() {
         let col = match &a.arg {
-            Some(e) => Some(eval_expr(e, &rg)?),
+            Some(e) => Some(eval_expr(e, &rg, &sel)?),
             None => None,
         };
         let mut rows = sel.clone();
@@ -837,23 +932,196 @@ fn run_row_group(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>, si: usize, g: 
             simd::and_words(&mut rows, &c.valid);
         }
         let acc = &mut st.accs[ai];
-        update(acc, a.func, col.as_ref(), &rows, gids.as_deref(), n, st.budget)?;
+        let done = match &local {
+            Some(l) => update_local(acc, a.func, col.as_ref(), &rows, &sel, l, n),
+            None => false,
+        };
+        if !done {
+            if gids.is_none() && !q.group_by.is_empty() {
+                // Row-by-row aggregate over slot-grouped rows: global ids from the slots.
+                let l = local
+                    .as_ref()
+                    .ok_or_else(|| StorageError::invalid_value("internal: no groups"))?;
+                let mut g = vec![0u32; n];
+                for_each_set(&sel, |i| g[i] = l.gids[l.slot[i] as usize]);
+                gids = Some(g);
+            }
+            update(
+                acc,
+                a.func,
+                col.as_ref(),
+                &rows,
+                gids.as_deref(),
+                n,
+                st.budget,
+            )?;
+        }
+        if let Some(c) = col {
+            give_col(c);
+        }
     }
     Ok(())
 }
 
-fn update(acc: &mut Acc, func: AggFunc, col: Option<&ColV>, rows: &[u64], gids: Option<&[u32]>, n: usize, budget: &Budget) -> Result<()> {
+/// Most local slots per row group (more groups fall back to per-row lookups).
+const MAX_SLOTS: usize = 255;
+/// Slot of rows outside the selection.
+const SINK: u8 = 255;
+
+/// Row group-local grouping: the slot of every row and the global group id of every slot.
+struct Local {
+    slot: Vec<u8>,
+    gids: Vec<u32>,
+}
+
+/// Calls `f(i)` for every set bit, stopping at the first error.
+fn for_each_set_try(words: &[u64], mut f: impl FnMut(usize) -> Result<()>) -> Result<()> {
+    for (w, &word) in words.iter().enumerate() {
+        let mut m = word;
+        while m != 0 {
+            f(w * 64 + m.trailing_zeros() as usize)?;
+            m &= m - 1;
+        }
+    }
+    Ok(())
+}
+
+fn local_slots(
+    keys: &[KeyCol],
+    space: usize,
+    sel: &[u64],
+    n: usize,
+    st: &mut State<'_>,
+) -> Result<Option<Local>> {
+    // Combined code of every row (mixed radix over the keys' dictionaries).
+    let mut idx = vec![0u32; n];
+    for k in keys {
+        if let KeyCol::Codes(c, e) = k {
+            let radix = e.len().max(1) as u32;
+            for (x, &code) in idx.iter_mut().zip(c) {
+                *x = *x * radix + code;
+            }
+        }
+    }
+    let mut slot_of = vec![SINK; space];
+    let mut gids: Vec<u32> = Vec::new();
+    let mut slot = vec![SINK; n];
+    let mut overflow = false;
+    for_each_set_try(sel, |i| {
+        if overflow {
+            return Ok(());
+        }
+        let code = idx[i] as usize;
+        if slot_of[code] == SINK {
+            if gids.len() >= MAX_SLOTS {
+                overflow = true;
+                return Ok(());
+            }
+            // Decode the combined code back into each key's dictionary entry.
+            let mut rest = code;
+            let mut parts = vec![0usize; keys.len()];
+            for (p, k) in parts.iter_mut().zip(keys).rev() {
+                if let KeyCol::Codes(_, e) = k {
+                    let radix = e.len().max(1);
+                    *p = rest % radix;
+                    rest /= radix;
+                }
+            }
+            let mut key = Vec::with_capacity(keys.len());
+            let mut rep = Vec::with_capacity(keys.len());
+            for (k, p) in keys.iter().zip(&parts) {
+                if let KeyCol::Codes(_, e) = k {
+                    let (gv, pv) = &e[*p];
+                    key.push(gv.clone());
+                    rep.push(pv.clone());
+                }
+            }
+            slot_of[code] = gids.len() as u8;
+            gids.push(st.group(key, rep)?);
+        }
+        slot[i] = slot_of[code];
+        Ok(())
+    })?;
+    Ok((!overflow).then_some(Local { slot, gids }))
+}
+
+/// Count / sum / avg over slot-grouped rows: one branch-free scatter pass into a few
+/// accumulators (four interleaved copies to break store-to-load dependencies). `false` when
+/// the aggregate needs the row-by-row path.
+fn update_local(
+    acc: &mut Acc,
+    func: AggFunc,
+    col: Option<&ColV>,
+    rows: &[u64],
+    sel: &[u64],
+    l: &Local,
+    n: usize,
+) -> bool {
+    if !matches!(func, AggFunc::Count | AggFunc::Sum | AggFunc::Avg)
+        || col.is_some_and(|c| !matches!(c.col, Col::I64 { .. }))
+    {
+        return false;
+    }
+    // Rows without a value go to the sink too.
+    let masked;
+    let slots: &[u8] = if rows == sel {
+        &l.slot
+    } else {
+        let mut s = vec![SINK; n];
+        for_each_set(rows, |i| s[i] = l.slot[i]);
+        masked = s;
+        &masked
+    };
+    let mut counts = [[0u64; 256]; 4];
+    let mut sums = [[0i128; 256]; 4];
+    match col.map(|c| &c.col) {
+        Some(Col::I64 { v, .. }) => {
+            for (i, (&s, &x)) in slots.iter().zip(v.iter()).enumerate() {
+                sums[i & 3][s as usize] += i128::from(x);
+                counts[i & 3][s as usize] += 1;
+            }
+        }
+        _ => {
+            for (i, &s) in slots.iter().enumerate() {
+                counts[i & 3][s as usize] += 1;
+            }
+        }
+    }
+    for (k, &g) in l.gids.iter().enumerate() {
+        let c: u64 = counts.iter().map(|a| a[k]).sum();
+        if c == 0 {
+            continue;
+        }
+        let g = g as usize;
+        match (&mut *acc, col.map(|c| &c.col)) {
+            (Acc::Count(cs), _) => cs[g] += c,
+            (Acc::Sum(ss), Some(Col::I64 { scale, dec, .. })) => {
+                ss[g].add_exact(sums.iter().map(|a| a[k]).sum(), *scale, *dec)
+            }
+            (Acc::Avg(ss, cs), Some(Col::I64 { scale, dec, .. })) => {
+                ss[g].add_exact(sums.iter().map(|a| a[k]).sum(), *scale, *dec);
+                cs[g] += c;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+fn update(
+    acc: &mut Acc,
+    func: AggFunc,
+    col: Option<&ColV>,
+    rows: &[u64],
+    gids: Option<&[u32]>,
+    n: usize,
+    budget: &Budget,
+) -> Result<()> {
     let gid = |i: usize| gids.map_or(0, |g| g[i]) as usize;
     match (acc, col) {
         (Acc::Count(c), _) => match gids {
             None => c[0] += simd::count_ones(rows),
-            Some(g) => {
-                for i in 0..n {
-                    if bit(rows, i) {
-                        c[g[i] as usize] += 1;
-                    }
-                }
-            }
+            Some(g) => for_each_set(rows, |i| c[g[i] as usize] += 1),
         },
         (Acc::Sum(s), Some(col)) => sum_into(s, None, &col.col, rows, gids, n),
         (Acc::Avg(s, c), Some(col)) => sum_into(s, Some(c), &col.col, rows, gids, n),
@@ -903,14 +1171,32 @@ fn sum_into(s: &mut [SumAcc], mut counts: Option<&mut Vec<u64>>, col: &Col, rows
             }
         }
         (Col::I64 { v, scale, dec, .. }, Some(g)) => {
-            for i in 0..n {
-                if bit(rows, i) {
+            // Per-group partial sums for this row group, folded once per group.
+            let groups = s.len();
+            if groups <= 1 << 16 {
+                let mut acc = vec![0i128; groups];
+                let mut cnt = vec![0u64; groups];
+                for_each_set(rows, |i| {
+                    let k = g[i] as usize;
+                    acc[k] += i128::from(v[i]);
+                    cnt[k] += 1;
+                });
+                for k in 0..groups {
+                    if cnt[k] > 0 {
+                        s[k].add_exact(acc[k], *scale, *dec);
+                        if let Some(c) = counts.as_deref_mut() {
+                            c[k] += cnt[k];
+                        }
+                    }
+                }
+            } else {
+                for_each_set(rows, |i| {
                     let k = g[i] as usize;
                     s[k].add_exact(i128::from(v[i]), *scale, *dec);
                     if let Some(c) = counts.as_deref_mut() {
                         c[k] += 1;
                     }
-                }
+                });
             }
         }
         _ => {
@@ -1072,7 +1358,13 @@ pub fn run(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>) -> Result<AggregateR
         .enumerate()
         .flat_map(|(si, s)| (0..s.segment.row_groups().len()).map(move |g| (si, g)))
         .collect();
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(morsels.len()).clamp(1, 16);
+    let cores = std::env::var("STORINE_THREADS")
+        .ok()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    let threads = cores.min(morsels.len()).clamp(1, 16);
+    let profile = std::env::var_os("STORINE_PROFILE").is_some();
+    let started = std::time::Instant::now();
     let next = AtomicUsize::new(0);
     let results: Mutex<Vec<(usize, State<'_>)>> = Mutex::new(Vec::new());
     let failure: Mutex<Option<StorageError>> = Mutex::new(None);
@@ -1104,14 +1396,20 @@ pub fn run(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>) -> Result<AggregateR
     if let Some(e) = failure.into_inner().unwrap_or_else(|p| p.into_inner()) {
         return Err(e);
     }
+    let scanned = started.elapsed();
     let mut parts = results.into_inner().unwrap_or_else(|p| p.into_inner());
     parts.sort_by_key(|(t, _)| *t);
     let mut total = State::new(q, &budget)?;
     for (_, st) in parts {
         total.merge(st)?;
     }
+    let merged = started.elapsed();
     add_documents(q, &snap.delta, &mut total)?;
-    finish(q, total)
+    let out = finish(q, total);
+    if profile {
+        eprintln!("[analytics] {} morsels on {threads} threads: scan {scanned:?}, merge {:?}, delta+finish {:?}", morsels.len(), merged - scanned, started.elapsed() - merged);
+    }
+    out
 }
 
 /// Runs `q` over documents only (a collection without column segments).

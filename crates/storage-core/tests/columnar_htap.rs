@@ -300,3 +300,79 @@ fn files_left_by_a_crash_are_swept_and_never_trusted() {
     }
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn document_stores_pack_records_and_still_open_one_file_per_record_stores() {
+    let d = dir("layout");
+    // A store written with one file per record (the old default) ...
+    {
+        let engine = std::sync::Arc::new(
+            storage_core::StorageEngine::<storage_core::DocumentRecord>::open(
+                &d,
+                EngineConfig {
+                    collection_name: "documents".into(),
+                    ..EngineConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let s = DocumentStore::from_engine(engine).unwrap();
+        for i in 0..200 {
+            s.put("t", &format!("k{i}"), doc(i, 0)).unwrap();
+        }
+    }
+    let files_before = std::fs::read_dir(d.join("records")).map(|_| ()).is_ok();
+    assert!(files_before);
+    // ... opens with the packed layout: old records read, updates and new records work.
+    {
+        let s = DocumentStore::open(&d, EngineConfig::default()).unwrap();
+        for i in 0..200 {
+            assert_eq!(
+                s.get("t", &format!("k{i}")).unwrap().unwrap().fields,
+                doc(i, 0)
+            );
+        }
+        for i in 0..100 {
+            s.put("t", &format!("k{i}"), doc(i, 1)).unwrap();
+        }
+        for i in 200..400 {
+            s.put("t", &format!("k{i}"), doc(i, 0)).unwrap();
+        }
+    }
+    let s = DocumentStore::open(&d, EngineConfig::default()).unwrap();
+    for i in 0..400 {
+        let want = if i < 100 { doc(i, 1) } else { doc(i, 0) };
+        assert_eq!(
+            s.get("t", &format!("k{i}")).unwrap().unwrap().fields,
+            want,
+            "k{i}"
+        );
+    }
+    drop(s);
+    // A fresh store packs documents: a few segment files, not one file per document.
+    let d2 = dir("layout2");
+    {
+        let s = DocumentStore::open(&d2, EngineConfig::default()).unwrap();
+        for i in 0..2000 {
+            s.put("t", &format!("k{i}"), doc(i, 0)).unwrap();
+        }
+    }
+    let count = walk(&d2);
+    assert!(count < 100, "{count} files for 2000 documents");
+    let _ = std::fs::remove_dir_all(&d);
+    let _ = std::fs::remove_dir_all(&d2);
+}
+
+fn walk(p: &std::path::Path) -> usize {
+    std::fs::read_dir(p).map_or(0, |rd| {
+        rd.flatten()
+            .map(|e| {
+                if e.path().is_dir() {
+                    walk(&e.path())
+                } else {
+                    1
+                }
+            })
+            .sum()
+    })
+}

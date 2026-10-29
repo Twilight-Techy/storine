@@ -333,6 +333,37 @@ impl<'a> IntChunk<'a> {
         }
     }
 
+    /// Writes the values of the rows whose bits are set in `rows` into `out` (same indexes;
+    /// other entries are left as they are). `false` for encodings without random access
+    /// (DELTA, RLE): decode those with [`Self::decode_into`].
+    pub fn gather(&self, rows: &[u64], out: &mut [i64]) -> bool {
+        let each = |f: &mut dyn FnMut(usize)| {
+            for (w, &word) in rows.iter().enumerate() {
+                let mut m = word;
+                while m != 0 {
+                    f(w * 64 + m.trailing_zeros() as usize);
+                    m &= m - 1;
+                }
+            }
+        };
+        match self {
+            Self::Const { value, .. } => {
+                each(&mut |i| out[i] = *value);
+                true
+            }
+            Self::For { min, packed } => {
+                each(&mut |i| out[i] = (*min as u64).wrapping_add(packed.get(i)) as i64);
+                true
+            }
+            Self::Dict { dict, codes } => {
+                let last = dict.len().saturating_sub(1);
+                each(&mut |i| out[i] = dict[(codes.get(i) as usize).min(last)]);
+                true
+            }
+            Self::Delta { .. } | Self::Rle { .. } => false,
+        }
+    }
+
     /// Value `i` (slow path).
     pub fn get(&self, i: usize) -> i64 {
         let mut one = [0i64];

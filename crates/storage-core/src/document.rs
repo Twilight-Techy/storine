@@ -33,6 +33,14 @@ use storage_types::{Decimal, FastHashMap, InlineId, Result, RoundingMode, Storag
 
 use crate::engine::{EngineConfig, Precondition, StorageEngine, WriteKind, WriteOp, WriteResult};
 
+/// Default layout of document stores: records up to 64 KiB packed into arena segments of up
+/// to 64 MiB; larger records in their own files.
+pub const DOCUMENT_LAYOUT: crate::engine::StorageLayoutMode =
+    crate::engine::StorageLayoutMode::AdaptiveArena {
+        arena_threshold_bytes: 64 * 1024,
+        segment_capacity: 64 * 1024 * 1024,
+    };
+
 /// Collection id of [`DocumentRecord`] in WAL frames and catalogs.
 pub const DOCUMENT_COLLECTION_ID: u16 = 2;
 /// Maximum number of secondary indexes per collection (bounded by the per-record index
@@ -872,6 +880,11 @@ impl DocumentStore {
     pub fn open(dir: impl AsRef<Path>, mut config: EngineConfig) -> Result<Self> {
         if config.collection_name == EngineConfig::default().collection_name {
             config.collection_name = "documents".to_string();
+        }
+        // Documents are small and numerous: pack them into arena segments unless the caller
+        // chose a layout (one file per record costs a filesystem block, ~4 KiB, per document).
+        if config.layout_mode == crate::engine::StorageLayoutMode::DedicatedFiles {
+            config.layout_mode = DOCUMENT_LAYOUT;
         }
         let engine = Arc::new(StorageEngine::<DocumentRecord>::open(dir.as_ref(), config)?);
         Self::from_engine(engine)

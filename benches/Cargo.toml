@@ -29,5 +29,9 @@ storage-server = { path = "../crates/storage-server" }
 workspace = true
 
 [[bin]]
+name = "olap-bench"
+path = "src/bin/olap_bench.rs"
+
+[[bin]]
 name = "reactor-scale"
 path = "src/bin/reactor_scale.rs"

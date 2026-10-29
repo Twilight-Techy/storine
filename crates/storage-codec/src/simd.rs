@@ -97,6 +97,23 @@ fn unpack64<const W: usize>(src: &[u64; 64], out: &mut [u64]) {
     }
 }
 
+/// 64 values of `W <= 56` bits from the `W * 8 + 8` bytes starting at `blk`: value `j` lies
+/// within the unaligned 8-byte word at byte `j * W / 8`, so each value is one load, one shift
+/// and one mask (offsets are constants once `W` is).
+#[inline(always)]
+fn unpack64_bytes<const W: usize>(blk: &[u8], out: &mut [u64]) {
+    let mask = (1u64 << W) - 1;
+    for (j, o) in out.iter_mut().take(64).enumerate() {
+        let bit = j * W;
+        let at = bit >> 3;
+        let b: [u8; 8] = blk
+            .get(at..at + 8)
+            .and_then(|s| s.try_into().ok())
+            .unwrap_or_default();
+        *o = (u64::from_le_bytes(b) >> (bit & 7)) & mask;
+    }
+}
+
 #[inline(always)]
 fn unpack_w<const W: usize>(words: &[u8], start: usize, out: &mut [u64]) {
     let n = out.len();
@@ -109,6 +126,14 @@ fn unpack_w<const W: usize>(words: &[u8], start: usize, out: &mut [u64]) {
     let mut src = [0u64; 64];
     while i + 64 <= n {
         let first_word = (start + i) / 64 * W;
+        if W <= 56 {
+            // One bounds check per 64 values; the block always has its padding word.
+            if let Some(blk) = words.get(first_word * 8..first_word * 8 + W * 8 + 8) {
+                unpack64_bytes::<W>(blk, &mut out[i..i + 64]);
+                i += 64;
+                continue;
+            }
+        }
         for (k, s) in src.iter_mut().take(W).enumerate() {
             *s = word(words, first_word + k);
         }
@@ -214,6 +239,29 @@ multiversion! {
     /// Bit `i` of `out` = `vals[i] == x`.
     pub fn eq_u64(vals: &[u64], x: u64, out: &mut [u64]) {
         bits_where(vals, out, |v| v == x);
+    }
+}
+
+multiversion! {
+    /// Bit `i` of `out` = `table[codes[i]] != 0` (codes past the table use its last entry):
+    /// dictionary codes to selection bits.
+    pub fn lookup_bits(codes: &[u64], table: &[u8], out: &mut [u64]) {
+        let last = table.len().saturating_sub(1);
+        if table.is_empty() {
+            out.fill(0);
+            return;
+        }
+        for (w, chunk) in out.iter_mut().zip(codes.chunks(64)) {
+            let mut bytes = [0u8; 64];
+            for (b, &c) in bytes.iter_mut().zip(chunk) {
+                *b = u8::from(table[(c as usize).min(last)] != 0);
+            }
+            let mut m = 0u64;
+            for (k, eight) in bytes.chunks_exact(8).enumerate() {
+                m |= pack8([eight[0], eight[1], eight[2], eight[3], eight[4], eight[5], eight[6], eight[7]]) << (k * 8);
+            }
+            *w = m;
+        }
     }
 }
 
@@ -413,7 +461,9 @@ mod tests {
         // The dispatcher picked one copy; the inner bodies are the same code. Compare the
         // public function against a direct scalar recomputation for float predicates, the only
         // kernels where evaluation order could matter.
-        let vals: Vec<f64> = (0..5000).map(|i| ((i as f64) * 0.37).sin() * 1e6).collect();
+        let vals: Vec<f64> = (0..5000)
+            .map(|i| (f64::from(i) * 0.37).sin() * 1e6)
+            .collect();
         let mut a = vec![0u64; vals.len().div_ceil(64)];
         range_f64(&vals, -3e5, true, 2.5e5, false, &mut a);
         let mut b = vec![0u64; a.len()];

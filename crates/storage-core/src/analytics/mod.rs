@@ -31,7 +31,11 @@ pub enum GroupKey {
     /// The value of a field (dotted path).
     Field(String),
     /// Numbers and timestamps bucketed: `offset + floor((v - offset) / width) * width`.
-    Bucket { field: String, width: i64, offset: i64 },
+    Bucket {
+        field: String,
+        width: i64,
+        offset: i64,
+    },
 }
 
 /// An aggregate function.

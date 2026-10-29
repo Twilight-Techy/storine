@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use storage_codec::simd;
 use storage_codec::types::{PropertyValue, PropertyValueRef};
 use storage_columnar::column::{BytesBody, FloatBody, I128Body};
-use storage_columnar::int::{IntChunk, BLOCK};
+use storage_columnar::int::IntChunk;
 use storage_columnar::{Body, Chunk, Kind, Val};
 use storage_types::{Decimal, FastHashMap, InlineId};
 
@@ -119,58 +119,77 @@ fn fill(out: &mut [u64], n: usize, value: bool) {
     }
 }
 
-/// Bits of rows matching `f` (`out` has `ceil(n / 64)` words).
-pub(crate) fn eval(f: &Filter, rg: &RowGroupView<'_>, out: &mut [u64]) {
-    let n = rg.n;
+/// Bits of the `active` rows matching `f` (`out` and `active` have `ceil(n / 64)` words; bits
+/// outside `active` come out clear). Leaves skip 64-row words with no active row, so each
+/// conjunct of an `And` only looks at the rows the earlier ones kept.
+pub(crate) fn eval(f: &Filter, rg: &RowGroupView<'_>, active: &[u64], out: &mut [u64]) {
     match f {
         Filter::And(fs) => {
-            fill(out, n, true);
+            out.copy_from_slice(active);
             let mut tmp = vec![0u64; out.len()];
             for x in fs {
-                eval(x, rg, &mut tmp);
+                if out.iter().all(|w| *w == 0) {
+                    break;
+                }
+                let cur = out.to_vec();
+                eval(x, rg, &cur, &mut tmp);
                 simd::and_words(out, &tmp);
             }
         }
         Filter::Or(fs) => {
-            fill(out, n, false);
+            out.fill(0);
             let mut tmp = vec![0u64; out.len()];
             for x in fs {
-                eval(x, rg, &mut tmp);
+                eval(x, rg, active, &mut tmp);
                 simd::or_words(out, &tmp);
             }
         }
         Filter::Not(x) => {
-            eval(x, rg, out);
-            let mut all = vec![0u64; out.len()];
-            fill(&mut all, n, true);
-            for (o, a) in out.iter_mut().zip(&all) {
-                *o = !*o & a;
+            let mut tmp = vec![0u64; out.len()];
+            eval(x, rg, active, &mut tmp);
+            for ((o, a), t) in out.iter_mut().zip(active).zip(&tmp) {
+                *o = a & !t;
             }
         }
         Filter::KeyPrefix(prefix) => {
             out.fill(0);
-            for (i, k) in rg.row_keys().iter().enumerate() {
-                if k.starts_with(prefix.as_str()) {
+            let keys = rg.row_keys();
+            for_each_active(active, |i| {
+                if keys.get(i).is_some_and(|k| k.starts_with(prefix.as_str())) {
                     set_bit(out, i);
                 }
-            }
+            });
         }
-        leaf => eval_leaf(leaf, rg, out),
+        leaf => {
+            eval_leaf(leaf, rg, active, out);
+            simd::and_words(out, active);
+        }
+    }
+}
+
+#[inline]
+fn for_each_active(active: &[u64], mut f: impl FnMut(usize)) {
+    for (w, &word) in active.iter().enumerate() {
+        let mut m = word;
+        while m != 0 {
+            f(w * 64 + m.trailing_zeros() as usize);
+            m &= m - 1;
+        }
     }
 }
 
 /// Row-by-row: `matches_value` on each row's value (exact for every kind).
-fn rows_slow(f: &Filter, rg: &RowGroupView<'_>, path: &str, out: &mut [u64]) {
+fn rows_slow(f: &Filter, rg: &RowGroupView<'_>, path: &str, active: &[u64], out: &mut [u64]) {
     out.fill(0);
-    for i in 0..rg.n {
+    for_each_active(active, |i| {
         let v = rg.value_at(path, i);
         if with_ref(&v, |r| f.matches_value(r)) {
             set_bit(out, i);
         }
-    }
+    });
 }
 
-fn eval_leaf(f: &Filter, rg: &RowGroupView<'_>, out: &mut [u64]) {
+fn eval_leaf(f: &Filter, rg: &RowGroupView<'_>, active: &[u64], out: &mut [u64]) {
     let n = rg.n;
     let Some(path) = f.path() else {
         fill(out, n, false);
@@ -184,7 +203,7 @@ fn eval_leaf(f: &Filter, rg: &RowGroupView<'_>, out: &mut [u64]) {
         _ => false,
     };
     if rg.has_children(path) || complex_probe {
-        rows_slow(f, rg, path, out);
+        rows_slow(f, rg, path, active, out);
         return;
     }
     let Some(chunk) = rg.chunks.get(path) else {
@@ -214,22 +233,39 @@ fn eval_leaf(f: &Filter, rg: &RowGroupView<'_>, out: &mut [u64]) {
                     _ => PropertyValue::Int64(x),
                 }
             };
-            int_leaf(f, ic, n, &ctor, out)
+            int_leaf(f, ic, n, &ctor, active, out)
         }
-        Body::Int128(I128Body::Small(ic)) => int_leaf(f, ic, n, &|x| PropertyValue::Int128(i128::from(x)), out),
+        Body::Int128(I128Body::Small(ic)) => int_leaf(
+            f,
+            ic,
+            n,
+            &|x| PropertyValue::Int128(i128::from(x)),
+            active,
+            out,
+        ),
         Body::Decimal(I128Body::Small(ic), scales) => match scales {
             IntChunk::Const { value, .. } if (0..=38).contains(value) => {
                 let s = *value as u8;
-                int_leaf(f, ic, n, &|x| Decimal::new(i128::from(x), s).map_or(PropertyValue::Null, PropertyValue::Decimal), out)
+                int_leaf(
+                    f,
+                    ic,
+                    n,
+                    &|x| {
+                        Decimal::new(i128::from(x), s)
+                            .map_or(PropertyValue::Null, PropertyValue::Decimal)
+                    },
+                    active,
+                    out,
+                )
             }
             _ => false,
         },
         Body::Float(fb) => float_leaf(f, fb, n, out),
-        Body::Bytes(kind, bb) => bytes_leaf(f, *kind, bb, n, out),
+        Body::Bytes(kind, bb) => bytes_leaf(f, *kind, bb, n, active, out),
         _ => false,
     };
     if !decided {
-        rows_slow(f, rg, path, out);
+        rows_slow(f, rg, path, active, out);
         return;
     }
     // Rows without a value take the null answer.
@@ -342,7 +378,36 @@ fn ordered_rows(f: &Filter, vals: &[i64], ctor: &dyn Fn(i64) -> PropertyValue, o
     true
 }
 
-fn int_leaf(f: &Filter, ic: &IntChunk<'_>, n: usize, ctor: &dyn Fn(i64) -> PropertyValue, out: &mut [u64]) -> bool {
+/// Selection bits of dictionary-coded rows: `allowed[code]` per row, in 64-row words, skipping
+/// words without an active row.
+fn code_rows(
+    codes: &storage_columnar::bits::Packed<'_>,
+    allowed: &[u8],
+    n: usize,
+    active: &[u64],
+    out: &mut [u64],
+) {
+    out.fill(0);
+    let mut buf = [0u64; 64];
+    for (w, &a) in active.iter().enumerate() {
+        if a == 0 {
+            continue;
+        }
+        let start = w * 64;
+        let k = (n - start).min(64);
+        codes.unpack_into(start, &mut buf[..k]);
+        simd::lookup_bits(&buf[..k], allowed, &mut out[w..w + 1]);
+    }
+}
+
+fn int_leaf(
+    f: &Filter,
+    ic: &IntChunk<'_>,
+    n: usize,
+    ctor: &dyn Fn(i64) -> PropertyValue,
+    active: &[u64],
+    out: &mut [u64],
+) -> bool {
     match ic {
         IntChunk::Const { value, .. } => {
             let v = with_ref(&ctor(*value), |r| f.matches_value(r));
@@ -350,20 +415,11 @@ fn int_leaf(f: &Filter, ic: &IntChunk<'_>, n: usize, ctor: &dyn Fn(i64) -> Prope
             true
         }
         IntChunk::Dict { dict, codes } => {
-            let allowed: Vec<bool> = dict.iter().map(|&x| with_ref(&ctor(x), |r| f.matches_value(r))).collect();
-            out.fill(0);
-            let mut buf = [0u64; BLOCK];
-            let mut i = 0;
-            while i < n {
-                let k = (n - i).min(BLOCK);
-                codes.unpack_into(i, &mut buf[..k]);
-                for (j, &c) in buf[..k].iter().enumerate() {
-                    if allowed.get(c as usize).copied().unwrap_or(false) {
-                        set_bit(out, i + j);
-                    }
-                }
-                i += k;
-            }
+            let allowed: Vec<u8> = dict
+                .iter()
+                .map(|&x| u8::from(with_ref(&ctor(x), |r| f.matches_value(r))))
+                .collect();
+            code_rows(codes, &allowed, n, active, out);
             true
         }
         _ => {
@@ -415,7 +471,14 @@ fn bytes_value(kind: Kind, raw: &[u8]) -> PropertyValue {
     }
 }
 
-fn bytes_leaf(f: &Filter, kind: Kind, bb: &BytesBody<'_>, n: usize, out: &mut [u64]) -> bool {
+fn bytes_leaf(
+    f: &Filter,
+    kind: Kind,
+    bb: &BytesBody<'_>,
+    n: usize,
+    active: &[u64],
+    out: &mut [u64],
+) -> bool {
     let test = |raw: &[u8]| -> bool {
         // Text compares and matches without allocating in the common case.
         if kind == Kind::Text {
@@ -435,33 +498,21 @@ fn bytes_leaf(f: &Filter, kind: Kind, bb: &BytesBody<'_>, n: usize, out: &mut [u
         }
         BytesBody::Dict { codes, offsets, blob } => {
             let entries = offsets.len().saturating_sub(1);
-            let allowed: Vec<bool> = (0..entries)
+            let allowed: Vec<u8> = (0..entries)
                 .map(|e| {
                     let (a, b) = (offsets[e] as usize, offsets[e + 1] as usize);
-                    test(blob.bytes().get(a..b).unwrap_or_default())
+                    u8::from(test(blob.bytes().get(a..b).unwrap_or_default()))
                 })
                 .collect();
-            out.fill(0);
-            let mut buf = [0u64; BLOCK];
-            let mut i = 0;
-            while i < n {
-                let k = (n - i).min(BLOCK);
-                codes.unpack_into(i, &mut buf[..k]);
-                for (j, &c) in buf[..k].iter().enumerate() {
-                    if allowed.get(c as usize).copied().unwrap_or(false) {
-                        set_bit(out, i + j);
-                    }
-                }
-                i += k;
-            }
+            code_rows(codes, &allowed, n, active, out);
         }
         BytesBody::Plain { .. } => {
             out.fill(0);
-            for i in 0..n {
+            for_each_active(active, |i| {
                 if test(bb.get(i)) {
                     set_bit(out, i);
                 }
-            }
+            });
         }
     }
     true
