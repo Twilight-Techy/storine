@@ -18,6 +18,7 @@ pub mod catalog;
 pub mod columnar;
 mod decrypt_cache;
 pub mod document;
+pub mod dist;
 pub mod document_wire;
 pub mod engine;
 pub mod linearizability;

@@ -39,6 +39,7 @@ use crate::engine::{Precondition, StorageEngine, WriteKind, WriteOp, WriteResult
 use crate::sharding::NodeId;
 
 const RAFT_META_MAGIC: u32 = 0x5241_4654; // "RAFT"
+const RAFT_SPAN_MAGIC: u32 = 0x5241_5350; // "RASP"
 
 /// Role of a node in a Raft replication group (`F-DIST-02`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +65,87 @@ pub enum RaftCommand {
     SweepExpired { now_ns: u64 },
     /// New cluster configuration (`TASK-121`), effective from the moment it is appended.
     Config(Membership),
+    /// Range split (`TASK-138`): this group keeps `[start, at)`; `[at, end)` becomes the new
+    /// group `right`, whose replicas are this group's (the data is already in every replica's
+    /// engine, so a split moves no data).
+    Split { at: Vec<u8>, right: u64 },
+}
+
+/// The slice of the key space (raw id bytes, `start <= key < end`) a Raft group replicates.
+/// A whole-engine group covers everything.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct KeySpan {
+    pub start: Vec<u8>,
+    /// `None`: to the end of the key space.
+    pub end: Option<Vec<u8>>,
+}
+
+impl KeySpan {
+    /// Everything.
+    pub const fn all() -> Self {
+        Self { start: Vec::new(), end: None }
+    }
+
+    pub fn new(start: impl Into<Vec<u8>>, end: Option<Vec<u8>>) -> Self {
+        Self { start: start.into(), end }
+    }
+
+    #[inline]
+    pub fn contains(&self, key: &[u8]) -> bool {
+        key >= self.start.as_slice() && self.end.as_deref().is_none_or(|e| key < e)
+    }
+
+    #[inline]
+    pub fn contains_id(&self, id: InlineId) -> bool {
+        self.contains(id.as_bytes())
+    }
+
+    pub fn is_all(&self) -> bool {
+        self.start.is_empty() && self.end.is_none()
+    }
+
+    /// `[start, at)` and `[at, end)`, if `at` lies strictly inside.
+    pub fn split_at(&self, at: &[u8]) -> Option<(KeySpan, KeySpan)> {
+        if at <= self.start.as_slice() || !self.contains(at) {
+            return None;
+        }
+        Some((KeySpan::new(self.start.clone(), Some(at.to_vec())), KeySpan::new(at.to_vec(), self.end.clone())))
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.start.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.start);
+        match &self.end {
+            Some(e) => {
+                out.push(1);
+                out.extend_from_slice(&(e.len() as u32).to_le_bytes());
+                out.extend_from_slice(e);
+            }
+            None => out.push(0),
+        }
+    }
+
+    pub fn decode(r: &mut storage_codec::value_wire::SveReader<'_>) -> Result<Self> {
+        let start = r.bytes()?.to_vec();
+        let end = match r.u8()? {
+            0 => None,
+            1 => Some(r.bytes()?.to_vec()),
+            _ => return Err(StorageError::corrupted_header("bad key span flag")),
+        };
+        Ok(Self { start, end })
+    }
+}
+
+/// A split applied by a group, for its host to start the right-hand group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitEvent {
+    /// Index of the split entry: the right-hand group starts with this as its snapshot point.
+    pub index: u64,
+    pub term: u64,
+    pub right: u64,
+    pub right_span: KeySpan,
+    /// Voters of the group at the split (the right-hand group starts with the same).
+    pub members: Membership,
 }
 
 /// One cluster member: its node id, the address it serves on (Raft RPCs and clients), and
@@ -712,6 +794,7 @@ const ENTRY_OPS: u8 = 2;
 const ENTRY_NOOP: u8 = 3;
 const ENTRY_SWEEP: u8 = 4;
 const ENTRY_CONFIG: u8 = 5;
+const ENTRY_SPLIT: u8 = 6;
 
 fn encode_log_entry(entry: &RaftLogEntry, out: &mut Vec<u8>) {
     out.extend_from_slice(&entry.term.to_le_bytes());
@@ -726,6 +809,10 @@ fn encode_log_entry(entry: &RaftLogEntry, out: &mut Vec<u8>) {
         RaftCommand::Config(m) => {
             config = m.encode();
             (InlineId::EMPTY, 0, ENTRY_CONFIG, config.as_slice())
+        }
+        RaftCommand::Split { at, right } => {
+            config = at.clone();
+            (InlineId::EMPTY, *right, ENTRY_SPLIT, config.as_slice())
         }
     };
     out.extend_from_slice(&id.to_raw_bytes());
@@ -760,6 +847,7 @@ fn decode_log_entry(bytes: &[u8], cursor: usize) -> Result<(RaftLogEntry, usize)
         ENTRY_NOOP => RaftCommand::Noop,
         ENTRY_SWEEP => RaftCommand::SweepExpired { now_ns: aux },
         ENTRY_CONFIG => RaftCommand::Config(Membership::decode(payload)?),
+        ENTRY_SPLIT => RaftCommand::Split { at: payload.to_vec(), right: aux },
         _ => return Err(StorageError::corrupted_header("unknown RaftLogEntry kind")),
     };
     Ok((RaftLogEntry { term, index, command }, end))
@@ -920,6 +1008,57 @@ struct RaftStorage {
     installing_path: PathBuf,
     /// Cluster configuration at the compaction point (`TASK-121`).
     members_path: PathBuf,
+    /// Key span of a range group (`TASK-137`); absent for a whole-engine group.
+    span_path: PathBuf,
+}
+
+impl RaftStorage {
+    fn for_group(dir: &Path, stem: &str, group: Option<u64>) -> Self {
+        let stem = match group {
+            Some(g) => format!("{stem}_r{g}"),
+            None => stem.to_string(),
+        };
+        Self {
+            meta_path: dir.join(format!("{stem}_raft.meta")),
+            log_path: dir.join(format!("{stem}_raft.log")),
+            snapshot_path: dir.join(format!("{stem}_raft.snapshot")),
+            recv_path: dir.join(format!("{stem}_raft.snapshot.recv")),
+            installing_path: dir.join(format!("{stem}_raft.installing")),
+            members_path: dir.join(format!("{stem}_raft.members")),
+            span_path: dir.join(format!("{stem}_raft.span")),
+        }
+    }
+
+    fn save_span(&self, span: &KeySpan) -> Result<()> {
+        let mut body = Vec::new();
+        span.encode(&mut body);
+        let mut full = Vec::with_capacity(12 + body.len());
+        full.extend_from_slice(&RAFT_SPAN_MAGIC.to_le_bytes());
+        full.extend_from_slice(&checksum_payload(&body).to_le_bytes());
+        full.extend_from_slice(&body);
+        atomic_write_replace(&self.span_path, &full, true)
+    }
+
+    fn load_span(&self) -> Result<Option<KeySpan>> {
+        if !self.span_path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read(&self.span_path).map_err(|e| StorageError::io("read raft span", e))?;
+        if raw.len() < 12 || read_u32_le(&raw, 0) != RAFT_SPAN_MAGIC {
+            return Err(StorageError::corrupted_header("raft span file invalid"));
+        }
+        let expected = read_u64_le(&raw, 4);
+        let actual = checksum_payload(&raw[12..]);
+        if expected != actual {
+            return Err(StorageError::checksum_mismatch(expected, actual));
+        }
+        let mut r = storage_codec::value_wire::SveReader::new(&raw[12..]);
+        let span = KeySpan::decode(&mut r)?;
+        if r.remaining() != 0 {
+            return Err(StorageError::corrupted_header("trailing bytes after raft span"));
+        }
+        Ok(Some(span))
+    }
 }
 
 const MEMBERS_MAGIC: u32 = 0x4d46_5452; // "RTFM": raft members
@@ -998,12 +1137,20 @@ impl RaftStorage {
         for e in entries {
             Self::encode_log_frame(e, &mut buf);
         }
-        let mut file = storage_types::vfs::at(&self.log_path).open(&self.log_path, storage_types::vfs::OpenOpts::append())
+        let vfs = storage_types::vfs::at(&self.log_path);
+        let created = !vfs.exists(&self.log_path);
+        let mut file = vfs.open(&self.log_path, storage_types::vfs::OpenOpts::append())
             .map_err(|e| StorageError::io("open raft log", e))?;
         file.write_all(&buf)
             .map_err(|e| StorageError::io("append raft log", e))?;
         file.sync_data()
-            .map_err(|e| StorageError::io("fsync raft log", e))
+            .map_err(|e| StorageError::io("fsync raft log", e))?;
+        if created {
+            // Acknowledged entries in a new log file survive a power cut only once its
+            // directory entry is durable too.
+            sync_parent(&self.log_path).map_err(|e| StorageError::io("fsync raft log directory", e))?;
+        }
+        Ok(())
     }
 
     fn rewrite_log(&self, log: &[RaftLogEntry]) -> Result<()> {
@@ -1128,6 +1275,14 @@ pub struct RaftNode<T: ZeroCopyRecord + Indexable> {
     /// When set, votes are refused while a leader was heard from within this window ("leader
     /// stickiness", Raft thesis §4.2.3), which keeps leader leases safe.
     vote_stickiness: Mutex<Option<Duration>>,
+    /// Range group id (`None`: the group replicates the whole engine).
+    group: Option<u64>,
+    /// The keys this group replicates; shrinks when the group splits.
+    span: std::sync::RwLock<KeySpan>,
+    /// Splits applied since the host last asked ([`Self::take_splits`]).
+    splits: Mutex<Vec<SplitEvent>>,
+    /// Engine directory and file stem (to create right-hand groups on a split).
+    stem: String,
 }
 
 #[derive(Debug, Default)]
@@ -1157,15 +1312,24 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     /// Corrupted Raft state is an error: silently starting over could let this node vote twice
     /// in a term or forget committed entries.
     pub fn new(node_id: NodeId, engine: Arc<StorageEngine<T>>) -> Result<Self> {
+        Self::open_group(node_id, engine, None, KeySpan::all())
+    }
+
+    /// Opens (or creates) range group `group` over the part `span` of a shared engine
+    /// (`TASK-137`): its own log and hard state, the engine (and its WAL) shared with every
+    /// other group on this node. A persisted span (after splits) wins over `span`.
+    pub fn open_group(node_id: NodeId, engine: Arc<StorageEngine<T>>, group: Option<u64>, span: KeySpan) -> Result<Self> {
         let stem = crate::engine::collection_file_stem(engine.collection_name())?;
-        let dir = engine.base_dir();
-        let storage = RaftStorage {
-            meta_path: dir.join(format!("{stem}_raft.meta")),
-            log_path: dir.join(format!("{stem}_raft.log")),
-            snapshot_path: dir.join(format!("{stem}_raft.snapshot")),
-            recv_path: dir.join(format!("{stem}_raft.snapshot.recv")),
-            installing_path: dir.join(format!("{stem}_raft.installing")),
-            members_path: dir.join(format!("{stem}_raft.members")),
+        let dir = engine.base_dir().to_path_buf();
+        let storage = RaftStorage::for_group(&dir, &stem, group);
+        let span = match storage.load_span()? {
+            Some(saved) => saved,
+            None => {
+                if group.is_some() {
+                    storage.save_span(&span)?;
+                }
+                span
+            }
         };
         let initial_state = storage.load()?.unwrap_or_else(RaftState::new);
         let node = Self {
@@ -1179,6 +1343,10 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             applied_cv: Condvar::new(),
             last_contact: Mutex::new(Instant::now()),
             vote_stickiness: Mutex::new(None),
+            group,
+            span: std::sync::RwLock::new(span),
+            splits: Mutex::new(Vec::new()),
+            stem,
         };
         // A replicated engine changes only through consensus: refuse direct writes
         // (`ReadOnlyReplica`) on every replica, leader included.
@@ -1194,6 +1362,47 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     #[inline]
     pub const fn node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    /// Range group id (`None` for a whole-engine group).
+    pub const fn group(&self) -> Option<u64> {
+        self.group
+    }
+
+    /// The keys this group replicates.
+    pub fn span(&self) -> KeySpan {
+        self.span.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Splits applied since the last call (the host starts the right-hand groups).
+    pub fn take_splits(&self) -> Vec<SplitEvent> {
+        std::mem::take(&mut *self.splits.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// Range groups persisted in `engine`'s directory (`(group id, span)`), to reopen at start.
+    pub fn persisted_groups(engine: &StorageEngine<T>) -> Result<Vec<u64>> {
+        let stem = crate::engine::collection_file_stem(engine.collection_name())?;
+        let prefix = format!("{stem}_r");
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(engine.base_dir()) else { return Ok(out) };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let Some(id) = name.strip_prefix(&prefix).and_then(|r| r.strip_suffix("_raft.span")).and_then(|d| d.parse().ok()) {
+                out.push(id);
+            }
+        }
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// Ids of live records in this group's span.
+    fn span_ids(&self) -> Vec<InlineId> {
+        let span = self.span();
+        let ids = self.engine.live_ids();
+        if span.is_all() {
+            return ids;
+        }
+        ids.into_iter().filter(|id| span.contains_id(*id)).collect()
     }
 
     #[inline]
@@ -1571,6 +1780,19 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         self.lock_state().bootstrap = members;
     }
 
+    /// Persists the first configuration of a new group (a range created on this node): unlike
+    /// [`Self::set_bootstrap_membership`] it survives restarts. A no-op once the group has a
+    /// configuration or any log.
+    pub fn initialize_membership(&self, members: Membership) -> Result<()> {
+        let mut st = self.lock_state();
+        if st.base_config.is_some() || !st.log.is_empty() || st.snapshot_index != 0 {
+            return Ok(());
+        }
+        self.storage.save_members(&(0, members.clone()))?;
+        st.base_config = Some((0, members));
+        self.storage.save_hard_state(&st)
+    }
+
     /// The configuration in force on this node (the latest appended one).
     pub fn membership(&self) -> Membership {
         self.lock_state().membership().1.clone()
@@ -1945,7 +2167,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 .ok_or_else(|| StorageError::corrupted_header("raft snapshot point is missing"))?;
             let config = st.membership_at(last_index);
             drop(st);
-            (last_index, last_term, config, self.engine.begin_read_snapshot(), self.engine.live_ids())
+            (last_index, last_term, config, self.engine.begin_read_snapshot(), self.span_ids())
         };
         let mut tmp = self.storage.snapshot_path.as_os_str().to_os_string();
         tmp.push(".tmp");
@@ -2069,12 +2291,16 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         // 2. The engine is about to hold a mix of old and snapshot state until step 4.
         atomic_write_replace(&self.storage.installing_path, &last_index.to_le_bytes(), true)?;
         // 3. Engine state := snapshot state.
+        let span = self.span();
         for_each_snapshot_record(recv, |id, frame| {
+            if !span.contains_id(id) {
+                return Ok(()); // another group's key: never ours to write
+            }
             let (hdr, record) = RecordCodec::decode_owned::<T>(frame.as_slice())?;
             // Exact version and TTL: every replica holds identical versions.
             self.engine.install_exact(id, &record, hdr.version(), hdr.ttl_expires_at_ns)
         })?;
-        for id in self.engine.live_ids() {
+        for id in self.span_ids() {
             if !ids.contains(&id) {
                 let _ = self.engine.delete_internal(id)?;
             }
@@ -2130,7 +2356,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         }
         {
             let _apply = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
-            for id in self.engine.live_ids() {
+            for id in self.span_ids() {
                 let _ = self.engine.delete_internal(id)?;
             }
             self.engine.sync_wal()?;
@@ -2153,6 +2379,52 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     /// decisions use the leader's proposal time. A rejected batch (failed precondition, invalid
     /// value) is a normal, replicated outcome; only environment failures (I/O, memory) are errors
     /// that stop the apply loop.
+    /// Applies a split (idempotent: a replay after a crash finds it done). Order: the right-hand
+    /// group's state first, then this group's shorter span, then `last_applied` (by the caller),
+    /// so a crash at any point either redoes the split or finds it complete.
+    fn apply_split(&self, entry: &RaftLogEntry, at: &[u8], right: u64) -> Result<()> {
+        let span = self.span();
+        if span.end.as_deref() == Some(at) && self.group.is_some() {
+            // Already applied before a restart: re-announce so the host opens the right group.
+        } else {
+            let Some((_, right_span)) = span.split_at(at) else {
+                // A split at a key this group does not hold is refused identically everywhere.
+                return Err(StorageError::invalid_key("split key outside the range"));
+            };
+            let dir = self.engine.base_dir().to_path_buf();
+            let rs = RaftStorage::for_group(&dir, &self.stem, Some(right));
+            let members = self.lock_state().membership().1.clone();
+            let mut st = RaftState::new();
+            // Terms never decrease along a log: the right-hand group starts in the split
+            // entry's term, so its first leader (term + 1 or later) appends after it.
+            st.current_term = entry.term;
+            st.snapshot_index = entry.index;
+            st.snapshot_term = entry.term;
+            st.commit_index = entry.index;
+            st.last_applied = entry.index;
+            if !members.is_empty() {
+                rs.save_members(&(entry.index, members.clone()))?;
+                st.base_config = Some((entry.index, members));
+            }
+            rs.save_span(&right_span)?;
+            rs.rewrite_log(&[])?;
+            rs.save_hard_state(&st)?;
+            let left = KeySpan::new(span.start.clone(), Some(at.to_vec()));
+            if self.group.is_some() {
+                self.storage.save_span(&left)?;
+            }
+            *self.span.write().unwrap_or_else(|p| p.into_inner()) = left;
+        }
+        let right_span = KeySpan::new(at.to_vec(), span.end.clone().filter(|e| e.as_slice() != at).or_else(|| {
+            // Replay: the right span is the one persisted for the right group.
+            let dir = self.engine.base_dir().to_path_buf();
+            RaftStorage::for_group(&dir, &self.stem, Some(right)).load_span().ok().flatten().and_then(|s| s.end)
+        }));
+        let members = self.lock_state().membership().1.clone();
+        self.splits.lock().unwrap_or_else(|p| p.into_inner()).push(SplitEvent { index: entry.index, term: entry.term, right, right_span, members });
+        Ok(())
+    }
+
     fn apply_entry_to_engine(&self, entry: &RaftLogEntry) -> Result<ApplyOutcome> {
         let min = Some(Version(entry.index));
         let now_fallback = || {
@@ -2160,7 +2432,25 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
         };
+        let span = self.span();
+        let outside = |ids: &mut dyn Iterator<Item = InlineId>| {
+            if span.is_all() {
+                return false;
+            }
+            for id in ids {
+                if !span.contains_id(id) {
+                    return true;
+                }
+            }
+            false
+        };
         let outcome = match &entry.command {
+            // A write proposed before a split and applied after it, for keys the group no
+            // longer holds, is refused the same way on every replica.
+            RaftCommand::Upsert { id, .. } | RaftCommand::Delete { id } if outside(&mut core::iter::once(*id)) => {
+                Err(StorageError::invalid_key("key outside this range (it split): re-route"))
+            }
+            RaftCommand::Split { at, right } => self.apply_split(entry, at, *right).map(|()| Vec::new()),
             RaftCommand::Upsert { id, frame } => {
                 let (_hdr, owned) = RecordCodec::decode_owned::<T>(frame.as_slice())?;
                 self.engine.commit_at(vec![WriteOp::put(*id, owned)], min, now_fallback())
@@ -2169,11 +2459,16 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 self.engine.commit_at(vec![WriteOp::delete(*id)], min, now_fallback())
             }
             RaftCommand::Ops(bytes) => match decode_raft_ops::<T>(bytes.as_slice()) {
+                Ok((_, ops)) if outside(&mut ops.iter().map(|o| o.id)) => {
+                    Err(StorageError::invalid_key("key outside this range (it split): re-route"))
+                }
                 Ok((now_ns, ops)) => self.engine.commit_at(ops, min, now_ns),
                 Err(e) => Err(e),
             },
             RaftCommand::Noop | RaftCommand::Config(_) => Ok(Vec::new()),
-            RaftCommand::SweepExpired { now_ns } => self.engine.sweep_expired_at(*now_ns).map(|_| Vec::new()),
+            RaftCommand::SweepExpired { now_ns } if span.is_all() => self.engine.sweep_expired_at(*now_ns).map(|_| Vec::new()),
+            // TTL sweeps of a shared engine run in its whole-engine group only.
+            RaftCommand::SweepExpired { .. } => Ok(Vec::new()),
         };
         match outcome {
             Err(e @ (StorageError::Io { .. } | StorageError::ResourceExhausted { .. })) => Err(e),

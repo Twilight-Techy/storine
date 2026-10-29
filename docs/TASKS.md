@@ -973,9 +973,38 @@ This document defines the strict chronological execution order for building the 
 
 ## Stage 30: Scale-Out & Multi-Region (`TASK-137` – `TASK-144`)
 
-- [ ] **TASK-137: Multi-Raft Ranges (`F-GEO-01`)** — many Raft groups per node over one engine / WAL; coalesced heartbeats; quiescent idle ranges.
+- [x] **TASK-137: Multi-Raft Ranges (`F-GEO-01`)** — many Raft groups per node over one engine / WAL; coalesced heartbeats; quiescent idle ranges.
+  - **Ranges**: a range is a `RaftNode` group over a `KeySpan` (raw id bytes) of the node's single engine and WAL (`RaftNode::open_group`).
+    - Each group has its own log and hard state, and snapshots are built, installed and reset within the span only.
+    - Writes for keys outside the span are refused at apply, identically on every replica.
+    - TTL sweeps of a shared engine run only in a whole-engine group.
+  - **Splits are metadata only**: a replicated `Split { at, right }` entry shrinks the left span and creates the right-hand group from the same data and replicas.
+    - Order: the right group's state, then the left span, then `last_applied`, so a crash redoes the split or finds it done.
+    - The right group starts in the split entry's term, so log terms never decrease.
+  - **Driver** (`dist/node.rs`, sans-IO): elections with pre-vote, pipelined replication, quorum commit, read-index reads, chunked snapshot catch-up and split handling for every range.
+    - All of a node's traffic to a peer travels as **one batch per node pair**.
+    - **Quiescence**: an idle leader sends `Quiesce` and goes silent; followers then drop their election timers while the leader's node keeps sending (possibly empty) batches.
+    - A node restart (new incarnation), a silent leader node, or a campaign by the quiesced-on node wakes the range. Pre-votes are refused while a leader is live (thesis §9.6).
+  - **Bugs found by the simulator and fixed**:
+    - a new Raft log file's directory entry was never synced, so acknowledged entries were lost on a power cut;
+    - a range's first configuration lived only in memory, so after a restart its replicas never campaigned;
+    - a split-created group started in term 0 below its snapshot term, which broke leader completeness;
+    - followers stayed quiescent on a leader that had restarted.
+  - **Exit Criteria (met)**:
+    - **Idle cost**: 200 idle ranges on 3 nodes exchange exactly 240 batches in 2 s (one per node pair per heartbeat) and 0 range messages.
+    - **3 nodes**: 300 seeds with splits during writes, crashes with power cuts and partitions, checked for per-range election safety, log matching, leader completeness, state-machine safety, convergence and linearizability across splits.
+    - **3 regions**: 300 more seeds on 5 nodes with region latencies and outages.
+    - **Totals**: 1,127 splits, 1,143 crashes and about 26,700 acknowledged writes; all pass.
 - [ ] **TASK-138: Meta Range, Routing & Rebalancing (`F-GEO-02`)** — replicated range descriptors; leaseholder routing in servers and SDKs; splits, merges and replica moves balanced by count, disk and load.
-- [ ] **TASK-139: Hybrid Logical Clocks & Uncertainty (`F-GEO-03`)** — HLC timestamps, maximum-offset enforcement with self-fencing, uncertainty-interval reads, optional commit-wait.
+- [x] **TASK-139: Hybrid Logical Clocks & Uncertainty (`F-GEO-03`)** — HLC timestamps, maximum-offset enforcement with self-fencing, uncertainty-interval reads, optional commit-wait.
+  - `dist/hlc.rs`:
+    - `Timestamp (wall ns, logical)`, which sorts as 12 big-endian bytes;
+    - `Hlc::now` / `update` (monotonic even when the physical clock steps back; causal across messages);
+    - a remote timestamp more than `max_offset` ahead is refused and **fences** the node until an operator lifts it;
+    - `Uncertainty` windows `(read_ts, read_ts + max_offset]` with restart;
+    - `commit_wait` (waits until `ts` is in the past on every clock);
+    - `SystemClock` and `ManualClock`.
+  - Every node batch carries the sender's timestamp. Transactions and reads use the clock from `TASK-140` on.
 - [ ] **TASK-140: Distributed Transactions (`F-GEO-04`)** — transaction records, write intents, parallel commits, serializable timestamp ordering with read refresh, deadlock detection, intent resolution, exactly-once coordinators.
 - [ ] **TASK-141: Locality, Zone Configurations & Survival Goals (`F-GEO-05`)** — region / zone labels, constraints, lease preferences, zone / region survival; closed-timestamp follower reads; global and regional-by-row tables.
 - [ ] **TASK-142: Region-Scale Verification (`F-GEO-06`)** — simulator runs with region latencies and outages; multi-process clusters behind the fault proxy.
