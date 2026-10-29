@@ -99,21 +99,9 @@ impl<'a> Packed<'a> {
         }
     }
 
-    /// Values `start .. start + out.len()` into `out` (the range must be in bounds).
+    /// Values `start .. start + out.len()` into `out` (vectorized, `storage_codec::simd`).
     pub fn unpack_into(&self, start: usize, out: &mut [u64]) {
-        if self.width == 0 {
-            out.fill(0);
-            return;
-        }
-        let width = self.width as usize;
-        let mask = if self.width == 64 { u64::MAX } else { (1u64 << self.width) - 1 };
-        let mut bit = start * width;
-        for o in out.iter_mut() {
-            let (w, off) = (bit >> 6, (bit & 63) as u32);
-            let two = u128::from(self.word(w)) | (u128::from(self.word(w + 1)) << 64);
-            *o = (two >> off) as u64 & mask;
-            bit += width;
-        }
+        storage_codec::simd::unpack(self.words, self.width, start, out);
     }
 }
 

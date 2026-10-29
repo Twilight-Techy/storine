@@ -267,42 +267,58 @@ impl<'a> IntChunk<'a> {
         match self {
             Self::Const { value, .. } => out.fill(*value),
             Self::For { min, packed } => {
-                let mut buf = [0u64; 256];
+                let mut buf = [0u64; BLOCK];
                 let mut done = 0;
                 while done < out.len() {
                     let k = (out.len() - done).min(buf.len());
                     packed.unpack_into(start + done, &mut buf[..k]);
-                    for (o, &u) in out[done..done + k].iter_mut().zip(&buf[..k]) {
-                        *o = (*min as u64).wrapping_add(u) as i64;
-                    }
+                    storage_codec::simd::add_base(*min as u64, &buf[..k], &mut out[done..done + k]);
                     done += k;
                 }
             }
             Self::Delta { min_delta, anchors, packed } => {
+                let mut deltas = [0u64; BLOCK];
                 let mut i = start;
                 let end = start + out.len();
+                let md = *min_delta as u64;
                 while i < end {
                     let block = i / BLOCK;
                     let block_start = block * BLOCK;
-                    let block_end = ((block + 1) * BLOCK).min(end);
-                    let a = &anchors[block * 8..block * 8 + 8];
-                    let mut acc = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
-                    for j in block_start + 1..=i {
-                        acc = acc.wrapping_add(packed.get(j)).wrapping_add(*min_delta as u64);
+                    let block_end = ((block + 1) * BLOCK).min(end).min(packed.len());
+                    if block_end <= block_start {
+                        break;
                     }
-                    out[i - start] = acc as i64;
-                    for j in i + 1..block_end {
-                        acc = acc.wrapping_add(packed.get(j)).wrapping_add(*min_delta as u64);
-                        out[j - start] = acc as i64;
+                    let a = anchors.get(block * 8..block * 8 + 8).unwrap_or(&[0; 8]);
+                    let mut acc = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
+                    // Prefix sum from the block anchor (vectorized unpack, then one add per value).
+                    let span = block_end - block_start;
+                    packed.unpack_into(block_start, &mut deltas[..span]);
+                    for (j, d) in deltas[..span].iter().enumerate().skip(1) {
+                        acc = acc.wrapping_add(*d).wrapping_add(md);
+                        let pos = block_start + j;
+                        if pos >= i {
+                            out[pos - start] = acc as i64;
+                        }
+                    }
+                    if block_start >= i {
+                        out[block_start - start] = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]) as i64;
                     }
                     i = block_end;
                 }
             }
             Self::Dict { dict, codes } => {
-                for (k, o) in out.iter_mut().enumerate() {
-                    // A code outside the dictionary only exists in a hostile file whose
-                    // checksums were forged: it reads as 0, never out of bounds.
-                    *o = dict.get(codes.get(start + k) as usize).copied().unwrap_or(0);
+                let mut buf = [0u64; BLOCK];
+                let mut done = 0;
+                while done < out.len() {
+                    let k = (out.len() - done).min(buf.len());
+                    codes.unpack_into(start + done, &mut buf[..k]);
+                    // A code outside the dictionary only exists in a hostile file whose checksums
+                    // were forged: it is clamped (a wrong value, never out of bounds).
+                    let last = dict.len().saturating_sub(1);
+                    for (o, &c) in out[done..done + k].iter_mut().zip(&buf[..k]) {
+                        *o = dict[(c as usize).min(last)];
+                    }
+                    done += k;
                 }
             }
             Self::Rle { values, ends } => {

@@ -95,3 +95,41 @@ fn lineitem_footprint_and_decode_speed() {
     println!("decode+sum l_shipdate: {:?} ({:.2} ns/value, {:.0} M values/s) [{sum}]", el, el.as_nanos() as f64 / n as f64, n as f64 / el.as_secs_f64() / 1e6);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+#[ignore]
+fn kernel_speed() {
+    use std::time::Instant;
+    let n = 1 << 20;
+    for width in [1u8, 7, 12, 20, 33, 57] {
+        let mask = (1u64 << width) - 1;
+        let vals: Vec<u64> = (0..n as u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15) & mask).collect();
+        let mut packed = Vec::new();
+        storage_columnar::bits::pack(vals.iter().copied(), n, width, &mut packed);
+        let mut out = vec![0u64; 2048];
+        let t = Instant::now();
+        let mut acc = 0u64;
+        for rep in 0..10 {
+            for b in (0..n).step_by(2048) {
+                storage_codec::simd::unpack(&packed, width, b, &mut out);
+                acc = acc.wrapping_add(out[rep]);
+            }
+        }
+        let ns = t.elapsed().as_nanos() as f64 / (10 * n) as f64;
+        println!("unpack width {width:2}: {ns:.3} ns/value [{acc}] avx2={}", storage_codec::simd::avx2_enabled());
+    }
+    let vals: Vec<i64> = (0..n as i64).collect();
+    let mask = vec![u64::MAX; n / 64];
+    let t = Instant::now();
+    let mut s = 0i128;
+    for _ in 0..10 {
+        s += storage_codec::simd::sum_i64_masked(&vals, &mask);
+    }
+    println!("sum_i64_masked: {:.3} ns/value [{s}]", t.elapsed().as_nanos() as f64 / (10 * n) as f64);
+    let mut m = vec![0u64; n / 64];
+    let t = Instant::now();
+    for _ in 0..10 {
+        storage_codec::simd::range_i64(&vals, 1000, 500_000, &mut m);
+    }
+    println!("range_i64: {:.3} ns/value [{}]", t.elapsed().as_nanos() as f64 / (10 * n) as f64, m[100]);
+}

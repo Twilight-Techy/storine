@@ -15,6 +15,7 @@ pub mod sha512;
 pub mod field_ops;
 pub mod scratch;
 pub mod sealed_file;
+pub mod simd;
 pub mod types;
 pub mod value_wire;
 

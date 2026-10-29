@@ -791,6 +791,33 @@ impl<'a> Chunk<'a> {
     }
 }
 
+impl Body<'_> {
+    /// Values of an `Int128` / `Decimal` mantissa body (`n` values).
+    pub fn i128_values(b: &I128Body<'_>, n: usize) -> Vec<i128> {
+        i128_values(b, n)
+    }
+
+    /// Values of a float body (`n` values).
+    pub fn float_values(f: &FloatBody<'_>, n: usize) -> Vec<f64> {
+        float_values(f, n)
+    }
+}
+
+impl Val {
+    /// The column value of a document value (`None` for null-like nothing; lists, maps and
+    /// explicit nulls become `Nested`, as when segments are written).
+    pub fn from_property(v: &PropertyValue) -> Option<Val> {
+        match v {
+            PropertyValue::List(_) | PropertyValue::Map(_) | PropertyValue::Null => {
+                let mut sve = Vec::new();
+                storage_codec::value_wire::encode_value(v, &mut sve);
+                Some(Val::Nested(sve))
+            }
+            other => val_of_owned(other),
+        }
+    }
+}
+
 fn body_kind(b: &Body<'_>) -> Kind {
     match b {
         Body::AllNull | Body::Variant { .. } => Kind::Null,

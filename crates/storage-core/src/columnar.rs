@@ -664,6 +664,24 @@ impl ColumnarCollection {
     }
 }
 
+/// Every document of `collection` as of one MVCC snapshot (collections without segments).
+pub fn snapshot_documents(engine: &StorageEngine<DocumentRecord>, collection: &str) -> Result<Vec<Document>> {
+    let read = engine.begin_read_snapshot();
+    let bm = engine.tag_index().get_bitmap(COLLECTION_FIELD_ID, collection_tag(collection));
+    let primary = engine.primary_index();
+    let mut docs = Vec::new();
+    for ord in bm.to_vec() {
+        let Some(id) = primary.resolve_ordinal(ord) else { continue };
+        if let Some((version, rec)) = read.get(id)? {
+            if rec.collection == collection {
+                docs.push(Document { key: rec.key, version, fields: rec.fields });
+            }
+        }
+    }
+    docs.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok(docs)
+}
+
 /// A consistent analytic view: live segment rows and delta documents as of one snapshot.
 pub struct ColumnarSnapshot<'e> {
     read: ReadSnapshot<'e, DocumentRecord>,

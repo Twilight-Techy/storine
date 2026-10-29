@@ -448,7 +448,7 @@ fn push_index(snap: &mut IndexSnapshot, fid: u16, value: &PropertyValueRef<'_>) 
 }
 
 /// Borrowed view of an owned value (scalars only; lists and maps are never indexed).
-fn value_ref_of(v: &PropertyValue) -> PropertyValueRef<'_> {
+pub fn value_ref_of(v: &PropertyValue) -> PropertyValueRef<'_> {
     match v {
         PropertyValue::Null | PropertyValue::List(_) | PropertyValue::Map(_) => PropertyValueRef::Null,
         PropertyValue::Bool(b) => PropertyValueRef::Bool(*b),
@@ -469,7 +469,7 @@ fn value_ref_of(v: &PropertyValue) -> PropertyValueRef<'_> {
 
 /// Rank of a value's type in the total sort order: null < bool < numbers < text < bytes < uuid
 /// < id < list < map.
-fn type_rank(v: &PropertyValueRef<'_>) -> u8 {
+pub fn type_rank(v: &PropertyValueRef<'_>) -> u8 {
     match v {
         PropertyValueRef::Null => 0,
         PropertyValueRef::Bool(_) => 1,
@@ -612,39 +612,64 @@ impl Filter {
     }
 
     fn matches_depth(&self, key: &str, fields: MapRef<'_>, depth: usize) -> bool {
-        use core::cmp::Ordering;
         if depth > 64 {
             return false;
         }
+        match self {
+            Self::And(fs) => fs.iter().all(|f| f.matches_depth(key, fields, depth + 1)),
+            Self::Or(fs) => fs.iter().any(|f| f.matches_depth(key, fields, depth + 1)),
+            Self::Not(f) => !f.matches_depth(key, fields, depth + 1),
+            Self::KeyPrefix(prefix) => key.starts_with(prefix.as_str()),
+            leaf => {
+                let field = leaf.path().map_or(PropertyValueRef::Null, |p| lookup_path(fields, p));
+                leaf.matches_value(field)
+            }
+        }
+    }
+
+    /// The field path a leaf predicate tests (`None` for `KeyPrefix` and combinators).
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::Eq(p, _)
+            | Self::Ne(p, _)
+            | Self::Lt(p, _)
+            | Self::Le(p, _)
+            | Self::Gt(p, _)
+            | Self::Ge(p, _)
+            | Self::Between(p, ..)
+            | Self::In(p, _)
+            | Self::Prefix(p, _)
+            | Self::Contains(p, _)
+            | Self::Exists(p)
+            | Self::Missing(p) => Some(p),
+            Self::KeyPrefix(_) | Self::And(_) | Self::Or(_) | Self::Not(_) => None,
+        }
+    }
+
+    /// Whether a leaf predicate holds for a field whose value is `field` (`Null` = absent).
+    /// The single definition of leaf semantics: document queries and columnar analytics both
+    /// evaluate leaves through it, so they always agree. Combinators and `KeyPrefix` return
+    /// `false` (they do not test one field).
+    pub fn matches_value(&self, field: PropertyValueRef<'_>) -> bool {
+        use core::cmp::Ordering;
         // Ordered comparisons only hold between comparable (same-rank, non-null) values.
-        fn ordered(fields: MapRef<'_>, path: &str, v: &PropertyValue, ok: fn(Ordering) -> bool) -> bool {
-            let field = lookup_path(fields, path);
+        let ordered = |v: &PropertyValue, ok: fn(Ordering) -> bool| -> bool {
             let probe = value_ref_of(v);
             !matches!(field, PropertyValueRef::Null)
                 && type_rank(&field) == type_rank(&probe)
                 && ok(compare_values(&field, &probe))
-        }
+        };
         match self {
-            Self::Eq(path, v) => eq_value(&lookup_path(fields, path), v),
-            Self::Ne(..) => {
-                let Self::Ne(path, v) = self else { return false };
-                !Self::Eq(path.clone(), v.clone()).matches_depth(key, fields, depth + 1)
-            }
-            Self::Lt(p, v) => ordered(fields, p, v, |o| o == Ordering::Less),
-            Self::Le(p, v) => ordered(fields, p, v, |o| o != Ordering::Greater),
-            Self::Gt(p, v) => ordered(fields, p, v, |o| o == Ordering::Greater),
-            Self::Ge(p, v) => ordered(fields, p, v, |o| o != Ordering::Less),
-            Self::Between(p, lo, hi) => {
-                ordered(fields, p, lo, |o| o != Ordering::Less) && ordered(fields, p, hi, |o| o != Ordering::Greater)
-            }
-            Self::In(path, values) => {
-                let field = lookup_path(fields, path);
-                values.iter().any(|v| eq_value(&field, v))
-            }
-            Self::Prefix(path, prefix) => {
-                matches!(lookup_path(fields, path), PropertyValueRef::Text(s) if s.starts_with(prefix.as_str()))
-            }
-            Self::Contains(path, v) => match (lookup_path(fields, path), v) {
+            Self::Eq(_, v) => eq_value(&field, v),
+            Self::Ne(_, v) => !eq_value(&field, v),
+            Self::Lt(_, v) => ordered(v, |o| o == Ordering::Less),
+            Self::Le(_, v) => ordered(v, |o| o != Ordering::Greater),
+            Self::Gt(_, v) => ordered(v, |o| o == Ordering::Greater),
+            Self::Ge(_, v) => ordered(v, |o| o != Ordering::Less),
+            Self::Between(_, lo, hi) => ordered(lo, |o| o != Ordering::Less) && ordered(hi, |o| o != Ordering::Greater),
+            Self::In(_, values) => values.iter().any(|v| eq_value(&field, v)),
+            Self::Prefix(_, prefix) => matches!(field, PropertyValueRef::Text(s) if s.starts_with(prefix.as_str())),
+            Self::Contains(_, v) => match (field, v) {
                 (PropertyValueRef::Text(s), PropertyValue::Text(sub)) => s.contains(sub.as_str()),
                 (PropertyValueRef::List(items), probe) => {
                     let probe_ref = value_ref_of(probe);
@@ -652,12 +677,9 @@ impl Filter {
                 }
                 _ => false,
             },
-            Self::Exists(path) => !matches!(lookup_path(fields, path), PropertyValueRef::Null),
-            Self::Missing(path) => matches!(lookup_path(fields, path), PropertyValueRef::Null),
-            Self::KeyPrefix(prefix) => key.starts_with(prefix.as_str()),
-            Self::And(fs) => fs.iter().all(|f| f.matches_depth(key, fields, depth + 1)),
-            Self::Or(fs) => fs.iter().any(|f| f.matches_depth(key, fields, depth + 1)),
-            Self::Not(f) => !f.matches_depth(key, fields, depth + 1),
+            Self::Exists(_) => !matches!(field, PropertyValueRef::Null),
+            Self::Missing(_) => matches!(field, PropertyValueRef::Null),
+            Self::KeyPrefix(_) | Self::And(_) | Self::Or(_) | Self::Not(_) => false,
         }
     }
 
@@ -1751,6 +1773,18 @@ impl DocumentStore {
             return Ok(None);
         }
         self.columnar.ensure(&self.engine, collection).map(Some)
+    }
+
+    /// Runs an aggregation (`TASK-128`): over column segments when the collection is columnar,
+    /// otherwise over its documents. Either way the result is exact and as of one snapshot.
+    pub fn aggregate(&self, q: &crate::analytics::AggregateQuery) -> Result<crate::analytics::AggregateResult> {
+        validate_collection_name(&q.collection, true)?;
+        if let Some(c) = self.columnar(&q.collection)? {
+            let snap = c.snapshot()?;
+            return crate::analytics::run(q, &snap);
+        }
+        let docs = crate::columnar::snapshot_documents(&self.engine, &q.collection)?;
+        crate::analytics::run_documents(q, &docs)
     }
 
     /// Opens a projection for every collection declared columnar.
