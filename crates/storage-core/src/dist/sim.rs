@@ -60,6 +60,8 @@ pub struct DistSimConfig {
     pub replication: usize,
     /// Move replicas between nodes and transfer leases while clients run.
     pub moves: bool,
+    /// Merge adjacent ranges while clients run (lease co-location, freeze, merge).
+    pub merges: bool,
     pub tick_us: u64,
     pub client_timeout: u64,
     pub max_events: u64,
@@ -86,6 +88,7 @@ impl Default for DistSimConfig {
             splits: true,
             replication: 3,
             moves: false,
+            merges: false,
             tick_us: 10_000,
             client_timeout: 1_500_000,
             max_events: 2_000_000,
@@ -112,6 +115,13 @@ pub struct DistSimReport {
     pub messages: u64,
     pub moves: usize,
     pub transfers: usize,
+    pub merges: usize,
+    /// Allocator changes and the splits / merges the drivers applied (summed over nodes).
+    pub allocator_actions: u64,
+    pub applied_splits: u64,
+    pub applied_merges: u64,
+    /// Replicas per node at the end.
+    pub replicas_per_node: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +152,8 @@ enum Ev {
     Heal { epoch: u64 },
     /// Replica move of `range` to `node`: 1 = promote once caught up, 2 = remove an old voter.
     Move { range: RangeId, node: NodeId, phase: u8, tries: u8 },
+    /// Merge of `right` into `left`: 0 = co-locate the leases, 1 = freeze, 2 = merge.
+    Merge { left: RangeId, right: RangeId, phase: u8, tries: u8 },
 }
 
 struct SimNode {
@@ -235,7 +247,7 @@ impl<'c> Sim<'c> {
             let sim = SimVfs::new(&dir, rng.next_u64()).map_err(|e| StorageError::io("simulated disk", e))?;
             let mount = sim.mount();
             let engine = Arc::new(StorageEngine::<DocumentRecord>::open(&dir, engine_config())?);
-            let mut d = NodeDriver::new((i + 1) as NodeId, engine, NodeConfig { seed: seed ^ (i as u64 + 1), ..cfg.node.clone() });
+            let mut d = NodeDriver::new((i + 1) as NodeId, engine, NodeConfig { seed: seed ^ (i as u64 + 1), trace: std::env::var_os("STORINE_SIM_TRACE").is_some(), ..cfg.node.clone() });
             for (r, span) in spans.iter().enumerate() {
                 let members: Vec<NodeId> = (0..repl).map(|j| ((r + j) % cfg.nodes + 1) as NodeId).collect();
                 if members.contains(&((i + 1) as NodeId)) {
@@ -372,6 +384,13 @@ impl<'c> Sim<'c> {
             }
             if let Some(since) = wind_down {
                 if self.now - since > 2_000_000 && self.converged() {
+                    for d in self.nodes.iter().filter_map(|n| n.driver.as_ref()) {
+                        let st = d.stats();
+                        self.report.allocator_actions += st.allocator_actions;
+                        self.report.applied_splits += st.splits;
+                        self.report.applied_merges += st.merges;
+                        self.report.replicas_per_node.push(d.ranges().len());
+                    }
                     break;
                 }
                 if self.now - since > 60_000_000 {
@@ -416,6 +435,7 @@ impl<'c> Sim<'c> {
             }
             Ev::Restart { node } => self.restart(node)?,
             Ev::Move { range, node, phase, tries } => self.move_step(range, node, phase, tries),
+            Ev::Merge { left, right, phase, tries } => self.merge_step(left, right, phase, tries),
             Ev::Heal { epoch } => {
                 if epoch == self.epoch {
                     self.cut.iter_mut().for_each(|r| r.iter_mut().for_each(|c| *c = false));
@@ -433,7 +453,7 @@ impl<'c> Sim<'c> {
         for n in self.nodes.iter().filter_map(|n| n.driver.as_ref()) {
             for r in n.ranges() {
                 let Some(rep) = n.replica(r) else { continue };
-                if rep.span().contains_id(id) {
+                if !rep.is_frozen() && rep.span().contains_id(id) {
                     let term = rep.current_term();
                     if best.as_ref().is_none_or(|b| term > b.2) {
                         best = Some((r, n.leader_of(r), term));
@@ -645,6 +665,21 @@ impl<'c> Sim<'c> {
 
     fn fault(&mut self) -> Result<(), DistSimFailure> {
         let n = self.nodes.len();
+        if self.cfg.merges && self.rng.below(3) == 0 {
+            // Merge a random range with its right-hand neighbour.
+            let ranges = self.all_ranges();
+            let Some(&left) = ranges.get(self.rng.below(ranges.len().max(1))) else { return Ok(()) };
+            let Some(l) = self.leader_index(left) else { return Ok(()) };
+            let Some(end) = self.nodes[l].driver.as_ref().and_then(|d| d.replica(left)).and_then(|x| x.span().end) else { return Ok(()) };
+            let right = ranges.iter().copied().find(|&r| {
+                self.nodes.iter().filter_map(|x| x.driver.as_ref()).any(|d| d.replica(r).is_some_and(|x| !x.is_frozen() && x.span().start == end))
+            });
+            if let Some(right) = right {
+                self.log(format!("merge r{right} into r{left}: start"));
+                self.schedule(1_000, Ev::Merge { left, right, phase: 0, tries: 0 });
+            }
+            return Ok(());
+        }
         match self.rng.below(10) {
             0..=2 if self.cfg.partitions => {
                 self.epoch += 1;
@@ -738,6 +773,87 @@ impl<'c> Sim<'c> {
         Ok(())
     }
 
+    fn merge_step(&mut self, left: RangeId, right: RangeId, phase: u8, tries: u8) {
+        // Once frozen, the merge is seen through (a frozen range serves nothing).
+        if phase < 2 && (!self.faults_on || tries > 30) {
+            return;
+        }
+        let tries = tries.min(100);
+        let retry = |s: &mut Self, phase: u8| s.schedule(200_000, Ev::Merge { left, right, phase, tries: tries + 1 });
+        let (Some(l), Some(r)) = (self.leader_index(left), self.leader_index(right)) else { return retry(self, phase) };
+        match phase {
+            0 => {
+                if l == r {
+                    return self.schedule(1_000, Ev::Merge { left, right, phase: 1, tries: 0 });
+                }
+                let to = (l + 1) as NodeId;
+                if self.nodes[r].driver.as_mut().is_some_and(|d| d.transfer_lease(right, to).is_ok()) {
+                    self.log(format!("merge r{right} into r{left}: lease to n{to}"));
+                    self.flush(r);
+                }
+                retry(self, 0);
+            }
+            1 => {
+                if l != r {
+                    return retry(self, 0);
+                }
+                let d = self.nodes[l].driver.as_mut().expect("leader has a driver");
+                let mut lm = d.members_of(left);
+                let mut rm = d.members_of(right);
+                lm.sort_unstable();
+                rm.sort_unstable();
+                if lm.iter().any(|&(_, v)| !v) {
+                    return retry(self, 1); // a move is still running on the left
+                }
+                if lm != rm {
+                    // Align the right range's replicas with the left's, one change at a time:
+                    // promote a caught-up learner, add a missing replica, remove an extra one.
+                    let want: Vec<NodeId> = lm.iter().map(|&(id, _)| id).collect();
+                    let me = d.id();
+                    let changed = if let Some(&(x, _)) = rm.iter().find(|&&(id, v)| !v && want.contains(&id)) {
+                        d.caught_up(right, x) && d.promote(right, x).is_ok()
+                    } else if let Some(&x) = want.iter().find(|&&id| !rm.iter().any(|&(r, _)| r == id)) {
+                        rm.iter().all(|&(_, v)| v) && d.add_learner(right, x).is_ok()
+                    } else if let Some(&(y, _)) = rm.iter().find(|&&(id, _)| !want.contains(&id) && id != me) {
+                        d.remove_member(right, y).is_ok()
+                    } else {
+                        false
+                    };
+                    if changed {
+                        self.log(format!("merge r{right} into r{left}: align replicas"));
+                        self.flush(l);
+                    }
+                    return retry(self, 1);
+                }
+                if d.freeze(right).is_ok() {
+                    self.log(format!("merge r{right} into r{left}: freeze"));
+                    self.flush(l);
+                    self.schedule(100_000, Ev::Merge { left, right, phase: 2, tries: 0 });
+                } else {
+                    retry(self, 1);
+                }
+            }
+            _ => {
+                let d = self.nodes[l].driver.as_mut().expect("leader has a driver");
+                if d.propose_merge(left, right).is_ok() {
+                    self.report.merges += 1;
+                    self.log(format!("merge r{right} into r{left}: merge"));
+                    self.flush(l);
+                } else if l != r {
+                    // The right range's lease moved off (a frozen range still elects
+                    // leaders): bring it back.
+                    let to = (l + 1) as NodeId;
+                    if self.nodes[r].driver.as_mut().is_some_and(|d| d.transfer_lease(right, to).is_ok()) {
+                        self.flush(r);
+                    }
+                    retry(self, 2);
+                } else {
+                    retry(self, 2);
+                }
+            }
+        }
+    }
+
     fn all_ranges(&self) -> Vec<RangeId> {
         let mut rs: Vec<RangeId> = self.nodes.iter().filter_map(|n| n.driver.as_ref()).flat_map(|d| d.ranges()).collect();
         rs.sort_unstable();
@@ -825,7 +941,7 @@ impl<'c> Sim<'c> {
         }
         let dir = self.nodes[node].dir.clone();
         let engine = StorageEngine::<DocumentRecord>::open(&dir, engine_config()).map_err(|e| self.fail(format!("n{} engine recovery: {e}", node + 1)))?;
-        let mut d = NodeDriver::new((node + 1) as NodeId, Arc::new(engine), NodeConfig { seed: self.seed ^ (node as u64 + 1) ^ self.now, incarnation: self.now, ..self.cfg.node.clone() });
+        let mut d = NodeDriver::new((node + 1) as NodeId, Arc::new(engine), NodeConfig { seed: self.seed ^ (node as u64 + 1) ^ self.now, incarnation: self.now, trace: std::env::var_os("STORINE_SIM_TRACE").is_some(), ..self.cfg.node.clone() });
         d.reopen_ranges().map_err(|e| self.fail(format!("n{} range recovery: {e}", node + 1)))?;
         self.nodes[node].driver = Some(d);
         self.log(format!("n{} restarted", node + 1));
@@ -836,6 +952,10 @@ impl<'c> Sim<'c> {
     fn converged(&self) -> bool {
         let drivers: Vec<&NodeDriver> = self.nodes.iter().filter_map(|n| n.driver.as_ref()).collect();
         if drivers.len() != self.nodes.len() {
+            return false;
+        }
+        // Allocators settled: nothing changed for 2 s (they do not oscillate).
+        if self.cfg.node.allocator.is_some() && drivers.iter().any(|d| self.now.saturating_sub(d.last_allocator_action()) < 2_000_000) {
             return false;
         }
         for r in self.all_ranges() {
@@ -864,7 +984,7 @@ impl<'c> Sim<'c> {
             let mut seen: Option<(NodeId, Option<i64>)> = None;
             for n in &self.nodes {
                 let Some(d) = &n.driver else { continue };
-                let hosts = d.ranges().into_iter().any(|r| d.replica(r).is_some_and(|x| x.span().contains_id(id)));
+                let hosts = d.ranges().into_iter().any(|r| d.replica(r).is_some_and(|x| !x.is_frozen() && x.span().contains_id(id)));
                 if !hosts {
                     continue;
                 }

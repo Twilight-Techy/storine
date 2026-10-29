@@ -1014,6 +1014,32 @@ This document defines the strict chronological execution order for building the 
     - lost `Init` messages and orphan learners (`Init` resent with each forced snapshot; orphans collected after 10 s);
     - removed replicas that never learned of their removal (`Gone`, sent by any replica whose committed configuration excludes the sender).
   - The simulator's leader-completeness check now only demands entries committed in earlier terms (a legitimately elected lower-term leader may lack a later-term commit).
+  - **Done (merges)**: two Raft commands.
+    - `Freeze` ends all writes to the right-hand range.
+    - `Merge` carries that range's final records, so every replica of the left range applies the same state, lagging ones included.
+    - A merge is proposed only by the node leading both ranges, with equal voters and every replica of the right range having applied everything (followers report their applied index).
+    - Absorbed replicas are retired at once, keeping their records. Replicas elsewhere are told `Gone(merged)`, also from a persisted tombstone.
+    - Tested by `ranges_merge_safely` (400 seeds).
+  - **Done (allocator)**: `dist/alloc.rs` is a pure, unit-tested planner. `NodeDriver` runs it on its leaseholders every interval, from store loads gossiped in the per-node-pair batches. It covers:
+    - repair (promote, replace dead replicas, up/down to the replication factor);
+    - count and bytes rebalancing: nodes take turns, nothing starts while any store reports a move in progress, and a move always relieves the store that motivated it;
+    - lease balancing;
+    - size and load splits (median key / median of sampled written keys);
+    - merges of small neighbours (lease co-location, replica alignment by the left range only, freeze, merge).
+    - `allocator_splits_merges_and_rebalances_safely` runs 5 nodes with no simulator-driven changes. Over 400 seeds it applied 4,587 splits and 7,158 merges; every seed stayed linearizable, settled (allocators idle for 2 s) and balanced.
+  - **Replica-safety fixes found on the way**. A node never holds two live replicas of one key:
+    - an `Init` overlapping a live or frozen local replica is refused;
+    - a snapshot install that would widen a span over another live replica is refused and restarted;
+    - leaders never send a snapshot older than the range's last split or merge.
+  - **Tombstones**: a destroyed replica persists the log position (term, index) of the configuration that removed it. An `Init` from an older position, e.g. a stale leader's uncommitted configuration, is refused. Re-creating it would revive a replica with no log and no votes, which could elect that stale leader.
+  - **Other fixes**:
+    - members re-added while their removal was pending kept losing their progress;
+    - a removed node's `Missing` now completes its removal (this was a message storm);
+    - a node that caught up past a split by snapshot never created the right-hand range: now `Missing` triggers `Init`;
+    - learners without a leader for 10 s probe their members;
+    - orphan learners are collected without deleting keys other local replicas own;
+    - WAL syncs before span changes (split, freeze).
+  - **Open**: descriptor publication to the meta range and range-cache routing in servers / SDKs (`dist/meta.rs` holds descriptors, the meta index and the cache).
 - [x] **TASK-139: Hybrid Logical Clocks & Uncertainty (`F-GEO-03`)** — HLC timestamps, maximum-offset enforcement with self-fencing, uncertainty-interval reads, optional commit-wait.
   - `dist/hlc.rs`:
     - `Timestamp (wall ns, logical)`, which sorts as 12 big-endian bytes;

@@ -24,8 +24,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use storage_types::testing::SweepRng;
-use storage_types::{Result, StorageError};
+use storage_types::{InlineId, Result, StorageError};
 
+use crate::dist::alloc::{self, Action, AllocatorConfig, LeftView, MemberView, NeighbourView, RangeView, StoreLoad, StoreView};
 use crate::dist::hlc::Timestamp;
 use crate::document::DocumentRecord;
 use crate::engine::{StorageEngine, WriteOp};
@@ -53,6 +54,12 @@ pub struct NodeConfig {
     /// Distinguishes this start of the node from earlier ones (e.g. the start time): a
     /// restart wakes every range that was quiescent on the old incarnation.
     pub incarnation: u64,
+    /// Every node of the cluster (they exchange batches, which carry store loads).
+    pub cluster: Vec<NodeId>,
+    /// Leaseholder queues: repair, rebalancing, splits and merges ([`crate::dist::alloc`]).
+    pub allocator: Option<AllocatorConfig>,
+    /// Print replica lifecycle and allocator decisions to stderr (debugging).
+    pub trace: bool,
 }
 
 impl Default for NodeConfig {
@@ -67,6 +74,9 @@ impl Default for NodeConfig {
             max_bytes_per_append: 1 << 20,
             seed: 1,
             incarnation: 0,
+            cluster: Vec::new(),
+            allocator: None,
+            trace: false,
         }
     }
 }
@@ -77,20 +87,31 @@ pub enum RaftMsg {
     Vote(RequestVoteReq),
     VoteResp { req: RequestVoteReq, resp: RequestVoteResp },
     Append { req: AppendEntriesReq, hb: u64 },
-    AppendResp { resp: AppendEntriesResp, req_term: u64, last_sent: u64, hb: u64 },
+    /// `applied`: the follower's applied index (a merge waits for every replica of the
+    /// absorbed range to have applied its freeze).
+    AppendResp { resp: AppendEntriesResp, req_term: u64, last_sent: u64, hb: u64, applied: u64 },
     Snap(InstallSnapshotReq),
     SnapResp { resp: InstallSnapshotResp, req_term: u64, last_included: u64 },
     /// The leader of `term` has nothing to send: stop the election timer while its node lives.
     Quiesce { term: u64, commit: u64 },
     /// Create this range here as a learner (a replica being added): its span and the
     /// configuration that includes it. A snapshot follows.
-    Init { span: crate::raft::KeySpan, members: Vec<(NodeId, bool)> },
+    /// `config`: the log position of the sender's configuration (a replica destroyed by a
+    /// later configuration is not re-created, see [`crate::raft::RaftNode::destroy_with_tombstone`]).
+    Init { span: crate::raft::KeySpan, members: Vec<(NodeId, bool)>, config: crate::raft::LogPos },
     /// Leadership transfer: campaign now, without pre-vote (the leader asked).
     TimeoutNow { term: u64 },
     /// From a leader whose committed configuration (at log index `config_index`) does not
     /// include the receiver: its replica is gone (unless it knows a newer configuration).
+    /// [`GONE_MERGED`]: the range was merged away.
     Gone { config_index: u64 },
+    /// The receiver of a leader's message hosts no replica of the range (it caught up past a
+    /// split by snapshot, so never created the right-hand range): a member is created anew.
+    Missing,
 }
+
+/// `Gone` for a range absorbed by a merge.
+pub const GONE_MERGED: u64 = u64::MAX;
 
 /// Everything one node sends another in one go.
 #[derive(Clone, Debug, Default)]
@@ -100,6 +121,8 @@ pub struct Batch {
     pub incarnation: u64,
     /// The sender's clock (hybrid logical time), for the receiver's [`crate::dist::hlc::Hlc`].
     pub ts: Timestamp,
+    /// The sender's store load (allocator gossip).
+    pub load: StoreLoad,
     pub msgs: Vec<(RangeId, RaftMsg)>,
 }
 
@@ -113,6 +136,8 @@ struct Progress {
     force_snapshot: bool,
     /// The snapshot must be at or after this index (the configuration that added the replica).
     snapshot_min: u64,
+    /// The follower's applied index, as last reported.
+    applied: u64,
 }
 
 #[derive(Debug)]
@@ -160,6 +185,11 @@ struct ReplicaState {
     /// Last time a leader of the current term was heard from (pre-vote check, thesis §9.6).
     leader_contact: u64,
     reads: Vec<PendingRead>,
+    /// Leader: writes proposed since the last allocator round, and a sample of their keys.
+    writes: u64,
+    written: Vec<Vec<u8>>,
+    /// Leader: the store a rebalance of this range relieves (removed once the new replica votes).
+    planned_removal: Option<NodeId>,
 }
 
 /// Counters for tests and metrics.
@@ -170,6 +200,8 @@ pub struct NodeStats {
     pub elections: u64,
     pub quiesced: u64,
     pub splits: u64,
+    pub merges: u64,
+    pub allocator_actions: u64,
     pub replicas_added: u64,
     pub replicas_removed: u64,
 }
@@ -194,12 +226,31 @@ pub struct NodeDriver {
     ready_reads: Vec<ReadToken>,
     stats: NodeStats,
     clock: Timestamp,
+    /// Ranges merged away here: a replica of one that still campaigns is told it is gone.
+    merged: BTreeSet<RangeId>,
+    /// Every hosted replica (weak), for the snapshot overlap check.
+    registry: Registry,
+    /// Gossiped store loads.
+    loads: BTreeMap<NodeId, StoreLoad>,
+    /// This store's load, refreshed every allocator round.
+    load: StoreLoad,
+    last_alloc: u64,
+    /// When the allocator last changed something.
+    last_action: u64,
 }
 
 impl core::fmt::Debug for NodeDriver {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("NodeDriver").field("id", &self.id).field("ranges", &self.replicas.len()).finish()
     }
+}
+
+/// Every hosted replica of a node (weak), shared with the replicas' snapshot overlap checks.
+type Registry = Arc<std::sync::Mutex<Vec<(RangeId, std::sync::Weak<Replica>)>>>;
+
+/// No log and no snapshot (with no `Init` either, a replica bootstrapped empty replays the log).
+fn holds_nothing(raft: &Replica) -> bool {
+    raft.snapshot_index() == 0 && raft.last_log_index() == 0
 }
 
 fn voters(raft: &Replica) -> Vec<NodeId> {
@@ -209,6 +260,7 @@ fn voters(raft: &Replica) -> Vec<NodeId> {
 impl NodeDriver {
     pub fn new(id: NodeId, engine: Arc<StorageEngine<DocumentRecord>>, cfg: NodeConfig) -> Self {
         let rng = SweepRng::new(cfg.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ u64::from(id) | 1);
+        let peers = cfg.cluster.iter().copied().filter(|&n| n != id).collect();
         Self {
             id,
             engine,
@@ -220,11 +272,17 @@ impl NodeDriver {
             heard: BTreeMap::new(),
             incarnations: BTreeMap::new(),
             sent: BTreeMap::new(),
-            peers: BTreeSet::new(),
+            peers,
             next_read: 0,
             ready_reads: Vec::new(),
             stats: NodeStats::default(),
             clock: Timestamp::ZERO,
+            merged: BTreeSet::new(),
+            registry: Arc::default(),
+            loads: BTreeMap::new(),
+            load: StoreLoad::default(),
+            last_alloc: 0,
+            last_action: 0,
         }
     }
 
@@ -260,12 +318,30 @@ impl NodeDriver {
         let ids = RaftNode::persisted_groups(&self.engine)?;
         for &r in &ids {
             let raft = Arc::new(RaftNode::open_group(self.id, Arc::clone(&self.engine), Some(r), KeySpan::all())?);
+            let orphan = holds_nothing(&raft) && !raft.membership().is_voter(self.id);
             self.add_replica(r, raft);
+            if orphan {
+                // A learner that never got its snapshot: collected unless one arrives.
+                let now = self.now;
+                if let Some(x) = self.replicas.get_mut(&r) {
+                    x.uninitialized_since = Some(now);
+                }
+            }
         }
         Ok(ids)
     }
 
     fn add_replica(&mut self, range: RangeId, raft: Arc<Replica>) {
+        // Snapshots must not make this replica overlap another live one here.
+        let registry = Arc::clone(&self.registry);
+        raft.set_overlap_guard(Arc::new(move |group, span| {
+            registry.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|(id, w)| *id != group && w.upgrade().is_some_and(|o| !o.is_frozen() && o.span().overlaps(span)))
+        }));
+        {
+            let mut reg = self.registry.lock().unwrap_or_else(|p| p.into_inner());
+            reg.retain(|(id, w)| *id != range && w.strong_count() > 0);
+            reg.push((range, Arc::downgrade(&raft)));
+        }
         for v in voters(&raft) {
             if v != self.id {
                 self.peers.insert(v);
@@ -290,6 +366,9 @@ impl NodeDriver {
                 leader_quiet: false,
                 leader_contact: 0,
                 reads: Vec::new(),
+                writes: 0,
+                written: Vec::new(),
+                planned_removal: None,
             },
         );
     }
@@ -363,7 +442,7 @@ impl NodeDriver {
         }
         let out: Vec<(NodeId, Batch)> = std::mem::take(&mut self.outbox)
             .into_iter()
-            .map(|(to, msgs)| (to, Batch { from: self.id, incarnation: self.cfg.incarnation, ts: self.clock, msgs }))
+            .map(|(to, msgs)| (to, Batch { from: self.id, incarnation: self.cfg.incarnation, ts: self.clock, load: self.load, msgs }))
             .collect();
         for (to, b) in &out {
             self.sent.insert(*to, now);
@@ -381,16 +460,198 @@ impl NodeDriver {
         for range in ranges {
             self.tick_range(range)?;
         }
+        if let Some(cfg) = self.cfg.allocator.clone() {
+            if self.now.saturating_sub(self.last_alloc) >= cfg.interval_us {
+                self.last_alloc = self.now;
+                self.allocate(&cfg)?;
+            }
+        }
         self.after_progress()
+    }
+
+    /// One allocator round over the ranges this node leads ([`crate::dist::alloc`]).
+    fn allocate(&mut self, cfg: &AllocatorConfig) -> Result<()> {
+        let elapsed_us = cfg.interval_us.max(1);
+        // Keys per hosted range, in one pass over the engine.
+        let mut spans: Vec<(Vec<u8>, RangeId)> = self.replicas.iter().filter(|(_, r)| !r.raft.is_frozen()).map(|(&id, r)| (r.raft.span().start, id)).collect();
+        spans.sort();
+        let mut keys: BTreeMap<RangeId, Vec<InlineId>> = BTreeMap::new();
+        for id in self.engine.live_ids() {
+            let at = spans.partition_point(|(start, _)| start.as_slice() <= id.as_bytes());
+            if let Some(&(_, range)) = at.checked_sub(1).and_then(|i| spans.get(i)) {
+                if self.replicas[&range].raft.span().contains_id(id) {
+                    keys.entry(range).or_default().push(id);
+                }
+            }
+        }
+        let leases = self.replicas.values().filter(|r| r.raft.is_leader() && r.lead_term == r.raft.current_term()).count() as u32;
+        let stats = self.engine.stats();
+        let moving = self.moving_ranges();
+        self.load = StoreLoad { replicas: self.replicas.len() as u32, leases, bytes: (stats.mapped_bytes + stats.hot_dirty_bytes) as u64, moving };
+        let now = self.now;
+        let mut stores: BTreeMap<NodeId, StoreView> = BTreeMap::new();
+        stores.insert(self.id, StoreView { load: self.load, live: true });
+        for (&n, &load) in &self.loads {
+            let live = self.heard.get(&n).is_some_and(|&t| now.saturating_sub(t) < cfg.dead_after_us);
+            stores.insert(n, StoreView { load, live });
+        }
+        let led: Vec<RangeId> = self.replicas.iter().filter(|(_, r)| r.raft.is_leader() && r.lead_term == r.raft.current_term()).map(|(&id, _)| id).collect();
+        // Replica rebalancing takes turns: one live node per interval.
+        let turn = {
+            let live: Vec<NodeId> = stores.iter().filter(|(_, s)| s.live).map(|(&n, _)| n).collect();
+            let slot = (self.now / cfg.interval_us.max(1)) as usize % live.len().max(1);
+            live.get(slot) == Some(&self.id) && stores.values().all(|s| !s.live || s.load.moving == 0)
+        };
+        let mut rebalanced = !turn;
+        for range in led {
+            let Some(mut view) = self.range_view(range, &keys, elapsed_us) else { continue };
+            view.rebalanced_this_round = rebalanced;
+            if let Some(r) = self.replicas.get_mut(&range) {
+                r.writes = 0;
+            }
+            let Some(action) = alloc::plan(cfg, &view, &stores) else { continue };
+            self.stats.allocator_actions += 1;
+            self.last_action = self.now;
+            self.trace(|| format!("r{range} {:?} {:?}: {action:?}", view.members.iter().map(|m| (m.node, m.voter)).collect::<Vec<_>>(), view.keys));
+            let _ = match action {
+                Action::AddLearner(n) => self.add_learner(range, n).map(drop),
+                Action::Rebalance { add, relieve } => {
+                    rebalanced = true;
+                    // Later plans this round see the move (no herd onto one store).
+                    if let Some(s) = stores.get_mut(&add) {
+                        s.load.replicas += 1;
+                    }
+                    if let Some(s) = stores.get_mut(&relieve) {
+                        s.load.replicas = s.load.replicas.saturating_sub(1);
+                    }
+                    let res = self.add_learner(range, add).map(drop);
+                    if res.is_ok() {
+                        if let Some(r) = self.replicas.get_mut(&range) {
+                            r.planned_removal = Some(relieve);
+                        }
+                    }
+                    res
+                }
+                Action::Promote(n) => self.promote(range, n).map(drop),
+                Action::Remove(n) => {
+                    if let Some(r) = self.replicas.get_mut(&range) {
+                        if r.planned_removal == Some(n) {
+                            r.planned_removal = None;
+                        }
+                    }
+                    self.remove_member(range, n).map(drop)
+                }
+                Action::TransferLease(n) | Action::LeaseToLeft(n) => self.transfer_lease(range, n),
+                Action::Split(at) => {
+                    let right = self.new_range_id(range);
+                    self.propose_split(range, at, right).map(drop)
+                }
+                Action::RightAddLearner(r, n) => self.add_learner(r, n).map(drop),
+                Action::RightPromote(r, n) => self.promote(r, n).map(drop),
+                Action::RightRemove(r, n) => self.remove_member(r, n).map(drop),
+                Action::Freeze(r) => self.freeze(r).map(drop),
+                Action::Merge(r) => self.propose_merge(range, r).map(drop),
+            };
+        }
+        // Gossip a move started this round straight away (other nodes' turns wait for it).
+        self.load.moving = self.moving_ranges();
+        Ok(())
+    }
+
+    /// Ranges led here with a replica change under way (learners, a planned removal, an
+    /// uncommitted configuration).
+    fn moving_ranges(&self) -> u32 {
+        self.replicas
+            .values()
+            .filter(|r| r.raft.is_leader() && r.lead_term == r.raft.current_term())
+            .filter(|r| r.planned_removal.is_some() || !r.removing.is_empty() || !r.raft.membership_state().1 || r.raft.membership().members().iter().any(|m| !m.voter))
+            .count() as u32
+    }
+
+    /// When the allocator last acted (0: never).
+    pub fn last_allocator_action(&self) -> u64 {
+        self.last_action
+    }
+
+    /// A fresh range id for a split of `range` proposed now (ranges never reuse ids: the
+    /// pair (range, next log index) is unique, and only one proposal per index commits).
+    fn new_range_id(&self, range: RangeId) -> RangeId {
+        let index = self.replicas.get(&range).map_or(0, |r| r.raft.last_log_index() + 1);
+        let mut h = range.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ index.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+        h ^= h >> 29;
+        (h | (1 << 62)) & !(1 << 63)
+    }
+
+    fn member_views(&self, range: RangeId) -> Vec<MemberView> {
+        let Some(r) = self.replicas.get(&range) else { return Vec::new() };
+        let last = r.raft.last_log_index();
+        self.members_of(range).into_iter().map(|(node, voter)| MemberView { node, voter, caught_up: node == self.id || r.progress.get(&node).is_some_and(|p| p.matched >= last) }).collect()
+    }
+
+    fn range_view(&self, range: RangeId, keys: &BTreeMap<RangeId, Vec<InlineId>>, elapsed_us: u64) -> Option<RangeView> {
+        let r = self.replicas.get(&range)?;
+        let span = r.raft.span();
+        let ids = keys.get(&range).map_or(&[][..], Vec::as_slice);
+        let interior = |k: &[u8]| span.split_at(k).is_some() && !crate::dist::meta::splits_meta(k);
+        let size_split_key = {
+            let mut sorted: Vec<&[u8]> = ids.iter().map(|i| i.as_bytes()).collect();
+            sorted.sort_unstable();
+            sorted.get(sorted.len() / 2).map(|k| k.to_vec()).filter(|k| interior(k))
+        };
+        let load_split_key = {
+            let mut w = r.written.clone();
+            w.sort_unstable();
+            w.get(w.len() / 2).cloned().filter(|k| interior(k))
+        };
+        let neighbour = |pred: &dyn Fn(&crate::raft::KeySpan) -> bool| self.replicas.iter().find(|(&id, x)| id != range && pred(&x.raft.span())).map(|(&id, _)| id);
+        let right = span.end.as_ref().and_then(|end| neighbour(&|s| s.start == *end)).map(|id| {
+            let x = &self.replicas[&id];
+            NeighbourView {
+                range: id,
+                keys: keys.get(&id).map_or(0, Vec::len),
+                led_here: x.raft.is_leader() && x.lead_term == x.raft.current_term(),
+                frozen: x.raft.is_frozen(),
+                members: self.member_views(id),
+                merge_ready: self.merge_ready(range, id),
+            }
+        });
+        let left = (!span.start.is_empty()).then(|| neighbour(&|s| s.end.as_deref() == Some(span.start.as_slice()))).flatten().map(|id| LeftView { keys: keys.get(&id).map_or(0, Vec::len), leader: self.leader_of(id) });
+        let committed = r.raft.membership_state().1;
+        Some(RangeView {
+            range,
+            me: self.id,
+            members: self.member_views(range),
+            config_settled: committed && r.removing.is_empty(),
+            frozen: r.raft.is_frozen(),
+            keys: ids.len(),
+            writes_per_sec: r.writes.saturating_mul(1_000_000) / elapsed_us,
+            size_split_key,
+            load_split_key,
+            right,
+            left,
+            planned_removal: r.planned_removal,
+            rebalanced_this_round: false,
+        })
     }
 
     fn tick_range(&mut self, range: RangeId) -> Result<()> {
         let now = self.now;
         // An Init-created replica that never got its snapshot is an orphan (the move it was
         // for was lost): remove it; a live move re-creates it.
+        if let Some(r) = self.replicas.get_mut(&range) {
+            if r.uninitialized_since.is_none() && holds_nothing(&r.raft) && !r.raft.membership().is_voter(self.id) {
+                r.uninitialized_since = Some(now); // however it was created
+            }
+        }
         if let Some(r) = self.replicas.get(&range) {
-            if r.uninitialized_since.is_some_and(|t| now.saturating_sub(t) > 10_000_000) && r.raft.snapshot_index() == 0 && r.raft.last_log_index() == 0 {
-                self.destroy_replica(range)?;
+            // Only a learner: it never voted, so it may be re-created without a tombstone (an
+            // orphan that may have voted stays until it learns its fate).
+            if r.uninitialized_since.is_some_and(|t| now.saturating_sub(t) > 10_000_000) && r.raft.snapshot_index() == 0 && r.raft.last_log_index() == 0 && !r.raft.membership().is_voter(self.id) {
+                if let Some(r) = self.replicas.remove(&range) {
+                    let others: Vec<crate::raft::KeySpan> = self.replicas.values().map(|o| o.raft.span()).collect();
+                    r.raft.destroy_with_tombstone(|id| others.iter().any(|sp| sp.contains_id(id)), (0, 0))?;
+                    self.stats.replicas_removed += 1;
+                }
                 return Ok(());
             }
         }
@@ -438,7 +699,8 @@ impl NodeDriver {
             let m = raft.membership();
             if m.is_voter(self.id) {
                 self.campaign(range)?;
-            } else if !m.is_empty() && !m.contains(self.id) {
+            } else if !m.is_empty() && (!m.contains(self.id) || now.saturating_sub(r.leader_contact) > 10_000_000) {
+                // (A learner long without a leader asks too: its range may be gone.)
                 // Removed, but not sure the removal committed: ask the members (they answer
                 // `Gone` once it has).
                 self.reset_election(range);
@@ -512,7 +774,7 @@ impl NodeDriver {
         r.progress = peers
             .iter()
             .filter(|&&p| p != me)
-            .map(|&p| (p, Progress { next, matched: 0, snapshot_offset: None, force_snapshot: learners.contains(&p), snapshot_min: if learners.contains(&p) { min } else { 0 } }))
+            .map(|&p| (p, Progress { next, matched: 0, snapshot_offset: None, force_snapshot: learners.contains(&p), snapshot_min: if learners.contains(&p) { min } else { 0 }, applied: 0 }))
             .collect();
         r.acks.clear();
         r.leader_quiet = false;
@@ -534,7 +796,7 @@ impl NodeDriver {
         if !raft.is_leader() || raft.current_term() != r.lead_term {
             return;
         }
-        let pr = r.progress.get(&peer).copied().unwrap_or(Progress { next: raft.last_log_index() + 1, matched: 0, snapshot_offset: None, force_snapshot: false, snapshot_min: 0 });
+        let pr = r.progress.get(&peer).copied().unwrap_or(Progress { next: raft.last_log_index() + 1, matched: 0, snapshot_offset: None, force_snapshot: false, snapshot_min: 0, applied: 0 });
         if pr.force_snapshot && raft.last_applied() < pr.snapshot_min {
             return; // the new replica's snapshot must include its own addition: wait for it
         }
@@ -545,7 +807,7 @@ impl NodeDriver {
                 if pr.force_snapshot && offset == 0 {
                     // A new replica may not exist yet (lost Init): (re)create it first.
                     let members = raft.membership().members().iter().map(|m| (m.id, m.voter)).collect();
-                    self.push(peer, range, RaftMsg::Init { span: raft.span(), members });
+                    self.push(peer, range, RaftMsg::Init { span: raft.span(), members, config: raft.config_position() });
                 }
                 self.push(peer, range, RaftMsg::Snap(req));
             }
@@ -583,6 +845,7 @@ impl NodeDriver {
     pub fn step(&mut self, batch: Batch, now: u64) -> Result<()> {
         self.now = self.now.max(now);
         self.heard.insert(batch.from, self.now);
+        self.loads.insert(batch.from, batch.load);
         if self.incarnations.insert(batch.from, batch.incarnation).is_some_and(|old| old != batch.incarnation) {
             // The node restarted: it leads nothing now, so ranges quiescent on it wake up.
             for r in self.replicas.values_mut() {
@@ -593,14 +856,21 @@ impl NodeDriver {
             }
         }
         for (range, msg) in batch.msgs {
-            if let RaftMsg::Init { span, members } = &msg {
+            if let RaftMsg::Init { span, members, config } = &msg {
                 if !self.replicas.contains_key(&range) {
-                    self.create_learner(range, span.clone(), members)?;
+                    self.create_learner(range, span.clone(), members, *config)?;
                 }
                 continue;
             }
             if self.replicas.contains_key(&range) {
                 self.step_one(batch.from, range, msg)?;
+                self.retire_merged()?;
+            } else if matches!(msg, RaftMsg::Vote(_) | RaftMsg::Append { .. } | RaftMsg::Quiesce { .. } | RaftMsg::Snap(_))
+                && (self.merged.contains(&range) || (matches!(msg, RaftMsg::Vote(_)) && Replica::tombstone_of(&self.engine, range) == crate::raft::TOMBSTONE_FOREVER))
+            {
+                self.push(batch.from, range, RaftMsg::Gone { config_index: GONE_MERGED });
+            } else if matches!(msg, RaftMsg::Append { .. } | RaftMsg::Quiesce { .. }) {
+                self.push(batch.from, range, RaftMsg::Missing);
             }
         }
         self.after_progress()
@@ -662,9 +932,10 @@ impl NodeDriver {
                     }
                     self.reset_election(range);
                 }
-                self.push(from, range, RaftMsg::AppendResp { resp, req_term, last_sent, hb });
+                let applied = raft.last_applied();
+                self.push(from, range, RaftMsg::AppendResp { resp, req_term, last_sent, hb, applied });
             }
-            RaftMsg::AppendResp { resp, req_term, last_sent, hb } => {
+            RaftMsg::AppendResp { resp, req_term, last_sent, hb, applied } => {
                 if resp.term > raft.current_term() {
                     raft.observe_term(resp.term)?;
                     return Ok(());
@@ -676,6 +947,7 @@ impl NodeDriver {
                 let a = r.acks.entry(from).or_insert(0);
                 *a = (*a).max(hb);
                 let Some(p) = r.progress.get_mut(&from) else { return Ok(()) };
+                p.applied = p.applied.max(applied);
                 if resp.success {
                     p.matched = p.matched.max(resp.match_index.min(last_sent));
                     p.next = p.next.max(p.matched + 1);
@@ -730,8 +1002,41 @@ impl NodeDriver {
                 }
             }
             RaftMsg::Init { .. } => {}
+            RaftMsg::Missing => {
+                // A member being removed that already dropped its replica: removal done.
+                if let Some(r) = self.replicas.get_mut(&range) {
+                    if r.removing.iter().any(|&(n, _)| n == from) {
+                        r.removing.retain(|&(n, _)| n != from);
+                        if !raft.membership().contains(from) {
+                            r.progress.remove(&from);
+                        }
+                        return Ok(());
+                    }
+                }
+                // A member without a replica: (re)create it from a snapshot, like a new one.
+                if raft.is_leader() && raft.membership().contains(from) {
+                    if let Some(p) = self.replicas.get_mut(&range).and_then(|r| r.progress.get_mut(&from)) {
+                        if !p.force_snapshot {
+                            p.force_snapshot = true;
+                            p.snapshot_offset = None;
+                            p.snapshot_min = 0;
+                            self.wake(range);
+                            self.replicate(range, from);
+                        }
+                    }
+                }
+            }
             RaftMsg::Gone { config_index } => {
-                if raft.config_index() <= config_index && !raft.is_leader() {
+                // `GONE_MERGED` comes only from a node that applied the merge absorbing this
+                // range: every replica of it is obsolete, a stale leader's included.
+                if config_index == GONE_MERGED {
+                    self.merged.insert(range);
+                    if let Some(r) = self.replicas.remove(&range) {
+                        let others: Vec<crate::raft::KeySpan> = self.replicas.values().map(|o| o.raft.span()).collect();
+                        r.raft.destroy_with_tombstone(|id| others.iter().any(|sp| sp.contains_id(id)), crate::raft::TOMBSTONE_FOREVER)?;
+                        self.stats.replicas_removed += 1;
+                    }
+                } else if raft.config_index() <= config_index && !raft.is_leader() {
                     self.destroy_replica(range)?;
                 }
             }
@@ -811,7 +1116,7 @@ impl NodeDriver {
     /// Proposes a write batch on the leaseholder of `range`; returns its log index (wait for it
     /// with the replica's `wait_applied` once [`Self::applied`] reaches it).
     pub fn propose(&mut self, range: RangeId, ops: &[WriteOp<DocumentRecord>], now_ns: u64) -> Result<u64> {
-        let r = self.replicas.get(&range).ok_or_else(|| StorageError::invalid_key("range not hosted on this node"))?;
+        let r = self.live(range)?;
         if !(r.raft.is_leader() && r.lead_term == r.raft.current_term()) {
             return Err(StorageError::NotLeader { leader: r.raft.leader_id().map(u64::from) });
         }
@@ -820,6 +1125,16 @@ impl NodeDriver {
             return Err(StorageError::invalid_key("key outside this range: re-route"));
         }
         let index = r.raft.propose_ops_at(ops, now_ns)?;
+        if let Some(r) = self.replicas.get_mut(&range) {
+            r.writes += 1;
+            // A small sample of recently written keys (load-based split points).
+            let slot = if r.written.len() < 32 { None } else { Some((r.writes as usize).wrapping_mul(0x9E37) % 32) };
+            let key = ops[0].id.as_bytes().to_vec();
+            match slot {
+                None => r.written.push(key),
+                Some(i) => r.written[i] = key,
+            }
+        }
         self.wake(range);
         self.broadcast(range);
         self.advance_commit(range)?;
@@ -828,7 +1143,10 @@ impl NodeDriver {
 
     /// Proposes splitting `range` at `at` into a new range `right` (same replicas).
     pub fn propose_split(&mut self, range: RangeId, at: Vec<u8>, right: RangeId) -> Result<u64> {
-        let r = self.replicas.get(&range).ok_or_else(|| StorageError::invalid_key("range not hosted on this node"))?;
+        let r = self.live(range)?;
+        if crate::dist::meta::splits_meta(&at) {
+            return Err(StorageError::invalid_key("the meta range never splits inside the meta prefix"));
+        }
         if !r.raft.is_leader() {
             return Err(StorageError::NotLeader { leader: r.raft.leader_id().map(u64::from) });
         }
@@ -842,8 +1160,111 @@ impl NodeDriver {
         Ok(index)
     }
 
+    fn trace(&self, line: impl FnOnce() -> String) {
+        if self.cfg.trace {
+            eprintln!("trace t={} n{}: {}", self.now, self.id, line());
+        }
+    }
+
+    /// A hosted replica that is not frozen for a merge.
+    fn live(&self, range: RangeId) -> Result<&ReplicaState> {
+        let r = self.replicas.get(&range).ok_or_else(|| StorageError::invalid_key("range not hosted on this node"))?;
+        if r.raft.is_frozen() {
+            return Err(StorageError::invalid_key("range frozen for a merge: re-route"));
+        }
+        Ok(r)
+    }
+
+    /// Merge step 1 on the leaseholder of the right-hand range: no write applies after this.
+    pub fn freeze(&mut self, range: RangeId) -> Result<u64> {
+        let r = self.live(range)?;
+        if !(r.raft.is_leader() && r.lead_term == r.raft.current_term()) {
+            return Err(StorageError::NotLeader { leader: r.raft.leader_id().map(u64::from) });
+        }
+        let index = r.raft.propose(crate::raft::RaftCommand::Freeze)?;
+        self.wake(range);
+        self.broadcast(range);
+        self.advance_commit(range)?;
+        Ok(index)
+    }
+
+    /// Whether `left` can absorb `right` now: this node leads both; `right` is its frozen
+    /// right-hand neighbour and every replica of it has applied everything (so none can
+    /// still apply an older write); both have the same voters and no learners.
+    pub fn merge_ready(&self, left: RangeId, right: RangeId) -> bool {
+        let (Some(l), Some(r)) = (self.replicas.get(&left), self.replicas.get(&right)) else { return false };
+        let leads = |x: &ReplicaState| x.raft.is_leader() && x.lead_term == x.raft.current_term();
+        if !leads(l) || !leads(r) || !r.raft.is_frozen() || l.raft.is_frozen() || l.raft.span().end.as_deref() != Some(r.raft.span().start.as_slice()) {
+            return false;
+        }
+        let mut lm = self.members_of(left);
+        let mut rm = self.members_of(right);
+        lm.sort_unstable();
+        rm.sort_unstable();
+        if lm != rm || lm.iter().any(|&(_, v)| !v) || !l.raft.membership_state().1 || !r.raft.membership_state().1 {
+            return false;
+        }
+        let done = r.raft.commit_index();
+        r.raft.last_applied() >= done && lm.iter().all(|&(id, _)| id == self.id || r.progress.get(&id).is_some_and(|p| p.applied >= done))
+    }
+
+    /// Merge step 2: proposes that `left` absorbs `right` (see [`Self::merge_ready`]).
+    pub fn propose_merge(&mut self, left: RangeId, right: RangeId) -> Result<u64> {
+        if !self.merge_ready(left, right) {
+            return Err(StorageError::invalid_value("ranges not ready to merge"));
+        }
+        let cmd = self.replicas[&left].raft.merge_command(&self.replicas[&right].raft)?;
+        let index = self.replicas[&left].raft.propose(cmd)?;
+        self.wake(left);
+        self.broadcast(left);
+        self.advance_commit(left)?;
+        Ok(index)
+    }
+
+    /// Retires replicas absorbed by merges applied here. Run straight after every message, so
+    /// no absorbed replica applies anything once its keys belong to the merged range.
+    fn retire_merged(&mut self) -> Result<()> {
+        let mut events = Vec::new();
+        for (&left, r) in &self.replicas {
+            for ev in r.raft.take_merges() {
+                events.push((left, r.raft.is_leader(), ev));
+            }
+        }
+        for (left, leading, ev) in events {
+            self.stats.merges += 1;
+            self.trace(|| format!("merged r{} into r{left}", ev.right));
+            self.merged.insert(ev.right);
+            let left_members: Vec<NodeId> = self.members_of(left).into_iter().map(|(id, _)| id).collect();
+            if self.replicas.contains_key(&ev.right) {
+                // Its keys belong to the merged range's state now (even if that range split
+                // again in the same batch of entries): keep them all.
+                self.retire_replica(ev.right)?;
+            }
+            if leading {
+                for &(id, _) in &ev.members {
+                    if id != self.id && !left_members.contains(&id) {
+                        self.push(id, ev.right, RaftMsg::Gone { config_index: GONE_MERGED });
+                    }
+                }
+            }
+        }
+        // (A frozen replica left behind on a node that learned the merge by snapshot is told
+        // `Gone` by the merged range's replicas when it campaigns.)
+        Ok(())
+    }
+
+    /// Removes a replica's group files but none of its records (another local range owns them).
+    fn retire_replica(&mut self, range: RangeId) -> Result<()> {
+        if let Some(r) = self.replicas.remove(&range) {
+            r.raft.destroy_with_tombstone(|_| true, crate::raft::TOMBSTONE_FOREVER)?;
+            self.stats.replicas_removed += 1;
+        }
+        Ok(())
+    }
+
     /// Removes a replica, deleting its records except those another local replica holds.
     fn destroy_replica(&mut self, range: RangeId) -> Result<()> {
+        self.trace(|| format!("destroy r{range}"));
         if let Some(r) = self.replicas.remove(&range) {
             let others: Vec<crate::raft::KeySpan> = self.replicas.values().map(|o| o.raft.span()).collect();
             r.raft.destroy_keeping(|id| others.iter().any(|sp| sp.contains_id(id)))?;
@@ -852,7 +1273,20 @@ impl NodeDriver {
         Ok(())
     }
 
-    fn create_learner(&mut self, range: RangeId, span: crate::raft::KeySpan, members: &[(NodeId, bool)]) -> Result<()> {
+    fn create_learner(&mut self, range: RangeId, span: crate::raft::KeySpan, members: &[(NodeId, bool)], config: crate::raft::LogPos) -> Result<()> {
+        self.trace(|| format!("init r{range} {members:?} at {config:?}"));
+        if Replica::tombstone_of(&self.engine, range) >= config {
+            return Ok(()); // destroyed here by a configuration at least as new: stale request
+        }
+        // A live local replica still holds some of these keys (it has not caught up with the
+        // split that made this range): creating this one now would let that replica's log
+        // replay overwrite it. The leader retries once that one has caught up.
+        // (A replica created by an earlier `Init` that never got its snapshot does not count:
+        // it starts from a snapshot, never from replaying the log. A frozen one does: the merge
+        // still to be applied here rewrites its keys with their frozen values.)
+        if self.replicas.values().any(|r| r.uninitialized_since.is_none() && r.raft.span().overlaps(&span)) {
+            return Ok(());
+        }
         let raft = Arc::new(RaftNode::open_group(self.id, Arc::clone(&self.engine), Some(range), span)?);
         if raft.membership().is_empty() {
             let m = Membership::new(members.iter().map(|&(id, voter)| crate::raft::Member { id, addr: String::new(), voter }).collect())?;
@@ -873,7 +1307,7 @@ impl NodeDriver {
     }
 
     fn propose_config(&mut self, range: RangeId, next: Vec<(NodeId, bool)>) -> Result<u64> {
-        let r = self.replicas.get(&range).ok_or_else(|| StorageError::invalid_key("range not hosted on this node"))?;
+        let r = self.live(range)?;
         if !(r.raft.is_leader() && r.lead_term == r.raft.current_term()) {
             return Err(StorageError::NotLeader { leader: r.raft.leader_id().map(u64::from) });
         }
@@ -883,8 +1317,10 @@ impl NodeDriver {
             if id != self.id {
                 self.peers.insert(id);
                 if let Some(r) = self.replicas.get_mut(&range) {
+                    // Re-added before its earlier removal finished: no longer being removed.
+                    r.removing.retain(|&(n, _)| n != id);
                     let next_index = r.raft.last_log_index();
-                    r.progress.entry(id).or_insert(Progress { next: next_index, matched: 0, snapshot_offset: None, force_snapshot: false, snapshot_min: 0 });
+                    r.progress.entry(id).or_insert(Progress { next: next_index, matched: 0, snapshot_offset: None, force_snapshot: false, snapshot_min: 0, applied: 0 });
                 }
             }
         }
@@ -909,7 +1345,8 @@ impl NodeDriver {
             p.snapshot_min = index;
         }
         let span = self.replicas.get(&range).map(|r| r.raft.span()).unwrap_or_default();
-        self.push(node, range, RaftMsg::Init { span, members: next });
+        let config = self.replicas.get(&range).map_or((0, index), |r| (r.raft.current_term(), index));
+        self.push(node, range, RaftMsg::Init { span, members: next, config });
         Ok(index)
     }
 
@@ -950,6 +1387,7 @@ impl NodeDriver {
 
     /// Starts a linearizable read on the leaseholder of `range`.
     pub fn read_index(&mut self, range: RangeId) -> Result<ReadToken> {
+        self.live(range)?;
         let r = self.replicas.get_mut(&range).ok_or_else(|| StorageError::invalid_key("range not hosted on this node"))?;
         let raft = Arc::clone(&r.raft);
         if !(raft.is_leader() && r.lead_term == raft.current_term()) {
@@ -980,6 +1418,7 @@ impl NodeDriver {
 
     /// Finishes reads and starts the right-hand groups of applied splits.
     fn after_progress(&mut self) -> Result<()> {
+        self.retire_merged()?;
         let ranges: Vec<RangeId> = self.replicas.keys().copied().collect();
         let mut splits = Vec::new();
         for range in ranges {
@@ -1029,8 +1468,16 @@ impl NodeDriver {
                 }
             }
             r.removing.retain(|(n, _)| !done.contains(n));
+            let m = r.raft.membership();
             for n in &done {
-                r.progress.remove(n);
+                // Re-added since (by another leader): still a member, keep replicating.
+                if !m.contains(*n) {
+                    r.progress.remove(n);
+                }
+            }
+            // Retried at heartbeat pace, not after every message.
+            if now.saturating_sub(r.last_heartbeat) < self.cfg.heartbeat_us && r.last_heartbeat != now {
+                continue;
             }
             for n in pending {
                 self.replicate(range, n);
@@ -1050,10 +1497,11 @@ impl NodeDriver {
             self.destroy_replica(range)?;
         }
         for ev in splits {
-            if self.replicas.contains_key(&ev.right) {
+            if self.replicas.contains_key(&ev.right) || Replica::tombstone_of(&self.engine, ev.right) > (0, 0) {
                 continue;
             }
             self.stats.splits += 1;
+            self.trace(|| format!("split -> r{} {:?}", ev.right, ev.right_span));
             let raft = Arc::new(RaftNode::open_group(self.id, Arc::clone(&self.engine), Some(ev.right), ev.right_span.clone())?);
             if raft.membership().is_empty() && !ev.members.is_empty() {
                 raft.initialize_membership(ev.members.clone())?;

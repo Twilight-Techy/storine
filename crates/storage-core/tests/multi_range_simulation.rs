@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use storage_core::dist::alloc::AllocatorConfig;
 use storage_core::dist::node::{NodeConfig, NodeDriver};
 use storage_core::dist::sim::{run, DistSimConfig, DistSimReport};
 use storage_core::raft::KeySpan;
@@ -69,6 +70,32 @@ fn replicas_move_and_leases_transfer_safely() {
     let transfers: usize = reports.iter().map(|r| r.transfers).sum();
     eprintln!("moves: {moves} replica moves, {transfers} lease transfers");
     assert!(moves > 0 && transfers > 0);
+}
+
+#[test]
+fn ranges_merge_safely() {
+    let cfg = DistSimConfig { nodes: 4, regions: vec![0, 0, 0, 0], replication: 3, merges: true, moves: true, ops_per_client: 80, ..DistSimConfig::default() };
+    let reports = sweep("merges", &cfg, 10);
+    let merges: usize = reports.iter().map(|r| r.merges).sum();
+    eprintln!("merges: {merges} merges");
+    assert!(merges > 0);
+}
+
+/// No simulator-driven changes: the drivers' allocators split hot and large ranges, merge
+/// small ones, repair and rebalance replicas and leases, under crashes and partitions.
+#[test]
+fn allocator_splits_merges_and_rebalances_safely() {
+    let alloc = AllocatorConfig { replication: 3, split_keys: 8, split_writes_per_sec: 12, merge_keys: 7, interval_us: 300_000, dead_after_us: 3_000_000, rebalance_slack: 2 };
+    let node = NodeConfig { cluster: vec![1, 2, 3, 4, 5], allocator: Some(alloc), ..DistSimConfig::default().node };
+    let cfg = DistSimConfig { nodes: 5, regions: vec![0; 5], initial_ranges: 6, replication: 3, splits: false, ops_per_client: 80, keys: 16, node, ..DistSimConfig::default() };
+    let reports = sweep("allocator", &cfg, 10);
+    let s = |f: fn(&DistSimReport) -> u64| reports.iter().map(f).sum::<u64>();
+    eprintln!("allocator: {} actions, {} splits, {} merges applied", s(|r| r.allocator_actions), s(|r| r.applied_splits), s(|r| r.applied_merges));
+    assert!(s(|r| r.applied_splits) > 0 && s(|r| r.applied_merges) > 0);
+    for r in &reports {
+        let (lo, hi) = (r.replicas_per_node.iter().min().copied().unwrap_or(0), r.replicas_per_node.iter().max().copied().unwrap_or(0));
+        assert!(hi - lo <= 3, "seed {}: replicas per node {:?}", r.seed, r.replicas_per_node);
+    }
 }
 
 /// Idle cost scales with nodes, not ranges: 3 nodes sharing 200 idle ranges exchange about

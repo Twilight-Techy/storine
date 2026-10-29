@@ -411,7 +411,7 @@ impl World {
         let dir = self.nodes[node].dir.clone();
         let engine = Arc::new(StorageEngine::<DocumentRecord>::open(&dir, engine_config())?);
         let members: Vec<NodeId> = (1..=self.cfg.nodes as NodeId).collect();
-        let cfg = NodeConfig { seed: self.rng.next_u64(), incarnation: self.now + 1, ..self.cfg.node.clone() };
+        let cfg = NodeConfig { seed: self.rng.next_u64(), incarnation: self.now + 1, trace: std::env::var_os("STORINE_SIM_TRACE").is_some(), ..self.cfg.node.clone() };
         let mut d = NodeDriver::new((node + 1) as NodeId, engine, cfg);
         match fresh {
             Some(spans) => {
