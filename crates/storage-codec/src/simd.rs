@@ -136,12 +136,19 @@ fn unpack_w<const W: usize>(words: &[u8], start: usize, out: &mut [u64]) {
     while i + 64 <= n {
         let first_word = (start + i) / 64 * W;
         if W <= 56 {
-            // One bounds check per 64 values; the block always has its padding word.
-            if let Some(blk) = words.get(first_word * 8..first_word * 8 + W * 8 + 8) {
-                unpack64_bytes::<W>(blk, &mut out[i..i + 64]);
-                i += 64;
-                continue;
+            // One bounds check per 64 values; the block always has its padding word. A block
+            // without it (only ever the last) goes value by value: one unrolled kernel per
+            // width, not two.
+            match words.get(first_word * 8..first_word * 8 + W * 8 + 8) {
+                Some(blk) => unpack64_bytes::<W>(blk, &mut out[i..i + 64]),
+                None => {
+                    for (k, o) in out[i..i + 64].iter_mut().enumerate() {
+                        *o = get_one(words, W, start + i + k);
+                    }
+                }
             }
+            i += 64;
+            continue;
         }
         for (k, s) in src.iter_mut().take(W).enumerate() {
             *s = word(words, first_word + k);
@@ -165,14 +172,14 @@ macro_rules! dispatch_width {
     };
 }
 
-multiversion! {
-    /// Values `start .. start + out.len()` of a packed area of `width`-bit values. Reads past
-    /// the end of `words` yield zero bits (callers validate lengths; this never panics).
-    pub fn unpack(words: &[u8], width: u8, start: usize, out: &mut [u64]) {
-        dispatch_width!(width as usize, words, start, out;
-            1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32
-            33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64)
-    }
+/// Values `start .. start + out.len()` of a packed area of `width`-bit values. Reads past
+/// the end of `words` yield zero bits (callers validate lengths; this never panics).
+/// Scalar shifts and loads, so one copy serves every CPU (a second, AVX2-compiled copy of 64
+/// unrolled widths cost ~100 KiB for no measurable gain).
+pub fn unpack(words: &[u8], width: u8, start: usize, out: &mut [u64]) {
+    dispatch_width!(width as usize, words, start, out;
+        1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32
+        33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64)
 }
 
 multiversion! {
