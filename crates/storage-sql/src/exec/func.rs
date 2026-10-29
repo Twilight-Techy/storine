@@ -32,6 +32,24 @@ fn int(d: &Datum) -> SqlResult<i64> {
     d.as_i64()
 }
 
+/// Longest text a function builds (PostgreSQL's limit is 1 GB too).
+const MAX_TEXT: usize = 1 << 30;
+
+/// `s` repeated `n` times, refused past `MAX_TEXT` bytes (`n` is the caller's).
+pub(crate) fn repeat_text(s: &str, n: i64) -> SqlResult<String> {
+    let n = usize::try_from(n).unwrap_or(0);
+    if s.len().saturating_mul(n) > MAX_TEXT {
+        return Err(SqlError::new("54000", "requested length too large"));
+    }
+    Ok(s.repeat(n))
+}
+
+/// Argument `i`, NULL when the call has fewer (a missing argument must not panic).
+fn arg(args: &[Datum], i: usize) -> &Datum {
+    static NULL: Datum = Datum::Null;
+    args.get(i).unwrap_or(&NULL)
+}
+
 fn null_if_any(args: &[Datum]) -> bool {
     args.iter().any(Datum::is_null)
 }
@@ -140,7 +158,8 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             }
             let sep = text(&a0);
             Datum::Text(
-                args[1..]
+                args.get(1..)
+                    .unwrap_or_default()
                     .iter()
                     .filter(|d| !d.is_null())
                     .map(text)
@@ -154,20 +173,20 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
                 return Ok(Datum::Null);
             }
             let chars: Vec<char> = text(&a0).chars().collect();
-            let start = int(&args[1])?;
+            let start = int(arg(args, 1))?;
             let len = if args.len() > 2 {
-                Some(int(&args[2])?)
+                Some(int(arg(args, 2))?)
             } else {
                 None
             };
             // 1-based; MySQL negative starts count from the end.
             let begin = if start < 0 && mysql {
-                chars.len() as i64 + start
+                (chars.len() as i64).saturating_add(start)
             } else {
-                start - 1
+                start.saturating_sub(1)
             };
             let end = match len {
-                Some(l) => begin + l,
+                Some(l) => begin.saturating_add(l),
                 None => chars.len() as i64,
             };
             let (b, e) = (
@@ -185,9 +204,9 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
                 return Ok(Datum::Null);
             }
             let chars: Vec<char> = text(&a0).chars().collect();
-            let n = int(&args[1])?;
+            let n = int(arg(args, 1))?;
             let n = if n < 0 {
-                (chars.len() as i64 + n).max(0) as usize
+                (chars.len() as i64).saturating_add(n).max(0) as usize
             } else {
                 (n as usize).min(chars.len())
             };
@@ -203,12 +222,12 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             }
             // position(needle, hay); strpos/instr(hay, needle); locate/charindex(needle, hay[, start]).
             let (needle, hay) = if matches!(name, "strpos" | "instr") {
-                (text(&args[1]), text(&a0))
+                (text(arg(args, 1)), text(&a0))
             } else {
-                (text(&a0), text(&args[1]))
+                (text(&a0), text(arg(args, 1)))
             };
             let start = if args.len() > 2 {
-                int(&args[2])?.max(1) as usize - 1
+                int(arg(args, 2))?.max(1) as usize - 1
             } else {
                 0
             };
@@ -223,11 +242,11 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             if null_if_any(args) {
                 return Ok(Datum::Null);
             }
-            let from = text(&args[1]);
+            let from = text(arg(args, 1));
             if from.is_empty() {
                 a0.clone()
             } else {
-                Datum::Text(text(&a0).replace(&from, &text(&args[2])))
+                Datum::Text(text(&a0).replace(&from, &text(arg(args, 2))))
             }
         }
         "trim" | "btrim" | "ltrim" | "rtrim" => {
@@ -236,7 +255,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             }
             let s = text(&a0);
             let set: Vec<char> = if args.len() > 1 {
-                text(&args[1]).chars().collect()
+                text(arg(args, 1)).chars().collect()
             } else {
                 vec![' ']
             };
@@ -252,9 +271,12 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
                 return Ok(Datum::Null);
             }
             let s: Vec<char> = text(&a0).chars().collect();
-            let n = int(&args[1])?.max(0) as usize;
+            let n = int(arg(args, 1))?.max(0) as usize;
+            if n > MAX_TEXT {
+                return Err(SqlError::new("54000", "requested length too large"));
+            }
             let fill: Vec<char> = if args.len() > 2 {
-                text(&args[2]).chars().collect()
+                text(arg(args, 2)).chars().collect()
             } else {
                 vec![' ']
             };
@@ -269,8 +291,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             if null_if_any(args) {
                 return Ok(Datum::Null);
             }
-            let n = int(&args[1])?.clamp(0, 1_000_000) as usize;
-            Datum::Text(text(&a0).repeat(n))
+            Datum::Text(repeat_text(&text(&a0), int(arg(args, 1))?)?)
         }
         "reverse" => map_text(&a0, |s| s.chars().rev().collect()),
         "initcap" => map_text(&a0, |s| {
@@ -295,9 +316,9 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             if null_if_any(args) {
                 return Ok(Datum::Null);
             }
-            let n = int(&args[2])?;
+            let n = int(arg(args, 2))?;
             let s = text(&a0);
-            let parts: Vec<&str> = s.split(text(&args[1]).as_str()).collect();
+            let parts: Vec<&str> = s.split(text(arg(args, 1)).as_str()).collect();
             let idx = if n > 0 { n - 1 } else { parts.len() as i64 + n };
             Datum::Text(
                 usize::try_from(idx)
@@ -310,7 +331,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             if null_if_any(args) {
                 return Ok(Datum::Null);
             }
-            Datum::Bool(text(&a0).starts_with(&text(&args[1])))
+            Datum::Bool(text(&a0).starts_with(&text(arg(args, 1))))
         }
         "ascii" => match &a0 {
             Datum::Null => Datum::Null,
@@ -357,7 +378,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
                 Datum::Bytes(b) => b.clone(),
                 d => text(d).into_bytes(),
             };
-            match text(&args[1]).to_ascii_lowercase().as_str() {
+            match text(arg(args, 1)).to_ascii_lowercase().as_str() {
                 "hex" => Datum::Text(crate::hash::hex(&bytes)),
                 "base64" => Datum::Text(crate::hash::base64_encode(&bytes)),
                 "escape" => Datum::Text(String::from_utf8_lossy(&bytes).into_owned()),
@@ -374,7 +395,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
                 return Ok(Datum::Null);
             }
             let s = text(&a0);
-            match text(&args[1]).to_ascii_lowercase().as_str() {
+            match text(arg(args, 1)).to_ascii_lowercase().as_str() {
                 "hex" => Datum::Bytes(datum::parse_bytea(&format!("\\x{s}"))),
                 "base64" => Datum::Bytes(
                     crate::hash::base64_decode(s.trim())
@@ -400,18 +421,22 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
                 return Ok(Datum::Null);
             }
             let flags = if args.len() > 3 {
-                text(&args[3])
+                text(arg(args, 3))
             } else {
                 String::new()
             };
-            let re = crate::exec::regex::Regex::new(&text(&args[1]), flags.contains('i'))?;
-            Datum::Text(re.replace(&text(&a0), &text(&args[2]), flags.contains('g') || mysql))
+            let re = crate::exec::regex::Regex::new(&text(arg(args, 1)), flags.contains('i'))?;
+            Datum::Text(re.replace(
+                &text(&a0),
+                &text(arg(args, 2)),
+                flags.contains('g') || mysql,
+            ))
         }
         "regexp_like" => {
             if null_if_any(args) {
                 return Ok(Datum::Null);
             }
-            let re = crate::exec::regex::Regex::new(&text(&args[1]), true)?;
+            let re = crate::exec::regex::Regex::new(&text(arg(args, 1)), true)?;
             Datum::Bool(re.is_match(&text(&a0)))
         }
         "string_to_array" => {
@@ -419,7 +444,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
                 return Ok(Datum::Null);
             }
             let s = text(&a0);
-            let sep = text(&args[1]);
+            let sep = text(arg(args, 1));
             Datum::Array(if s.is_empty() {
                 Vec::new()
             } else {
@@ -446,7 +471,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             // format('%s and %L', a, b): %s plain, %I identifier, %L literal.
             let fmt = text(&a0);
             let mut out = String::new();
-            let mut it = args[1..].iter();
+            let mut it = args.get(1..).unwrap_or_default().iter();
             let mut chars = fmt.chars().peekable();
             while let Some(c) = chars.next() {
                 if c == '%' {
@@ -559,7 +584,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
                             .map_err(|_| SqlError::numeric_out_of_range("out of range"))?,
                     )
                 } else {
-                    let p = Decimal::from_i128(10i128.pow((-places).min(30) as u32));
+                    let p = Decimal::from_i128(10i128.pow(places.unsigned_abs().min(30) as u32));
                     let q = x
                         .checked_div(p, 0, RoundingMode::HalfUp)
                         .and_then(|q| q.checked_mul(p))
@@ -590,11 +615,11 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
         },
         "mod" => {
             arity(name, args, 2, 2)?;
-            datum::arith('%', &a0, &args[1])?
+            datum::arith('%', &a0, arg(args, 1))?
         }
         "div" => {
             arity(name, args, 2, 2)?;
-            match datum::arith('/', &a0, &args[1])? {
+            match datum::arith('/', &a0, arg(args, 1))? {
                 Datum::Numeric(d) => Datum::Numeric(d.rescale(0, RoundingMode::Down).unwrap_or(d)),
                 Datum::Float(f) => Datum::Float(f.trunc()),
                 other => other,
@@ -613,7 +638,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
                 }
                 let (b, x) = (
                     datum::to_f64(&a0).unwrap_or(0.0),
-                    datum::to_f64(&args[1]).unwrap_or(0.0),
+                    datum::to_f64(arg(args, 1)).unwrap_or(0.0),
                 );
                 Datum::Float(x.ln() / b.ln())
             } else if mysql {
@@ -657,7 +682,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
         }
         "nullif" => {
             arity(name, args, 2, 2)?;
-            if ex.equals(&a0, &args[1]) == Some(true) {
+            if ex.equals(&a0, arg(args, 1)) == Some(true) {
                 Datum::Null
             } else {
                 a0.clone()
@@ -688,14 +713,14 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             }
             date_trunc(
                 &text(&a0).to_ascii_lowercase(),
-                &cast(&args[1], &DataType::Timestamp)?,
+                &cast(arg(args, 1), &DataType::Timestamp)?,
             )?
         }
         "date_part" | "datepart" => {
             if null_if_any(args) {
                 return Ok(Datum::Null);
             }
-            extract(&text(&a0).to_ascii_lowercase(), &args[1])?
+            extract(&text(&a0).to_ascii_lowercase(), arg(args, 1))?
         }
         "year" | "month" | "day" | "dayofmonth" | "hour" | "minute" | "second" | "quarter"
         | "week" | "dayofweek" | "dayofyear" => {
@@ -756,8 +781,8 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             if null_if_any(args) {
                 return Ok(Datum::Null);
             }
-            let iv = match &args[1] {
-                Datum::Interval { .. } => args[1].clone(),
+            let iv = match arg(args, 1) {
+                Datum::Interval { .. } => arg(args, 1).clone(),
                 d => datum::Datum::Interval {
                     months: 0,
                     days: int(d)?,
@@ -773,7 +798,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             }
             let (a, b) = (
                 cast(&a0, &DataType::Date)?,
-                cast(&args[1], &DataType::Date)?,
+                cast(arg(args, 1), &DataType::Date)?,
             );
             match (a, b) {
                 (Datum::Date(x), Datum::Date(y)) => Datum::Int(i64::from(x) - i64::from(y)),
@@ -786,7 +811,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             }
             Datum::Text(format_datetime(
                 &a0,
-                &text(&args[1]),
+                &text(arg(args, 1)),
                 name == "date_format",
             )?)
         }
@@ -794,11 +819,15 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             if null_if_any(args) {
                 return Ok(Datum::Null);
             }
-            Datum::Date(datum::days_from_civil(
-                int(&a0)? as i32,
-                int(&args[1])? as u32,
-                int(&args[2])? as u32,
-            ))
+            let (y, m, d) = (int(&a0)?, int(arg(args, 1))?, int(arg(args, 2))?);
+            if y.unsigned_abs() > 1_000_000
+                || !(1..=12).contains(&m)
+                || d < 1
+                || d > i64::from(datum::days_in_month(y as i32, m as u32))
+            {
+                return Err(SqlError::new("22008", "date field value out of range"));
+            }
+            Datum::Date(datum::days_from_civil(y as i32, m as u32, d as u32))
         }
         "timezone" => args.get(1).cloned().unwrap_or(Datum::Null),
         // MySQL CONVERT_TZ: fixed offsets and UTC; named zones are NULL, as in a MySQL
@@ -808,8 +837,8 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
                 return Ok(Datum::Null);
             }
             match (
-                tz_offset_secs(&text(&args[1])),
-                tz_offset_secs(&text(&args[2])),
+                tz_offset_secs(&text(arg(args, 1))),
+                tz_offset_secs(&text(arg(args, 2))),
             ) {
                 (Some(from), Some(to)) => {
                     let Datum::Timestamp(ns) = cast(&a0, &DataType::Timestamp)? else {
@@ -867,7 +896,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
         "nextval" => Datum::Int(crate::exec::dml::nextval(&ex.s.engine, &text(&a0))?),
         "currval" => Datum::Int(ex.s.last_insert_id),
         "setval" => {
-            let v = int(&args[1])?;
+            let v = int(arg(args, 1))?;
             crate::exec::dml::setval(&ex.s.engine, &text(&a0), v)?;
             Datum::Int(v)
         }
@@ -916,7 +945,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             if null_if_any(args) {
                 return Ok(Datum::Null);
             }
-            Datum::Text(format!("{}_{}_seq", text(&a0), text(&args[1])))
+            Datum::Text(format!("{}_{}_seq", text(&a0), text(arg(args, 1))))
         }
         "to_regclass" | "regclass" => match &a0 {
             Datum::Null => Datum::Null,
@@ -1034,7 +1063,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
                     None => return Ok(Datum::Null),
                 }
             }
-            for k in &args[1..] {
+            for k in args.get(1..).unwrap_or_default() {
                 match json_get(&cur, k, false)? {
                     Datum::Json(s) => cur = s,
                     _ => return Ok(Datum::Null),
@@ -1137,8 +1166,8 @@ fn float2(args: &[Datum], f: fn(f64, f64) -> f64) -> SqlResult<Datum> {
         return Ok(Datum::Null);
     }
     Ok(Datum::Float(f(
-        datum::to_f64(&args[0]).unwrap_or(0.0),
-        datum::to_f64(&args[1]).unwrap_or(0.0),
+        datum::to_f64(arg(args, 0)).unwrap_or(0.0),
+        datum::to_f64(arg(args, 1)).unwrap_or(0.0),
     )))
 }
 
@@ -1706,16 +1735,16 @@ pub fn table_function(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Re
                 ));
             }
             let mut rows = Vec::new();
-            match (&args[0], &args[1]) {
+            match (arg(args, 0), arg(args, 1)) {
                 (Datum::Timestamp(_) | Datum::Date(_) | Datum::Text(_), _)
                     if matches!(
                         args.get(2),
                         Some(Datum::Interval { .. }) | Some(Datum::Text(_))
                     ) =>
                 {
-                    let mut cur = cast(&args[0], &DataType::Timestamp)?;
-                    let stop = cast(&args[1], &DataType::Timestamp)?;
-                    let step = cast(&args[2], &DataType::Interval)?;
+                    let mut cur = cast(arg(args, 0), &DataType::Timestamp)?;
+                    let stop = cast(arg(args, 1), &DataType::Timestamp)?;
+                    let step = cast(arg(args, 2), &DataType::Interval)?;
                     while compare(&cur, &stop) != std::cmp::Ordering::Greater
                         && rows.len() < 1_000_000
                     {
@@ -1728,8 +1757,12 @@ pub fn table_function(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Re
                     });
                 }
                 _ => {
-                    let (a, b) = (int(&args[0])?, int(&args[1])?);
-                    let step = if args.len() > 2 { int(&args[2])? } else { 1 };
+                    let (a, b) = (int(arg(args, 0))?, int(arg(args, 1))?);
+                    let step = if args.len() > 2 {
+                        int(arg(args, 2))?
+                    } else {
+                        1
+                    };
                     if step == 0 {
                         return Err(SqlError::new("22023", "step size cannot equal zero"));
                     }
@@ -1742,7 +1775,10 @@ pub fn table_function(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Re
                                 "generate_series is limited to 10,000,000 rows",
                             ));
                         }
-                        x += step;
+                        match x.checked_add(step) {
+                            Some(next) => x = next,
+                            None => break,
+                        }
                     }
                 }
             }

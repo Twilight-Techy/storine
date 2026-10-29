@@ -493,7 +493,7 @@ fn date_days(d: &Datum) -> Result<i64, SqlError> {
 
 fn timestamp_ns(d: &Datum) -> Result<i64, SqlError> {
     Ok(match d {
-        Datum::Date(days) => i64::from(*days) * 86_400_000_000_000,
+        Datum::Date(days) => day_ns(i64::from(*days), 0)?,
         other => match datum::cast(other, &DataType::Timestamp)? {
             Datum::Timestamp(ns) => ns,
             _ => 0,
@@ -1808,6 +1808,9 @@ fn read_typed_value(rd: &mut Rd<'_>, version: u32) -> Result<Datum, SqlError> {
             if n == 0 {
                 return Ok(Datum::Null);
             }
+            if n != 3 {
+                return Err(Rd::bad());
+            }
             let v = rd.take(n)?;
             Datum::Date((le_uint(v) as i64 - DAYS_0001_TO_1970) as i32)
         }
@@ -1830,7 +1833,7 @@ fn read_typed_value(rd: &mut Rd<'_>, version: u32) -> Result<Datum, SqlError> {
                 // DATETIMEOFFSET stores UTC; the offset only affects display.
                 let days = le_uint(v.get(time_len..time_len + 3).ok_or_else(Rd::bad)?) as i64
                     - DAYS_0001_TO_1970;
-                Datum::Timestamp(days * 86_400_000_000_000 + ns)
+                Datum::Timestamp(day_ns(days, ns)?)
             }
         }
         // Short-length types: maxlen (u16; 0xFFFF = MAX, sent as PLP), collation for text.
@@ -1930,9 +1933,14 @@ fn datetime(v: &[u8]) -> Result<Datum, SqlError> {
         }
         _ => return Err(Rd::bad()),
     };
-    Ok(Datum::Timestamp(
-        (days - DAYS_1900_TO_1970) * 86_400_000_000_000 + ns,
-    ))
+    Ok(Datum::Timestamp(day_ns(days - DAYS_1900_TO_1970, ns)?))
+}
+
+/// Nanoseconds since 1970 of `ns` into day `days` (they end in the year 2262).
+fn day_ns(days: i64, ns: i64) -> Result<i64, SqlError> {
+    days.checked_mul(86_400_000_000_000)
+        .and_then(|d| d.checked_add(ns))
+        .ok_or_else(|| SqlError::new("22008", "datetime parameter out of range"))
 }
 
 /// Whether a statement ending a transaction rolled it back (ENVCHANGE 10) rather than committed it.
@@ -1943,5 +1951,222 @@ fn rolls_back(st: &Statement) -> bool {
             then, otherwise, ..
         } => rolls_back(then) || otherwise.as_deref().is_some_and(rolls_back),
         _ => false,
+    }
+}
+
+/// Hostile-input sweeps over the TDS decoders (`TASK-135`).
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+    use crate::fuzz_support as fz;
+
+    fn prelogin() -> Vec<u8> {
+        let options: [(u8, &[u8]); 4] = [
+            (0x00, &[16, 0, 0x03, 0xe8, 0, 0]),
+            (0x01, &[ENCRYPT_ON]),
+            (0x03, &[1, 2, 3, 4]),
+            (0x04, &[0]),
+        ];
+        let mut head = Vec::new();
+        let mut data = Vec::new();
+        for (token, value) in options {
+            let off = (options.len() * 5 + 1 + data.len()) as u16;
+            head.push(token);
+            head.extend_from_slice(&off.to_be_bytes());
+            head.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            data.extend_from_slice(value);
+        }
+        head.push(0xff);
+        head.extend_from_slice(&data);
+        head
+    }
+
+    /// A LOGIN7 with user, password, database and (optionally) a FEDAUTH feature extension.
+    fn login7(fedauth: bool) -> Vec<u8> {
+        let mut b = vec![0u8; 94];
+        b[4..8].copy_from_slice(&TDS74.to_be_bytes());
+        b[8..12].copy_from_slice(&4096u32.to_le_bytes());
+        let put = |b: &mut Vec<u8>, at: usize, s: &[u8], chars: usize| {
+            let off = b.len() as u16;
+            b[at..at + 2].copy_from_slice(&off.to_le_bytes());
+            b[at + 2..at + 4].copy_from_slice(&(chars as u16).to_le_bytes());
+            b.extend_from_slice(s);
+        };
+        put(&mut b, 40, &utf16("app"), 3);
+        let pw: Vec<u8> = utf16("pw")
+            .iter()
+            .map(|x| x.rotate_right(4) ^ 0xa5)
+            .collect();
+        put(&mut b, 44, &pw, 2);
+        put(&mut b, 68, &utf16("db"), 2);
+        if fedauth {
+            b[27] |= 0x10;
+            let at = b.len() as u32 + 4;
+            put(&mut b, 56, &at.to_le_bytes(), 4);
+            let token = utf16("eyJ.token");
+            let mut data = vec![0x01 << 1];
+            data.extend_from_slice(&(token.len() as u32).to_le_bytes());
+            data.extend_from_slice(&token);
+            b.push(0x02);
+            b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            b.extend_from_slice(&data);
+            b.push(0xff);
+        }
+        let len = b.len() as u32;
+        b[0..4].copy_from_slice(&len.to_le_bytes());
+        b
+    }
+
+    /// An `sp_executesql` call with a parameter of every type the gateway reads.
+    fn rpc_body() -> Vec<u8> {
+        let mut t = Tokens::default();
+        // ALL_HEADERS: transaction descriptor.
+        t.u32(22).u32(18).u16(2).u64(0).u32(1);
+        t.u16(0xffff).u16(10).u16(0);
+        let param = |t: &mut Tokens, name: &str| {
+            t.b_varchar(name).u8(0);
+        };
+        param(&mut t, "@stmt");
+        let sql = utf16("SELECT @p1");
+        t.u8(0xe7)
+            .u16(0xffff)
+            .bytes(&COLLATION)
+            .u64(sql.len() as u64);
+        t.u32(sql.len() as u32).bytes(&sql).u32(0);
+        param(&mut t, "@params");
+        let decl = utf16("@p1 int");
+        t.u8(0xe7)
+            .u16(8000)
+            .bytes(&COLLATION)
+            .u16(decl.len() as u16)
+            .bytes(&decl);
+        param(&mut t, "@p1");
+        t.u8(0x26).u8(4).u8(4).u32(7);
+        param(&mut t, "@p2");
+        t.u8(0x6c).u8(17).u8(10).u8(2).u8(5).u8(1).u32(12_345);
+        param(&mut t, "@p3");
+        t.u8(0x2a)
+            .u8(7)
+            .u8(8)
+            .bytes(&[1, 2, 3, 4, 5])
+            .bytes(&[0x40, 0x42, 0x0b]);
+        param(&mut t, "@p4");
+        t.u8(0x28).u8(3).bytes(&[0x40, 0x42, 0x0b]);
+        param(&mut t, "@p5");
+        t.u8(0x24).u8(16).u8(16).bytes(&[9; 16]);
+        param(&mut t, "@p6");
+        t.u8(0x6f).u8(8).u8(8).u32(45_000).u32(300);
+        param(&mut t, "@p7");
+        t.u8(0x6e).u8(8).u8(8).u32(0).u32(10_000);
+        param(&mut t, "@p8");
+        t.u8(0x6d).u8(8).u8(8).bytes(&2.5f64.to_le_bytes());
+        param(&mut t, "@p9");
+        t.u8(0xa5).u16(8000).u16(3).bytes(&[1, 2, 3]);
+        param(&mut t, "@p10");
+        t.u8(0x23).u32(100).bytes(&COLLATION).u32(2).bytes(b"hi");
+        param(&mut t, "@p11");
+        t.u8(0xf1).u8(0).u64(4).u32(4).bytes(&utf16("<a")).u32(0);
+        param(&mut t, "@p12");
+        t.u8(0x2b)
+            .u8(3)
+            .u8(9)
+            .bytes(&[1, 2, 3, 4])
+            .bytes(&[0x40, 0x42, 0x0b])
+            .u16(60);
+        param(&mut t, "@p13");
+        t.u8(0x7a).u32(5);
+        t.u8(0xff);
+        t.b
+    }
+
+    fn rpc_calls(body: &[u8]) -> Result<usize, SqlError> {
+        let total = body
+            .get(..4)
+            .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+        let body = if (4..=body.len()).contains(&total) {
+            &body[total..]
+        } else {
+            body
+        };
+        let mut rd = Rd { b: body, pos: 0 };
+        let mut n = 0;
+        loop {
+            let call = read_rpc(&mut rd, TDS74)?;
+            n += call.params.len();
+            for p in &call.params {
+                let _ = (p.name.len(), p.value.as_text());
+            }
+            match rd.peek() {
+                Some(0x80 | 0xff) => rd.pos += 1,
+                _ => return Ok(n),
+            }
+            if rd.left() == 0 {
+                return Ok(n);
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_prelogin_and_login7() {
+        let mut rng = fz::rng(0x5444_0001);
+        let seeds = [prelogin(), login7(false), login7(true)];
+        let l = parse_login7(&seeds[2]).ok();
+        assert_eq!(
+            l.as_ref().map(|l| (l.user.as_str(), l.password.as_str())),
+            Some(("app", "pw"))
+        );
+        assert!(l.is_some_and(|l| l.fedauth.is_some_and(|f| f.token == "eyJ.token")));
+        for _ in 0..fz::iters(300_000) {
+            let pick = rng.below(seeds.len());
+            let input = fz::variant(&mut rng, &seeds[pick]);
+            fz::bounded(&input, || {
+                for token in 0..6 {
+                    let _ = prelogin_option(&input, token);
+                }
+                let _ = parse_login7(&input);
+                let _ = parse_fedauth(&input);
+            });
+        }
+    }
+
+    #[test]
+    fn fuzz_rpc_requests() {
+        let mut rng = fz::rng(0x5444_0002);
+        let body = rpc_body();
+        assert_eq!(rpc_calls(&body).ok(), Some(15));
+        for _ in 0..fz::iters(300_000) {
+            let input = fz::variant(&mut rng, &body);
+            fz::bounded(&input, || {
+                let _ = rpc_calls(&input);
+                // Any position as the start of a typed value.
+                let at = rng.below(input.len() + 1);
+                let _ = read_typed_value(&mut Rd { b: &input, pos: at }, TDS74);
+                let _ = (
+                    money(&input),
+                    datetime(&input),
+                    declared_names(&from_utf16(&input)),
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn fuzz_row_encoders() {
+        let mut rng = fz::rng(0x5444_0003);
+        for _ in 0..fz::iters(100_000) {
+            let ty = fz::data_type(&mut rng);
+            let values: Vec<Datum> = (0..rng.below(3)).map(|_| fz::datum(&mut rng)).collect();
+            let refs: Vec<&Datum> = values.iter().collect();
+            let version = [TDS72, TDS73, TDS74][rng.below(3)];
+            let wire = wire_type(&ty, &refs, version);
+            let mut t = Tokens {
+                b: Vec::new(),
+                room: 4088,
+            };
+            wire.type_info(&mut t);
+            for d in &values {
+                let _ = wire.value(d, &mut t);
+            }
+        }
     }
 }

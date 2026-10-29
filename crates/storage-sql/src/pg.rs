@@ -80,6 +80,16 @@ fn read_i32(r: &mut (impl Read + ?Sized)) -> io::Result<i32> {
     Ok(i32::from_be_bytes(b))
 }
 
+/// A message body of `len` bytes, allocated as it arrives (the length is the client's claim).
+fn read_body(r: &mut (impl Read + ?Sized), len: usize) -> io::Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(len.min(64 * 1024));
+    r.take(len as u64).read_to_end(&mut body)?;
+    if body.len() < len {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(body)
+}
+
 fn bad_input(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_owned())
 }
@@ -343,8 +353,7 @@ impl Conn {
             if !(4..=MAX_MESSAGE).contains(&len) {
                 return Err(bad_input("bad message length"));
             }
-            let mut body = vec![0u8; len - 4];
-            self.r.read_exact(&mut body)?;
+            let body = read_body(&mut self.r, len - 4)?;
             if self.skipping && !matches!(tag[0], b'S' | b'X') {
                 continue;
             }
@@ -588,8 +597,7 @@ impl Conn {
             if !(4..=MAX_MESSAGE).contains(&len) {
                 return Err(SqlError::new("08P01", "bad message length during COPY"));
             }
-            let mut body = vec![0u8; len - 4];
-            self.r.read_exact(&mut body).map_err(io_err)?;
+            let body = read_body(&mut self.r, len - 4).map_err(io_err)?;
             let eof = match tag[0] {
                 b'd' => {
                     if failure.is_none() && !trailer {
@@ -757,8 +765,7 @@ impl Conn {
             if !(4..=MAX_MESSAGE).contains(&len) {
                 return Err(SqlError::new("08P01", "bad message length during COPY"));
             }
-            let mut body = vec![0u8; len - 4];
-            self.r.read_exact(&mut body).map_err(io_err)?;
+            let body = read_body(&mut self.r, len - 4).map_err(io_err)?;
             let eof = match tag[0] {
                 b'd' => {
                     reader.feed(&body);
@@ -1375,7 +1382,9 @@ fn encode_binary(d: &Datum, ty: &DataType) -> Vec<u8> {
         (DataType::Bytes, Datum::Bytes(b)) => b.clone(),
         (DataType::Vector(_), Datum::Vector(v)) => crate::vector::encode_binary(v),
         (DataType::Uuid, Datum::Uuid(u)) => u.to_vec(),
-        (DataType::Date, Datum::Date(days)) => (days - PG_EPOCH_DAYS).to_be_bytes().to_vec(),
+        (DataType::Date, Datum::Date(days)) => {
+            days.saturating_sub(PG_EPOCH_DAYS).to_be_bytes().to_vec()
+        }
         (DataType::Timestamp | DataType::TimestampTz, Datum::Timestamp(ns)) => {
             (ns.div_euclid(1000) - PG_EPOCH_US).to_be_bytes().to_vec()
         }
@@ -1472,7 +1481,7 @@ fn numeric_from_binary(raw: &[u8]) -> SqlResult<Datum> {
     if raw.len() < 8 {
         return Err(bad());
     }
-    let n = i16::from_be_bytes([raw[0], raw[1]]) as usize;
+    let n = usize::try_from(i16::from_be_bytes([raw[0], raw[1]])).map_err(|_| bad())?;
     let weight = i32::from(i16::from_be_bytes([raw[2], raw[3]]));
     let sign = u16::from_be_bytes([raw[4], raw[5]]);
     let dscale = i16::from_be_bytes([raw[6], raw[7]]).max(0) as usize;
@@ -1485,6 +1494,9 @@ fn numeric_from_binary(raw: &[u8]) -> SqlResult<Datum> {
     let mut s = String::new();
     for k in 0..n {
         let g = i16::from_be_bytes([raw[8 + 2 * k], raw[9 + 2 * k]]);
+        if !(0..10_000).contains(&g) {
+            return Err(bad());
+        }
         s.push_str(&format!("{g:04}"));
     }
     // Digits represent groups at weights weight, weight-1, ...
@@ -1530,7 +1542,36 @@ fn decode_text(oid: u32, raw: &[u8]) -> SqlResult<Datum> {
     datum::cast(&Datum::Text(s), &ty)
 }
 
+fn is_array_oid(oid: u32) -> bool {
+    matches!(
+        oid,
+        1000 | 1001
+            | 1003
+            | 1005
+            | 1007
+            | 1009
+            | 1014
+            | 1015
+            | 1016
+            | 1021
+            | 1022
+            | 1115
+            | 1182
+            | 1185
+            | 1231
+            | 2951
+            | 199
+            | 3807
+    )
+}
+
 fn decode_binary(oid: u32, raw: &[u8]) -> SqlResult<Datum> {
+    let out_of_range = || {
+        SqlError::new(
+            "22008",
+            format!("binary parameter for type {oid} is out of range"),
+        )
+    };
     let bad = || SqlError::new("22P03", format!("invalid binary parameter for type {oid}"));
     let be8 = |r: &[u8]| -> SqlResult<[u8; 8]> { r.try_into().map_err(|_| bad()) };
     Ok(match oid {
@@ -1550,16 +1591,33 @@ fn decode_binary(oid: u32, raw: &[u8]) -> SqlResult<Datum> {
         1700 => numeric_from_binary(raw)?,
         17 => Datum::Bytes(raw.to_vec()),
         2950 => Datum::Uuid(raw.try_into().map_err(|_| bad())?),
-        1082 => Datum::Date(i32::from_be_bytes(raw.try_into().map_err(|_| bad())?) + PG_EPOCH_DAYS),
-        1114 | 1184 => Datum::Timestamp((i64::from_be_bytes(be8(raw)?) + PG_EPOCH_US) * 1000),
-        1083 => Datum::Time(i64::from_be_bytes(be8(raw)?) * 1000),
-        1000 | 1001 | 1003 | 1005 | 1007 | 1009 | 1014 | 1015 | 1016 | 1021 | 1022 | 1115
-        | 1182 | 1185 | 1231 | 2951 | 199 | 3807 => {
+        1082 => Datum::Date(
+            i32::from_be_bytes(raw.try_into().map_err(|_| bad())?)
+                .checked_add(PG_EPOCH_DAYS)
+                .ok_or_else(out_of_range)?,
+        ),
+        // Nanoseconds since 1970 hold the years 1677 to 2262 (not PostgreSQL's infinities).
+        1114 | 1184 => Datum::Timestamp(
+            i64::from_be_bytes(be8(raw)?)
+                .checked_add(PG_EPOCH_US)
+                .and_then(|us| us.checked_mul(1000))
+                .ok_or_else(out_of_range)?,
+        ),
+        1083 => Datum::Time(
+            i64::from_be_bytes(be8(raw)?)
+                .checked_mul(1000)
+                .ok_or_else(out_of_range)?,
+        ),
+        oid if is_array_oid(oid) => {
             // ndim, has-null flag, element type, (length, lower bound) per dimension, elements.
             let mut b = Body { b: raw, pos: 0 };
             let ndim = b.i32().map_err(|_| bad())?;
             let _flags = b.i32().map_err(|_| bad())?;
             let elem = b.i32().map_err(|_| bad())? as u32;
+            if is_array_oid(elem) {
+                // Each level would recurse: dimensions are `ndim`, not nested arrays.
+                return Err(bad());
+            }
             if ndim == 0 {
                 return Ok(Datum::Array(Vec::new()));
             }
@@ -1851,6 +1909,248 @@ mod tests {
             let d: Decimal = s.parse().unwrap();
             let back = numeric_from_binary(&numeric_binary(d)).unwrap();
             assert_eq!(back.as_text(), d.to_string(), "{s}");
+        }
+    }
+}
+
+/// Hostile-input sweeps over the PostgreSQL decoders (`TASK-135`): structurally valid
+/// messages and values, mutated, must give errors, never panics or huge allocations.
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+    use crate::fuzz_support::{self as fz, SweepRng};
+
+    fn startup_packet(params: &[(&str, &str)]) -> Vec<u8> {
+        let mut body = 196_608i32.to_be_bytes().to_vec();
+        for (k, v) in params {
+            body.extend_from_slice(k.as_bytes());
+            body.push(0);
+            body.extend_from_slice(v.as_bytes());
+            body.push(0);
+        }
+        body.push(0);
+        let mut p = ((body.len() + 4) as i32).to_be_bytes().to_vec();
+        p.extend_from_slice(&body);
+        p
+    }
+
+    /// The startup-parameter loop of `Conn::run`.
+    fn startup_params(body: &[u8]) -> io::Result<HashMap<String, String>> {
+        let mut p = HashMap::new();
+        let mut b = Body {
+            b: body.get(4..).unwrap_or_default(),
+            pos: 0,
+        };
+        loop {
+            let k = b.cstr()?;
+            if k.is_empty() {
+                return Ok(p);
+            }
+            let v = b.cstr()?;
+            p.insert(k, v);
+        }
+    }
+
+    #[test]
+    fn fuzz_startup_and_message_framing() {
+        let mut rng = fz::rng(0x5047_0001);
+        let seeds = [
+            startup_packet(&[("user", "app"), ("database", "db")]),
+            startup_packet(&[("user", "x"), ("application_name", "psql")]),
+            [8i32.to_be_bytes(), 80_877_103i32.to_be_bytes()].concat(),
+        ];
+        // A message stream: Query, Parse, Sync.
+        let mut stream = Vec::new();
+        for (tag, body) in [
+            (b'Q', &b"SELECT 1\0"[..]),
+            (b'P', b"s1\0SELECT $1\0\0\x01\0\0\0\x17"),
+            (b'S', b""),
+        ] {
+            stream.push(tag);
+            stream.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+            stream.extend_from_slice(body);
+        }
+        for _ in 0..fz::iters(200_000) {
+            let pick = rng.below(seeds.len());
+            let input = fz::variant(&mut rng, &seeds[pick]);
+            fz::bounded(&input, || {
+                if let Ok(body) = read_startup(&mut &input[..]) {
+                    let _ = startup_params(&body);
+                }
+            });
+            let input = fz::variant(&mut rng, &stream);
+            fz::bounded(&input, || {
+                let mut r = &input[..];
+                for _ in 0..4 {
+                    let mut tag = [0u8; 1];
+                    if r.read_exact(&mut tag).is_err() {
+                        break;
+                    }
+                    let Ok(len) = read_i32(&mut r) else { break };
+                    let len = len as usize;
+                    if !(4..=MAX_MESSAGE).contains(&len) {
+                        break;
+                    }
+                    let Ok(body) = read_body(&mut r, len - 4) else {
+                        break;
+                    };
+                    let mut b = Body { b: &body, pos: 0 };
+                    let _ = (b.cstr(), b.cstr(), b.i16(), b.i32(), b.u8());
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn fuzz_scram_exchange() {
+        let mut rng = fz::rng(0x5047_0002);
+        let mut first = b"SCRAM-SHA-256\0".to_vec();
+        let client_first = b"n,,n=app,r=abcdefghijklmnop";
+        first.extend_from_slice(&(client_first.len() as i32).to_be_bytes());
+        first.extend_from_slice(client_first);
+        let fin = b"c=biws,r=abcdefghijklmnopXYZ,p=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let mut base = Vec::new();
+        for body in [&first[..], &fin[..]] {
+            base.push(b'p');
+            base.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+            base.extend_from_slice(body);
+        }
+        for _ in 0..fz::iters(20_000) {
+            let input = fz::variant(&mut rng, &base);
+            let password = (rng.below(2) == 0).then_some("pw");
+            fz::bounded(&input, || {
+                let mut out = Vec::new();
+                let _ = scram(&mut &input[..], &mut out, password);
+            });
+        }
+    }
+
+    /// Valid binary and text encodings of the parameter types the gateway decodes.
+    fn value_seeds(rng: &mut SweepRng) -> Vec<(u32, Vec<u8>, String)> {
+        let mut out = Vec::new();
+        for _ in 0..256 {
+            let ty = fz::data_type(rng);
+            let d = fz::datum(rng);
+            let Ok(d) = datum::cast(&d, &ty) else {
+                continue;
+            };
+            if d.is_null() {
+                continue;
+            }
+            let oid = system::type_oid(&ty);
+            out.push((oid, encode_binary(&d, &ty), encode_text(&d, &ty)));
+        }
+        let mut int_array = Vec::new();
+        for x in [1i32, 1, 23, 2, 1, 4, 7, -1] {
+            int_array.extend_from_slice(&x.to_be_bytes());
+        }
+        out.push((1007, int_array, "{7,NULL}".into()));
+        out.push((
+            1700,
+            numeric_binary("-12345.678".parse().unwrap_or_default()),
+            "1e-5".into(),
+        ));
+        out.push((
+            crate::vector::VECTOR_OID,
+            crate::vector::encode_binary(&[1.0, 2.5]),
+            "[1,2.5]".into(),
+        ));
+        out
+    }
+
+    const OIDS: [u32; 24] = [
+        16,
+        17,
+        20,
+        21,
+        23,
+        25,
+        114,
+        700,
+        701,
+        1000,
+        1007,
+        1009,
+        1082,
+        1083,
+        1114,
+        1184,
+        1186,
+        1700,
+        2950,
+        3802,
+        crate::vector::VECTOR_OID,
+        crate::vector::VECTOR_ARRAY_OID,
+        0,
+        u32::MAX,
+    ];
+
+    #[test]
+    fn fuzz_parameter_decoders() {
+        let mut rng = fz::rng(0x5047_0003);
+        let seeds = value_seeds(&mut rng);
+        assert!(seeds.len() > 10);
+        for _ in 0..fz::iters(300_000) {
+            let (oid, bin, text) = &seeds[rng.below(seeds.len())];
+            let oid = if rng.below(4) == 0 {
+                OIDS[rng.below(OIDS.len())]
+            } else {
+                *oid
+            };
+            let raw = fz::variant(&mut rng, bin);
+            fz::bounded(&(oid, &raw), || {
+                let _ = decode_binary(oid, &raw);
+                let _ = numeric_from_binary(&raw);
+            });
+            let raw = fz::variant(&mut rng, text.as_bytes());
+            fz::bounded(&(oid, &raw), || {
+                let _ = decode_text(oid, &raw);
+            });
+        }
+    }
+
+    #[test]
+    fn fuzz_value_encoders() {
+        let mut rng = fz::rng(0x5047_0004);
+        for _ in 0..fz::iters(100_000) {
+            let ty = fz::data_type(&mut rng);
+            let d = fz::datum(&mut rng);
+            let d = datum::cast(&d, &ty).unwrap_or(d);
+            if d.is_null() {
+                continue;
+            }
+            let oid = system::type_oid(&ty);
+            let bin = encode_binary(&d, &ty);
+            let _ = decode_binary(oid, &bin);
+            let text = encode_text(&d, &ty);
+            let _ = decode_text(oid, text.as_bytes());
+            let _ = (d.as_text(), d.to_text(true), datum::json_of(&d));
+        }
+    }
+
+    #[test]
+    fn fuzz_copy_binary_tuples() {
+        let mut rng = fz::rng(0x5047_0005);
+        let mut tuple = 3i16.to_be_bytes().to_vec();
+        for f in [&b"abc"[..], b"", b"\x00\x00\x00\x07"] {
+            tuple.extend_from_slice(&(f.len() as i32).to_be_bytes());
+            tuple.extend_from_slice(f);
+        }
+        tuple.extend_from_slice(&(-1i32).to_be_bytes());
+        tuple.extend_from_slice(&(-1i16).to_be_bytes());
+        for _ in 0..fz::iters(200_000) {
+            let raw = fz::variant(&mut rng, &tuple);
+            let width = rng.below(5);
+            fz::bounded(&raw, || {
+                let mut pos = 0;
+                while let Ok(Some((used, fields))) = binary_tuple(&raw[pos..], width) {
+                    assert!(used > 0 && pos + used <= raw.len());
+                    for (s, e) in fields.into_iter().flatten().flatten() {
+                        let _ = decode_binary(23, &raw[pos + s..pos + e]);
+                    }
+                    pos += used;
+                }
+            });
         }
     }
 }

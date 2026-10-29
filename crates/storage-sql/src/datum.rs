@@ -414,7 +414,10 @@ pub fn arith(op: char, a: &Datum, b: &Datum) -> SqlResult<Datum> {
         ('-', Date(d), Int(n)) => return Ok(Date(d.saturating_sub(*n as i32))),
         ('-', Date(x), Date(y)) => return Ok(Int(i64::from(*x) - i64::from(*y))),
         ('-', Timestamp(_) | Date(_), Timestamp(_) | Date(_)) => {
-            let ns = to_ns(a).unwrap_or(0) - to_ns(b).unwrap_or(0);
+            let ns = to_ns(a)
+                .unwrap_or(0)
+                .checked_sub(to_ns(b).unwrap_or(0))
+                .ok_or_else(interval_range)?;
             return Ok(Interval {
                 months: 0,
                 days: ns / NS_PER_DAY,
@@ -434,11 +437,18 @@ pub fn arith(op: char, a: &Datum, b: &Datum) -> SqlResult<Datum> {
                 ns: n2,
             },
         ) => {
-            let s = if op == '+' { 1 } else { -1 };
+            let f = |x: &i64, y: &i64| {
+                if op == '+' {
+                    x.checked_add(*y)
+                } else {
+                    x.checked_sub(*y)
+                }
+                .ok_or_else(interval_range)
+            };
             return Ok(Interval {
-                months: m1 + s * m2,
-                days: d1 + s * d2,
-                ns: n1 + s * n2,
+                months: f(m1, m2)?,
+                days: f(d1, d2)?,
+                ns: f(n1, n2)?,
             });
         }
         _ => {}
@@ -547,25 +557,40 @@ fn trim_division(d: Decimal) -> Decimal {
     }
 }
 
+fn interval_range() -> SqlError {
+    SqlError::new("22008", "interval out of range")
+}
+
 fn add_interval(t: &Datum, iv: &Datum, sign: i64) -> SqlResult<Datum> {
     let Datum::Interval { months, days, ns } = iv else {
         return Err(SqlError::internal("not an interval"));
     };
-    let base = to_ns(t).ok_or_else(|| SqlError::internal("not a timestamp"))?;
+    let range = || SqlError::new("22008", "timestamp out of range");
+    let base = to_ns(t).ok_or_else(range)?;
     let day = base.div_euclid(NS_PER_DAY);
     let rem = base.rem_euclid(NS_PER_DAY);
     let (y, m, d) = civil_from_days(day as i32);
-    let total = i64::from(y) * 12 + i64::from(m - 1) + sign * months;
-    let (ny, nm) = (
-        total.div_euclid(12) as i32,
-        (total.rem_euclid(12) + 1) as u32,
-    );
+    let total = (i64::from(y) * 12 + i64::from(m - 1))
+        .checked_add(months.checked_mul(sign).ok_or_else(range)?)
+        .ok_or_else(range)?;
+    let ny = total.div_euclid(12);
+    if ny.unsigned_abs() > 1_000_000 {
+        return Err(range());
+    }
+    let (ny, nm) = (ny as i32, (total.rem_euclid(12) + 1) as u32);
     let nd = d.min(days_in_month(ny, nm));
-    let new_day = i64::from(days_from_civil(ny, nm, nd)) + sign * days;
-    let out = new_day * NS_PER_DAY + rem + sign * ns;
+    let new_day = i64::from(days_from_civil(ny, nm, nd))
+        .checked_add(days.checked_mul(sign).ok_or_else(range)?)
+        .ok_or_else(range)?;
     Ok(match t {
-        Datum::Date(_) if *ns == 0 => Datum::Date(new_day as i32),
-        _ => Datum::Timestamp(out),
+        Datum::Date(_) if *ns == 0 => Datum::Date(i32::try_from(new_day).map_err(|_| range())?),
+        _ => Datum::Timestamp(
+            new_day
+                .checked_mul(NS_PER_DAY)
+                .and_then(|x| x.checked_add(rem))
+                .and_then(|x| x.checked_add(ns.checked_mul(sign)?))
+                .ok_or_else(range)?,
+        ),
     })
 }
 
@@ -708,7 +733,11 @@ pub fn cast(d: &Datum, ty: &DataType) -> SqlResult<Datum> {
         },
         DataType::Timestamp | DataType::TimestampTz => match d {
             Timestamp(ns) => Timestamp(*ns),
-            Date(days) => Timestamp(i64::from(*days) * NS_PER_DAY),
+            Date(days) => Timestamp(
+                i64::from(*days)
+                    .checked_mul(NS_PER_DAY)
+                    .ok_or_else(|| SqlError::new("22008", "timestamp out of range"))?,
+            ),
             Text(s) => Timestamp(parse_timestamp(s).ok_or_else(|| bad(d))?),
             Int(secs) => Timestamp(secs.saturating_mul(NS_PER_SEC)),
             _ => return Err(cast_err(d, ty)),
@@ -780,7 +809,7 @@ pub fn fit_numeric(x: Decimal, spec: Option<(u8, u8)>) -> SqlResult<Decimal> {
     if p > 0 && digits > u32::from(p) && !r.is_zero() {
         return Err(SqlError::numeric_out_of_range(format!(
             "numeric field overflow: a field with precision {p}, scale {s} must round to an absolute value less than 10^{}",
-            p - s
+            i32::from(p) - i32::from(s)
         )));
     }
     Ok(r)
@@ -842,7 +871,10 @@ pub fn to_value(d: &Datum, ty: &DataType) -> storine::Value {
         Datum::Text(s) | Datum::Json(s) => V::Text(s.clone()),
         Datum::Bytes(b) => V::Bytes(b.clone()),
         Datum::Timestamp(ns) => V::Timestamp(*ns),
-        Datum::Date(days) => V::Timestamp(i64::from(*days) * NS_PER_DAY),
+        // Days beyond the nanosecond range (years 1677 to 2262) are kept as their text.
+        Datum::Date(days) => i64::from(*days)
+            .checked_mul(NS_PER_DAY)
+            .map_or_else(|| V::Text(format_date(*days)), V::Timestamp),
         Datum::Time(ns) => V::Text(format_time(*ns)),
         Datum::Interval { .. } => V::Text(d.as_text()),
         Datum::Uuid(u) => V::Uuid(*u),
@@ -1008,21 +1040,24 @@ pub fn format_float(f: f64) -> String {
 }
 
 pub fn days_from_civil(y: i32, m: u32, d: u32) -> i32 {
+    // In i64, clamped: callers validate their fields, but no input may overflow here.
+    let (y, m, d) = (i64::from(y), i64::from(m), i64::from(d));
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u32;
+    let yoe = y - era * 400;
     let mp = (m + 9) % 12;
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe as i32 - 719_468
+    (era * 146_097 + doe - 719_468).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 pub fn civil_from_days(z: i32) -> (i32, u32, u32) {
-    let z = z + 719_468;
+    // In i64: every i32 day count (about ±5.8 million years) has a representable year.
+    let z = i64::from(z) + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u32;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i32 + era * 400;
+    let y = (i64::from(yoe) + era * 400) as i32;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
@@ -1085,7 +1120,8 @@ pub fn format_timestamp(ns: i64, with_zone: bool) -> String {
 fn format_interval(months: i64, days: i64, ns: i64) -> String {
     let mut parts = Vec::new();
     let (y, mo) = (months / 12, months % 12);
-    let plural = |n: i64, u: &str| format!("{n} {u}{}", if n.abs() == 1 { "" } else { "s" });
+    let plural =
+        |n: i64, u: &str| format!("{n} {u}{}", if n.unsigned_abs() == 1 { "" } else { "s" });
     if y != 0 {
         parts.push(plural(y, "year"));
     }
@@ -1097,7 +1133,7 @@ fn format_interval(months: i64, days: i64, ns: i64) -> String {
     }
     if ns != 0 || parts.is_empty() {
         let neg = ns < 0;
-        let t = format_time(ns.abs());
+        let t = format_time(ns.checked_abs().unwrap_or(i64::MAX));
         parts.push(if neg { format!("-{t}") } else { t });
     }
     parts.join(" ")
@@ -1122,7 +1158,7 @@ pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
         .chars()
         .filter(|c| *c != '-')
         .collect();
-    if h.len() != 32 {
+    if h.len() != 32 || !h.bytes().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 16];
@@ -1135,7 +1171,8 @@ pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
 /// PostgreSQL `bytea` input: `\x0102` hex or escape format; anything else is taken as bytes.
 pub fn parse_bytea(s: &str) -> Vec<u8> {
     if let Some(h) = s.strip_prefix("\\x") {
-        if h.len() % 2 == 0 {
+        // Hex digits only: `from_str_radix` takes a sign, and slicing needs ASCII.
+        if h.len() % 2 == 0 && h.bytes().all(|c| c.is_ascii_hexdigit()) {
             if let Some(v) = (0..h.len())
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&h[i..i + 2], 16).ok())
@@ -1161,7 +1198,7 @@ pub fn parse_time(s: &str) -> Option<i64> {
         }
         None => (0, ""),
     };
-    if h > 24 || m > 59 || sec > 60 {
+    if !(0..=24).contains(&h) || !(0..=59).contains(&m) || !(0..=60).contains(&sec) {
         return None;
     }
     let mut frac_ns = 0i64;
@@ -1197,10 +1234,11 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
     let y: i32 = dp.next()?.parse().ok()?;
     let m: u32 = dp.next()?.parse().ok()?;
     let d: u32 = dp.next()?.parse().ok()?;
-    if !(1..=12).contains(&m) || d == 0 || d > days_in_month(y, m) {
+    if !(1..=12).contains(&m) || d == 0 || d > days_in_month(y, m) || y.unsigned_abs() > 1_000_000 {
         return None;
     }
-    let mut ns = i64::from(days_from_civil(y, m, d)) * NS_PER_DAY;
+    // Nanoseconds since 1970 reach the years 1677 to 2262.
+    let mut ns = i64::from(days_from_civil(y, m, d)).checked_mul(NS_PER_DAY)?;
     if rest.is_empty() {
         return Some(ns);
     }
@@ -1213,21 +1251,29 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
         let (hh, mm) = if let Some((a, b)) = z.split_once(':') {
             (a.parse::<i64>().ok()?, b.parse::<i64>().ok()?)
         } else if z.len() == 4 {
-            (z[..2].parse::<i64>().ok()?, z[2..].parse::<i64>().ok()?)
+            (
+                z.get(..2)?.parse::<i64>().ok()?,
+                z.get(2..)?.parse::<i64>().ok()?,
+            )
         } else {
             (z.parse::<i64>().ok()?, 0)
         };
+        if !(0..=99).contains(&hh) || !(0..=59).contains(&mm) {
+            return None;
+        }
         let sign = if &rest[i..=i] == "-" { -1 } else { 1 };
         (&rest[..i], sign * (hh * 3600 + mm * 60) * NS_PER_SEC)
     } else {
         (rest, 0)
     };
-    ns += parse_time(time.trim())?;
-    Some(ns - offset)
+    ns = ns.checked_add(parse_time(time.trim())?)?;
+    ns.checked_sub(offset)
 }
 
 /// `1 day`, `2 hours 30 minutes`, `1 year 2 mons 3 days 04:05:06`, `P1D` is not supported.
 pub fn parse_interval(s: &str) -> Option<Datum> {
+    // A whole number of units that fits in i64 (`None` for NaN, infinities and overflow).
+    let whole = |x: f64| (x.is_finite() && x.abs() < 9.2e18).then_some(x as i64);
     let mut months = 0i64;
     let mut days = 0i64;
     let mut ns = 0i64;
@@ -1238,7 +1284,7 @@ pub fn parse_interval(s: &str) -> Option<Datum> {
         if t.contains(':') {
             let neg = t.starts_with('-');
             let v = parse_time(t.trim_start_matches(['-', '+']))?;
-            ns += if neg { -v } else { v };
+            ns = ns.checked_add(if neg { -v } else { v })?;
             i += 1;
             continue;
         }
@@ -1248,19 +1294,20 @@ pub fn parse_interval(s: &str) -> Option<Datum> {
             .map(|u| u.to_ascii_lowercase())
             .unwrap_or_else(|| "second".into());
         let unit = unit.trim_end_matches(',').trim_end_matches('s');
-        match unit {
-            "year" | "yr" | "y" => months += (n * 12.0) as i64,
-            "mon" | "month" => months += n as i64,
-            "week" | "w" => days += (n * 7.0) as i64,
-            "day" | "d" => days += n as i64,
-            "hour" | "hr" | "h" => ns += (n * 3600.0 * 1e9) as i64,
-            "minute" | "min" | "m" => ns += (n * 60.0 * 1e9) as i64,
-            "second" | "sec" | "" => ns += (n * 1e9) as i64,
-            "millisecond" | "msec" | "ms" => ns += (n * 1e6) as i64,
-            "microsecond" | "u" => ns += (n * 1e3) as i64,
-            "quarter" => months += (n * 3.0) as i64,
+        let (field, x) = match unit {
+            "year" | "yr" | "y" => (&mut months, n * 12.0),
+            "mon" | "month" => (&mut months, n),
+            "week" | "w" => (&mut days, n * 7.0),
+            "day" | "d" => (&mut days, n),
+            "hour" | "hr" | "h" => (&mut ns, n * 3600.0 * 1e9),
+            "minute" | "min" | "m" => (&mut ns, n * 60.0 * 1e9),
+            "second" | "sec" | "" => (&mut ns, n * 1e9),
+            "millisecond" | "msec" | "ms" => (&mut ns, n * 1e6),
+            "microsecond" | "u" => (&mut ns, n * 1e3),
+            "quarter" => (&mut months, n * 3.0),
             _ => return None,
-        }
+        };
+        *field = field.checked_add(whole(x)?)?;
         i += 2;
     }
     Some(Datum::Interval { months, days, ns })
@@ -1450,5 +1497,38 @@ mod tests {
             from_value(&to_value(&t, &DataType::Time), Some(&DataType::Time)),
             t
         );
+    }
+}
+
+/// Value-level sweeps (`TASK-135`): casts, arithmetic, comparison and formatting of arbitrary
+/// values, extremes included, give results or errors, never panics.
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+    use crate::fuzz_support as fz;
+
+    #[test]
+    fn fuzz_casts_arithmetic_and_formats() {
+        let mut rng = fz::rng(0x4441_0001);
+        for _ in 0..fz::iters(200_000) {
+            let (a, b) = (fz::datum(&mut rng), fz::datum(&mut rng));
+            let ty = fz::data_type(&mut rng);
+            let a = if rng.below(2) == 0 {
+                cast(&a, &ty).unwrap_or(a)
+            } else {
+                a
+            };
+            let _ = cast(&a, &fz::data_type(&mut rng));
+            for op in ['+', '-', '*', '/', '%'] {
+                let _ = arith(op, &a, &b);
+            }
+            let _ = (compare(&a, &b), sql_cmp(&a, &b), group_eq(&a, &b));
+            let _ = (hash_key(&a), json_of(&a), a.as_text(), a.to_text(true));
+            let _ = (a.truthy(), a.as_i64(), to_decimal(&a), to_f64(&a));
+            let _ = from_value(&to_value(&a, &ty), Some(&ty));
+            if let Datum::Numeric(x) = a {
+                let _ = fit_numeric(x, Some((rng.below(40) as u8, rng.below(40) as u8)));
+            }
+        }
     }
 }

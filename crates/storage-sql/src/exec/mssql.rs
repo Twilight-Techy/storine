@@ -1358,6 +1358,21 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+fn parts_error() -> SqlError {
+    SqlError::new(
+        "22008",
+        "Cannot construct data type, some of the arguments have values which are not valid.",
+    )
+}
+
+/// Days since 1970 of a valid year (1-9999), month and day.
+fn date_parts(y: i64, m: i64, d: i64) -> Result<i64, SqlError> {
+    if !(1..=9999).contains(&y) || !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
+        return Err(parts_error());
+    }
+    Ok(days_from_civil(y, m, d))
+}
+
 fn days_in_month(y: i64, m: i64) -> i64 {
     let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
     days_from_civil(ny, nm, 1) - days_from_civil(y, m, 1)
@@ -1741,7 +1756,10 @@ fn call(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Option<Datum>> {
             }
             let (ns, _) = instant(&a(0))?;
             let (y, m, _) = civil(ns.div_euclid(NS_PER_DAY));
-            let total = y * 12 + (m - 1) + args.get(1).map_or(Ok(0), Datum::as_i64)?;
+            let total = (y * 12 + (m - 1))
+                .checked_add(args.get(1).map_or(Ok(0), Datum::as_i64)?)
+                .filter(|t| t.unsigned_abs() < 120_000)
+                .ok_or_else(|| SqlError::new("22008", "EOMONTH is out of range"))?;
             let (ny, nm) = (total.div_euclid(12), total.rem_euclid(12) + 1);
             Datum::Date(days_from_civil(ny, nm, days_in_month(ny, nm)) as i32)
         }
@@ -1749,27 +1767,33 @@ fn call(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Option<Datum>> {
             if any_null(3) {
                 return Ok(Some(N));
             }
-            Datum::Date(days_from_civil(a(0).as_i64()?, a(1).as_i64()?, a(2).as_i64()?) as i32)
+            Datum::Date(date_parts(a(0).as_i64()?, a(1).as_i64()?, a(2).as_i64()?)? as i32)
         }
         "datetimefromparts" | "datetime2fromparts" => {
             if any_null(6) {
                 return Ok(Some(N));
             }
-            let days = days_from_civil(a(0).as_i64()?, a(1).as_i64()?, a(2).as_i64()?);
-            let frac = match name {
-                "datetimefromparts" => a(6).as_i64().unwrap_or(0) * 1_000_000,
+            let days = date_parts(a(0).as_i64()?, a(1).as_i64()?, a(2).as_i64()?)?;
+            let (h, mi, sec) = (a(3).as_i64()?, a(4).as_i64()?, a(5).as_i64()?);
+            let (f, unit) = match name {
+                "datetimefromparts" => (a(6).as_i64().unwrap_or(0), 1_000_000),
                 _ => {
-                    let f = a(6).as_i64().unwrap_or(0);
                     let p = a(7).as_i64().unwrap_or(7).clamp(0, 7) as u32;
-                    f * 10i64.pow(9 - p)
+                    (a(6).as_i64().unwrap_or(0), 10i64.pow(9 - p))
                 }
             };
+            if !(0..24).contains(&h)
+                || !(0..60).contains(&mi)
+                || !(0..60).contains(&sec)
+                || !(0..1_000_000_000 / unit).contains(&f)
+            {
+                return Err(parts_error());
+            }
+            let ns = (h * 3600 + mi * 60 + sec) * 1_000_000_000 + f * unit;
             Datum::Timestamp(
-                days * NS_PER_DAY
-                    + a(3).as_i64()? * 3_600_000_000_000
-                    + a(4).as_i64()? * 60_000_000_000
-                    + a(5).as_i64()? * 1_000_000_000
-                    + frac,
+                days.checked_mul(NS_PER_DAY)
+                    .and_then(|d| d.checked_add(ns))
+                    .ok_or_else(|| SqlError::new("22008", "datetime value out of range"))?,
             )
         }
         "isdate" => i(i64::from(
@@ -1827,13 +1851,16 @@ fn call(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Option<Datum>> {
             if any_null(2) {
                 return Ok(Some(N));
             }
-            t(text(&a(0)).repeat(a(1).as_i64()?.max(0) as usize))
+            t(crate::exec::func::repeat_text(
+                &text(&a(0)),
+                a(1).as_i64()?,
+            )?)
         }
         "space" => {
             if any_null(1) {
                 return Ok(Some(N));
             }
-            t(" ".repeat(a(0).as_i64()?.max(0) as usize))
+            t(crate::exec::func::repeat_text(" ", a(0).as_i64()?)?)
         }
         "stuff" => {
             if any_null(4) {

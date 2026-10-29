@@ -5,7 +5,7 @@ use crate::error::{SqlError, SqlResult};
 use crate::lexer::{tokenize, Dialect, Token};
 
 /// Words that end an expression or a table reference, so they cannot be bare aliases.
-const RESERVED: &[&str] = &[
+pub(crate) const RESERVED: &[&str] = &[
     "select",
     "from",
     "where",
@@ -118,11 +118,7 @@ fn tokens_sql(tokens: &[Token], dialect: Dialect) -> SqlResult<String> {
 
 pub fn parse(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Statement>, usize)> {
     let (tokens, params) = tokenize(sql, dialect)?;
-    let mut p = Parser {
-        tokens,
-        pos: 0,
-        dialect,
-    };
+    let mut p = Parser::new(tokens, dialect);
     let mut out = Vec::new();
     loop {
         while p.eat_op(";") {}
@@ -242,11 +238,7 @@ pub fn parse_one(sql: &str, dialect: Dialect) -> SqlResult<(Statement, usize)> {
 /// Parses one expression (stored defaults and checks).
 pub fn parse_expr(sql: &str, dialect: Dialect) -> SqlResult<Expr> {
     let (tokens, _) = tokenize(sql, dialect)?;
-    let mut p = Parser {
-        tokens,
-        pos: 0,
-        dialect,
-    };
+    let mut p = Parser::new(tokens, dialect);
     let e = p.expr()?;
     if !p.at_end() {
         return Err(p.unexpected("end of expression"));
@@ -257,11 +249,7 @@ pub fn parse_expr(sql: &str, dialect: Dialect) -> SqlResult<Expr> {
 /// Parses a column type name such as `numeric(12,2)` or `timestamp with time zone`.
 pub fn parse_data_type(sql: &str) -> SqlResult<DataType> {
     let (tokens, _) = tokenize(sql, Dialect::Postgres)?;
-    let mut p = Parser {
-        tokens,
-        pos: 0,
-        dialect: Dialect::Postgres,
-    };
+    let mut p = Parser::new(tokens, Dialect::Postgres);
     let (ty, _) = p.data_type()?;
     if !p.at_end() {
         return Err(p.unexpected("end of type"));
@@ -269,13 +257,150 @@ pub fn parse_data_type(sql: &str) -> SqlResult<DataType> {
     Ok(ty)
 }
 
+/// Deepest recursion the parser allows (nested parentheses, subqueries, `NOT NOT ...`).
+const MAX_DEPTH: usize = 160;
+/// Tallest expression or query tree accepted: later stages walk trees recursively.
+const MAX_HEIGHT: usize = 1000;
+/// Operators chained without parentheses in one expression (`a OR b OR ...`).
+const MAX_CHAIN: usize = 4 * MAX_HEIGHT;
+
+fn too_deep() -> SqlError {
+    SqlError::new("54001", "statement nested too deeply")
+}
+
+/// The height of `e` (a subquery counts as one level; its own height is tracked while it is
+/// parsed), or more than `limit` once that is exceeded. Iterative: `e` may be deep.
+fn expr_height<'a>(e: &'a Expr, limit: usize) -> usize {
+    let mut max = 0;
+    let mut stack: Vec<(&'a Expr, usize)> = vec![(e, 1)];
+    while let Some((e, h)) = stack.pop() {
+        max = max.max(h);
+        if max > limit {
+            break;
+        }
+        let mut push = |c: &'a Expr| stack.push((c, h + 1));
+        match e {
+            Expr::Unary { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::IsNull { expr, .. }
+            | Expr::IsBool { expr, .. }
+            | Expr::Extract { expr, .. }
+            | Expr::InSubquery { expr, .. } => push(expr),
+            Expr::Binary { left, right, .. }
+            | Expr::IsDistinctFrom { left, right, .. }
+            | Expr::AnyAll { left, right, .. }
+            | Expr::Index {
+                expr: left,
+                index: right,
+            } => {
+                push(left);
+                push(right);
+            }
+            Expr::Function { args, over, .. } => {
+                args.iter().for_each(&mut push);
+                if let Some(w) = over {
+                    w.partition_by.iter().for_each(&mut push);
+                    w.order_by.iter().for_each(|o| push(&o.expr));
+                }
+            }
+            Expr::Tuple(args) | Expr::Array(args) => args.iter().for_each(push),
+            Expr::Case {
+                operand,
+                whens,
+                else_,
+            } => {
+                operand.iter().for_each(|o| push(o));
+                for (w, t) in whens {
+                    push(w);
+                    push(t);
+                }
+                else_.iter().for_each(|x| push(x));
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                push(expr);
+                push(low);
+                push(high);
+            }
+            Expr::InList { expr, list, .. } => {
+                push(expr);
+                list.iter().for_each(push);
+            }
+            Expr::Like {
+                expr,
+                pattern,
+                escape,
+                ..
+            } => {
+                push(expr);
+                push(pattern);
+                escape.iter().for_each(|x| push(x));
+            }
+            _ => {}
+        }
+    }
+    max
+}
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     dialect: Dialect,
+    /// Current recursion depth (`MAX_DEPTH`).
+    depth: usize,
+    /// Operators chained in the current expression or query (`MAX_CHAIN`).
+    chain: usize,
+    /// Set operations and joins chained in the current query.
+    query_chain: usize,
+    /// Tallest subquery inside the current expression.
+    sub_height: usize,
+    /// Tallest expression or subquery bound seen in the current query.
+    max_height: usize,
 }
 
 impl Parser {
+    fn new(tokens: Vec<Token>, dialect: Dialect) -> Parser {
+        Parser {
+            tokens,
+            pos: 0,
+            dialect,
+            depth: 0,
+            chain: 0,
+            query_chain: 0,
+            sub_height: 0,
+            max_height: 0,
+        }
+    }
+
+    // ── nesting limits ──
+
+    /// Runs `f` one recursion level deeper ("statement nested too deeply" past `MAX_DEPTH`).
+    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> SqlResult<T>) -> SqlResult<T> {
+        if self.depth >= MAX_DEPTH {
+            return Err(too_deep());
+        }
+        self.depth += 1;
+        let r = f(self);
+        self.depth -= 1;
+        r
+    }
+
+    /// Counts one more set operation or join in the current query.
+    fn query_step(&mut self) -> SqlResult<()> {
+        self.query_chain += 1;
+        self.chain_step()
+    }
+
+    /// Counts one more chained operator (a tree level built without recursion).
+    fn chain_step(&mut self) -> SqlResult<()> {
+        self.chain += 1;
+        if self.chain > MAX_CHAIN {
+            return Err(too_deep());
+        }
+        Ok(())
+    }
+
     // ── token helpers ──
 
     fn at_end(&self) -> bool {
@@ -547,6 +672,10 @@ impl Parser {
     // ── statements ──
 
     fn statement(&mut self) -> SqlResult<Statement> {
+        self.nested(Self::statement_inner)
+    }
+
+    fn statement_inner(&mut self) -> SqlResult<Statement> {
         let kw = match self.peek() {
             Some(t) => t.keyword().unwrap_or_default(),
             None => return Ok(Statement::Empty),
@@ -2630,6 +2759,24 @@ impl Parser {
     // ── queries ──
 
     fn query(&mut self) -> SqlResult<Query> {
+        let outer = (
+            std::mem::take(&mut self.chain),
+            std::mem::take(&mut self.query_chain),
+            std::mem::take(&mut self.max_height),
+        );
+        let q = self.nested(Self::query_inner);
+        let height = self.max_height + self.query_chain + 2;
+        (self.chain, self.query_chain) = (outer.0, outer.1);
+        self.max_height = outer.2.max(height);
+        let q = q?;
+        if height > MAX_HEIGHT {
+            return Err(too_deep());
+        }
+        self.sub_height = self.sub_height.max(height);
+        Ok(q)
+    }
+
+    fn query_inner(&mut self) -> SqlResult<Query> {
         let mut ctes = Vec::new();
         let mut recursive = false;
         if self.eat_kw("with") {
@@ -2755,6 +2902,7 @@ impl Parser {
             if !all {
                 self.eat_kw("distinct");
             }
+            self.query_step()?;
             let (right, _) = self.set_term()?;
             left = SetExpr::SetOp {
                 op,
@@ -2773,6 +2921,7 @@ impl Parser {
             if !all {
                 self.eat_kw("distinct");
             }
+            self.query_step()?;
             let (right, _) = self.set_primary()?;
             left = SetExpr::SetOp {
                 op: SetOp::Intersect,
@@ -3005,6 +3154,7 @@ impl Parser {
                 }
                 break;
             };
+            self.query_step()?;
             let right = self.table_factor()?;
             let constraint = if natural {
                 JoinConstraint::Natural
@@ -3052,7 +3202,7 @@ impl Parser {
                     lateral,
                 });
             }
-            let inner = self.table_ref()?;
+            let inner = self.nested(Self::table_ref)?;
             self.expect_op(")")?;
             return Ok(inner);
         }
@@ -3105,13 +3255,26 @@ impl Parser {
     // ── expressions ──
 
     pub(crate) fn expr(&mut self) -> SqlResult<Expr> {
-        self.or_expr()
+        let outer_chain = std::mem::take(&mut self.chain);
+        let outer_sub = std::mem::take(&mut self.sub_height);
+        let e = self.nested(Self::or_expr);
+        self.chain = outer_chain;
+        let sub = std::mem::replace(&mut self.sub_height, outer_sub);
+        let e = e?;
+        let height = expr_height(&e, MAX_HEIGHT) + sub;
+        if height > MAX_HEIGHT {
+            return Err(too_deep());
+        }
+        self.sub_height = self.sub_height.max(sub);
+        self.max_height = self.max_height.max(height);
+        Ok(e)
     }
 
     fn or_expr(&mut self) -> SqlResult<Expr> {
         let mut left = self.xor_expr()?;
         loop {
             if self.eat_kw("or") || (self.dialect == Dialect::MySql && self.eat_op("||")) {
+                self.chain_step()?;
                 let right = self.xor_expr()?;
                 left = Expr::binary(BinaryOp::Or, left, right);
             } else {
@@ -3123,6 +3286,7 @@ impl Parser {
     fn xor_expr(&mut self) -> SqlResult<Expr> {
         let mut left = self.and_expr()?;
         while self.eat_kw("xor") {
+            self.chain_step()?;
             let right = self.and_expr()?;
             left = Expr::binary(BinaryOp::Xor, left, right);
         }
@@ -3133,6 +3297,7 @@ impl Parser {
         let mut left = self.not_expr()?;
         loop {
             if self.eat_kw("and") || (self.dialect == Dialect::MySql && self.eat_op("&&")) {
+                self.chain_step()?;
                 let right = self.not_expr()?;
                 left = Expr::binary(BinaryOp::And, left, right);
             } else {
@@ -3143,7 +3308,7 @@ impl Parser {
 
     fn not_expr(&mut self) -> SqlResult<Expr> {
         if self.eat_kw("not") {
-            let e = self.not_expr()?;
+            let e = self.nested(Self::not_expr)?;
             return Ok(Expr::Unary {
                 op: UnaryOp::Not,
                 expr: Box::new(e),
@@ -3151,7 +3316,7 @@ impl Parser {
         }
         if self.dialect == Dialect::MySql && self.is_op("!") {
             self.pos += 1;
-            let e = self.not_expr()?;
+            let e = self.nested(Self::not_expr)?;
             return Ok(Expr::Unary {
                 op: UnaryOp::Not,
                 expr: Box::new(e),
@@ -3164,6 +3329,7 @@ impl Parser {
     fn predicate(&mut self) -> SqlResult<Expr> {
         let mut left = self.bit_or()?;
         loop {
+            self.chain_step()?;
             if self.eat_kw("is") {
                 let negated = self.eat_kw("not");
                 left = if self.eat_kw("null") || self.eat_kw("unknown") {
@@ -3373,7 +3539,10 @@ impl Parser {
                     case_insensitive: true,
                     negated: true,
                 },
-                _ => return Ok(left),
+                _ => {
+                    self.chain -= 1; // no operator after all
+                    return Ok(left);
+                }
             };
             self.pos += 1;
             if self.is_kw("any") || self.is_kw("some") || self.is_kw("all") {
@@ -3410,6 +3579,7 @@ impl Parser {
                 return Ok(left);
             };
             self.pos += 1;
+            self.chain_step()?;
             let right = self.bit_and()?;
             left = Expr::binary(op, left, right);
         }
@@ -3419,6 +3589,7 @@ impl Parser {
         let mut left = self.shift()?;
         while self.is_op("&") {
             self.pos += 1;
+            self.chain_step()?;
             let right = self.shift()?;
             left = Expr::binary(BinaryOp::BitAnd, left, right);
         }
@@ -3436,6 +3607,7 @@ impl Parser {
                 return Ok(left);
             };
             self.pos += 1;
+            self.chain_step()?;
             let right = self.other_op()?;
             left = Expr::binary(op, left, right);
         }
@@ -3459,6 +3631,7 @@ impl Parser {
                 _ => return Ok(left),
             };
             self.pos += 1;
+            self.chain_step()?;
             let right = self.additive()?;
             left = Expr::binary(op, left, right);
         }
@@ -3475,6 +3648,7 @@ impl Parser {
                 return Ok(left);
             };
             self.pos += 1;
+            self.chain_step()?;
             let right = self.multiplicative()?;
             left = Expr::binary(op, left, right);
         }
@@ -3497,6 +3671,7 @@ impl Parser {
                 return Ok(left);
             };
             self.pos += 1;
+            self.chain_step()?;
             let right = self.power()?;
             left = Expr::binary(op, left, right);
         }
@@ -3506,7 +3681,7 @@ impl Parser {
         let left = self.unary()?;
         if self.is_op("^") && self.dialect != Dialect::MySql {
             self.pos += 1;
-            let right = self.power()?;
+            let right = self.nested(Self::power)?;
             return Ok(Expr::binary(BinaryOp::Pow, left, right));
         }
         Ok(left)
@@ -3514,7 +3689,7 @@ impl Parser {
 
     fn unary(&mut self) -> SqlResult<Expr> {
         if self.eat_op("-") {
-            let e = self.unary()?;
+            let e = self.nested(Self::unary)?;
             return Ok(match e {
                 Expr::Number(n) if !n.starts_with('-') => Expr::Number(format!("-{n}")),
                 other => Expr::Unary {
@@ -3531,13 +3706,13 @@ impl Parser {
             && !self.is_op_at(1, ",")
         {
             self.pos += 1;
-            return self.unary();
+            return self.nested(Self::unary);
         }
         if self.eat_op("+") {
-            return self.unary();
+            return self.nested(Self::unary);
         }
         if self.eat_op("~") {
-            let e = self.unary()?;
+            let e = self.nested(Self::unary)?;
             return Ok(Expr::Unary {
                 op: UnaryOp::BitNot,
                 expr: Box::new(e),
@@ -3545,6 +3720,7 @@ impl Parser {
         }
         let mut e = self.primary()?;
         loop {
+            self.chain_step()?;
             if self.eat_op("::") {
                 if let Some(f) = self.reg_cast() {
                     e = func(f, vec![e]);
@@ -3587,6 +3763,7 @@ impl Parser {
                     over: None,
                 };
             } else {
+                self.chain -= 1; // no postfix operator after all
                 return Ok(e);
             }
         }

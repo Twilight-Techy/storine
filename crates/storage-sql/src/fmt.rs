@@ -9,12 +9,52 @@ fn quote_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// An identifier, double-quoted when it is not a plain lower-case word.
+/// Words an expression reads as more than a name (`select`, `true`, `current_date` ...).
+const KEYWORDS: &[&str] = &[
+    "array",
+    "both",
+    "cast",
+    "convert",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_schema",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "date",
+    "datetime",
+    "exists",
+    "extract",
+    "interval",
+    "leading",
+    "localtime",
+    "localtimestamp",
+    "next",
+    "position",
+    "row",
+    "session_user",
+    "substring",
+    "time",
+    "timestamp",
+    "timestamptz",
+    "trailing",
+    "trim",
+    "user",
+    "value",
+    "binary",
+    "any",
+    "some",
+];
+
+/// An identifier, double-quoted when it is not a plain lower-case word or is a keyword.
 pub fn quote_ident(s: &str) -> String {
     let plain = !s.is_empty()
         && s.chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-        && !s.starts_with(|c: char| c.is_ascii_digit());
+        && !s.starts_with(|c: char| c.is_ascii_digit())
+        && !KEYWORDS.contains(&s)
+        && !crate::parser::RESERVED.contains(&s);
     if plain {
         s.to_owned()
     } else {
@@ -105,11 +145,34 @@ impl Display for Expr {
                 write!(f, "{}{name}", if *system { "@@" } else { "@" })
             }
             Expr::Unary { op, expr } => match op {
-                UnaryOp::Neg => write!(f, "(-{expr})"),
+                // `- -1` with a space: `--` would start a comment.
+                UnaryOp::Neg => write!(f, "(- {expr})"),
                 UnaryOp::Not => write!(f, "(NOT {expr})"),
                 UnaryOp::BitNot => write!(f, "(~{expr})"),
             },
-            Expr::Binary { op, left, right } => write!(f, "({left} {} {right})", op_str(op)),
+            Expr::Binary { op, left, right } => {
+                // A left-leaning chain of one operator (`a OR b OR c`) is written flat: it
+                // parses back to the same tree, without one parenthesis per link.
+                let mut rights = vec![&**right];
+                let mut base = &**left;
+                while let Expr::Binary {
+                    op: inner,
+                    left,
+                    right,
+                } = base
+                {
+                    if inner != op || *op == BinaryOp::Pow {
+                        break;
+                    }
+                    rights.push(&**right);
+                    base = &**left;
+                }
+                write!(f, "({base}")?;
+                for r in rights.iter().rev() {
+                    write!(f, " {} {r}", op_str(op))?;
+                }
+                f.write_str(")")
+            }
             Expr::Function {
                 name,
                 args,
@@ -265,6 +328,24 @@ mod tests {
             let e = parse_expr(sql, Dialect::Postgres).unwrap();
             let again = parse_expr(&e.to_string(), Dialect::Postgres).unwrap();
             assert_eq!(e, again, "{sql} -> {e}");
+        }
+    }
+
+    #[test]
+    fn long_chains_and_keyword_columns_render_back() {
+        // A long chain renders flat (one parenthesis per link would pass the nesting limit).
+        let chain = (0..500)
+            .map(|i| format!("a = {i}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        for sql in [
+            chain.as_str(),
+            "\"select\" + \"user\" * \"date\"",
+            "2 ^ 3 ^ 4",
+        ] {
+            let e = parse_expr(sql, Dialect::Postgres).unwrap();
+            let again = parse_expr(&e.to_string(), Dialect::Postgres).unwrap();
+            assert_eq!(e, again, "{sql}");
         }
     }
 }

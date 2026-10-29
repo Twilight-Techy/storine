@@ -861,7 +861,8 @@ fn text_value(d: &Datum, ty: &DataType) -> Vec<u8> {
 }
 
 fn mysql_datetime(ns: i64) -> String {
-    let s = datum::format_timestamp(ns - ns.rem_euclid(1000), false);
+    let us = ns.checked_sub(ns.rem_euclid(1000)).unwrap_or(ns);
+    let s = datum::format_timestamp(us, false);
     // MySQL prints a fixed six-digit fraction only when there is one.
     match s.split_once('.') {
         Some((a, f)) => format!("{a}.{f:0<6}"),
@@ -992,18 +993,27 @@ fn read_binary_param(rd: &mut Rd<'_>, t: u8, unsigned: bool) -> io::Result<Datum
             }
             let y = i32::from(u16::from_le_bytes([g(0), g(1)]));
             let days = datum::days_from_civil(y, u32::from(g(2)).max(1), u32::from(g(3)).max(1));
-            let mut ns = i64::from(days) * 86_400_000_000_000;
-            if n >= 7 {
-                ns += (i64::from(g(4)) * 3600 + i64::from(g(5)) * 60 + i64::from(g(6)))
-                    * 1_000_000_000;
-            }
-            if n >= 11 {
-                ns += i64::from(u32::from_le_bytes([g(7), g(8), g(9), g(10)])) * 1000;
-            }
-            if t == T_DATE {
-                Datum::Date(days)
+            let us = if n >= 11 {
+                i64::from(u32::from_le_bytes([g(7), g(8), g(9), g(10)]))
             } else {
-                Datum::Timestamp(ns)
+                0
+            };
+            let secs = i64::from(g(4)) * 3600 + i64::from(g(5)) * 60 + i64::from(g(6));
+            // Nanoseconds since 1970 end in 2262: later values stay text (casts reject them).
+            let ns = i64::from(days)
+                .checked_mul(86_400_000_000_000)
+                .and_then(|ns| ns.checked_add(secs * 1_000_000_000 + us * 1000));
+            match (t, ns) {
+                (T_DATE, _) => Datum::Date(days),
+                (_, Some(ns)) => Datum::Timestamp(ns),
+                (_, None) => Datum::Text(format!(
+                    "{y:04}-{:02}-{:02} {:02}:{:02}:{:02}.{us:06}",
+                    g(2),
+                    g(3),
+                    g(4),
+                    g(5),
+                    g(6)
+                )),
             }
         }
         T_TIME => {
@@ -1014,13 +1024,23 @@ fn read_binary_param(rd: &mut Rd<'_>, t: u8, unsigned: bool) -> io::Result<Datum
                 return Ok(Datum::Time(0));
             }
             let days = i64::from(u32::from_le_bytes([g(1), g(2), g(3), g(4)]));
+            let hours = days * 24 + i64::from(g(5));
             let mut ns =
-                ((days * 24 + i64::from(g(5))) * 3600 + i64::from(g(6)) * 60 + i64::from(g(7)))
-                    * 1_000_000_000;
+                i128::from(hours * 3600 + i64::from(g(6)) * 60 + i64::from(g(7))) * 1_000_000_000;
             if n >= 12 {
-                ns += i64::from(u32::from_le_bytes([g(8), g(9), g(10), g(11)])) * 1000;
+                ns += i128::from(u32::from_le_bytes([g(8), g(9), g(10), g(11)])) * 1000;
             }
-            Datum::Time(if g(0) == 1 { -ns } else { ns })
+            let ns = if g(0) == 1 { -ns } else { ns };
+            match i64::try_from(ns) {
+                Ok(ns) => Datum::Time(ns),
+                // Beyond ±292 years: text, which casts to TIME reject.
+                Err(_) => Datum::Text(format!(
+                    "{}{hours}:{:02}:{:02}",
+                    if g(0) == 1 { "-" } else { "" },
+                    g(6),
+                    g(7)
+                )),
+            }
         }
         T_DECIMAL | T_JSON | T_VARCHAR | T_BIT | T_BLOB | T_VAR_STRING | T_STRING | 0xf7 | 0xf8
         | 0xf9 | 0xfa | 0xfb => {
@@ -1084,6 +1104,153 @@ mod tests {
             let mut v = Vec::new();
             lenenc(&mut v, n);
             assert_eq!(Rd { b: &v, pos: 0 }.lenenc().unwrap(), n);
+        }
+    }
+}
+
+/// Hostile-input sweeps over the MySQL decoders (`TASK-135`).
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+    use crate::fuzz_support as fz;
+
+    /// The HandshakeResponse41 fields `Conn::run` reads.
+    fn handshake_response(resp: &[u8]) -> io::Result<()> {
+        let mut rd = Rd { b: resp, pos: 0 };
+        let caps = rd.u32()?;
+        rd.u32()?;
+        rd.u8()?;
+        rd.take(23)?;
+        rd.cstr()?;
+        if caps & CLIENT_PLUGIN_AUTH_LENENC != 0 {
+            rd.lenenc_bytes()?;
+        } else if caps & CLIENT_SECURE_CONNECTION != 0 {
+            let n = rd.u8()? as usize;
+            rd.take(n)?;
+        } else {
+            rd.cstr()?;
+        }
+        if caps & CLIENT_CONNECT_WITH_DB != 0 && rd.left() > 0 {
+            rd.cstr()?;
+        }
+        if caps & CLIENT_PLUGIN_AUTH != 0 && rd.left() > 0 {
+            rd.cstr()?;
+        }
+        Ok(())
+    }
+
+    /// The parameter block of COM_STMT_EXECUTE, as `Conn::execute` reads it.
+    fn execute_params(body: &[u8], n: usize) -> io::Result<Vec<Datum>> {
+        let mut rd = Rd { b: body, pos: 0 };
+        rd.u32()?;
+        rd.u8()?;
+        rd.u32()?;
+        let mut types = Vec::new();
+        let mut params = Vec::new();
+        let bitmap = rd.take(n.div_ceil(8))?.to_vec();
+        if rd.u8()? == 1 {
+            for _ in 0..n {
+                let t = rd.u8()?;
+                let flags = rd.u8()?;
+                types.push((t, flags & 0x80 != 0));
+            }
+        }
+        for i in 0..n {
+            if bitmap[i / 8] & (1 << (i % 8)) != 0 {
+                params.push(Datum::Null);
+                continue;
+            }
+            let (t, unsigned) = types.get(i).copied().unwrap_or((T_VAR_STRING, false));
+            params.push(read_binary_param(&mut rd, t, unsigned)?);
+        }
+        Ok(params)
+    }
+
+    #[test]
+    fn fuzz_handshake_response() {
+        let mut rng = fz::rng(0x4d59_0001);
+        let mut resp = (CLIENT_PROTOCOL_41
+            | CLIENT_SECURE_CONNECTION
+            | CLIENT_PLUGIN_AUTH
+            | CLIENT_PLUGIN_AUTH_LENENC
+            | CLIENT_CONNECT_WITH_DB)
+            .to_le_bytes()
+            .to_vec();
+        resp.extend_from_slice(&(1u32 << 24).to_le_bytes());
+        resp.push(255);
+        resp.extend_from_slice(&[0; 23]);
+        resp.extend_from_slice(b"app\0");
+        lenenc_str(&mut resp, &[7; 20]);
+        resp.extend_from_slice(b"db\0mysql_native_password\0");
+        for _ in 0..fz::iters(300_000) {
+            let input = fz::variant(&mut rng, &resp);
+            fz::bounded(&input, || {
+                let _ = handshake_response(&input);
+                let mut rd = Rd { b: &input, pos: 0 };
+                while rd.lenenc_bytes().is_ok() {}
+            });
+        }
+    }
+
+    #[test]
+    fn fuzz_binary_parameters() {
+        let mut rng = fz::rng(0x4d59_0002);
+        // Statement 1, no cursor, one iteration, 7 parameters (the third NULL), types bound.
+        let mut body = 1u32.to_le_bytes().to_vec();
+        body.push(0);
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.push(0b0000_0100);
+        body.push(1);
+        for (t, f) in [
+            (T_LONGLONG, 0x80),
+            (T_DATETIME, 0),
+            (T_NULL, 0),
+            (T_TIME, 0),
+            (T_VAR_STRING, 0),
+            (T_DOUBLE, 0),
+            (T_NEWDECIMAL, 0),
+        ] {
+            body.extend_from_slice(&[t, f]);
+        }
+        body.extend_from_slice(&u64::MAX.to_le_bytes());
+        body.extend_from_slice(&[11, 0xe7, 0x07, 12, 31, 23, 59, 59, 0x3f, 0x42, 0x0f, 0]);
+        body.extend_from_slice(&[12, 1, 0xff, 0xff, 0xff, 0xff, 23, 59, 59, 1, 0, 0, 0]);
+        lenenc_str(&mut body, "héllo".as_bytes());
+        body.extend_from_slice(&1.5f64.to_le_bytes());
+        lenenc_str(&mut body, b"-12.50e3");
+        assert_eq!(execute_params(&body, 7).map(|p| p.len()).ok(), Some(7));
+        for _ in 0..fz::iters(300_000) {
+            let input = fz::variant(&mut rng, &body);
+            let n = if rng.below(4) == 0 { rng.below(40) } else { 7 };
+            fz::bounded(&input, || {
+                if let Ok(params) = execute_params(&input, n) {
+                    for p in &params {
+                        let _ = (p.as_text(), datum::cast(p, &DataType::Timestamp));
+                    }
+                }
+                // Every parameter type over the same bytes.
+                let t = rng.next_u64() as u8;
+                let _ = read_binary_param(&mut Rd { b: &input, pos: 0 }, t, rng.below(2) == 0);
+            });
+        }
+    }
+
+    #[test]
+    fn fuzz_row_encoders() {
+        let mut rng = fz::rng(0x4d59_0003);
+        for _ in 0..fz::iters(100_000) {
+            let cols: Vec<OutCol> = (0..rng.below(4))
+                .map(|i| OutCol {
+                    name: format!("c{i}"),
+                    ty: fz::data_type(&mut rng),
+                    table: None,
+                })
+                .collect();
+            let row: Vec<Datum> = cols.iter().map(|_| fz::datum(&mut rng)).collect();
+            let _ = binary_row(&row, &cols);
+            for (d, c) in row.iter().zip(&cols) {
+                let _ = (text_value(d, &c.ty), column_def(c, "db"));
+            }
         }
     }
 }

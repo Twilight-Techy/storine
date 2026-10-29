@@ -1484,3 +1484,153 @@ mod tests {
         assert_eq!(ed25519_pkcs8_seed(&pkcs8[..47]), None);
     }
 }
+
+/// Hostile-input sweeps over the TLS record and handshake parsing (`TASK-135`).
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+    use crate::fuzz_support as fz;
+
+    fn vec8(b: &[u8]) -> Vec<u8> {
+        let mut v = vec![b.len() as u8];
+        v.extend_from_slice(b);
+        v
+    }
+
+    fn vec16(b: &[u8]) -> Vec<u8> {
+        let mut v = (b.len() as u16).to_be_bytes().to_vec();
+        v.extend_from_slice(b);
+        v
+    }
+
+    fn u16s(list: &[u16]) -> Vec<u8> {
+        list.iter().flat_map(|x| x.to_be_bytes()).collect()
+    }
+
+    /// A ClientHello record: TLS 1.3 (with or without an x25519 share) or TLS 1.2 only.
+    fn client_hello(tls13: bool, share: bool) -> Vec<u8> {
+        let mut body = TLS12.to_be_bytes().to_vec();
+        body.extend_from_slice(&[7; 32]);
+        body.extend_from_slice(&vec8(&[1; 32]));
+        body.extend_from_slice(&vec16(&u16s(&[
+            CHACHA20_POLY1305_SHA256,
+            ECDHE_ECDSA_CHACHA20_POLY1305,
+            EMPTY_RENEGOTIATION_INFO_SCSV,
+        ])));
+        body.extend_from_slice(&vec8(&[0]));
+        let mut exts = Vec::new();
+        if tls13 {
+            exts.push(ext(0x002b, &vec8(&u16s(&[TLS13, TLS12]))));
+        }
+        exts.push(ext(0x000a, &vec16(&u16s(&[0x0017, X25519]))));
+        exts.push(ext(0x000d, &vec16(&u16s(&[0x0403, ED25519]))));
+        exts.push(ext(0x0017, &[]));
+        exts.push(ext(0x0010, &vec16(&vec8(b"postgresql"))));
+        if share {
+            let mut ks = X25519.to_be_bytes().to_vec();
+            ks.extend_from_slice(&vec16(&x25519_public(&[5; 32])));
+            exts.push(ext(0x0033, &vec16(&ks)));
+        }
+        body.extend_from_slice(&vec16(&exts.concat()));
+        plain_record(CT_HANDSHAKE, &handshake_msg(HS_CLIENT_HELLO, &body))
+    }
+
+    #[test]
+    fn fuzz_client_hello_parsing() {
+        let mut rng = fz::rng(0x544c_0001);
+        let seeds = [
+            client_hello(true, true),
+            client_hello(true, false),
+            client_hello(false, false),
+        ];
+        let ch = parse_client_hello(&seeds[0][5..]).ok();
+        assert!(ch.is_some_and(|c| c.x25519_share.is_some() && c.versions.contains(&TLS13)));
+        for _ in 0..fz::iters(300_000) {
+            let pick = rng.below(seeds.len());
+            let input = fz::variant(&mut rng, &seeds[pick]);
+            fz::bounded(&input, || {
+                let mut hs = HandshakeReader {
+                    buf: Vec::new(),
+                    app_keys: None,
+                    app_data: None,
+                };
+                if let Ok((_, msg)) = hs.next(&mut &input[..], None) {
+                    let _ = parse_client_hello(&msg);
+                }
+                if input.len() >= 4 {
+                    let _ = parse_client_hello(&input);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn fuzz_handshakes() {
+        let mut rng = fz::rng(0x544c_0002);
+        let cfg = TlsConfig::self_signed(&["localhost"]).expect("certificate");
+        let seeds = [
+            client_hello(true, true),
+            client_hello(true, false),
+            client_hello(false, false),
+        ];
+        for _ in 0..fz::iters(5_000) {
+            let pick = rng.below(seeds.len());
+            let mut input = fz::variant(&mut rng, &seeds[pick]);
+            // Sometimes a valid hello followed by hostile records.
+            if rng.below(3) == 0 {
+                input = seeds[pick].clone();
+                let n = rng.below(64);
+                let mut rec = vec![
+                    [
+                        CT_HANDSHAKE,
+                        CT_APPLICATION_DATA,
+                        CT_ALERT,
+                        CT_CHANGE_CIPHER_SPEC,
+                    ][rng.below(4)],
+                    3,
+                    3,
+                ];
+                rec.extend_from_slice(&(n as u16).to_be_bytes());
+                rec.extend_from_slice(&fz::junk(&mut rng, n));
+                fz::poke_len(&mut rng, &mut rec);
+                input.extend_from_slice(&rec);
+            }
+            let tds7 = rng.below(2) == 0;
+            fz::bounded(&input, || {
+                let mut out = Vec::new();
+                let _ = accept_inner(&input[..], &mut out, &cfg, "postgresql", tds7);
+            });
+        }
+    }
+
+    #[test]
+    fn fuzz_application_records() {
+        let mut rng = fz::rng(0x544c_0003);
+        let mut keys = Keys::new([3; 32]);
+        let mut stream = Vec::new();
+        for (ct, body) in [
+            (CT_APPLICATION_DATA, &b"hello"[..]),
+            (CT_HANDSHAKE, &handshake_msg(HS_KEY_UPDATE, &[1])[..]),
+            (CT_ALERT, &[1, ALERT_CLOSE_NOTIFY][..]),
+        ] {
+            stream.extend_from_slice(&keys.seal(ct, body).expect("seal"));
+        }
+        for _ in 0..fz::iters(100_000) {
+            let input = fz::variant(&mut rng, &stream);
+            fz::bounded(&input, || {
+                let mut r = TlsReader {
+                    inner: &input[..],
+                    keys: Keys::new([3; 32]),
+                    plain: Vec::new(),
+                    pos: 0,
+                    update: Arc::new(AtomicBool::new(false)),
+                    closed: false,
+                };
+                let mut sink = Vec::new();
+                let _ = r.read_to_end(&mut sink);
+                let _ = r.post_handshake(&input);
+                let _ = read_record(&mut &input[..]);
+            });
+        }
+    }
+}
