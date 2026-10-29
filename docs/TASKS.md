@@ -953,7 +953,7 @@ This document defines the strict chronological execution order for building the 
     - **Nemesis**: `SIGKILL` with restart from the data directory, `SIGSTOP` / `SIGCONT` (a paused leader must not serve a stale read when it wakes), isolation through the proxies.
     - **Workload**: 4 clients write and read 3 keys throughout; the history must be linearizable.
   - **Exit Criteria (met)**: a 120 s run had 3 kills, 19 pauses, 5 partitions, 16 half-open isolations and 9 delay episodes. It made 29,979 acknowledged writes (133 unknown) and 30,492 reads, and the history was linearizable. The default run is 20 s (`STORINE_CHAOS_SECS`).
-- [~] **TASK-135: Structure-Aware Fuzzing (`F-SIM-04`)** — generators for every decoder and parser, millions of iterations, corpora from the conformance vectors.
+- [x] **TASK-135: Structure-Aware Fuzzing (`F-SIM-04`)** — generators for every decoder and parser, millions of iterations, corpora from the conformance vectors.
   - **Engine, codec and storage decoders** (`storage-core/tests/fuzz_decoders.rs`, `storage-columnar/tests/fuzz_chunks.rs`, `storage-server/tests/fuzz_requests.rs`, plus the WAL and record-server sweeps):
     - **Corpus**: the published conformance vectors (`protocol/vectors/vectors.json`).
     - **Generators**: real encoders build random values, documents, write batches, nested filters, queries, field operations, Raft messages and op batches, record frames, LZ4 blocks, and integer and value column chunks of every kind (mixed kinds, nulls).
@@ -964,7 +964,19 @@ This document defines the strict chronological execution order for building the 
       - whatever a decoder accepts re-encodes and decodes again;
       - the document server keeps serving after every few hundred hostile requests.
   - **Run** (release with debug assertions and overflow checks, `STORINE_FUZZ_ITERS=100–200`): about 10M decoder inputs × 25 decoders, 3.5M column-chunk decodes, 500k forged WAL frames, 200k mutated document requests and 90k mutated record requests over TCP. No panics.
-  - **Open**: the SQL gateway's parser and wire protocols (PostgreSQL, MySQL, TDS, TLS).
+  - **SQL gateway**:
+    - **Corpus and generators**: SQL text in four dialects (corpus scanned from the executor tests; token, keyword, unicode and splice mutations; pathological nesting up to 100k levels) plus the value, vector and COPY parsers.
+    - **Every built-in function**, called with edge-case arguments.
+    - **Private decoders** (in-crate): PostgreSQL, MySQL, TDS, TLS 1.3, Kerberos and OIDC.
+    - **Wire level**: real PostgreSQL, MySQL and TDS servers with TLS and password logins, 120k hostile sessions; a panic hook, a 64 MiB per-allocation tripwire and periodic `SELECT 1` health checks.
+  - **SQL gateway fixes**:
+    - **Parser**: unbounded recursion (now nesting depth 160, operator chains 4000 and tree height 1000, failing with SQLSTATE 54001).
+    - **Wire allocation**: messages allocated their claimed length before any bytes arrived; they now grow as bytes arrive.
+    - **Overflow**: about 30 integer overflows in date, time, interval and numeric decoding and arithmetic.
+    - **Text handling**: UTF-8 slicing panics.
+    - **Functions**: argument-count panics; uncapped `repeat` / `lpad` / `REPLICATE` / `SPACE` results (now capped at 1 GiB, SQLSTATE 54000).
+    - **Formatter**: output that did not parse back (keyword columns, `--1`, quoted function names, deep chains).
+  - **SQL gateway run**: about 290M in-crate iterations plus 11M public-API inputs, release build with debug assertions and overflow checks on. No failures.
 - [x] **TASK-136: Crash-Point Sweeps (`F-SIM-05`)** — kill at every `k`-th I/O call, recover, check acknowledged writes, torn state and index equality.
   - `tests/power_loss.rs::crash_at_every_io_call`: a fixed 40-operation workload (puts, deletes, 3-record transactions, checkpoints) is stopped at every I/O call `k = 1 ..= total + 1` in each of 4 layouts / index tiers, then recovered:
     - after a random power cut, a process kill and a total loss of unsynced data;
