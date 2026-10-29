@@ -5,5 +5,9 @@
 //!   coalesced heartbeats, quiescent idle ranges (`TASK-137`).
 
 pub mod hlc;
+pub mod mvcc;
 pub mod node;
+pub mod server;
+pub mod txn;
+pub mod txn_sim;
 pub mod sim;

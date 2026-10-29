@@ -1005,9 +1005,39 @@ This document defines the strict chronological execution order for building the 
     - `commit_wait` (waits until `ts` is in the past on every clock);
     - `SystemClock` and `ManualClock`.
   - Every node batch carries the sender's timestamp. Transactions and reads use the clock from `TASK-140` on.
-- [ ] **TASK-140: Distributed Transactions (`F-GEO-04`)** — transaction records, write intents, parallel commits, serializable timestamp ordering with read refresh, deadlock detection, intent resolution, exactly-once coordinators.
+- [x] **TASK-140: Distributed Transactions (`F-GEO-04`)** — transaction records, write intents, parallel commits, serializable timestamp ordering with read refresh, deadlock detection, intent resolution, exactly-once coordinators.
+  - **MVCC keys** (`dist/mvcc.rs`): each key's record holds its committed versions at HLC timestamps (tombstones for deletes, GC below a threshold) and at most one write intent naming its transaction record. Transaction records are ordinary keys (`_txn/<id>`), so they replicate, split and route like data. Pure rules:
+    - reads with uncertainty restarts;
+    - writes pushed above newer commits and the timestamp cache;
+    - resolution at exactly the commit timestamp;
+    - read refresh.
+  - **Range server** (`dist/server.rs`): leaseholder evaluation with per-key latches, under a read-index confirmation. Each effect is proposed as one version-checked record write, so every replica applies the same decision, and a concurrent change re-evaluates.
+    - **Timestamp cache**: tagged with the reading transaction, so a transaction's own reads never push its writes. A new leaseholder starts it at its clock: the HLC carried by heartbeats and votes bounds every read the old leader can still serve.
+    - **Record rules**: stage, conditional commit and abort, and wound-wait push (absent records too, via the intent's age).
+    - **Staging-recovery probes** that prevent a missing intent from ever landing below the staged timestamp.
+  - **Coordinator** (`dist/txn.rs`, over a `KvSender`):
+    - buffered writes;
+    - **parallel commit** (intents plus a staging record in one round trip; committed once every intent lands at or below the staged timestamp; then an explicit commit and intent resolution);
+    - read refresh when pushed;
+    - uncertainty restarts;
+    - **wound-wait** (older wounds, younger waits: no wait-for cycles, hence no deadlocks);
+    - abandoned-transaction recovery;
+    - **definite outcomes**: after the first commit round, any failure is settled from the record (staging records recovered), and only an unreachable record yields `CommitUnknown`.
+  - **Simulator** (`dist/txn_sim.rs`): real coordinators on threads that only run while holding a baton, handed out in seeded order. Interleavings are concurrent, and each seed replays exactly.
+    - **Checks**: bank audits (snapshot reads of every account) see the conserved total; every committed transaction, replayed in commit-timestamp order, read exactly what the serial order gives; the final state equals the serial result.
+  - **Bugs found by the simulator and fixed**:
+    - a transaction's own reads pushed its own writes forever;
+    - a recovery decided on a stale staging record and raced a re-stage (decisions are now conditional on the examined timestamp and epoch);
+    - a re-sent intent of an implicitly committed transaction moved to a later timestamp, splitting the commit;
+    - a late replayed write of an already resolved transaction became a zombie intent, which resurrected an old value (writes now remember their committer, and resolution drops intents above the commit timestamp);
+    - post-commit failures were reported as "nothing committed".
+  - **Exit Criteria (met)**:
+    - 400 seeds: calm, faults, and 5 nodes in 3 regions with outages.
+    - About 10,600 committed transfers and 3,400 snapshot audits, all serializable, under 1,175 crashes (power cuts) and 2,559 partitions.
 - [ ] **TASK-141: Locality, Zone Configurations & Survival Goals (`F-GEO-05`)** — region / zone labels, constraints, lease preferences, zone / region survival; closed-timestamp follower reads; global and regional-by-row tables.
-- [ ] **TASK-142: Region-Scale Verification (`F-GEO-06`)** — simulator runs with region latencies and outages; multi-process clusters behind the fault proxy.
+- [~] **TASK-142: Region-Scale Verification (`F-GEO-06`)** — simulator runs with region latencies and outages; multi-process clusters behind the fault proxy.
+  - **Done (simulator)**: `dist::sim` and `dist::txn_sim` run 5 nodes in 3 regions, with per-pair latency (0.2–2 ms within a region, 20–60 ms across), clock skew within the offset bound, and whole-region outages (`three_regions_with_region_outages`, `bank_transfers_across_regions`).
+  - **Open**: multi-process clusters of the range layer behind the fault proxy (needs the range server over TCP, `TASK-143`).
 - [ ] **TASK-143: SDK & SQL Integration (`F-GEO-07`)** — range-aware SDK routing in 8 languages; SQL transactions across ranges.
 - [ ] **TASK-144: Cluster Backups & Changefeeds (`F-GEO-08`)** — consistent cluster-wide backups at one timestamp; resumable change data capture.
 
