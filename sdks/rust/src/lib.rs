@@ -21,11 +21,16 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+mod analytics;
 mod client;
 mod error;
 mod value;
 mod wire;
 
+pub use analytics::{
+    approx_count_distinct, avg, bucket, count, count_distinct, count_of, field, lit, max, min, sum, Agg,
+    AggregateQuery, AggregateResult, ColumnRow, ColumnScan, Expr, GroupKey,
+};
 pub use client::{connect, connect_with, ByteStream, Client, Collection, Options, Scan, Transaction};
 pub use error::{Error, Result};
 pub use value::{dec, decode, encode, Decimal, Doc, Value};

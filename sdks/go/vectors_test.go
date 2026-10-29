@@ -135,6 +135,12 @@ func comparable(v any) any {
 		return fmt.Sprintf("ts:%d", x.UnixNano())
 	case float64:
 		return fmt.Sprintf("f:%x", math.Float64bits(x))
+	case [][]any:
+		out := make([]any, len(x))
+		for i, e := range x {
+			out[i] = comparable(e)
+		}
+		return out
 	case []any:
 		out := make([]any, len(x))
 		for i, e := range x {
@@ -217,6 +223,14 @@ func TestRequestVectors(t *testing.T) {
 		return w.b
 	}
 	price := "price"
+	s0099 := "s0099"
+	agg := func(q AggregateQuery) []byte {
+		b, _, err := encodeAggregate("sales", q)
+		if err != nil {
+			panic(err)
+		}
+		return b
+	}
 	built := map[string][]byte{
 		"get accounts/alice":                            encodeGet("accounts", "alice"),
 		"get accounts/alice: bytes 1000..1004 of photo": must(encodeGetRange("accounts", "alice", "photo", 1000, 4)),
@@ -248,6 +262,41 @@ func TestRequestVectors(t *testing.T) {
 		"admin: create index items.price":  admin(1, "items", &price),
 		"info: collection items":           admin(6, "items", nil),
 		"info: list collections":           {3},
+		// Analytics (TASK-129).
+		"aggregate: by region where day >= 20, count / sum(price * qty) / avg(qty), sum desc, limit 2": agg(AggregateQuery{
+			Aggs: []NamedAgg{
+				{"orders", Count()},
+				{"revenue", Sum(Field("price").Times(Field("qty")))},
+				{"avg_qty", Avg("qty")},
+			},
+			Where:   Ge("day", 20),
+			GroupBy: []any{"region"},
+			OrderBy: []string{"-revenue"},
+			Limit:   2,
+		}),
+		"aggregate: totals (count distinct, approx count distinct, min, max, count of field)": agg(AggregateQuery{
+			Aggs: []NamedAgg{
+				{"regions", CountDistinct("region")},
+				{"customers", ApproxCountDistinct(Field("customer"))},
+				{"min_price", Min("price")},
+				{"max_price", Max("price")},
+				{"coupons", CountOf("coupon")},
+			},
+		}),
+		"aggregate: weekly buckets of day (width 7, offset 3) and region, sum(qty - 1) and sum(-price + 2.5), budgets": agg(AggregateQuery{
+			Aggs: []NamedAgg{
+				{"units", Sum(Field("qty").Minus(Lit(1)))},
+				{"x", Sum(Field("price").Neg().Plus(Lit(MustDecimal("2.5"))))},
+			},
+			GroupBy:      []any{Bucket("day", 7, 3), "region"},
+			OrderBy:      []string{"day", "-region"},
+			MemoryBudget: 1 << 20,
+			SpillBudget:  1 << 30,
+		}),
+		"scan: qty, price where region = eu, limit 500": must(encodeScanColumns("sales", Eq("region", "eu"), []string{"qty", "price"}, nil, 500)),
+		"scan: meta.size after s0099 (default limit)":   must(encodeScanColumns("sales", nil, []string{"meta.size"}, &s0099, 0)),
+		"admin: enable columnar sales":                  admin(10, "sales", nil),
+		"admin: disable columnar sales":                 admin(11, "sales", nil),
 	}
 	seen := 0
 	for _, vec := range loadVectors(t).Requests {
@@ -290,6 +339,39 @@ func TestResponseVectors(t *testing.T) {
 	total, data, err := decodeByteRange(r["byte range: total 5000, 4 bytes"])
 	if err != nil || total != 5000 || !bytes.Equal(data, []byte{0xde, 0xad, 0xbe, 0xef}) {
 		t.Fatalf("byte range: %d %x %v", total, data, err)
+	}
+	ar, err := decodeAggregateResult(r["aggregate: matched 4, pruned 2, rows [eu, 3, 12.50] [us, 1, null]"])
+	if err != nil || ar.Matched != 4 || ar.PrunedRowGroups != 2 || ar.SpilledBytes != 0 {
+		t.Fatalf("aggregate result: %+v %v", ar, err)
+	}
+	want := [][]any{{"eu", int64(3), MustDecimal("12.50")}, {"us", int64(1), nil}}
+	if !reflect.DeepEqual(comparable(ar.Rows), comparable(want)) || ar.Rows[0][2].(Decimal).String() != "12.50" {
+		t.Fatalf("aggregate rows: %#v", ar.Rows)
+	}
+	sp, err := decodeScanPage(r["scan page: total 2, next s1, row s1 [7, 9.99]"])
+	if err != nil || sp.total != 2 || sp.nextKey == nil || *sp.nextKey != "s1" || sp.fields != 2 || len(sp.rows) != 1 ||
+		sp.rows[0].key != "s1" || !reflect.DeepEqual(comparable(sp.rows[0].values), comparable([]any{int64(7), MustDecimal("9.99")})) {
+		t.Fatalf("scan page: %+v %v", sp, err)
+	}
+}
+
+func TestAggregateValidation(t *testing.T) {
+	cases := map[string]AggregateQuery{
+		"unknown order column": {Aggs: []NamedAgg{{"n", Count()}}, OrderBy: []string{"-nope"}},
+		"missing name":         {Aggs: []NamedAgg{{"", Count()}}},
+		"duplicate column":     {Aggs: []NamedAgg{{"region", Count()}}, GroupBy: []any{"region"}},
+		"bad argument":         {Aggs: []NamedAgg{{"s", Sum(42)}}},
+		"bad group key":        {Aggs: []NamedAgg{{"n", Count()}}, GroupBy: []any{7}},
+		"zero bucket width":    {Aggs: []NamedAgg{{"n", Count()}}, GroupBy: []any{Bucket("day", 0, 0)}},
+		"negative limit":       {Aggs: []NamedAgg{{"n", Count()}}, Limit: -1},
+	}
+	for name, q := range cases {
+		if _, _, err := encodeAggregate("sales", q); !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if _, err := encodeScanColumns("sales", nil, []string{"a"}, nil, maxScanPageSize+1); !errors.Is(err, ErrInvalid) {
+		t.Error(err)
 	}
 }
 

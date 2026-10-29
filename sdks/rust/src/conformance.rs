@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::analytics::*;
 use crate::value::{decode, encode, encode_fields, Decimal, Doc, Value};
 use crate::wire::*;
 use crate::{dec, doc, Error};
@@ -310,6 +311,50 @@ fn requests() {
     built.insert("admin: create index items.price", encode_admin(1, "items", Some("price")).unwrap());
     built.insert("info: collection items", encode_admin(6, "items", None).unwrap());
     built.insert("info: list collections", vec![3]);
+    // Analytics (TASK-129).
+    let agg = |q: AggregateQuery| encode_aggregate("sales", &q).unwrap();
+    built.insert(
+        "aggregate: by region where day >= 20, count / sum(price * qty) / avg(qty), sum desc, limit 2",
+        agg(AggregateQuery::new()
+            .agg("orders", count())
+            .agg("revenue", sum(field("price") * field("qty")))
+            .agg("avg_qty", avg("qty"))
+            .filter(ge("day", 20))
+            .group_by("region")
+            .order_by("-revenue")
+            .limit(2)),
+    );
+    built.insert(
+        "aggregate: totals (count distinct, approx count distinct, min, max, count of field)",
+        agg(AggregateQuery::new()
+            .agg("regions", count_distinct("region"))
+            .agg("customers", approx_count_distinct(field("customer")))
+            .agg("min_price", min("price"))
+            .agg("max_price", max("price"))
+            .agg("coupons", count_of("coupon"))),
+    );
+    built.insert(
+        "aggregate: weekly buckets of day (width 7, offset 3) and region, sum(qty - 1) and sum(-price + 2.5), budgets",
+        agg(AggregateQuery::new()
+            .agg("units", sum(field("qty") - lit(1)))
+            .agg("x", sum(-field("price") + lit(dec("2.5"))))
+            .group_by(bucket("day", 7, 3))
+            .group_by("region")
+            .order_by("day")
+            .order_by("-region")
+            .memory_budget(1 << 20)
+            .spill_budget(1 << 30)),
+    );
+    built.insert(
+        "scan: qty, price where region = eu, limit 500",
+        encode_scan("sales", Some(&eq("region", "eu")), &["qty", "price"], None, 500).unwrap(),
+    );
+    built.insert(
+        "scan: meta.size after s0099 (default limit)",
+        encode_scan("sales", None, &["meta.size"], Some("s0099"), 0).unwrap(),
+    );
+    built.insert("admin: enable columnar sales", encode_admin(10, "sales", None).unwrap());
+    built.insert("admin: disable columnar sales", encode_admin(11, "sales", None).unwrap());
     let v = vectors();
     let reqs = v.get("requests").arr();
     for vec in reqs {
@@ -332,6 +377,34 @@ fn responses() {
     let (total, data) = decode_byte_range(&r["byte range: total 5000, 4 bytes"]).unwrap();
     assert_eq!((total, data), (5000, vec![0xde, 0xad, 0xbe, 0xef]));
     assert!(matches!(decode_byte_range(&r["byte range: total 5000, 4 bytes"][..15]), Err(Error::Invalid(_))));
+    let a = decode_aggregate_result(&r["aggregate: matched 4, pruned 2, rows [eu, 3, 12.50] [us, 1, null]"]).unwrap();
+    assert_eq!((a.matched, a.pruned_row_groups, a.spilled_bytes), (4, 2, 0));
+    assert_eq!(
+        a.rows,
+        vec![
+            vec![Value::Text("eu".into()), Value::Int(3), Value::Decimal(dec("12.50"))],
+            vec![Value::Text("us".into()), Value::Int(1), Value::Null],
+        ]
+    );
+    let p = decode_scan_page(&r["scan page: total 2, next s1, row s1 [7, 9.99]"]).unwrap();
+    assert_eq!((p.total, p.next_key.as_deref(), p.fields), (2, Some("s1"), 2));
+    assert_eq!(p.rows, vec![("s1".to_owned(), vec![Value::Int(7), Value::Decimal(dec("9.99"))])]);
+}
+
+#[test]
+fn aggregate_validation() {
+    let bad = [
+        AggregateQuery::new().agg("n", count()).order_by("-nope"),
+        AggregateQuery::new().agg("", count()),
+        AggregateQuery::new().agg("region", count()).group_by("region"),
+        AggregateQuery::new().agg("n", count()).group_by(bucket("day", 0, 0)),
+    ];
+    for q in bad {
+        assert!(matches!(encode_aggregate("sales", &q), Err(Error::Invalid(_))), "{q:?}");
+    }
+    assert!(matches!(encode_scan("sales", None, &["a"], None, 100_001), Err(Error::Invalid(_))));
+    let q = AggregateQuery::new().agg("n", count()).group_by(bucket("day", 7, 0)).group_by("region");
+    assert_eq!(q.columns(), vec!["day", "region", "n"]);
 }
 
 #[test]

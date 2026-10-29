@@ -208,7 +208,7 @@ impl Not for Filter {
 }
 
 impl Filter {
-    fn encode(&self, out: &mut Vec<u8>, depth: usize) -> Result<()> {
+    pub(crate) fn encode(&self, out: &mut Vec<u8>, depth: usize) -> Result<()> {
         if depth > MAX_DEPTH {
             return Err(invalid("filter nesting is too deep (max 32)"));
         }

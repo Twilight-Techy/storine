@@ -302,3 +302,161 @@ fn three_nodes_redirect_and_failover() {
     drop(servers);
     let _ = std::fs::remove_dir_all(base);
 }
+
+/// Analytics (TASK-129): expectations computed here from the inserted documents must match the server exactly,
+/// on the row store, with columnar enabled, and after disabling it.
+#[test]
+fn analytics() {
+    use std::collections::{BTreeMap, BTreeSet};
+    use storine::{
+        and, avg, bucket, count, count_distinct, field, ge, max, min, sum, AggregateQuery, AggregateResult, Decimal,
+    };
+
+    let Some((_server, db, dir)) = single_node() else { return };
+    let sales = db.collection("sales");
+    struct Sale {
+        key: String,
+        region: &'static str,
+        qty: i64,
+        price: i64, // cents
+        day: i64,
+    }
+    let regions = ["eu", "us", "apac"];
+    let data: Vec<Sale> = (0..3000i64)
+        .map(|i| Sale {
+            key: format!("s{i:05}"),
+            region: regions[(i % 3) as usize],
+            qty: i % 17 + 1,
+            price: (i * 7919) % 10000 + 100,
+            day: i % 60,
+        })
+        .collect();
+    for chunk in data.chunks(200) {
+        db.transaction(|tx| {
+            for s in chunk {
+                tx.put(
+                    "sales",
+                    &s.key,
+                    doc! { "region" => s.region, "qty" => s.qty, "price" => Decimal::new(i128::from(s.price), 2)?, "day" => s.day },
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+    let cents = |m: i128| Value::Decimal(Decimal::new(m, 2).unwrap());
+    // The server's exact mean: 6 more fractional digits, half-even.
+    let mean = |sum: i128, scale: u8, n: i128| {
+        let scaled = sum * 1_000_000;
+        let (mut q, r) = (scaled / n, scaled % n);
+        if (r.abs() * 2 > n) || (r.abs() * 2 == n && q % 2 != 0) {
+            q += scaled.signum();
+        }
+        Value::Decimal(Decimal::new(q, scale + 6).unwrap())
+    };
+
+    // Grouped by region: count, sum(price * qty), avg(qty), min / max(price), count_distinct(day); -revenue, limit 2.
+    #[derive(Default)]
+    struct G {
+        n: i64,
+        qty: i128,
+        revenue: i128,
+        min: i64,
+        max: i64,
+        days: BTreeSet<i64>,
+    }
+    let mut groups: BTreeMap<&str, G> = BTreeMap::new();
+    for s in &data {
+        let g = groups.entry(s.region).or_insert_with(|| G { min: s.price, max: s.price, ..G::default() });
+        g.n += 1;
+        g.qty += i128::from(s.qty);
+        g.revenue += i128::from(s.price * s.qty);
+        g.min = g.min.min(s.price);
+        g.max = g.max.max(s.price);
+        g.days.insert(s.day);
+    }
+    let mut ranked: Vec<(&str, &G)> = groups.iter().map(|(r, g)| (*r, g)).collect();
+    ranked.sort_by(|a, b| b.1.revenue.cmp(&a.1.revenue).then(a.0.cmp(b.0)));
+    let grouped: Vec<Vec<Value>> = ranked[..2]
+        .iter()
+        .map(|(r, g)| {
+            vec![
+                Value::from(*r),
+                Value::Int(g.n),
+                cents(g.revenue),
+                mean(g.qty, 0, i128::from(g.n)),
+                cents(i128::from(g.min)),
+                cents(i128::from(g.max)),
+                Value::Int(g.days.len() as i64),
+            ]
+        })
+        .collect();
+    let grouped_query = AggregateQuery::new()
+        .agg("orders", count())
+        .agg("revenue", sum(field("price") * field("qty")))
+        .agg("avg_qty", avg("qty"))
+        .agg("min_price", min("price"))
+        .agg("max_price", max("price"))
+        .agg("days", count_distinct("day"))
+        .group_by("region")
+        .order_by("-revenue")
+        .limit(2);
+
+    // Weekly buckets of day (width 7, offset 3): sum(qty), count.
+    let mut buckets: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+    for s in &data {
+        let b = 3 + (s.day - 3).div_euclid(7) * 7;
+        let e = buckets.entry(b).or_default();
+        e.0 += s.qty;
+        e.1 += 1;
+    }
+    let bucket_rows: Vec<Vec<Value>> =
+        buckets.iter().map(|(b, (q, n))| vec![Value::Int(*b), Value::Int(*q), Value::Int(*n)]).collect();
+    let bucket_query =
+        AggregateQuery::new().agg("units", sum("qty")).agg("n", count()).group_by(bucket("day", 7, 3)).order_by("day");
+
+    // Filtered totals: region us and day >= 30.
+    let picked: Vec<&Sale> = data.iter().filter(|s| s.region == "us" && s.day >= 30).collect();
+    let (fqty, fsum) = picked.iter().fold((0i64, 0i128), |(q, p), s| (q + s.qty, p + i128::from(s.price)));
+    let filtered =
+        vec![vec![Value::Int(picked.len() as i64), Value::Int(fqty), cents(fsum), mean(fsum, 2, picked.len() as i128)]];
+    let filtered_query = AggregateQuery::new()
+        .agg("n", count())
+        .agg("units", sum("qty"))
+        .agg("total", sum("price"))
+        .agg("avg_price", avg("price"))
+        .filter(and([eq("region", "us"), ge("day", 30)]));
+
+    let run_all = |mode: &str| {
+        let r: AggregateResult = sales.aggregate(grouped_query.clone()).unwrap();
+        assert_eq!(r.matched, 3000, "{mode}");
+        assert_eq!(r.columns, ["region", "orders", "revenue", "avg_qty", "min_price", "max_price", "days"], "{mode}");
+        assert_eq!(r.rows, grouped, "{mode}: grouped");
+        assert_eq!(r.get(0, "revenue"), Some(&grouped[0][2]));
+        assert_eq!(sales.aggregate(bucket_query.clone()).unwrap().rows, bucket_rows, "{mode}: buckets");
+        let r = sales.aggregate(filtered_query.clone()).unwrap();
+        assert_eq!(r.matched, picked.len() as u64, "{mode}");
+        assert_eq!(r.rows, filtered, "{mode}: filtered");
+    };
+
+    run_all("row store");
+    assert!(matches!(sales.aggregate(grouped_query.clone().order_by("nope")), Err(Error::Invalid(_))));
+
+    sales.enable_columnar().unwrap();
+    run_all("columnar");
+
+    let eu: Vec<&Sale> = data.iter().filter(|s| s.region == "eu").collect();
+    let mut scan = sales.scan_columns(&["qty", "price"], eq("region", "eu"), 500);
+    let rows: Vec<_> = scan.by_ref().collect::<storine::Result<_>>().unwrap();
+    assert_eq!(scan.total(), Some(1000));
+    assert_eq!(rows.len(), eu.len());
+    for (row, s) in rows.iter().zip(&eu) {
+        assert_eq!(row.key, s.key);
+        assert_eq!(row.values, vec![Value::Int(s.qty), cents(i128::from(s.price))]);
+        assert_eq!(row.get("qty"), Some(&Value::Int(s.qty)));
+    }
+
+    sales.disable_columnar().unwrap();
+    run_all("columnar disabled");
+    let _ = std::fs::remove_dir_all(dir);
+}

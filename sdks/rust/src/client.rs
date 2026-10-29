@@ -454,8 +454,8 @@ fn ttl_ms(ttl: Duration) -> Result<u64> {
 /// A named set of documents. Every method is one atomic, exactly-once operation.
 #[derive(Debug)]
 pub struct Collection<'a> {
-    client: &'a Client,
-    name: String,
+    pub(crate) client: &'a Client,
+    pub(crate) name: String,
 }
 
 impl Collection<'_> {

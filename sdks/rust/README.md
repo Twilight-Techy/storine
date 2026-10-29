@@ -70,6 +70,36 @@ let mut out = std::fs::File::create("cat.png")?;
 for chunk in files.stream_bytes("f1", "data", 1 << 20) { out.write_all(&chunk?)?; }
 ```
 
+**Analytics**: `aggregate` filters, groups and aggregates on the server — exact (integer and decimal sums never
+round; `avg` of exact inputs is a `Decimal` with 6 more fractional digits) and as of one snapshot.
+`c.enable_columnar()` also keeps the collection as column segments for vectorized execution (same results);
+`c.disable_columnar()` drops them. Result columns are the group keys (named by their path) then the aggregates (named
+by `agg`), in order; `order_by` names output columns (`"-revenue"` descending).
+
+```rust
+use storine::{avg, bucket, count, eq, field, ge, sum, AggregateQuery};
+
+let res = sales.aggregate(
+    AggregateQuery::new()
+        .agg("orders", count()) // also count_of(arg)
+        .agg("revenue", sum(field("price") * field("qty"))) // + - * and unary -, lit(v)
+        .agg("avg_qty", avg("qty")) // min, max, count_distinct, approx_count_distinct
+        .filter(ge("day", 20))
+        .group_by("region")
+        .group_by(bucket("day", 7, 0)) // field paths and/or buckets
+        .order_by("-revenue")
+        .limit(10), // memory_budget / spill_budget: 0 = server defaults
+)?;
+for i in 0..res.rows.len() { println!("{:?} {:?}", res.get(i, "region"), res.get(i, "revenue")); }
+// res.columns, res.maps(), res.matched, res.pruned_row_groups, res.spilled_bytes
+
+// Chosen fields of every matching document, in key order, fetched lazily page by page (0: 1,000 per page):
+for row in sales.scan_columns(&["qty", "price"], eq("region", "eu"), 500) {
+    let row = row?;
+    println!("{} {:?} {:?}", row.key, row.get("qty"), row.values[1]);
+}
+```
+
 **Values** (`storine::Value`): `Null`, `Bool`, `Int` (i64; all smaller integer types convert), `UInt` (u64), `Int128`,
 `Float`, `Decimal` (exact, up to 38 digits — use it for money; `dec("19.99")`, `Decimal::parse`, `Decimal::new`), `Text`,
 `Bytes`, `Timestamp` (ns; `SystemTime` converts), `Uuid`, `Id`, `List` (`list![..]`) and `Map` (`doc! {..}`). Accessors:

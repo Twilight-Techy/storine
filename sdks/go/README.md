@@ -71,6 +71,34 @@ meta, err := files.GetFields(ctx, "f1", "name", "meta.size") // skips the blob
 _, err = io.Copy(out, files.StreamBytes(ctx, "f1", "data", 0))
 ```
 
+**Analytics**: `Aggregate` filters, groups and aggregates on the server — exact (integer and decimal sums never
+round; `Avg` of exact inputs is a `Decimal` with 6 more fractional digits) and as of one snapshot.
+`c.EnableColumnar(ctx)` also keeps the collection as column segments for vectorized execution (same results);
+`c.DisableColumnar(ctx)` drops them. Result columns are the group keys (named by their path) then the aggregates
+(named by you), in order; `OrderBy` names output columns (`"-revenue"` descending).
+
+```go
+res, err := sales.Aggregate(ctx, storine.AggregateQuery{
+	Aggs: []storine.NamedAgg{
+		{"orders", storine.Count()},                                            // also CountOf(arg)
+		{"revenue", storine.Sum(storine.Field("price").Times(storine.Field("qty")))}, // Plus / Minus / Times / Neg, Lit(v)
+		{"avg_qty", storine.Avg("qty")},                                        // Min, Max, CountDistinct, ApproxCountDistinct
+	},
+	Where:   storine.Ge("day", 20),
+	GroupBy: []any{"region", storine.Bucket("day", 7, 0)}, // field paths and/or buckets
+	OrderBy: []string{"-revenue"},
+	Limit:   10, // MemoryBudget / SpillBudget: 0 = server defaults
+})
+for i := range res.Rows { fmt.Println(res.Get(i, "region"), res.Get(i, "revenue")) } // also res.Columns, res.Maps()
+// res.Matched, res.PrunedRowGroups, res.SpilledBytes
+
+// Chosen fields of every matching document, in key order, page by page (0: 1,000 per page):
+err = sales.ScanColumns(ctx, []string{"qty", "price"}, storine.Eq("region", "eu"), 500, func(r *storine.ColumnRow) error {
+	fmt.Println(r.Key, r.Fields["qty"], r.Values[1])
+	return nil
+})
+```
+
 **Values**: `nil`, `bool`, all integer types (`int`… → int64, `uint64`/`uint` → uint64), `*big.Int` (up to 128 bits),
 `float64`, `storine.Decimal` (exact, up to 38 digits — use it for money; `MustDecimal("19.99")`, `ParseDecimal`, `NewDecimal`),
 `string`, `[]byte`, `time.Time` (nanoseconds, returned as UTC), `storine.UUID`, slices and `map[string]T` (as lists and maps).
@@ -87,6 +115,6 @@ automatically; reads come from the leader unless `FollowerReads` is set. Every c
 ## Tests
 
 ```bash
-go test -run 'Vector|Hostile|Mapping' .                       # protocol conformance (no server needed)
+go test -run 'Vector|Hostile|Mapping|Validation' .            # protocol conformance (no server needed)
 cargo build --release -p storage-server && go test -race .   # plus end-to-end, single node and 3-node failover
 ```
