@@ -1800,6 +1800,18 @@ impl DocumentStore {
         crate::analytics::run_documents(q, &docs)
     }
 
+    /// One page of a columnar scan (`TASK-129`): `fields` of the documents matching the filter,
+    /// in key order. Collections without column segments are scanned from the row store.
+    pub fn scan_columns(&self, q: &crate::analytics::ScanQuery) -> Result<crate::analytics::ScanPage> {
+        validate_collection_name(&q.collection, true)?;
+        if let Some(c) = self.columnar(&q.collection)? {
+            let snap = c.snapshot()?;
+            return crate::analytics::scan(q, &snap);
+        }
+        let docs = crate::columnar::snapshot_documents(&self.engine, &q.collection)?;
+        crate::analytics::scan_documents(q, &docs)
+    }
+
     /// Opens a projection for every collection declared columnar.
     fn sync_columnar(&self) -> Result<()> {
         let names: Vec<String> = self

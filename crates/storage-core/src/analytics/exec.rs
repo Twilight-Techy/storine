@@ -1001,6 +1001,22 @@ fn key_col(k: &GroupKey, rg: &RowGroupView<'_>, sel: &[u64]) -> KeyCol {
 
 // ── per row group ──
 
+/// Adds the columns `f` reads to `out`.
+pub(crate) fn filter_paths_into(f: Option<&crate::document::Filter>, out: &mut Vec<String>) {
+    use crate::document::Filter as F;
+    let Some(f) = f else { return };
+    match f {
+        F::And(fs) | F::Or(fs) => fs.iter().for_each(|x| filter_paths_into(Some(x), out)),
+        F::Not(x) => filter_paths_into(Some(x), out),
+        F::KeyPrefix(_) => out.push(storage_columnar::segment::KEY_NAME.to_owned()),
+        leaf => {
+            if let Some(p) = leaf.path() {
+                out.push(p.to_owned());
+            }
+        }
+    }
+}
+
 fn needed_columns(q: &AggregateQuery) -> Vec<String> {
     fn expr_paths(e: &Expr, out: &mut Vec<String>) {
         match e {
@@ -1013,23 +1029,8 @@ fn needed_columns(q: &AggregateQuery) -> Vec<String> {
             Expr::Neg(a) => expr_paths(a, out),
         }
     }
-    fn filter_paths(f: &crate::document::Filter, out: &mut Vec<String>) {
-        use crate::document::Filter as F;
-        match f {
-            F::And(fs) | F::Or(fs) => fs.iter().for_each(|x| filter_paths(x, out)),
-            F::Not(x) => filter_paths(x, out),
-            F::KeyPrefix(_) => out.push(storage_columnar::segment::KEY_NAME.to_owned()),
-            leaf => {
-                if let Some(p) = leaf.path() {
-                    out.push(p.to_owned());
-                }
-            }
-        }
-    }
     let mut out = Vec::new();
-    if let Some(f) = &q.filter {
-        filter_paths(f, &mut out);
-    }
+    filter_paths_into(q.filter.as_ref(), &mut out);
     for k in &q.group_by {
         match k {
             GroupKey::Field(p) | GroupKey::Bucket { field: p, .. } => out.push(p.clone()),
@@ -1045,18 +1046,29 @@ fn needed_columns(q: &AggregateQuery) -> Vec<String> {
     out
 }
 
-fn run_row_group(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>, si: usize, g: usize, needed: &[String], st: &mut State<'_>) -> Result<()> {
+/// Opens row group `g` of segment `si` and selects its live rows matching `filter`, then calls
+/// `f` with the view and the selection. `None` when zone maps rule the group out (`pruned` is
+/// incremented) or no live row remains.
+pub(crate) fn with_row_group<R>(
+    filter: Option<&crate::document::Filter>,
+    snap: &ColumnarSnapshot<'_>,
+    si: usize,
+    g: usize,
+    needed: &[String],
+    pruned: &mut u64,
+    f: impl FnOnce(&RowGroupView<'_>, Vec<u64>) -> Result<R>,
+) -> Result<Option<R>> {
     let seg = &snap.segments[si].segment;
     let seal = snap.seal();
     let n = seg.row_groups()[g].rows as usize;
     // Zone maps rule out row groups before any chunk is read or decoded.
-    if q.filter.as_ref().is_some_and(|f| super::filter::prune(f, seg, g)) {
-        st.pruned += 1;
-        return Ok(());
+    if filter.is_some_and(|f| super::filter::prune(f, seg, g)) {
+        *pruned += 1;
+        return Ok(None);
     }
     let mut sel = snap.live_mask(si, g);
     if sel.iter().all(|w| *w == 0) {
-        return Ok(());
+        return Ok(None);
     }
     // Columns this query reads (map-valued paths need their nested columns too).
     let names: Vec<String> = seg.columns().iter().map(|c| c.name.clone()).collect();
@@ -1081,11 +1093,26 @@ fn run_row_group(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>, si: usize, g: 
         decoded.insert(name, OnceCell::new());
     }
     let rg = RowGroupView { n, chunks, names: &names, decoded, keys: OnceCell::new() };
-    if let Some(f) = &q.filter {
+    if let Some(flt) = filter {
         let mut m = vec![0u64; sel.len()];
-        eval(f, &rg, &sel, &mut m);
+        eval(flt, &rg, &sel, &mut m);
         sel = m;
     }
+    if sel.iter().all(|w| *w == 0) {
+        return Ok(None);
+    }
+    f(&rg, sel).map(Some)
+}
+
+fn run_row_group(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>, si: usize, g: usize, needed: &[String], st: &mut State<'_>) -> Result<()> {
+    let mut pruned = 0;
+    with_row_group(q.filter.as_ref(), snap, si, g, needed, &mut pruned, |rg, sel| aggregate_row_group(q, rg, sel, st))?;
+    st.pruned += pruned;
+    Ok(())
+}
+
+fn aggregate_row_group(q: &AggregateQuery, rg: &RowGroupView<'_>, sel: Vec<u64>, st: &mut State<'_>) -> Result<()> {
+    let n = rg.n;
     let selected = simd::count_ones(&sel);
     if selected == 0 {
         return Ok(());
@@ -1094,7 +1121,7 @@ fn run_row_group(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>, si: usize, g: 
     // Groups. Dictionary-coded keys with a small combined code space get a local slot per row
     // (`SINK` for rows outside the selection), so aggregates scatter into a few accumulators
     // without per-row hashing; other keys fall back to one group lookup per row.
-    let keys: Vec<KeyCol> = q.group_by.iter().map(|k| key_col(k, &rg, &sel)).collect();
+    let keys: Vec<KeyCol> = q.group_by.iter().map(|k| key_col(k, rg, &sel)).collect();
     let mut local: Option<Local> = None;
     let mut gids: Option<Vec<u32>> = None;
     if !q.group_by.is_empty() {
@@ -1124,7 +1151,7 @@ fn run_row_group(q: &AggregateQuery, snap: &ColumnarSnapshot<'_>, si: usize, g: 
     }
     for (ai, a) in q.aggregates.iter().enumerate() {
         let col = match &a.arg {
-            Some(e) => Some(eval_expr(e, &rg, &sel)?),
+            Some(e) => Some(eval_expr(e, rg, &sel)?),
             None => None,
         };
         let mut rows = sel.clone();

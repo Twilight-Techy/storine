@@ -201,6 +201,32 @@ fn columnar_aggregates_equal_document_aggregates_for_random_filters() {
         vec![GroupKey::Bucket { field: "n".into(), width: 100, offset: 0 }],
         vec![GroupKey::Field("meta.b".into()), GroupKey::Field("opt".into())],
     ];
+    // Columnar scans page through exactly what the document path returns.
+    for round in 0..40 {
+        let f = if round == 0 { None } else { Some(filter(&mut r, 2)) };
+        let fields: Vec<String> = ["price", "meta", "meta.b", "list", "opt", "nope", "mixed"].iter().take(1 + round % 7).map(|s| (*s).to_owned()).collect();
+        let mut q = storage_core::analytics::ScanQuery { collection: "t".into(), filter: f.clone(), fields, after_key: None, limit: 300 + (round * 397) % 2500 };
+        let mut pages = 0;
+        loop {
+            let got = s.scan_columns(&q).unwrap();
+            let want = storage_core::analytics::scan_documents(&q, &docs).unwrap();
+            assert_eq!(got.total, want.total, "total for {f:?}");
+            assert_eq!(got.next_after_key, want.next_after_key);
+            assert_eq!(got.rows.len(), want.rows.len());
+            for (g, w) in got.rows.iter().zip(&want.rows) {
+                assert_eq!(g.0, w.0);
+                for (a, b) in g.1.iter().zip(&w.1) {
+                    assert!(same(a, b), "{} differs: {a:?} vs {b:?}", g.0);
+                }
+            }
+            pages += 1;
+            match got.next_after_key {
+                Some(k) => q.after_key = Some(k),
+                None => break,
+            }
+        }
+        assert!(pages >= 1);
+    }
     let mut checked = 0;
     for round in 0..300 {
         let f = if round == 0 { None } else { Some(filter(&mut r, 3)) };

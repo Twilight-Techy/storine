@@ -427,6 +427,324 @@ pub fn decode_document(r: &mut SveReader<'_>) -> Result<Document> {
     Ok(Document { key, version, fields })
 }
 
+// ── Analytics (`TASK-129`, `OP_DOC_AGGREGATE` / `OP_DOC_SCAN_COLUMNS`) ──
+
+use crate::analytics::{AggFunc, Aggregate, AggregateQuery, AggregateResult, Expr, GroupKey, ScanPage, ScanQuery};
+
+const KEY_FIELD: u8 = 1;
+const KEY_BUCKET: u8 = 2;
+const EXPR_FIELD: u8 = 1;
+const EXPR_CONST: u8 = 2;
+const EXPR_ADD: u8 = 3;
+const EXPR_SUB: u8 = 4;
+const EXPR_MUL: u8 = 5;
+const EXPR_NEG: u8 = 6;
+/// Deepest expression accepted (as for values).
+const MAX_EXPR_DEPTH: usize = 32;
+/// Most result rows one aggregate response carries.
+pub const MAX_AGGREGATE_ROWS: usize = 1_000_000;
+
+fn func_code(f: AggFunc) -> u8 {
+    match f {
+        AggFunc::Count => 1,
+        AggFunc::Sum => 2,
+        AggFunc::Avg => 3,
+        AggFunc::Min => 4,
+        AggFunc::Max => 5,
+        AggFunc::CountDistinct => 6,
+        AggFunc::ApproxCountDistinct => 7,
+    }
+}
+
+fn func_of(c: u8) -> Result<AggFunc> {
+    Ok(match c {
+        1 => AggFunc::Count,
+        2 => AggFunc::Sum,
+        3 => AggFunc::Avg,
+        4 => AggFunc::Min,
+        5 => AggFunc::Max,
+        6 => AggFunc::CountDistinct,
+        7 => AggFunc::ApproxCountDistinct,
+        _ => return Err(StorageError::invalid_value("unknown aggregate function")),
+    })
+}
+
+pub fn encode_expr(e: &Expr, out: &mut Vec<u8>) {
+    match e {
+        Expr::Field(p) => {
+            out.push(EXPR_FIELD);
+            put_str(out, p);
+        }
+        Expr::Const(v) => {
+            out.push(EXPR_CONST);
+            encode_value(v, out);
+        }
+        Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) => {
+            out.push(match e {
+                Expr::Add(..) => EXPR_ADD,
+                Expr::Sub(..) => EXPR_SUB,
+                _ => EXPR_MUL,
+            });
+            encode_expr(a, out);
+            encode_expr(b, out);
+        }
+        Expr::Neg(a) => {
+            out.push(EXPR_NEG);
+            encode_expr(a, out);
+        }
+    }
+}
+
+fn decode_expr(r: &mut SveReader<'_>, depth: usize) -> Result<Expr> {
+    if depth > MAX_EXPR_DEPTH {
+        return Err(StorageError::invalid_value("expression nested too deeply"));
+    }
+    Ok(match r.u8()? {
+        EXPR_FIELD => Expr::Field(r.str()?.to_owned()),
+        EXPR_CONST => Expr::Const(r.value()?),
+        k @ (EXPR_ADD | EXPR_SUB | EXPR_MUL) => {
+            let a = Box::new(decode_expr(r, depth + 1)?);
+            let b = Box::new(decode_expr(r, depth + 1)?);
+            match k {
+                EXPR_ADD => Expr::Add(a, b),
+                EXPR_SUB => Expr::Sub(a, b),
+                _ => Expr::Mul(a, b),
+            }
+        }
+        EXPR_NEG => Expr::Neg(Box::new(decode_expr(r, depth + 1)?)),
+        _ => return Err(StorageError::invalid_value("unknown expression kind")),
+    })
+}
+
+fn put_filter_opt(f: Option<&Filter>, out: &mut Vec<u8>) {
+    match f {
+        Some(f) => {
+            out.push(1);
+            encode_filter(f, out);
+        }
+        None => out.push(0),
+    }
+}
+
+fn get_filter_opt(r: &mut SveReader<'_>) -> Result<Option<Filter>> {
+    match r.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(decode_filter(r)?)),
+        _ => Err(StorageError::invalid_value("bad filter flag")),
+    }
+}
+
+/// `str collection | filter? | u32 n | key* | u32 n | (u8 func | u8 has_arg | expr?)* |
+/// u32 n | (u32 column | u8 desc)* | u32 limit | u64 memory_budget | u64 spill_budget`
+pub fn encode_aggregate(q: &AggregateQuery, out: &mut Vec<u8>) {
+    put_str(out, &q.collection);
+    put_filter_opt(q.filter.as_ref(), out);
+    out.extend_from_slice(&(q.group_by.len() as u32).to_le_bytes());
+    for k in &q.group_by {
+        match k {
+            GroupKey::Field(p) => {
+                out.push(KEY_FIELD);
+                put_str(out, p);
+            }
+            GroupKey::Bucket { field, width, offset } => {
+                out.push(KEY_BUCKET);
+                put_str(out, field);
+                out.extend_from_slice(&width.to_le_bytes());
+                out.extend_from_slice(&offset.to_le_bytes());
+            }
+        }
+    }
+    out.extend_from_slice(&(q.aggregates.len() as u32).to_le_bytes());
+    for a in &q.aggregates {
+        out.push(func_code(a.func));
+        match &a.arg {
+            Some(e) => {
+                out.push(1);
+                encode_expr(e, out);
+            }
+            None => out.push(0),
+        }
+    }
+    out.extend_from_slice(&(q.order_by.len() as u32).to_le_bytes());
+    for (c, d) in &q.order_by {
+        out.extend_from_slice(&u32::try_from(*c).unwrap_or(u32::MAX).to_le_bytes());
+        out.push(u8::from(*d == Direction::Desc));
+    }
+    out.extend_from_slice(&q.limit.map_or(0u32, |l| u32::try_from(l).unwrap_or(u32::MAX)).to_le_bytes());
+    out.extend_from_slice(&(q.memory_budget as u64).to_le_bytes());
+    out.extend_from_slice(&q.spill_budget.to_le_bytes());
+}
+
+pub fn decode_aggregate(body: &[u8]) -> Result<AggregateQuery> {
+    let mut r = SveReader::new(body);
+    let collection = r.str()?.to_owned();
+    let filter = get_filter_opt(&mut r)?;
+    let nk = r.count(5)?;
+    if nk > crate::analytics::MAX_QUERY_ITEMS {
+        return Err(StorageError::invalid_value("at most 64 group keys"));
+    }
+    let mut group_by = Vec::with_capacity(nk);
+    for _ in 0..nk {
+        group_by.push(match r.u8()? {
+            KEY_FIELD => GroupKey::Field(r.str()?.to_owned()),
+            KEY_BUCKET => {
+                let field = r.str()?.to_owned();
+                let width = r.i64()?;
+                let offset = r.i64()?;
+                GroupKey::Bucket { field, width, offset }
+            }
+            _ => return Err(StorageError::invalid_value("unknown group key kind")),
+        });
+    }
+    let na = r.count(2)?;
+    if na > crate::analytics::MAX_QUERY_ITEMS {
+        return Err(StorageError::invalid_value("at most 64 aggregates"));
+    }
+    let mut aggregates = Vec::with_capacity(na);
+    for _ in 0..na {
+        let func = func_of(r.u8()?)?;
+        let arg = match r.u8()? {
+            0 => None,
+            1 => Some(decode_expr(&mut r, 0)?),
+            _ => return Err(StorageError::invalid_value("bad argument flag")),
+        };
+        aggregates.push(Aggregate { func, arg });
+    }
+    let no = r.count(5)?;
+    if no > crate::analytics::MAX_QUERY_ITEMS {
+        return Err(StorageError::invalid_value("at most 64 order columns"));
+    }
+    let mut order_by = Vec::with_capacity(no);
+    for _ in 0..no {
+        let c = r.u32()? as usize;
+        let d = if r.u8()? != 0 { Direction::Desc } else { Direction::Asc };
+        order_by.push((c, d));
+    }
+    let limit = match r.u32()? {
+        0 => None,
+        l => Some(l as usize),
+    };
+    let memory_budget = usize::try_from(r.u64()?).unwrap_or(usize::MAX);
+    let spill_budget = r.u64()?;
+    if r.remaining() != 0 {
+        return Err(StorageError::invalid_value("trailing bytes after aggregate query"));
+    }
+    Ok(AggregateQuery { collection, filter, group_by, aggregates, order_by, limit, memory_budget, spill_budget })
+}
+
+/// `u64 matched | u64 pruned_row_groups | u64 spilled_bytes | u32 columns | u32 rows |
+/// rows × columns × value`
+pub fn encode_aggregate_result(res: &AggregateResult, out: &mut Vec<u8>) {
+    out.extend_from_slice(&res.matched.to_le_bytes());
+    out.extend_from_slice(&res.pruned_row_groups.to_le_bytes());
+    out.extend_from_slice(&res.spilled_bytes.to_le_bytes());
+    let cols = res.rows.first().map_or(0, Vec::len);
+    out.extend_from_slice(&(cols as u32).to_le_bytes());
+    out.extend_from_slice(&(res.rows.len() as u32).to_le_bytes());
+    for row in &res.rows {
+        for v in row {
+            encode_value(v, out);
+        }
+    }
+}
+
+pub fn decode_aggregate_result(body: &[u8]) -> Result<AggregateResult> {
+    let mut r = SveReader::new(body);
+    let matched = r.u64()?;
+    let pruned_row_groups = r.u64()?;
+    let spilled_bytes = r.u64()?;
+    let cols = r.u32()? as usize;
+    let n = r.count(cols)?;
+    let mut rows = Vec::with_capacity(n);
+    for _ in 0..n {
+        rows.push((0..cols).map(|_| r.value()).collect::<Result<Vec<_>>>()?);
+    }
+    if r.remaining() != 0 {
+        return Err(StorageError::invalid_value("trailing bytes after aggregate result"));
+    }
+    Ok(AggregateResult { rows, matched, pruned_row_groups, spilled_bytes })
+}
+
+/// `str collection | filter? | u32 n | str field* | u8 has_after | str after? | u32 limit`
+pub fn encode_scan(q: &ScanQuery, out: &mut Vec<u8>) {
+    put_str(out, &q.collection);
+    put_filter_opt(q.filter.as_ref(), out);
+    out.extend_from_slice(&(q.fields.len() as u32).to_le_bytes());
+    for f in &q.fields {
+        put_str(out, f);
+    }
+    match &q.after_key {
+        Some(k) => {
+            out.push(1);
+            put_str(out, k);
+        }
+        None => out.push(0),
+    }
+    out.extend_from_slice(&u32::try_from(q.limit).unwrap_or(u32::MAX).to_le_bytes());
+}
+
+pub fn decode_scan(body: &[u8]) -> Result<ScanQuery> {
+    let mut r = SveReader::new(body);
+    let collection = r.str()?.to_owned();
+    let filter = get_filter_opt(&mut r)?;
+    let n = r.count(4)?;
+    if n > crate::analytics::MAX_QUERY_ITEMS {
+        return Err(StorageError::invalid_value("a scan reads at most 64 fields"));
+    }
+    let fields = (0..n).map(|_| r.str().map(str::to_owned)).collect::<Result<Vec<_>>>()?;
+    let after_key = match r.u8()? {
+        0 => None,
+        1 => Some(r.str()?.to_owned()),
+        _ => return Err(StorageError::invalid_value("bad cursor flag")),
+    };
+    let limit = r.u32()? as usize;
+    if r.remaining() != 0 {
+        return Err(StorageError::invalid_value("trailing bytes after scan"));
+    }
+    Ok(ScanQuery { collection, filter, fields, after_key, limit })
+}
+
+/// `u64 total | u8 has_next | str next? | u32 fields | u32 rows | rows × (str key | fields × value)`
+pub fn encode_scan_page(page: &ScanPage, fields: usize, out: &mut Vec<u8>) {
+    out.extend_from_slice(&page.total.to_le_bytes());
+    match &page.next_after_key {
+        Some(k) => {
+            out.push(1);
+            put_str(out, k);
+        }
+        None => out.push(0),
+    }
+    out.extend_from_slice(&(fields as u32).to_le_bytes());
+    out.extend_from_slice(&(page.rows.len() as u32).to_le_bytes());
+    for (k, vals) in &page.rows {
+        put_str(out, k);
+        for v in vals {
+            encode_value(v, out);
+        }
+    }
+}
+
+pub fn decode_scan_page(body: &[u8]) -> Result<ScanPage> {
+    let mut r = SveReader::new(body);
+    let total = r.u64()?;
+    let next_after_key = match r.u8()? {
+        0 => None,
+        1 => Some(r.str()?.to_owned()),
+        _ => return Err(StorageError::invalid_value("bad cursor flag")),
+    };
+    let fields = r.u32()? as usize;
+    let n = r.count(4 + fields)?;
+    let mut rows = Vec::with_capacity(n);
+    for _ in 0..n {
+        let key = r.str()?.to_owned();
+        rows.push((key, (0..fields).map(|_| r.value()).collect::<Result<Vec<_>>>()?));
+    }
+    if r.remaining() != 0 {
+        return Err(StorageError::invalid_value("trailing bytes after scan page"));
+    }
+    Ok(ScanPage { rows, total, next_after_key })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

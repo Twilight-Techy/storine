@@ -9,7 +9,8 @@ use std::collections::BTreeMap;
 use storage_codec::value_wire::{encode_map_body, SveReader};
 use storage_core::document::{document_id, CollectionInfo, DocumentStore};
 use storage_core::document_wire::{
-    decode_query, decode_write_request, encode_page, encode_write_response, put_str,
+    decode_aggregate, decode_query, decode_scan, decode_write_request, encode_aggregate_result, encode_page,
+    encode_scan_page, encode_write_response, put_str, MAX_AGGREGATE_ROWS,
 };
 use storage_types::{InlineId, StorageError, Version};
 
@@ -31,6 +32,9 @@ pub const INFO_COLLECTION: u8 = 6;
 pub const ADMIN_CREATE_VECTOR_INDEX: u8 = 7;
 pub const ADMIN_DROP_VECTOR_INDEX: u8 = 8;
 pub const INFO_VECTOR_INDEXES: u8 = 9;
+/// Columnar storage (`TASK-126`, `TASK-129`): enable / disable (`str collection`).
+pub const ADMIN_CREATE_COLUMNAR: u8 = 10;
+pub const ADMIN_DROP_COLUMNAR: u8 = 11;
 
 pub(crate) type Reply = (u8, u64, Vec<u8>);
 
@@ -212,6 +216,47 @@ pub(crate) fn doc_query(store: &DocumentStore, body: &[u8]) -> Reply {
     }
 }
 
+/// `OP_DOC_AGGREGATE` -> result rows (`version` = matched rows).
+pub(crate) fn doc_aggregate(store: &DocumentStore, body: &[u8]) -> Reply {
+    let q = match decode_aggregate(body) {
+        Ok(q) => q,
+        Err(e) => return error_reply(&e),
+    };
+    match store.aggregate(&q) {
+        Ok(res) => {
+            if res.rows.len() > MAX_AGGREGATE_ROWS {
+                return (STATUS_INVALID, 0, b"aggregate result exceeds 1,000,000 groups; add a limit or a filter".to_vec());
+            }
+            let mut out = Vec::new();
+            encode_aggregate_result(&res, &mut out);
+            if out.len() > storage_types::MAX_PAYLOAD_SIZE as usize {
+                return (STATUS_INVALID, 0, b"aggregate result exceeds the maximum frame size; add a limit".to_vec());
+            }
+            (STATUS_OK, res.matched, out)
+        }
+        Err(e) => error_reply(&e),
+    }
+}
+
+/// `OP_DOC_SCAN_COLUMNS` -> one page (`version` = matching documents).
+pub(crate) fn doc_scan_columns(store: &DocumentStore, body: &[u8]) -> Reply {
+    let q = match decode_scan(body) {
+        Ok(q) => q,
+        Err(e) => return error_reply(&e),
+    };
+    match store.scan_columns(&q) {
+        Ok(page) => {
+            let mut out = Vec::new();
+            encode_scan_page(&page, q.fields.len(), &mut out);
+            if out.len() > storage_types::MAX_PAYLOAD_SIZE as usize {
+                return (STATUS_INVALID, 0, b"scan page exceeds the maximum frame size; use a smaller limit".to_vec());
+            }
+            (STATUS_OK, page.total, out)
+        }
+        Err(e) => error_reply(&e),
+    }
+}
+
 fn encode_info(info: &CollectionInfo, out: &mut Vec<u8>) {
     put_str(out, &info.name);
     out.extend_from_slice(&(info.indexes.len() as u32).to_le_bytes());
@@ -229,7 +274,15 @@ fn encode_info(info: &CollectionInfo, out: &mut Vec<u8>) {
 pub(crate) fn admin_is_slow(body: &[u8]) -> bool {
     matches!(
         body.first(),
-        Some(&(ADMIN_CREATE_INDEX | ADMIN_DROP_INDEX | ADMIN_DROP_COLLECTION | ADMIN_CREATE_VECTOR_INDEX | ADMIN_DROP_VECTOR_INDEX))
+        Some(
+            &(ADMIN_CREATE_INDEX
+                | ADMIN_DROP_INDEX
+                | ADMIN_DROP_COLLECTION
+                | ADMIN_CREATE_VECTOR_INDEX
+                | ADMIN_DROP_VECTOR_INDEX
+                | ADMIN_CREATE_COLUMNAR
+                | ADMIN_DROP_COLUMNAR)
+        )
     )
 }
 
@@ -246,6 +299,8 @@ pub(crate) fn doc_admin(store: &DocumentStore, body: &[u8], allow_writes: bool) 
                 | ADMIN_SET_EXTRA
                 | ADMIN_CREATE_VECTOR_INDEX
                 | ADMIN_DROP_VECTOR_INDEX
+                | ADMIN_CREATE_COLUMNAR
+                | ADMIN_DROP_COLUMNAR
         );
         if is_write && !allow_writes {
             return Err(StorageError::invalid_value("use OP_DOC_ADMIN for schema changes"));
@@ -292,6 +347,15 @@ pub(crate) fn doc_admin(store: &DocumentStore, body: &[u8], allow_writes: bool) 
                 let c = r.str()?.to_owned();
                 let f = r.str()?.to_owned();
                 store.drop_vector_index(&c, &f)?;
+                (STATUS_OK, 0, Vec::new())
+            }
+            ADMIN_CREATE_COLUMNAR | ADMIN_DROP_COLUMNAR => {
+                let c = r.str()?.to_owned();
+                if sub == ADMIN_CREATE_COLUMNAR {
+                    store.create_columnar(&c)?;
+                } else {
+                    store.drop_columnar(&c)?;
+                }
                 (STATUS_OK, 0, Vec::new())
             }
             INFO_VECTOR_INDEXES => {

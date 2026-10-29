@@ -117,6 +117,10 @@ pub const OP_SET_OPTIONS: u8 = 0x26;
 pub const OP_CLUSTER_INFO: u8 = 0x27;
 /// Admin: changes the cluster membership (`TASK-121`); see [`StorageClient::cluster_change`].
 pub const OP_CLUSTER_CHANGE: u8 = 0x28;
+/// Analytic aggregation over a collection (`TASK-129`, `protocol/PROTOCOL.md` §5.5).
+pub const OP_DOC_AGGREGATE: u8 = 0x29;
+/// Columnar scan of chosen fields (`TASK-129`, `protocol/PROTOCOL.md` §5.6).
+pub const OP_DOC_SCAN_COLUMNS: u8 = 0x2A;
 
 /// `OP_CLUSTER_CHANGE` actions.
 pub const CLUSTER_ADD_VOTER: u8 = 1;
@@ -141,6 +145,9 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 100_000;
 pub const MAX_AUTH_BODY: usize = 4096;
 /// Maximum concurrently running admin jobs (backup / compaction / checkpoint / shard import).
 pub const MAX_CONCURRENT_ADMIN_JOBS: usize = 2;
+/// Maximum concurrently running analytic queries (each one is itself parallel); more are
+/// answered `Overloaded` (SDKs retry with backoff).
+pub const MAX_CONCURRENT_ANALYTICS: usize = 8;
 
 /// Wire size of one `BatchPut` / `MigrateVShard` item header (`24B id + 4B frame_len`).
 const BATCH_ITEM_HEADER: usize = 28;
@@ -151,9 +158,8 @@ const fn required_role(op: u8) -> Option<RbacRole> {
     match op {
         OP_AUTH => Some(RbacRole::Unauthenticated),
         OP_GET_RAW_FRAME | OP_STATS | OP_BATCH_GET | OP_QUERY_HYBRID | OP_METRICS | OP_HEALTH
-        | OP_DOC_GET | OP_DOC_QUERY | OP_DOC_INFO | OP_SET_OPTIONS | OP_CLUSTER_INFO => {
-            Some(RbacRole::ReadOnly)
-        }
+        | OP_DOC_GET | OP_DOC_QUERY | OP_DOC_INFO | OP_SET_OPTIONS | OP_CLUSTER_INFO
+        | OP_DOC_AGGREGATE | OP_DOC_SCAN_COLUMNS => Some(RbacRole::ReadOnly),
         OP_PUT_RAW_FRAME | OP_DELETE | OP_CAS_PUT | OP_BATCH_PUT | OP_TXN | OP_DOC_WRITE
         | OP_DOC_ADMIN => Some(RbacRole::ReadWrite),
         OP_RAFT_VOTE | OP_RAFT_APPEND | OP_RAFT_SNAPSHOT | OP_MIGRATE_VSHARD | OP_ADMIN_BACKUP
@@ -177,7 +183,7 @@ const fn max_body_len(op: u8) -> usize {
         OP_DOC_GET => 128 * 1024,
         OP_SET_OPTIONS => 16,
         OP_CLUSTER_CHANGE => 512,
-        OP_DOC_QUERY | OP_DOC_ADMIN | OP_DOC_INFO => 1024 * 1024,
+        OP_DOC_QUERY | OP_DOC_ADMIN | OP_DOC_INFO | OP_DOC_AGGREGATE | OP_DOC_SCAN_COLUMNS => 1024 * 1024,
         // One snapshot chunk plus its fixed header.
         OP_RAFT_SNAPSHOT => RAFT_SNAPSHOT_CHUNK + 64,
         _ => 0,
@@ -434,6 +440,8 @@ struct ServerShared<T: ZeroCopyRecord + Indexable> {
     /// Raft cluster membership (writes through consensus, leader-only reads by default).
     cluster: Option<cluster::ClusterContext<T>>,
     admin_jobs: AtomicUsize,
+    /// Running analytic queries (`OP_DOC_AGGREGATE` / `OP_DOC_SCAN_COLUMNS`).
+    analytics_jobs: AtomicUsize,
     /// Every reactor shard, so `OP_METRICS` can merge their latency histograms.
     shards: Vec<Arc<ReactorShard>>,
     /// Requests slower than [`DEFAULT_SLOW_RPC_NS`] (bounded ring, `F-OBS-03`).
@@ -592,6 +600,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
                 pool: cluster::WorkerPool::new((num_workers * 4).clamp(4, 64), 4096),
             }),
             admin_jobs: AtomicUsize::new(0),
+            analytics_jobs: AtomicUsize::new(0),
             shards: shards.clone(),
             slow_log: SlowOperationLog::new(DEFAULT_SLOW_RPC_NS, SLOW_LOG_CAPACITY),
         });
@@ -1146,7 +1155,7 @@ enum OpClass {
 const fn op_class(op: u8) -> OpClass {
     match op {
         OP_GET_RAW_FRAME | OP_BATCH_GET | OP_QUERY_HYBRID | OP_STATS | OP_METRICS | OP_HEALTH
-        | OP_DOC_GET | OP_DOC_QUERY | OP_DOC_INFO => OpClass::Read,
+        | OP_DOC_GET | OP_DOC_QUERY | OP_DOC_INFO | OP_DOC_AGGREGATE | OP_DOC_SCAN_COLUMNS => OpClass::Read,
         OP_PUT_RAW_FRAME | OP_CAS_PUT | OP_BATCH_PUT | OP_DELETE | OP_TXN | OP_DOC_WRITE => {
             OpClass::Write
         }
@@ -1179,6 +1188,8 @@ const fn op_name(op: u8) -> &'static str {
         OP_DOC_QUERY => "doc_query",
         OP_DOC_ADMIN => "doc_admin",
         OP_DOC_INFO => "doc_info",
+        OP_DOC_AGGREGATE => "doc_aggregate",
+        OP_DOC_SCAN_COLUMNS => "doc_scan_columns",
         OP_TXN => "txn",
         OP_SET_OPTIONS => "set_options",
         OP_CLUSTER_INFO => "cluster_info",
@@ -1266,7 +1277,8 @@ fn route_cluster<T: ZeroCopyRecord + Indexable>(
                 Ok(reply(conn, cl.not_leader()))
             }
         }
-        OP_GET_RAW_FRAME | OP_BATCH_GET | OP_QUERY_HYBRID | OP_DOC_GET | OP_DOC_QUERY | OP_DOC_INFO => {
+        OP_GET_RAW_FRAME | OP_BATCH_GET | OP_QUERY_HYBRID | OP_DOC_GET | OP_DOC_QUERY | OP_DOC_INFO | OP_DOC_AGGREGATE
+        | OP_DOC_SCAN_COLUMNS => {
             if conn.follower_reads || (is_leader && cl.runtime.lease_valid()) {
                 return Err(body);
             }
@@ -1478,7 +1490,7 @@ fn execute_local<T: ZeroCopyRecord + Indexable>(
             conn.send_or_queue_response(status, version, &out)
         }
         // ── Document API (`TASK-098`) ───────────────────────────────────────────────
-        OP_DOC_GET | OP_DOC_QUERY | OP_DOC_INFO | OP_DOC_ADMIN => {
+        OP_DOC_GET | OP_DOC_QUERY | OP_DOC_INFO | OP_DOC_ADMIN | OP_DOC_AGGREGATE | OP_DOC_SCAN_COLUMNS => {
             let Some(ref store) = shared.documents else {
                 let _ = conn.send_or_queue_response(
                     STATUS_INVALID,
@@ -1487,7 +1499,9 @@ fn execute_local<T: ZeroCopyRecord + Indexable>(
                 );
                 return ConnStep::Progress;
             };
-            if op == OP_DOC_ADMIN && documents::admin_is_slow(&body) {
+            // Analytics run on job threads, never on the reactor: a long scan must not stall
+            // the OLTP requests this shard serves (`RULE-OLAP-01`).
+            if op == OP_DOC_AGGREGATE || op == OP_DOC_SCAN_COLUMNS || (op == OP_DOC_ADMIN && documents::admin_is_slow(&body)) {
                 match spawn_admin_job(op, body, shared, shard) {
                     Ok(rx) => {
                         conn.pending_job = Some(rx);
@@ -1883,12 +1897,18 @@ fn spawn_admin_job<T: ZeroCopyRecord + Indexable>(
         None
     };
 
-    let mut running = shared.admin_jobs.load(Ordering::Acquire);
+    let analytics = op == OP_DOC_AGGREGATE || op == OP_DOC_SCAN_COLUMNS;
+    let (counter, max, busy): (&AtomicUsize, usize, &'static [u8]) = if analytics {
+        (&shared.analytics_jobs, MAX_CONCURRENT_ANALYTICS, b"too many concurrent analytic queries")
+    } else {
+        (&shared.admin_jobs, MAX_CONCURRENT_ADMIN_JOBS, b"too many concurrent admin jobs")
+    };
+    let mut running = counter.load(Ordering::Acquire);
     loop {
-        if running >= MAX_CONCURRENT_ADMIN_JOBS {
-            return Err((STATUS_OVERLOADED, b"too many concurrent admin jobs"));
+        if running >= max {
+            return Err((STATUS_OVERLOADED, busy));
         }
-        match shared.admin_jobs.compare_exchange_weak(
+        match counter.compare_exchange_weak(
             running,
             running + 1,
             Ordering::AcqRel,
@@ -1906,13 +1926,17 @@ fn spawn_admin_job<T: ZeroCopyRecord + Indexable>(
         .name("storine-admin-job".into())
         .spawn(move || {
             let resp = run_admin_job(op, &body, backup_path.as_deref(), &job_shared);
-            job_shared.admin_jobs.fetch_sub(1, Ordering::AcqRel);
+            if analytics {
+                job_shared.analytics_jobs.fetch_sub(1, Ordering::AcqRel);
+            } else {
+                job_shared.admin_jobs.fetch_sub(1, Ordering::AcqRel);
+            }
             let _ = tx.send(resp);
             // The connection's worker may be blocked in poll with no timeout: wake it.
             job_shard.wake();
         });
     if spawned.is_err() {
-        shared.admin_jobs.fetch_sub(1, Ordering::AcqRel);
+        counter.fetch_sub(1, Ordering::AcqRel);
         return Err((STATUS_OVERLOADED, b"could not start admin job thread"));
     }
     Ok(rx)
@@ -1929,6 +1953,11 @@ fn run_admin_job<T: ZeroCopyRecord + Indexable>(
     match op {
         OP_DOC_ADMIN => match shared.documents {
             Some(ref store) => documents::doc_admin(store, body, true),
+            None => (STATUS_INVALID, 0, b"this server does not host the document API".to_vec()),
+        },
+        OP_DOC_AGGREGATE | OP_DOC_SCAN_COLUMNS => match shared.documents {
+            Some(ref store) if op == OP_DOC_AGGREGATE => documents::doc_aggregate(store, body),
+            Some(ref store) => documents::doc_scan_columns(store, body),
             None => (STATUS_INVALID, 0, b"this server does not host the document API".to_vec()),
         },
         OP_ADMIN_BACKUP => {
@@ -2446,6 +2475,28 @@ impl StorageClient {
         let (status, version, resp) = self.rpc(OP_DOC_QUERY, NO_KEY, &body)?;
         match status {
             STATUS_OK => storage_core::document_wire::decode_page(&resp),
+            s => Err(remote_error(s, version, &resp)),
+        }
+    }
+
+    /// Runs an analytic aggregation (`OP_DOC_AGGREGATE`).
+    pub fn doc_aggregate(&mut self, query: &storage_core::analytics::AggregateQuery) -> Result<storage_core::analytics::AggregateResult> {
+        let mut body = Vec::new();
+        storage_core::document_wire::encode_aggregate(query, &mut body);
+        let (status, version, resp) = self.rpc(OP_DOC_AGGREGATE, NO_KEY, &body)?;
+        match status {
+            STATUS_OK => storage_core::document_wire::decode_aggregate_result(&resp),
+            s => Err(remote_error(s, version, &resp)),
+        }
+    }
+
+    /// Reads one page of a columnar scan (`OP_DOC_SCAN_COLUMNS`).
+    pub fn doc_scan_columns(&mut self, query: &storage_core::analytics::ScanQuery) -> Result<storage_core::analytics::ScanPage> {
+        let mut body = Vec::new();
+        storage_core::document_wire::encode_scan(query, &mut body);
+        let (status, version, resp) = self.rpc(OP_DOC_SCAN_COLUMNS, NO_KEY, &body)?;
+        match status {
+            STATUS_OK => storage_core::document_wire::decode_scan_page(&resp),
             s => Err(remote_error(s, version, &resp)),
         }
     }

@@ -16,10 +16,12 @@
 
 mod exec;
 mod filter;
+mod scan;
 mod spill;
 mod values;
 
 pub use exec::{run, run_documents};
+pub use scan::{scan, scan_documents, ScanPage, ScanQuery, DEFAULT_SCAN_LIMIT, MAX_SCAN_LIMIT};
 pub use spill::DEFAULT_SPILL_BUDGET;
 pub use values::{GroupValue, Hll};
 

@@ -247,6 +247,82 @@ fn build() -> String {
     storage_core::document_wire::put_str(&mut info, "items");
     reqs.push(("info: collection items".into(), 0x25, info));
     reqs.push(("info: list collections".into(), 0x25, vec![3u8]));
+    // Analytics (`TASK-129`).
+    {
+        use storage_core::analytics::{AggFunc, Aggregate, AggregateQuery, Expr, GroupKey, ScanQuery};
+        use storage_core::document_wire::{encode_aggregate, encode_scan};
+        let f = |p: &str| Some(Expr::Field(p.into()));
+        let a = |func, arg| Aggregate { func, arg };
+        let cases = vec![
+            (
+                "aggregate: by region where day >= 20, count / sum(price * qty) / avg(qty), sum desc, limit 2",
+                AggregateQuery {
+                    collection: "sales".into(),
+                    filter: Some(Filter::Ge("day".into(), PropertyValue::Int64(20))),
+                    group_by: vec![GroupKey::Field("region".into())],
+                    aggregates: vec![
+                        a(AggFunc::Count, None),
+                        a(AggFunc::Sum, Some(Expr::Mul(Box::new(Expr::Field("price".into())), Box::new(Expr::Field("qty".into()))))),
+                        a(AggFunc::Avg, f("qty")),
+                    ],
+                    order_by: vec![(2, Direction::Desc)],
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            ),
+            (
+                "aggregate: totals (count distinct, approx count distinct, min, max, count of field)",
+                AggregateQuery {
+                    collection: "sales".into(),
+                    aggregates: vec![
+                        a(AggFunc::CountDistinct, f("region")),
+                        a(AggFunc::ApproxCountDistinct, f("customer")),
+                        a(AggFunc::Min, f("price")),
+                        a(AggFunc::Max, f("price")),
+                        a(AggFunc::Count, f("coupon")),
+                    ],
+                    ..Default::default()
+                },
+            ),
+            (
+                "aggregate: weekly buckets of day (width 7, offset 3) and region, sum(qty - 1) and sum(-price + 2.5), budgets",
+                AggregateQuery {
+                    collection: "sales".into(),
+                    group_by: vec![GroupKey::Bucket { field: "day".into(), width: 7, offset: 3 }, GroupKey::Field("region".into())],
+                    aggregates: vec![
+                        a(AggFunc::Sum, Some(Expr::Sub(Box::new(Expr::Field("qty".into())), Box::new(Expr::Const(PropertyValue::Int64(1)))))),
+                        a(AggFunc::Sum, Some(Expr::Add(Box::new(Expr::Neg(Box::new(Expr::Field("price".into())))), Box::new(Expr::Const(dec("2.5")))))),
+                    ],
+                    order_by: vec![(0, Direction::Asc), (1, Direction::Desc)],
+                    memory_budget: 1 << 20,
+                    spill_budget: 1 << 30,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (name, q) in cases {
+            let mut b = Vec::new();
+            encode_aggregate(&q, &mut b);
+            reqs.push((name.into(), 0x29, b));
+        }
+        let scans = vec![
+            (
+                "scan: qty, price where region = eu, limit 500",
+                ScanQuery { collection: "sales".into(), filter: Some(Filter::Eq("region".into(), PropertyValue::Text("eu".into()))), fields: vec!["qty".into(), "price".into()], after_key: None, limit: 500 },
+            ),
+            ("scan: meta.size after s0099 (default limit)", ScanQuery { collection: "sales".into(), filter: None, fields: vec!["meta.size".into()], after_key: Some("s0099".into()), limit: 0 }),
+        ];
+        for (name, q) in scans {
+            let mut b = Vec::new();
+            encode_scan(&q, &mut b);
+            reqs.push((name.into(), 0x2A, b));
+        }
+        for (cmd, name) in [(10u8, "admin: enable columnar sales"), (11u8, "admin: disable columnar sales")] {
+            let mut b = vec![cmd];
+            storage_core::document_wire::put_str(&mut b, "sales");
+            reqs.push((name.into(), 0x23, b));
+        }
+    }
     let n = reqs.len();
     for (i, (name, op, body)) in reqs.iter().enumerate() {
         let _ = writeln!(out, "    {{\"name\":{},\"opcode\":{},\"body_hex\":\"{}\"}}{}", esc(name), op, hex(body), if i + 1 < n { "," } else { "" });
@@ -267,7 +343,23 @@ fn build() -> String {
     rb.extend_from_slice(&5000u64.to_le_bytes());
     rb.extend_from_slice(&4u32.to_le_bytes());
     rb.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-    let _ = writeln!(out, "    {{\"name\":\"byte range: total 5000, 4 bytes\",\"opcode\":32,\"body_hex\":\"{}\"}}", hex(&rb));
+    let _ = writeln!(out, "    {{\"name\":\"byte range: total 5000, 4 bytes\",\"opcode\":32,\"body_hex\":\"{}\"}},", hex(&rb));
+    let agg = storage_core::analytics::AggregateResult {
+        rows: vec![
+            vec![PropertyValue::Text("eu".into()), PropertyValue::Int64(3), dec("12.50")],
+            vec![PropertyValue::Text("us".into()), PropertyValue::Int64(1), PropertyValue::Null],
+        ],
+        matched: 4,
+        pruned_row_groups: 2,
+        spilled_bytes: 0,
+    };
+    let mut ab = Vec::new();
+    storage_core::document_wire::encode_aggregate_result(&agg, &mut ab);
+    let _ = writeln!(out, "    {{\"name\":\"aggregate: matched 4, pruned 2, rows [eu, 3, 12.50] [us, 1, null]\",\"opcode\":41,\"body_hex\":\"{}\"}},", hex(&ab));
+    let scan = storage_core::analytics::ScanPage { rows: vec![("s1".into(), vec![PropertyValue::Int64(7), dec("9.99")])], total: 2, next_after_key: Some("s1".into()) };
+    let mut sb = Vec::new();
+    storage_core::document_wire::encode_scan_page(&scan, 2, &mut sb);
+    let _ = writeln!(out, "    {{\"name\":\"scan page: total 2, next s1, row s1 [7, 9.99]\",\"opcode\":42,\"body_hex\":\"{}\"}}", hex(&sb));
     out.push_str("  ]\n}\n");
     out
 }

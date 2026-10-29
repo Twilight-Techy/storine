@@ -210,10 +210,75 @@ Body: `u8 command | arguments`.
 | `7` create vector index | `0x23` | `str collection | str field | u32 dims` | `Ok` once existing documents are indexed; later writes of anything but `dims` numbers to the field are `Invalid` |
 | `8` drop vector index | `0x23` | `str collection | str field` | `Ok` |
 | `9` vector indexes | `0x25` | `str collection` | `u32 n | (str field | u32 dims | u8 ready)*` |
+| `10` enable columnar | `0x23` | `str collection` | `Ok`; the collection is also kept as column segments for analytics (§5.5, §5.6), built in the background |
+| `11` disable columnar | `0x23` | `str collection` | `Ok`; segments are deleted (analytics then read the row store) |
 
 `info := str name | u32 n | str index* | u32 m | str building_index* | map body (metadata)`.
 At most 16 secondary indexes and 4 vector indexes (up to 4,096 dimensions) per collection; indexes
 cover one top-level field; filters are always exact (index hits are re-checked).
+
+### 5.5 `OP_DOC_AGGREGATE` (`0x29`, role: read)
+
+Filters, groups and aggregates a collection on the server. On a columnar collection (§5.4, command
+`10`) it runs over column segments plus not-yet-merged writes with vectorized, parallel execution;
+otherwise it reads the row store. Either way the result is exact and as of one snapshot.
+
+```
+str collection
+u8 has_filter | filter (if 1)                      (the §5.3 filter)
+u32 n_keys (<= 64) | key*
+    key := u8 1 | str path                          group by a field's value
+         | u8 2 | str path | i64 width | i64 offset group by offset + floor((v - offset) / width) * width
+u32 n_aggs (<= 64) | (u8 func | u8 has_arg | expr (if 1))*
+    func: 1 count | 2 sum | 3 avg | 4 min | 5 max | 6 count_distinct | 7 approx_count_distinct
+    (only count may omit its argument: it then counts rows; with one it counts non-null values)
+    expr := u8 1 | str path                         a field (dotted path)
+          | u8 2 | value                            a constant
+          | u8 3 add | u8 4 sub | u8 5 mul → expr expr
+          | u8 6 neg → expr                         (depth <= 32)
+u32 n_order (<= 64) | (u32 column | u8 descending)*  (columns: group keys first, then aggregates)
+u32 limit            (0 = every group)
+u64 memory_budget    (0 = 256 MiB; group tables beyond it spill to disk)
+u64 spill_budget     (0 = 16 GiB of spill runs)
+```
+
+Response `Ok` (`version` = matched rows):
+`u64 matched | u64 pruned_row_groups | u64 spilled_bytes | u32 columns | u32 rows | rows × columns × value`.
+Rows are sorted by the order columns, then by the group keys; without grouping there is exactly one
+row.
+
+- **Exact numbers**: sums of integers and decimals are exact (`int64`, widening to `int128` or
+  `decimal`; overflow beyond 38 digits is `Invalid`, never a wrapped value). `avg` of exact inputs
+  is a decimal. Float sums are correctly rounded, so results never depend on thread count or data
+  layout. Arithmetic on mixed kinds follows `add` (§5.2).
+- **Group keys** use the comparison equality (§5.3): `1`, `1.0` and `1.00` are one group (reported
+  with one of its representations, chosen deterministically); null and missing values form one
+  group.
+- **min / max** use the total sort order (§5.3); `count_distinct` is exact; `approx_count_distinct`
+  is a HyperLogLog estimate (about 0.8 % standard error).
+- `pruned_row_groups` counts row groups skipped by zone maps without reading them;
+  `spilled_bytes > 0` means the query outgrew its memory budget and spilled.
+- Errors: `Invalid` (bad request, a non-numeric value in `sum` / `avg` arithmetic, overflow, more
+  than 1,000,000 result rows or a response over 256 MiB, budgets exhausted), `Overloaded` (more than
+  8 analytic queries running: retry with backoff).
+
+### 5.6 `OP_DOC_SCAN_COLUMNS` (`0x2A`, role: read)
+
+Reads chosen fields of every document matching a filter, in key order and in pages: a columnar
+export without transferring whole documents.
+
+```
+str collection
+u8 has_filter | filter (if 1)
+u32 n_fields (<= 64) | str path*          (dotted paths; a missing field reads as null)
+u8 has_after | str after_key (if 1)       (resume after this key)
+u32 limit                                 (0 = 1,000; at most 100,000)
+```
+
+Response `Ok` (`version` = total matches):
+`u64 total | u8 has_next | str next_after_key (if 1) | u32 n_fields | u32 rows | rows × (str key | n_fields × value)`.
+Pass `next_after_key` back as `after_key` for the next page; each page is consistent in itself.
+A path naming a nested map returns the map.
 
 ## 6. Session and cluster
 
@@ -239,4 +304,4 @@ documented in `crates/storage-server/src/lib.rs`. SDKs do not need them.
 
 ## 8. Not yet in the protocol (TODO)
 
-PHP and Ruby SDKs (TODO), TLS termination inside the server, streaming change feeds.
+TLS termination inside the server, streaming change feeds.
