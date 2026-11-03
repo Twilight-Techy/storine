@@ -130,7 +130,7 @@ pub fn resolve(addr: &str) -> Result<SocketAddr> {
 
 /// Response of a pooled job: `(status, version, body)`.
 pub(crate) type JobResponse = (u8, u64, Vec<u8>);
-type Job = Box<dyn FnOnce() -> JobResponse + Send + 'static>;
+pub(crate) type Job = Box<dyn FnOnce() -> JobResponse + Send + 'static>;
 /// Wakes the reactor shard that owns the connection waiting for a job.
 type Waker = Arc<dyn Fn() + Send + Sync>;
 type QueuedJob = (Job, mpsc::Sender<JobResponse>, Waker);

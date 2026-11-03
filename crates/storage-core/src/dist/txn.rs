@@ -213,6 +213,11 @@ impl Txn {
         self.writes.insert(key, Some(fields));
     }
 
+    /// Forgets every buffered write (a caller abandoning its changes; reads still count).
+    pub fn discard_writes(&mut self) {
+        self.writes.clear();
+    }
+
     pub fn delete(&mut self, key: Key) {
         self.writes.insert(key, None);
     }

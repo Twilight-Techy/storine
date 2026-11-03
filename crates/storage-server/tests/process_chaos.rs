@@ -7,6 +7,10 @@
 //! reads when it wakes). Clients write and read a few keys the whole time, and the history is
 //! checked for linearizability at the end.
 //!
+//! The same nemesis runs against a range cluster (`--ranges`, `TASK-142` / `TASK-143`), where
+//! every node coordinates distributed transactions: there, concurrent transfers between
+//! accounts must also conserve the total.
+//!
 //! `STORINE_CHAOS_SECS` sets the length (default 20 s).
 #![cfg(unix)]
 
@@ -129,16 +133,17 @@ struct Cluster {
     /// `proxies[i][j]`: link from node `i` to node `j`.
     proxies: Vec<Vec<Option<Proxy>>>,
     procs: Vec<Option<Child>>,
+    ranges: bool,
 }
 
 impl Cluster {
-    fn start(dir: &Path) -> Cluster {
+    fn start(dir: &Path, ranges: bool) -> Cluster {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).unwrap();
         let n = 3;
         let addrs: Vec<SocketAddr> = (0..n).map(|_| free_addr()).collect();
         let proxies = (0..n).map(|i| (0..n).map(|j| (i != j).then(|| Proxy::start(addrs[j]))).collect()).collect();
-        let mut c = Cluster { dir: dir.to_path_buf(), addrs, proxies, procs: (0..n).map(|_| None).collect() };
+        let mut c = Cluster { dir: dir.to_path_buf(), addrs, proxies, procs: (0..n).map(|_| None).collect(), ranges };
         for i in 0..n {
             c.spawn(i);
         }
@@ -157,6 +162,7 @@ impl Cluster {
             .arg(self.dir.join(format!("n{}", i + 1)))
             .arg(self.addrs[i].to_string())
             .args(["--node-id", &(i + 1).to_string(), "--peers", &peers.join(",")])
+            .args(if self.ranges { &["--ranges"][..] } else { &[][..] })
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -219,9 +225,36 @@ fn definitely_not_applied(e: &StorageError) -> bool {
 
 #[test]
 fn linearizable_under_kills_pauses_and_partitions() {
+    chaos(false);
+}
+
+/// A range cluster of 3 processes under the same nemesis (`TASK-142`).
+#[test]
+fn range_cluster_under_kills_pauses_and_partitions() {
+    chaos(true);
+}
+
+const ACCOUNTS: usize = 6;
+
+/// Connect and request timeout. A range-cluster write is a distributed transaction (several
+/// consensus rounds), so it gets longer than a single-group write.
+fn client_timeout(ranges: bool) -> Duration {
+    Duration::from_millis(if ranges { 5_000 } else { 300 })
+}
+
+fn add(key: &str, delta: i64) -> DocWrite {
+    DocWrite {
+        collection: "bank".into(),
+        key: key.into(),
+        op: DocOp::Patch(vec![storage_codec::field_ops::FieldOp::Add { path: "bal".into(), delta: PropertyValue::Int64(delta), min: Some(PropertyValue::Int64(0)), max: None }]),
+        precondition: Precondition::None,
+    }
+}
+
+fn chaos(ranges: bool) {
     let secs: u64 = std::env::var("STORINE_CHAOS_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
-    let dir = std::env::temp_dir().join(format!("storine_process_chaos_{}", std::process::id()));
-    let cluster = Arc::new(Mutex::new(Cluster::start(&dir)));
+    let dir = std::env::temp_dir().join(format!("storine_process_chaos_{}_{ranges}", std::process::id()));
+    let cluster = Arc::new(Mutex::new(Cluster::start(&dir, ranges)));
     let addrs = cluster.lock().unwrap().addrs.clone();
     let t0 = Instant::now();
     let now = move || t0.elapsed().as_micros() as u64;
@@ -235,7 +268,7 @@ fn linearizable_under_kills_pauses_and_partitions() {
     let deadline = Instant::now() + Duration::from_secs(20);
     'ready: loop {
         for a in &addrs {
-            if let Ok(mut c) = StorageClient::connect_timeout(*a, Duration::from_millis(200)) {
+            if let Ok(mut c) = StorageClient::connect_timeout(*a, client_timeout(ranges)) {
                 if c.doc_write(&[put("warmup", 0)], None).is_ok() {
                     break 'ready;
                 }
@@ -244,8 +277,75 @@ fn linearizable_under_kills_pauses_and_partitions() {
         assert!(Instant::now() < deadline, "cluster never elected a leader");
         thread::sleep(Duration::from_millis(100));
     }
+    // Range clusters: accounts for transfers (each one atomic across ranges).
+    let transfers = Arc::new(AtomicU64::new(0));
+    if ranges {
+        let seed: Vec<DocWrite> = (0..ACCOUNTS)
+            .map(|i| {
+                let mut f = BTreeMap::new();
+                f.insert("bal".to_string(), PropertyValue::Int64(100));
+                DocWrite { collection: "bank".into(), key: format!("a{i}"), op: DocOp::Put(f), precondition: Precondition::None }
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        'seeded: loop {
+            for a in &addrs {
+                if let Ok(mut c) = StorageClient::connect_timeout(*a, client_timeout(ranges)) {
+                    if c.doc_write(&seed, Some([0xA5; 16])).is_ok() {
+                        break 'seeded;
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "accounts never written");
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
 
     let mut workers = Vec::new();
+    for w in 0..(if ranges { 2u64 } else { 0 }) {
+        let (addrs, stop, transfers) = (addrs.clone(), Arc::clone(&stop), Arc::clone(&transfers));
+        workers.push(thread::spawn(move || {
+            let mut rng = SweepRng::new(w + 101);
+            let mut target = w as usize % addrs.len();
+            let mut client: Option<StorageClient> = None;
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                if client.is_none() {
+                    client = StorageClient::connect_timeout(addrs[target], client_timeout(ranges)).ok();
+                    if client.is_none() {
+                        target = (target + 1) % addrs.len();
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                }
+                let (a, b) = (rng.below(ACCOUNTS), rng.below(ACCOUNTS));
+                if a == b {
+                    continue;
+                }
+                n += 1;
+                // Retried with the same request id until it settles: applied at most once.
+                let mut rid = [0u8; 16];
+                rid[..8].copy_from_slice(&(w * 1_000_000 + n).to_le_bytes());
+                let batch = [add(&format!("a{a}"), -1), add(&format!("a{b}"), 1)];
+                for _ in 0..50 {
+                    let Some(c) = client.as_mut() else { break };
+                    match c.doc_write(&batch, Some(rid)) {
+                        Ok(_) => {
+                            transfers.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                        // Insufficient funds (a definite refusal).
+                        Err(StorageError::Rejected { status, .. }) if status == storage_server::STATUS_CONFLICT || status == storage_server::STATUS_INVALID => break,
+                        Err(_) => {
+                            target = (target + 1) % addrs.len();
+                            client = StorageClient::connect_timeout(addrs[target], client_timeout(ranges)).ok();
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                    }
+                }
+            }
+        }));
+    }
     for w in 0..4u64 {
         let (addrs, history, next_value, stop, counts) = (addrs.clone(), Arc::clone(&history), Arc::clone(&next_value), Arc::clone(&stop), Arc::clone(&counts));
         workers.push(thread::spawn(move || {
@@ -254,7 +354,7 @@ fn linearizable_under_kills_pauses_and_partitions() {
             let mut client: Option<StorageClient> = None;
             while !stop.load(Ordering::Relaxed) {
                 if client.is_none() {
-                    client = StorageClient::connect_timeout(addrs[target], Duration::from_millis(300)).ok();
+                    client = StorageClient::connect_timeout(addrs[target], client_timeout(ranges)).ok();
                     if client.is_none() {
                         target = (target + 1) % addrs.len();
                         thread::sleep(Duration::from_millis(20));
@@ -360,6 +460,31 @@ fn linearizable_under_kills_pauses_and_partitions() {
     }
     let counts = *counts.lock().unwrap();
     let history = history.lock().unwrap().clone();
+    if ranges {
+        // Every transfer applied atomically (or not at all): the total is conserved.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let total = loop {
+            let read = (|| -> Option<i64> {
+                let mut c = StorageClient::connect_timeout(addrs[0], client_timeout(ranges)).ok()?;
+                let mut t = 0;
+                for i in 0..ACCOUNTS {
+                    let d = c.doc_get("bank", &format!("a{i}")).ok()??;
+                    if let Some(PropertyValue::Int64(v)) = d.fields.get("bal") {
+                        t += v;
+                    }
+                }
+                Some(t)
+            })();
+            match read {
+                Some(t) => break t,
+                None if Instant::now() < deadline => thread::sleep(Duration::from_millis(200)),
+                None => panic!("accounts unreadable after the chaos"),
+            }
+        };
+        eprintln!("range cluster: {} transfers committed", transfers.load(Ordering::Relaxed));
+        assert_eq!(total, 100 * ACCOUNTS as i64, "money created or destroyed");
+        assert!(transfers.load(Ordering::Relaxed) > 0, "no transfer committed");
+    }
     eprintln!(
         "process chaos: {secs}s, faults {faults:?}, {} writes ok, {} unknown, {} reads, {} refusals",
         counts[0], counts[1], counts[2], counts[3]

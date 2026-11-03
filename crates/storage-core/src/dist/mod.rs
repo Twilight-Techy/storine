@@ -6,15 +6,20 @@
 //!   rebalancing (`TASK-138`).
 //! - [`alloc`]: the allocator's planning rules (`TASK-138`).
 //! - [`meta`]: range descriptors, the meta range and range caches (`TASK-138`).
+//! - [`docs`]: the document API over distributed transactions (`TASK-143`).
+//! - [`runtime`]: each node's real-time event loop, transports and the routing gateway
+//!   (`TASK-143`).
 //! - [`wire`]: encodings of node batches and KV requests between processes (`TASK-143`).
 //! - [`zone`]: localities, zone configurations, survival goals and closed-timestamp policies
 //!   (`TASK-141`).
 
 pub mod alloc;
+pub mod docs;
 pub mod hlc;
 pub mod meta;
 pub mod mvcc;
 pub mod node;
+pub mod runtime;
 pub mod server;
 pub mod txn;
 pub mod txn_sim;

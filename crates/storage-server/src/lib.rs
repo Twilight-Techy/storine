@@ -59,6 +59,7 @@
 
 pub mod cluster;
 pub mod documents;
+pub mod ranges;
 pub mod security;
 
 use std::io::{self, BufReader, BufWriter, IoSlice, Read, Write};
@@ -121,6 +122,11 @@ pub const OP_CLUSTER_CHANGE: u8 = 0x28;
 pub const OP_DOC_AGGREGATE: u8 = 0x29;
 /// Columnar scan of chosen fields (`TASK-129`, `protocol/PROTOCOL.md` §5.6).
 pub const OP_DOC_SCAN_COLUMNS: u8 = 0x2A;
+/// Range cluster (`TASK-143`, Admin role): one encoded driver batch between nodes.
+pub const OP_RANGE_BATCH: u8 = 0x2B;
+/// Range cluster (`TASK-143`, Admin role): one encoded KV request; replies with the encoded
+/// response.
+pub const OP_KV: u8 = 0x2C;
 
 /// `OP_CLUSTER_CHANGE` actions.
 pub const CLUSTER_ADD_VOTER: u8 = 1;
@@ -163,7 +169,7 @@ const fn required_role(op: u8) -> Option<RbacRole> {
         OP_PUT_RAW_FRAME | OP_DELETE | OP_CAS_PUT | OP_BATCH_PUT | OP_TXN | OP_DOC_WRITE
         | OP_DOC_ADMIN => Some(RbacRole::ReadWrite),
         OP_RAFT_VOTE | OP_RAFT_APPEND | OP_RAFT_SNAPSHOT | OP_MIGRATE_VSHARD | OP_ADMIN_BACKUP
-        | OP_ADMIN_COMPACT | OP_ADMIN_CHECKPOINT | OP_CLUSTER_CHANGE => Some(RbacRole::Admin),
+        | OP_ADMIN_COMPACT | OP_ADMIN_CHECKPOINT | OP_CLUSTER_CHANGE | OP_RANGE_BATCH | OP_KV => Some(RbacRole::Admin),
         _ => None,
     }
 }
@@ -177,7 +183,7 @@ const fn max_body_len(op: u8) -> usize {
         OP_QUERY_HYBRID => 64,
         OP_RAFT_VOTE => 64,
         OP_PUT_RAW_FRAME | OP_CAS_PUT | OP_BATCH_GET | OP_BATCH_PUT | OP_RAFT_APPEND
-        | OP_MIGRATE_VSHARD | OP_TXN | OP_DOC_WRITE => MAX_PAYLOAD_SIZE as usize,
+        | OP_MIGRATE_VSHARD | OP_TXN | OP_DOC_WRITE | OP_RANGE_BATCH | OP_KV => MAX_PAYLOAD_SIZE as usize,
         // Collection + key (+ a byte range or up to 256 projected paths); a query / collection
         // command (filters are small).
         OP_DOC_GET => 128 * 1024,
@@ -411,7 +417,19 @@ impl StorageServer<DocumentRecord> {
         raft: Option<Arc<RaftNode<DocumentRecord>>>,
     ) -> Result<Self> {
         let engine = Arc::clone(store.engine());
-        Self::start_inner(bind_addr, engine, max_connections, security, raft, Some(store), None)
+        Self::start_inner(bind_addr, engine, max_connections, security, raft, Some(store), None, None)
+    }
+
+    /// Starts a range-cluster node (`TASK-143`): the document API runs as distributed
+    /// transactions coordinated here; peers exchange range traffic on the same port.
+    pub fn start_documents_ranges(
+        bind_addr: &str,
+        engine: Arc<StorageEngine<DocumentRecord>>,
+        max_connections: usize,
+        security: SecurityConfig,
+        options: ranges::RangeOptions,
+    ) -> Result<Self> {
+        Self::start_inner(bind_addr, engine, max_connections, security, None, None, None, Some(options))
     }
 
     /// Starts a clustered document server: the store's writes go through `options.runtime`
@@ -426,7 +444,7 @@ impl StorageServer<DocumentRecord> {
         store.set_commit_sink(Arc::clone(&options.runtime) as Arc<dyn storage_core::CommitSink>);
         let engine = Arc::clone(store.engine());
         let raft = Some(Arc::clone(options.runtime.node()));
-        Self::start_inner(bind_addr, engine, max_connections, security, raft, Some(store), Some(options))
+        Self::start_inner(bind_addr, engine, max_connections, security, raft, Some(store), Some(options), None)
     }
 }
 
@@ -439,6 +457,8 @@ struct ServerShared<T: ZeroCopyRecord + Indexable> {
     documents: Option<Arc<DocumentStore>>,
     /// Raft cluster membership (writes through consensus, leader-only reads by default).
     cluster: Option<cluster::ClusterContext<T>>,
+    /// Range cluster (`TASK-143`): the document API runs as distributed transactions.
+    ranges: Option<ranges::RangeContext>,
     admin_jobs: AtomicUsize,
     /// Running analytic queries (`OP_DOC_AGGREGATE` / `OP_DOC_SCAN_COLUMNS`).
     analytics_jobs: AtomicUsize,
@@ -532,7 +552,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
         security: SecurityConfig,
         raft: Option<Arc<RaftNode<T>>>,
     ) -> Result<Self> {
-        Self::start_inner(bind_addr, engine, max_connections, security, raft, None, None)
+        Self::start_inner(bind_addr, engine, max_connections, security, raft, None, None, None)
     }
 
     /// Starts a clustered server: every write goes through Raft consensus (`options.runtime`),
@@ -546,7 +566,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
         options: cluster::ClusterOptions<T>,
     ) -> Result<Self> {
         let raft = Some(Arc::clone(options.runtime.node()));
-        Self::start_inner(bind_addr, engine, max_connections, security, raft, None, Some(options))
+        Self::start_inner(bind_addr, engine, max_connections, security, raft, None, Some(options), None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -558,6 +578,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
         raft: Option<Arc<RaftNode<T>>>,
         documents: Option<Arc<DocumentStore>>,
         cluster_opts: Option<cluster::ClusterOptions<T>>,
+        range_opts: Option<ranges::RangeOptions>,
     ) -> Result<Self> {
         if security.require_auth && security.token_count() == 0 {
             return Err(StorageError::invalid_key(
@@ -599,6 +620,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
                 client_addrs: o.client_addrs,
                 pool: cluster::WorkerPool::new((num_workers * 4).clamp(4, 64), 4096),
             }),
+            ranges: range_opts.map(|o| ranges::RangeContext::new(o, (num_workers * 8).clamp(8, 128))),
             admin_jobs: AtomicUsize::new(0),
             analytics_jobs: AtomicUsize::new(0),
             shards: shards.clone(),
@@ -1194,6 +1216,8 @@ const fn op_name(op: u8) -> &'static str {
         OP_SET_OPTIONS => "set_options",
         OP_CLUSTER_INFO => "cluster_info",
         OP_CLUSTER_CHANGE => "cluster_change",
+        OP_RANGE_BATCH => "range_batch",
+        OP_KV => "kv",
         _ => "unknown",
     }
 }
@@ -1207,9 +1231,66 @@ fn execute_request<T: ZeroCopyRecord + Indexable>(
     raw_id: [u8; 24],
     body: Vec<u8>,
 ) -> ConnStep {
+    if let Some(ref rc) = shared.ranges {
+        return route_ranges(conn, rc, shard, op, body);
+    }
     match route_cluster(conn, shared, shard, op, raw_id, body) {
         Ok(step) => step,
         Err(body) => execute_local(conn, shared, shard, op, raw_id, body),
+    }
+}
+
+/// Range-cluster serving (`TASK-143`): range traffic between nodes, and the document API as
+/// distributed transactions on the worker pool (never on a reactor thread). Opcodes of a single
+/// engine (typed frames, aggregates over local columns) are refused precisely.
+fn route_ranges(conn: &mut NonBlockingConn, rc: &ranges::RangeContext, shard: &Arc<ReactorShard>, op: u8, body: Vec<u8>) -> ConnStep {
+    let reply = |conn: &mut NonBlockingConn, (st, v, b): (u8, u64, Vec<u8>)| {
+        if conn.send_or_queue_response(st, v, &b).is_err() {
+            ConnStep::Closed
+        } else {
+            ConnStep::Progress
+        }
+    };
+    let job: cluster::Job = match op {
+        OP_RANGE_BATCH => {
+            rc.node.deliver(body);
+            return reply(conn, (STATUS_OK, 0, Vec::new()));
+        }
+        OP_KV => {
+            let node = Arc::clone(&rc.node);
+            let timeout = rc.kv_timeout();
+            Box::new(move || (STATUS_OK, 0, node.handle_encoded(&body, timeout)))
+        }
+        OP_DOC_GET | OP_DOC_WRITE | OP_DOC_QUERY | OP_DOC_INFO | OP_DOC_ADMIN | OP_DOC_AGGREGATE | OP_DOC_SCAN_COLUMNS => {
+            let backend = rc.backend();
+            Box::new(move || match op {
+                OP_DOC_GET => documents::doc_get(&backend, &body),
+                OP_DOC_WRITE => documents::doc_write(&backend, &body),
+                OP_DOC_QUERY => documents::doc_query(&backend, &body),
+                OP_DOC_INFO => documents::doc_admin(&backend, &body, false),
+                OP_DOC_AGGREGATE => documents::doc_aggregate(&backend, &body),
+                OP_DOC_SCAN_COLUMNS => documents::doc_scan_columns(&backend, &body),
+                _ => documents::doc_admin(&backend, &body, true),
+            })
+        }
+        OP_SET_OPTIONS => {
+            conn.follower_reads = body.first().is_some_and(|f| f & 1 != 0);
+            return reply(conn, (STATUS_OK, 0, Vec::new()));
+        }
+        OP_HEALTH => return reply(conn, (STATUS_OK, 0, b"{\"status\":\"ok\",\"mode\":\"ranges\"}".to_vec())),
+        OP_CLUSTER_INFO => return reply(conn, (STATUS_OK, 0, rc.cluster_info())),
+        _ => return reply(conn, (STATUS_INVALID, 0, b"this opcode is not available on a range cluster (use the document API)".to_vec())),
+    };
+    let wake: Arc<dyn Fn() + Send + Sync> = {
+        let sh = Arc::clone(shard);
+        Arc::new(move || sh.wake())
+    };
+    match rc.pool.submit(job, wake) {
+        Ok(rx) => {
+            conn.pending_job = Some(rx);
+            ConnStep::Progress
+        }
+        Err(()) => reply(conn, (STATUS_OVERLOADED, 0, b"request queue is full".to_vec())),
     }
 }
 
@@ -1511,10 +1592,10 @@ fn execute_local<T: ZeroCopyRecord + Indexable>(
                 }
             } else {
                 let (status, version, out) = match op {
-                    OP_DOC_GET => documents::doc_get(store, &body),
-                    OP_DOC_QUERY => documents::doc_query(store, &body),
-                    OP_DOC_INFO => documents::doc_admin(store, &body, false),
-                    _ => documents::doc_admin(store, &body, true),
+                    OP_DOC_GET => documents::doc_get(&**store, &body),
+                    OP_DOC_QUERY => documents::doc_query(&**store, &body),
+                    OP_DOC_INFO => documents::doc_admin(&**store, &body, false),
+                    _ => documents::doc_admin(&**store, &body, true),
                 };
                 conn.send_or_queue_response(status, version, &out)
             }
@@ -1694,7 +1775,7 @@ fn write_reply<T: ZeroCopyRecord + Indexable>(
         },
         OP_TXN => execute_txn(shared, body),
         OP_DOC_WRITE => match shared.documents {
-            Some(ref store) => documents::doc_write(store, body),
+            Some(ref store) => documents::doc_write(&**store, body),
             None => (STATUS_INVALID, 0, b"this server does not host the document API".to_vec()),
         },
         _ => (STATUS_INVALID, 0, b"not a write opcode".to_vec()),
@@ -1952,12 +2033,12 @@ fn run_admin_job<T: ZeroCopyRecord + Indexable>(
     let err = |e: StorageError| (STATUS_ERROR, 0u64, e.to_string().into_bytes());
     match op {
         OP_DOC_ADMIN => match shared.documents {
-            Some(ref store) => documents::doc_admin(store, body, true),
+            Some(ref store) => documents::doc_admin(&**store, body, true),
             None => (STATUS_INVALID, 0, b"this server does not host the document API".to_vec()),
         },
         OP_DOC_AGGREGATE | OP_DOC_SCAN_COLUMNS => match shared.documents {
-            Some(ref store) if op == OP_DOC_AGGREGATE => documents::doc_aggregate(store, body),
-            Some(ref store) => documents::doc_scan_columns(store, body),
+            Some(ref store) if op == OP_DOC_AGGREGATE => documents::doc_aggregate(&**store, body),
+            Some(ref store) => documents::doc_scan_columns(&**store, body),
             None => (STATUS_INVALID, 0, b"this server does not host the document API".to_vec()),
         },
         OP_ADMIN_BACKUP => {
@@ -2502,6 +2583,11 @@ impl StorageClient {
     }
 
     /// Sends a raw collection command (`OP_DOC_ADMIN` or `OP_DOC_INFO`, see `documents`).
+    /// Sends one request with `op` and returns `(status, version, body)` as received.
+    pub fn raw_call(&mut self, op: u8, body: &[u8]) -> Result<(u8, u64, Vec<u8>)> {
+        self.rpc(op, NO_KEY, body)
+    }
+
     pub fn doc_command(&mut self, op: u8, body: &[u8]) -> Result<(u64, Vec<u8>)> {
         let (status, version, resp) = self.rpc(op, NO_KEY, body)?;
         match status {

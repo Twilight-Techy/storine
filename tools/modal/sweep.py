@@ -14,7 +14,8 @@ Usage (from the repository root):
 
     modal run tools/modal/sweep.py --tests txn_simulation,multi_range_simulation --seeds 300
     modal run tools/modal/sweep.py --tests txn_simulation --only bank_transfers_with_meta --seeds 1000
-    modal run tools/modal/sweep.py --suite "-p storage-core -p storage-index"   # a whole `cargo test`
+    modal run tools/modal/sweep.py --suite-args "-p storage-core -p storage-index"   # a whole `cargo test`
+    modal run tools/modal/sweep.py --suite-args "-p storage-server --test process_chaos -- --nocapture" --env STORINE_CHAOS_SECS=90
 
 Tests whose body calls `sweep(` are seeded: seeds 1..=N in shards (`STORINE_SIM_SEED_RANGE`),
 plus one run at their default seeds for their aggregate checks; the others run once.
@@ -132,12 +133,12 @@ def run_shard(binary: bytes, name: str, test: str, lo: int, hi: int) -> list[dic
 
 
 @app.function(image=image, cpu=16, memory=32768, timeout=7200, volumes={"/target": target_vol})
-def suite(src: bytes, cargo_args: str) -> tuple[int, str]:
-    """Runs `cargo test --release <cargo_args>`; returns (exit code, summary)."""
+def suite(src: bytes, cargo_args: str, env: dict[str, str]) -> tuple[int, str]:
+    """Runs `cargo test --release <cargo_args>` with `env`; returns (exit code, summary)."""
     unpack(src)
-    proc = subprocess.run(f"cargo test --release --no-fail-fast {cargo_args} 2>&1", shell=True, cwd="/src", capture_output=True, text=True)
+    proc = subprocess.run(f"cargo test --release --no-fail-fast {cargo_args} 2>&1", shell=True, cwd="/src", capture_output=True, text=True, env={**os.environ, **env})
     target_vol.commit()
-    lines = [l for l in proc.stdout.splitlines() if l.startswith("test result") or "FAILED" in l or "panicked" in l or l.startswith("error")]
+    lines = [l for l in proc.stdout.splitlines() if l.startswith("test result") or "FAILED" in l or "panicked" in l or l.startswith("error") or "process chaos" in l or "range cluster" in l]
     return proc.returncode, "\n".join(lines[-200:])
 
 
@@ -154,12 +155,13 @@ def seeded_tests(root: str, name: str) -> tuple[list[str], list[str]]:
 
 
 @app.local_entrypoint()
-def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300, only: str = "", shard: int = 10, suite_args: str = ""):
+def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300, only: str = "", shard: int = 10, suite_args: str = "", env: str = ""):
     root = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True).stdout.strip()
     src = source_tarball(root)
     print(f"source: {len(src) / 1e6:.1f} MB")
     if suite_args:
-        code, summary = suite.remote(src, suite_args)
+        extra = dict(kv.split("=", 1) for kv in env.split(",") if "=" in kv)
+        code, summary = suite.remote(src, suite_args, extra)
         print(summary)
         print(f"cargo test exit code {code}")
         if code:

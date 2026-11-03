@@ -1009,6 +1009,9 @@ impl NodeDriver {
         r.quiescent = None;
         r.last_heartbeat = self.now;
         self.broadcast(range);
+        // A single-voter range is its own quorum: its no-op (and everything before it) commits
+        // now, not when a follower answers (there is none).
+        let _ = self.advance_commit(range);
     }
 
     fn broadcast(&mut self, range: RangeId) {

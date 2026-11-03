@@ -15,6 +15,12 @@
 //! `storage-cli cluster <leader> add N host:port` (it joins as a learner and is promoted to
 //! voter once it has caught up).
 //!
+//! Range cluster (`TASK-143`): `--ranges --node-id N --peers 1=host:port,...` starts the
+//! multi-range layer instead: the key space splits into ranges that move, split and merge
+//! automatically; every node serves the whole document API by coordinating distributed
+//! transactions, so clients may connect to any node. On first start every listed node holds one
+//! range over the whole key space; a restart reopens the node's ranges.
+//!
 //! Security configuration (environment):
 //! - `STORAGE_AUTH_TOKENS`: comma-separated `token:role` pairs (`role` = `read` | `write` | `admin`).
 //!   When set, every connection must authenticate (`OP_AUTH`). When unset, the server only
@@ -124,8 +130,11 @@ fn run() -> Result<()> {
         report((server.local_addr(), server.max_connections()), data_dir, auth_enabled, "agent records");
         return park(server, once);
     }
-    let store = Arc::new(DocumentStore::open(data_dir, EngineConfig::default())?);
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1));
+    if args.iter().any(|a| a == "--ranges") {
+        return run_ranges(data_dir, bind_addr, max_connections, security, flag("--node-id").map(String::as_str), flag("--peers").map(String::as_str), once);
+    }
+    let store = Arc::new(DocumentStore::open(data_dir, EngineConfig::default())?);
     let join = args.iter().any(|a| a == "--join");
     if let (Some(node_id), true) = (flag("--node-id"), flag("--peers").is_some() || join) {
         let node_id: NodeId = node_id
@@ -188,6 +197,51 @@ fn run() -> Result<()> {
     let server = StorageServer::start_documents(bind_addr, store, max_connections, security, None)?;
     report((server.local_addr(), server.max_connections()), data_dir, auth_enabled, "documents");
     park(server, once)
+}
+
+/// `--ranges`: one node of a range cluster (see the module docs).
+fn run_ranges(data_dir: &str, bind_addr: &str, max_connections: usize, security: SecurityConfig, node_id: Option<&str>, peers: Option<&str>, once: bool) -> Result<()> {
+    let node_id: NodeId = node_id
+        .ok_or_else(|| StorageError::invalid_key("--ranges needs --node-id"))?
+        .parse()
+        .map_err(|_| StorageError::invalid_key("--node-id must be a number (1-65535)"))?;
+    let members = parse_peers(peers.ok_or_else(|| StorageError::invalid_key("--ranges needs --peers (every node, this one included)"))?)?;
+    if !members.contains_key(&node_id) {
+        return Err(StorageError::invalid_key("--peers must list this node's own --node-id"));
+    }
+    let token = env::var("STORAGE_CLUSTER_TOKEN").ok();
+    let mut security = security;
+    if let Some(ref t) = token {
+        if t.len() < 16 {
+            return Err(StorageError::invalid_key("STORAGE_CLUSTER_TOKEN must be at least 16 characters"));
+        }
+        if security.require_auth {
+            security = security.with_token(t, RbacRole::Admin);
+        }
+    } else if security.require_auth {
+        return Err(StorageError::invalid_key("range clusters with authentication need STORAGE_CLUSTER_TOKEN (nodes authenticate with it)"));
+    }
+    let mut addrs = HashMap::new();
+    for (&id, addr) in &members {
+        addrs.insert(id, cluster::resolve(addr)?);
+    }
+    let n = addrs.len();
+    let server = storage_server::ranges::start_range_server(storage_server::ranges::RangeServerConfig {
+        data_dir: data_dir.into(),
+        bind_addr: bind_addr.to_string(),
+        node_id,
+        peers: addrs,
+        token,
+        security,
+        max_connections,
+        max_offset: Duration::from_millis(500),
+    })?;
+    report((server.local_addr(), server.max_connections()), data_dir, server_auth(&server), &format!("documents, range node {node_id} of {n}"));
+    park(server, once)
+}
+
+fn server_auth<T: storage_codec::ZeroCopyRecord + storage_index::Indexable>(_: &StorageServer<T>) -> bool {
+    env::var("STORAGE_AUTH_TOKENS").is_ok()
 }
 
 /// Parses `1=host:port,2=host:port,...`.

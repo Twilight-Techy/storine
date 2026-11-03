@@ -38,6 +38,82 @@ pub const ADMIN_DROP_COLUMNAR: u8 = 11;
 
 pub(crate) type Reply = (u8, u64, Vec<u8>);
 
+/// Where document operations run: a node's own store, or a range cluster (`TASK-143`). The
+/// handlers below decode and encode the wire format identically for both.
+pub(crate) trait DocBackend {
+    fn get(&self, c: &str, k: &str) -> storage_types::Result<Option<storage_core::Document>>;
+    fn get_fields(&self, c: &str, k: &str, paths: &[String]) -> storage_types::Result<Option<storage_core::Document>>;
+    fn read_bytes(&self, c: &str, k: &str, path: &str, offset: u64, len: usize) -> storage_types::Result<Option<storage_core::ByteRange>>;
+    fn write(&self, writes: Vec<storage_core::DocWrite>, request_id: Option<[u8; 16]>) -> storage_types::Result<storage_core::WriteSummary>;
+    fn query(&self, q: &storage_core::DocQuery) -> storage_types::Result<storage_core::DocPage>;
+    fn aggregate(&self, q: &storage_core::analytics::AggregateQuery) -> storage_types::Result<storage_core::analytics::AggregateResult>;
+    fn scan_columns(&self, q: &storage_core::analytics::ScanQuery) -> storage_types::Result<storage_core::analytics::ScanPage>;
+    fn collection_info(&self, c: &str) -> storage_types::Result<CollectionInfo>;
+    fn list_collections(&self) -> storage_types::Result<Vec<CollectionInfo>>;
+    fn create_index(&self, c: &str, f: &str) -> storage_types::Result<()>;
+    fn drop_index(&self, c: &str, f: &str) -> storage_types::Result<()>;
+    fn drop_collection(&self, c: &str) -> storage_types::Result<usize>;
+    fn set_collection_extra(&self, c: &str, extra: BTreeMap<String, storage_codec::PropertyValue>) -> storage_types::Result<()>;
+    fn create_vector_index(&self, c: &str, f: &str, dims: usize) -> storage_types::Result<()>;
+    fn drop_vector_index(&self, c: &str, f: &str) -> storage_types::Result<()>;
+    fn create_columnar(&self, c: &str) -> storage_types::Result<()>;
+    fn drop_columnar(&self, c: &str) -> storage_types::Result<()>;
+}
+
+impl DocBackend for DocumentStore {
+    fn get(&self, c: &str, k: &str) -> storage_types::Result<Option<storage_core::Document>> {
+        DocumentStore::get(self, c, k)
+    }
+    fn get_fields(&self, c: &str, k: &str, paths: &[String]) -> storage_types::Result<Option<storage_core::Document>> {
+        DocumentStore::get_fields(self, c, k, paths)
+    }
+    fn read_bytes(&self, c: &str, k: &str, path: &str, offset: u64, len: usize) -> storage_types::Result<Option<storage_core::ByteRange>> {
+        DocumentStore::read_bytes(self, c, k, path, offset, len)
+    }
+    fn write(&self, writes: Vec<storage_core::DocWrite>, request_id: Option<[u8; 16]>) -> storage_types::Result<storage_core::WriteSummary> {
+        DocumentStore::write(self, writes, request_id)
+    }
+    fn query(&self, q: &storage_core::DocQuery) -> storage_types::Result<storage_core::DocPage> {
+        DocumentStore::query(self, q)
+    }
+    fn aggregate(&self, q: &storage_core::analytics::AggregateQuery) -> storage_types::Result<storage_core::analytics::AggregateResult> {
+        DocumentStore::aggregate(self, q)
+    }
+    fn scan_columns(&self, q: &storage_core::analytics::ScanQuery) -> storage_types::Result<storage_core::analytics::ScanPage> {
+        DocumentStore::scan_columns(self, q)
+    }
+    fn collection_info(&self, c: &str) -> storage_types::Result<CollectionInfo> {
+        Ok(DocumentStore::collection_info(self, c))
+    }
+    fn list_collections(&self) -> storage_types::Result<Vec<CollectionInfo>> {
+        Ok(DocumentStore::list_collections(self))
+    }
+    fn create_index(&self, c: &str, f: &str) -> storage_types::Result<()> {
+        DocumentStore::create_index(self, c, f)
+    }
+    fn drop_index(&self, c: &str, f: &str) -> storage_types::Result<()> {
+        DocumentStore::drop_index(self, c, f)
+    }
+    fn drop_collection(&self, c: &str) -> storage_types::Result<usize> {
+        DocumentStore::drop_collection(self, c)
+    }
+    fn set_collection_extra(&self, c: &str, extra: BTreeMap<String, storage_codec::PropertyValue>) -> storage_types::Result<()> {
+        DocumentStore::set_collection_extra(self, c, extra)
+    }
+    fn create_vector_index(&self, c: &str, f: &str, dims: usize) -> storage_types::Result<()> {
+        DocumentStore::create_vector_index(self, c, f, dims)
+    }
+    fn drop_vector_index(&self, c: &str, f: &str) -> storage_types::Result<()> {
+        DocumentStore::drop_vector_index(self, c, f)
+    }
+    fn create_columnar(&self, c: &str) -> storage_types::Result<()> {
+        DocumentStore::create_columnar(self, c)
+    }
+    fn drop_columnar(&self, c: &str) -> storage_types::Result<()> {
+        DocumentStore::drop_columnar(self, c)
+    }
+}
+
 /// Maps an engine error to a wire status (the body carries the readable message).
 pub(crate) fn status_for(e: &StorageError) -> u8 {
     match e {
@@ -93,7 +169,7 @@ enum GetShape {
 
 /// `OP_DOC_GET`: `str collection | str key [| shape]` -> `map`, a byte range or a projected
 /// `map` (version in the header).
-pub(crate) fn doc_get(store: &DocumentStore, body: &[u8]) -> Reply {
+pub(crate) fn doc_get(store: &dyn DocBackend, body: &[u8]) -> Reply {
     let mut r = SveReader::new(body);
     let parsed = (|| -> storage_types::Result<(String, String, GetShape)> {
         let c = r.str()?.to_owned();
@@ -160,7 +236,7 @@ pub(crate) fn doc_get(store: &DocumentStore, body: &[u8]) -> Reply {
 }
 
 /// `OP_DOC_WRITE`: atomic batch of writes with preconditions, optionally idempotent.
-pub(crate) fn doc_write(store: &DocumentStore, body: &[u8]) -> Reply {
+pub(crate) fn doc_write(store: &dyn DocBackend, body: &[u8]) -> Reply {
     let (writes, request_id) = match decode_write_request(body) {
         Ok(v) => v,
         Err(e) => return error_reply(&e),
@@ -194,7 +270,7 @@ pub(crate) fn doc_write(store: &DocumentStore, body: &[u8]) -> Reply {
 }
 
 /// `OP_DOC_QUERY` -> page.
-pub(crate) fn doc_query(store: &DocumentStore, body: &[u8]) -> Reply {
+pub(crate) fn doc_query(store: &dyn DocBackend, body: &[u8]) -> Reply {
     let q = match decode_query(body) {
         Ok(q) => q,
         Err(e) => return error_reply(&e),
@@ -217,7 +293,7 @@ pub(crate) fn doc_query(store: &DocumentStore, body: &[u8]) -> Reply {
 }
 
 /// `OP_DOC_AGGREGATE` -> result rows (`version` = matched rows).
-pub(crate) fn doc_aggregate(store: &DocumentStore, body: &[u8]) -> Reply {
+pub(crate) fn doc_aggregate(store: &dyn DocBackend, body: &[u8]) -> Reply {
     let q = match decode_aggregate(body) {
         Ok(q) => q,
         Err(e) => return error_reply(&e),
@@ -239,7 +315,7 @@ pub(crate) fn doc_aggregate(store: &DocumentStore, body: &[u8]) -> Reply {
 }
 
 /// `OP_DOC_SCAN_COLUMNS` -> one page (`version` = matching documents).
-pub(crate) fn doc_scan_columns(store: &DocumentStore, body: &[u8]) -> Reply {
+pub(crate) fn doc_scan_columns(store: &dyn DocBackend, body: &[u8]) -> Reply {
     let q = match decode_scan(body) {
         Ok(q) => q,
         Err(e) => return error_reply(&e),
@@ -287,7 +363,7 @@ pub(crate) fn admin_is_slow(body: &[u8]) -> bool {
 }
 
 /// `OP_DOC_ADMIN` / `OP_DOC_INFO`: `u8 sub-command | args`.
-pub(crate) fn doc_admin(store: &DocumentStore, body: &[u8], allow_writes: bool) -> Reply {
+pub(crate) fn doc_admin(store: &dyn DocBackend, body: &[u8], allow_writes: bool) -> Reply {
     let mut r = SveReader::new(body);
     let mut run = || -> storage_types::Result<Reply> {
         let sub = r.u8()?;
@@ -317,7 +393,7 @@ pub(crate) fn doc_admin(store: &DocumentStore, body: &[u8], allow_writes: bool) 
                 (STATUS_OK, 0, Vec::new())
             }
             INFO_LIST_COLLECTIONS => {
-                let all = store.list_collections();
+                let all = store.list_collections()?;
                 let mut out = Vec::new();
                 out.extend_from_slice(&(all.len() as u32).to_le_bytes());
                 for info in &all {
@@ -360,7 +436,7 @@ pub(crate) fn doc_admin(store: &DocumentStore, body: &[u8], allow_writes: bool) 
             }
             INFO_VECTOR_INDEXES => {
                 let c = r.str()?.to_owned();
-                let info = store.collection_info(&c);
+                let info = store.collection_info(&c)?;
                 let mut out = (info.vectors.len() as u32).to_le_bytes().to_vec();
                 for v in &info.vectors {
                     put_str(&mut out, &v.field);
@@ -372,7 +448,7 @@ pub(crate) fn doc_admin(store: &DocumentStore, body: &[u8], allow_writes: bool) 
             INFO_COLLECTION => {
                 let c = r.str()?.to_owned();
                 let mut out = Vec::new();
-                encode_info(&store.collection_info(&c), &mut out);
+                encode_info(&store.collection_info(&c)?, &mut out);
                 (STATUS_OK, 0, out)
             }
             _ => return Err(StorageError::invalid_value("unknown collection command")),

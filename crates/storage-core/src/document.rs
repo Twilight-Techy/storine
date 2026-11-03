@@ -1854,7 +1854,7 @@ fn hex16(bytes: &[u8; 16]) -> String {
     s
 }
 
-fn check_fields(fields: &BTreeMap<String, PropertyValue>) -> Result<()> {
+pub(crate) fn check_fields(fields: &BTreeMap<String, PropertyValue>) -> Result<()> {
     for (k, v) in fields {
         if k.is_empty() || k.contains('.') {
             return Err(StorageError::invalid_value(
