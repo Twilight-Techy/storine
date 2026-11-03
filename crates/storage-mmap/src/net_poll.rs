@@ -952,7 +952,17 @@ mod epoll_tests {
         assert!(ep.wait(0).is_empty(), "nothing readable yet");
         clients[3].write_all(b"x").unwrap();
         clients[6].write_all(b"y").unwrap();
-        let mut ready: Vec<u64> = ep.wait(1000).to_vec();
+        // `wait` returns as soon as any socket is ready: the second write may land a moment
+        // later (it does under gVisor's loopback), so gather until both are seen.
+        let mut ready: Vec<u64> = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ready.len() < 2 && std::time::Instant::now() < deadline {
+            for &t in ep.wait(1000) {
+                if !ready.contains(&t) {
+                    ready.push(t);
+                }
+            }
+        }
         ready.sort_unstable();
         assert_eq!(ready, vec![3, 6]);
         // Write interest: an idle connected socket is immediately writable.

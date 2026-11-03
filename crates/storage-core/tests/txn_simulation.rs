@@ -1,6 +1,7 @@
 //! Distributed transactions under the deterministic simulator (`TASK-140`, `TASK-142`).
 //!
-//! `STORINE_SIM_SEEDS=n` widens the sweep; `STORINE_SIM_SEED=s` replays one seed.
+//! `STORINE_SIM_SEEDS=n` widens the sweep; `STORINE_SIM_SEED=s` replays one seed;
+//! `STORINE_SIM_SEED_RANGE=a-b` runs seeds `a..=b` (shards of `tools/modal/sweep.py`).
 
 use storage_core::dist::alloc::AllocatorConfig;
 use storage_core::dist::node::NodeConfig;
@@ -10,6 +11,10 @@ use storage_core::dist::zone::{self, ClosedTs, ZoneConfig, ZoneConfigs};
 fn seeds(default: u64) -> Vec<u64> {
     if let Some(s) = std::env::var("STORINE_SIM_SEED").ok().and_then(|s| s.parse().ok()) {
         return vec![s];
+    }
+    // A shard of a distributed sweep (`tools/modal/sweep.py`): seeds `a..=b`.
+    if let Some((a, b)) = std::env::var("STORINE_SIM_SEED_RANGE").ok().and_then(|r| r.split_once('-').and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))) {
+        return (a..=b).collect();
     }
     let n = std::env::var("STORINE_SIM_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(default);
     (1..=n).collect()

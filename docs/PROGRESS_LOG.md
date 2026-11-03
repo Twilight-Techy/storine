@@ -666,3 +666,13 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - **Rebalancing oscillation** (`TASK-138`): back-to-back allocator turns let two nodes move replicas onto one store before either heard of the other's move. Turns now have an idle interval between them.
   - All have regression tests, and the failing seeds are replayed on every run.
 - **Also**: the analytics budget's `fetch_update` (deprecated in the current toolchain) became a compare-exchange loop, which still builds on the 1.82 minimum Rust version.
+
+### Tooling: sweeps and suites on Modal — 2026-11-03
+
+- **Why**: on the 2-core development machine, a 300-seed sweep of both simulation suites took about an hour, so sweeps were run rarely.
+- **What**: `tools/modal/sweep.py` builds the simulation binaries once on a 16-CPU Modal container, with `target/` cached on a volume, and shards each test's seeds (`STORINE_SIM_SEED_RANGE=a-b`) across up to 200 containers. Each failing seed is reported with its replay command. Aggregate checks run once per test at its default seeds. `--suite-args` runs any `cargo test` there.
+- **Result**: both suites at 300 seeds in 84 s, and the full workspace suite in one call.
+- **Builds for other CPUs**: Modal builds use `-C target-cpu=x86-64-v3` instead of the repository's `native`, because a binary tuned to the build machine died with SIGILL on runners with other CPUs.
+- **Found on the way**:
+  - an epoll test assumed one `wait` returns every ready socket; it gathers until both are seen now (gVisor's loopback delivers the second write a moment later);
+  - a test helper's `mut` is needed only on CPU targets without AES-NI.

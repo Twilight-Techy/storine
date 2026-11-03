@@ -356,7 +356,9 @@ mod tests {
 
     fn both(key: &[u8]) -> Vec<Aes> {
         let hw = Aes::new(key).unwrap();
-        let sw = hw.clone();
+        // Mutated only where the hardware path exists for the build's CPU target.
+        #[allow(unused_mut)]
+        let mut sw = hw.clone();
         #[cfg(target_arch = "x86_64")]
         {
             sw.ni = false;

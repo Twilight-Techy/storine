@@ -1,6 +1,7 @@
 //! Multi-range clusters under the deterministic simulator (`TASK-137`, `TASK-142`).
 //!
-//! `STORINE_SIM_SEEDS=n` widens the sweep; `STORINE_SIM_SEED=s` replays one seed.
+//! `STORINE_SIM_SEEDS=n` widens the sweep; `STORINE_SIM_SEED=s` replays one seed;
+//! `STORINE_SIM_SEED_RANGE=a-b` runs seeds `a..=b` (shards of `tools/modal/sweep.py`).
 
 use std::sync::Arc;
 
@@ -13,6 +14,10 @@ use storage_core::{DocumentRecord, EngineConfig, StorageEngine};
 fn seeds(default: u64) -> Vec<u64> {
     if let Some(s) = std::env::var("STORINE_SIM_SEED").ok().and_then(|s| s.parse().ok()) {
         return vec![s];
+    }
+    // A shard of a distributed sweep (`tools/modal/sweep.py`): seeds `a..=b`.
+    if let Some((a, b)) = std::env::var("STORINE_SIM_SEED_RANGE").ok().and_then(|r| r.split_once('-').and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))) {
+        return (a..=b).collect();
     }
     let n = std::env::var("STORINE_SIM_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(default);
     (1..=n).collect()
@@ -186,7 +191,7 @@ fn zone_configs_place_replicas_and_leases() {
     // never settled (two nodes rebalanced onto one store in back-to-back turns, and back); 166
     // acknowledged a lost write (it took the outcome of a later proposal at the same index).
     let mut reports = sweep("zones", &cfg, 6);
-    if std::env::var("STORINE_SIM_SEED").is_err() {
+    if std::env::var("STORINE_SIM_SEED").is_err() && std::env::var("STORINE_SIM_SEED_RANGE").is_err() {
         for seed in [39, 89, 166] {
             reports.push(run(&std::env::temp_dir().join(format!("storine_zones_{seed}_{}", std::process::id())), seed, &cfg).unwrap_or_else(|f| panic!("zones seed {seed}: {f}")));
         }
