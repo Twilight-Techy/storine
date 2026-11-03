@@ -358,7 +358,7 @@ mod tests {
 
     fn both(key: &[u8]) -> Vec<Aes> {
         let hw = Aes::new(key).unwrap();
-        let mut sw = hw.clone();
+        let sw = hw.clone();
         #[cfg(target_arch = "x86_64")]
         {
             sw.ni = false;

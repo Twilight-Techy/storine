@@ -926,6 +926,17 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         self.inner.primary.ids_snapshot()
     }
 
+    /// Keeps live ids in byte order for [`Self::ids_in_span`] (range servers, `TASK-143`).
+    /// Call before serving. Off by default: the write path then pays one relaxed load.
+    pub fn enable_ordered_ids(&self) {
+        self.inner.primary.enable_ordered_ids();
+    }
+
+    /// Live ids in `[start, end)`, in byte order, at most `limit`: `O(log N + limit)`.
+    pub fn ids_in_span(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Vec<InlineId> {
+        self.inner.primary.ids_in_span(start, end, limit)
+    }
+
     /// `true` if this open reused persisted paged secondary indexes (`IndexTier::Paged` after a
     /// clean shutdown) instead of rebuilding them from the records.
     pub fn secondary_indexes_reused(&self) -> bool {

@@ -180,6 +180,8 @@ struct PendingWrite {
     key: usize,
     value: i64,
     index: u64,
+    /// Term the write was proposed in (its outcome is only ever that entry's).
+    term: u64,
     call: u64,
 }
 
@@ -802,12 +804,12 @@ impl<'c> Sim<'c> {
             self.next_value += 1;
             let value = self.next_value;
             let rec = AgentObjectRecord::new(key_id(key), format!("v{value}"), value, value);
-            match raft.propose_ops_at(&[WriteOp::put(key_id(key), rec)], self.now * 1_000) {
-                Ok(index) => {
+            match raft.propose_ops_at_tagged(&[WriteOp::put(key_id(key), rec)], self.now * 1_000) {
+                Ok((index, term)) => {
                     let h = self.history.len();
                     self.history.push((key, Event { call, ret: None, op: RegisterOp::Write(value) }));
                     self.open_op[client] = Some(h);
-                    self.nodes[target].writes.push(PendingWrite { client, key, value, index, call });
+                    self.nodes[target].writes.push(PendingWrite { client, key, value, index, term, call });
                     self.clients[client].state = ClientState::Busy { since: call, op: h };
                     self.broadcast(target);
                 }
@@ -917,7 +919,7 @@ impl<'c> Sim<'c> {
             for i in ready.into_iter().rev() {
                 let w = self.nodes[node].writes.remove(i);
                 let _ = (w.key, w.call);
-                match raft.wait_applied(w.index, std::time::Duration::ZERO) {
+                match raft.wait_applied(w.index, w.term, std::time::Duration::ZERO) {
                     Ok(_) => {
                         self.report.writes_ok += 1;
                         self.complete(w.client, RegisterOp::Write(w.value));

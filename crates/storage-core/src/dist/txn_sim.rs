@@ -64,6 +64,14 @@ pub struct TxnSimConfig {
     /// Clients route through their own range caches, filled by meta-range lookups
     /// (`TASK-138`), instead of the simulator's global view.
     pub meta_routing: bool,
+    /// A read's first attempt goes to a random replica of its range, not the leaseholder:
+    /// replicas serve it from their closed timestamps or redirect (`TASK-141`).
+    pub nearest_reads: bool,
+    /// Audits read `AS OF` this long ago (follower-readable); `0`: present-time audits.
+    pub audit_staleness_ns: u64,
+    /// Audits read every account with one scan of the accounts' span across ranges
+    /// (`TASK-143`) instead of a read per account.
+    pub scan_audits: bool,
 }
 
 impl Default for TxnSimConfig {
@@ -89,6 +97,9 @@ impl Default for TxnSimConfig {
             max_events: 5_000_000,
             node: NodeConfig { election_min_us: 300_000, election_max_us: 600_000, heartbeat_us: 50_000, snapshot_chunk: 2048, ..NodeConfig::default() },
             meta_routing: false,
+            nearest_reads: false,
+            audit_staleness_ns: 0,
+            scan_audits: false,
         }
     }
 }
@@ -112,6 +123,8 @@ pub struct TxnSimReport {
     /// Meta routing: lookups sent, and requests that reached a stale leaseholder or range.
     pub meta_lookups: usize,
     pub misroutes: usize,
+    /// Reads replicas served below their closed timestamps.
+    pub follower_reads: u64,
 }
 
 /// A transaction with an unknown outcome: id, reads, writes.
@@ -168,6 +181,8 @@ struct ClientSlot {
 }
 
 struct World {
+    /// Debugging (`STORINE_SIM_WATCH`): last seen state of watched records per node.
+    watched: BTreeMap<String, String>,
     cfg: TxnSimConfig,
     rng: SweepRng,
     now: u64,
@@ -263,13 +278,12 @@ impl World {
     }
 
     /// The range holding `key` and the node to ask.
-    fn route(&mut self, key: &Key) -> (Option<RangeId>, usize) {
-        let id = document_id(&key.0, &key.1).unwrap_or_default();
+    fn route(&mut self, at: &[u8]) -> (Option<RangeId>, usize) {
         let mut best: Option<(RangeId, u64, Option<NodeId>)> = None;
         for n in self.nodes.iter().filter_map(|n| n.server.as_ref()) {
             for r in n.driver.ranges() {
                 let Some(rep) = n.driver.replica(r) else { continue };
-                if rep.span().contains_id(id) && best.as_ref().is_none_or(|b| rep.current_term() > b.1) {
+                if rep.span().contains(at) && best.as_ref().is_none_or(|b| rep.current_term() > b.1) {
                     best = Some((r, rep.current_term(), n.driver.leader_of(r)));
                 }
             }
@@ -283,10 +297,39 @@ impl World {
         }
     }
 
+    /// Debugging: prints every change of a watched transaction record on any node.
+    fn watch(&mut self, prefix: &str) {
+        for i in 0..self.nodes.len() {
+            let Some(srv) = self.nodes[i].server.as_ref() else { continue };
+            let mut seen = String::new();
+            for id in srv.driver.engine().ids_in_span(b"_txn/", Some(b"_txn0"), usize::MAX) {
+                if let Ok((v, rec)) = srv.driver.engine().get_owned(id) {
+                    if rec.key.starts_with(prefix) {
+                        let st = rec.fields.get("s").map(|x| format!("{x:?}")).unwrap_or_default();
+                        let owner = srv.driver.ranges().into_iter().filter(|&r| srv.driver.replica(r).is_some_and(|x| x.span().contains_id(id))).map(|r| format!("r{r}{}", if srv.driver.is_leader(r) { "*" } else { "" })).collect::<Vec<_>>().join(",");
+                        seen = format!("v{} s={st} in {owner}", v.0);
+                    }
+                }
+            }
+            let key = format!("{prefix}@{i}");
+            if self.watched.get(&key) != Some(&seen) {
+                eprintln!("watch t={} n{}: {seen}", self.now, i + 1);
+                self.watched.insert(key, seen);
+            }
+        }
+    }
+
+    /// A random live node hosting a replica of `key`'s range.
+    fn random_host(&mut self, at: &[u8]) -> Option<usize> {
+        let hosts: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| self.nodes[i].server.as_ref().is_some_and(|s| s.driver.ranges().into_iter().any(|r| s.driver.replica(r).is_some_and(|x| !x.is_frozen() && x.span().contains(at)))))
+            .collect();
+        (!hosts.is_empty()).then(|| hosts[self.rng.below(hosts.len())])
+    }
+
     /// Meta routing: the node to send `key`'s request to, from the client's cache.
-    fn cached_route(&mut self, client: usize, key: &Key) -> Option<usize> {
-        let id = document_id(&key.0, &key.1).ok()?;
-        let d = self.slots[client].cache.lookup(id.as_bytes())?;
+    fn cached_route(&mut self, client: usize, at: &[u8]) -> Option<usize> {
+        let d = self.slots[client].cache.lookup(at)?;
         let n = *d.candidates().first()?;
         Some(usize::from(n) - 1)
     }
@@ -295,7 +338,7 @@ impl World {
     fn lookup(&mut self, client: usize, idx: usize, req: KvRequest, attempt: u32, delay: u64) {
         self.next_req += 1;
         let id = self.next_req;
-        let key = document_id(&req.key().0, &req.key().1).map(|i| i.as_bytes().to_vec()).unwrap_or_default();
+        let key = req.anchor();
         self.slots[client].outstanding.insert(id, (idx, req, attempt));
         self.slots[client].lookups.insert(id);
         self.slots[client].pub_lookups += 1;
@@ -309,7 +352,7 @@ impl World {
 
     fn submit(&mut self, client: usize, idx: usize, req: KvRequest, attempt: u32) {
         if self.cfg.meta_routing {
-            let Some(node) = self.cached_route(client, &req.key()) else {
+            let Some(node) = self.cached_route(client, &req.anchor()) else {
                 return self.lookup(client, idx, req, attempt, 0);
             };
             self.next_req += 1;
@@ -320,7 +363,12 @@ impl World {
         }
         self.next_req += 1;
         let id = self.next_req;
-        let (_, node) = self.route(&req.key());
+        let (_, mut node) = self.route(&req.anchor());
+        if self.cfg.nearest_reads && attempt == 0 && matches!(req, KvRequest::Get { .. }) {
+            if let Some(n) = self.random_host(&req.anchor()) {
+                node = n;
+            }
+        }
         self.slots[client].outstanding.insert(id, (idx, req.clone(), attempt));
         let d = self.latency(0, node);
         self.schedule(d, Ev::Request { to: node, id, client, req });
@@ -360,9 +408,9 @@ impl World {
                 }
                 match resp {
                     KvResponse::NotLeader { leader } if self.now < self.slots[client].deadline => {
-                        if let (Some(r), Some(l)) = (self.route(&req.key()).0, leader) {
+                        if let (Some(r), Some(l)) = (self.route(&req.anchor()).0, leader) {
                             self.leader_hint.insert(r, usize::from(l) - 1);
-                        } else if let Some(r) = self.route(&req.key()).0 {
+                        } else if let Some(r) = self.route(&req.anchor()).0 {
                             let n = self.rng.below(self.cfg.nodes);
                             self.leader_hint.insert(r, n);
                         }
@@ -371,17 +419,17 @@ impl World {
                         self.next_req += 1;
                         let nid = self.next_req;
                         self.slots[client].outstanding.insert(nid, (idx, req.clone(), attempt + 1));
-                        let (_, node) = self.route(&req.key());
+                        let (_, node) = self.route(&req.anchor());
                         self.schedule(backoff, Ev::Request { to: node, id: nid, client, req });
                     }
                     KvResponse::WrongRange if self.now < self.slots[client].deadline => {
-                        if let Some(r) = self.route(&req.key()).0 {
+                        if let Some(r) = self.route(&req.anchor()).0 {
                             self.leader_hint.remove(&r);
                         }
                         self.next_req += 1;
                         let nid = self.next_req;
                         self.slots[client].outstanding.insert(nid, (idx, req.clone(), attempt + 1));
-                        let (_, node) = self.route(&req.key());
+                        let (_, node) = self.route(&req.anchor());
                         self.schedule(10_000, Ev::Request { to: node, id: nid, client, req });
                     }
                     KvResponse::NotLeader { .. } | KvResponse::WrongRange => self.slots[client].replies[idx] = Some(Err("no leaseholder found".into())),
@@ -430,7 +478,7 @@ impl World {
                     for d in ds {
                         self.slots[client].cache.learn(d);
                     }
-                    if self.cached_route(client, &req.key()).is_some() {
+                    if self.cached_route(client, &req.anchor()).is_some() {
                         self.submit(client, idx, req, attempt);
                     } else if late {
                         self.slots[client].replies[idx] = Some(Err("no route".into()));
@@ -454,7 +502,7 @@ impl World {
             }
             return;
         }
-        let range = document_id(&req.key().0, &req.key().1).ok().and_then(|k| self.slots[client].cache.lookup(k.as_bytes()).map(|d| d.range));
+        let range = self.slots[client].cache.lookup(&req.anchor()).map(|d| d.range);
         match resp {
             KvResponse::NotLeader { leader } if !late => {
                 self.slots[client].misroutes += 1;
@@ -472,7 +520,7 @@ impl World {
                 self.next_req += 1;
                 let nid = self.next_req;
                 self.slots[client].outstanding.insert(nid, (idx, req.clone(), attempt + 1));
-                let node = self.cached_route(client, &req.key()).unwrap_or_else(|| self.rng.below(self.cfg.nodes));
+                let node = self.cached_route(client, &req.anchor()).unwrap_or_else(|| self.rng.below(self.cfg.nodes));
                 self.schedule(backoff, Ev::Request { to: node, id: nid, client, req });
             }
             KvResponse::WrongRange if !late => {
@@ -510,7 +558,9 @@ impl World {
                 if self.nodes.iter().all(|x| x.server.is_some()) {
                     self.report.crashes += 1;
                     self.nodes[node].sim.freeze();
-                    self.nodes[node].server = None;
+                    if let Some(srv) = self.nodes[node].server.take() {
+                        self.report.follower_reads += srv.follower_reads();
+                    }
                     let mode = if self.rng.below(2) == 0 { CutMode::Random } else { CutMode::KeepAll };
                     self.nodes[node].sim.set_mode(mode);
                     if let Err(e) = self.nodes[node].sim.power_cut() {
@@ -678,16 +728,38 @@ fn client_main(mut h: ClientHandle, cfg: TxnSimConfig) {
     for n in 0..cfg.txns_per_client {
         if n % cfg.audit_every == cfg.audit_every - 1 {
             // Audit: every account in one snapshot.
-            let res = txn::run(&mut h, |t, s| {
+            let read_all = |t: &mut txn::Txn, s: &mut dyn KvSender| -> Result<(i64, Vec<(Key, Value)>), TxnError> {
                 let mut reads = Vec::new();
                 let mut total = 0;
+                if cfg.scan_audits {
+                    let rows = t.scan(s, &crate::dist::zone::collection_span("acct"), 0)?;
+                    let mut found: BTreeMap<Key, Value> = rows.into_iter().map(|(k, v)| (k, Some(v))).collect();
+                    for i in 0..cfg.accounts {
+                        let v = found.remove(&account(i)).flatten();
+                        total += balance(&v);
+                        reads.push((account(i), v));
+                    }
+                    if let Some((k, _)) = found.into_iter().next() {
+                        return Err(TxnError::Invalid(format!("scan returned a key outside the accounts: {k:?}")));
+                    }
+                    return Ok((total, reads));
+                }
                 for i in 0..cfg.accounts {
                     let v = t.get(s, &account(i))?;
                     total += balance(&v);
                     reads.push((account(i), v));
                 }
                 Ok((total, reads))
-            });
+            };
+            let res = if cfg.audit_staleness_ns > 0 {
+                // A historical snapshot: replicas serve it once it is closed.
+                let at = h.now();
+                let at = Timestamp { wall: at.wall.saturating_sub(cfg.audit_staleness_ns).max(1), logical: 0 };
+                let mut t = txn::Txn::begin_as_of(&mut h, at);
+                read_all(&mut t, &mut h).and_then(|out| t.commit(&mut h).map(|ts| (out, ts)))
+            } else {
+                txn::run(&mut h, read_all)
+            };
             let shared = Arc::clone(&h.shared);
             let mut w = shared.0.lock().unwrap_or_else(|p| p.into_inner());
             match res {
@@ -738,6 +810,7 @@ fn client_main(mut h: ClientHandle, cfg: TxnSimConfig) {
                 w.report.unavailable += 1;
                 w.report.first_error.get_or_insert(e);
             }
+            Err(TxnError::Invalid(e)) => w.failure = Some(format!("coordinator: {e}")),
         }
     }
     let shared = Arc::clone(&h.shared);
@@ -777,6 +850,7 @@ pub fn run(root: &Path, seed: u64, cfg: &TxnSimConfig) -> Result<TxnSimReport, S
         committed: Vec::new(),
         unknown: Vec::new(),
         audits: Vec::new(),
+        watched: BTreeMap::new(),
         report: TxnSimReport { seed, ..TxnSimReport::default() },
         failure: None,
         processed: 0,
@@ -875,6 +949,9 @@ pub fn run(root: &Path, seed: u64, cfg: &TxnSimConfig) -> Result<TxnSimReport, S
                 return Err("event budget exhausted (livelock?)".into());
             }
             w.handle(ev);
+            if let Ok(prefix) = std::env::var("STORINE_SIM_WATCH") {
+                w.watch(&prefix);
+            }
         }
     })();
     {
@@ -915,6 +992,7 @@ fn check(w: &mut World) -> Result<(), String> {
     w.report.meta_lookups = w.slots.iter().map(|s| s.pub_lookups).sum();
     w.report.misroutes = w.slots.iter().map(|s| s.misroutes).sum();
     w.report.end_time = w.now;
+    w.report.follower_reads += w.nodes.iter().filter_map(|n| n.server.as_ref()).map(NodeServer::follower_reads).sum::<u64>();
     w.nodes.iter().find_map(|n| n.server.as_ref()).ok_or("no live node")?;
     // Each key is read from the leaseholder of its range (replicas are not on every node).
     let nodes: Vec<&NodeServer> = w.nodes.iter().filter_map(|n| n.server.as_ref()).collect();
@@ -949,6 +1027,31 @@ fn check(w: &mut World) -> Result<(), String> {
             w.committed.push(Committed { ts, reads, writes });
         }
     }
+    // State-machine safety: replicas of a range that applied the same index hold the same
+    // records in its span (byte for byte, versions aside: those are node-local).
+    {
+        let mut by_range: BTreeMap<RangeId, Vec<(usize, u64, KeySpan)>> = BTreeMap::new();
+        for (i, n) in w.nodes.iter().enumerate() {
+            let Some(srv) = n.server.as_ref() else { continue };
+            for r in srv.driver.ranges() {
+                if let Some(x) = srv.driver.replica(r) {
+                    by_range.entry(r).or_default().push((i, x.last_applied(), x.span()));
+                }
+            }
+        }
+        let state = |i: usize, span: &KeySpan| -> Vec<(String, String, BTreeMap<String, PropertyValue>)> {
+            let Some(srv) = w.nodes[i].server.as_ref() else { return Vec::new() };
+            let e = srv.driver.engine();
+            e.ids_in_span(&span.start, span.end.as_deref(), usize::MAX).into_iter().filter_map(|id| e.get_owned(id).ok()).map(|(_, r)| (r.collection, r.key, r.fields)).collect()
+        };
+        for (r, reps) in &by_range {
+            for (a, b) in reps.iter().zip(reps.iter().skip(1)) {
+                if a.1 == b.1 && a.2 == b.2 && state(a.0, &a.2) != state(b.0, &b.2) {
+                    return Err(format!("state-machine safety: r{r} differs between n{} and n{} at applied index {}", a.0 + 1, b.0 + 1, a.1));
+                }
+            }
+        }
+    }
     // Audits: the total is conserved in every snapshot.
     let total = w.cfg.initial_balance * w.cfg.accounts as i64;
     for (ts, t) in &w.audits {
@@ -970,11 +1073,30 @@ fn check(w: &mut World) -> Result<(), String> {
             return Err(format!("audit at {ts} saw total {t}, expected {total}{detail}"));
         }
     }
-    // Serializability: replay in commit-timestamp order.
+    // Serializability: replay in commit-timestamp order. Transactions at one timestamp go in
+    // any order their reads allow: a read at `ts` sees writes at `ts` (a later write would have
+    // been pushed above the read), so a writer precedes the readers of its keys.
     let mut model: BTreeMap<Key, Value> = (0..w.cfg.accounts).map(|i| (account(i), Some(bal(w.cfg.initial_balance)))).collect();
     let mut txns = w.committed.clone();
     txns.sort_by_key(|c| c.ts);
-    for c in &txns {
+    let mut start = 0;
+    while start < txns.len() {
+        let end = start + txns[start..].iter().take_while(|c| c.ts == txns[start].ts).count();
+        let mut done = start;
+        while done < end {
+            let fits = |c: &Committed| c.reads.iter().all(|(k, v)| &model.get(k).cloned().flatten() == v);
+            let Some(next) = (done..end).find(|&i| fits(&txns[i])) else { break };
+            txns.swap(done, next);
+            for (k, v) in &txns[done].writes {
+                model.insert(k.clone(), v.clone());
+            }
+            done += 1;
+        }
+        if done == end {
+            start = end;
+            continue;
+        }
+        let c = &txns[done];
         for (k, v) in &c.reads {
             let have = model.get(k).cloned().flatten();
             if &have != v {
@@ -993,9 +1115,7 @@ fn check(w: &mut World) -> Result<(), String> {
                 return Err(format!("serializability: a transaction committed at {} read {k:?} = {v:?}, but the serial order gives {have:?}{detail}", c.ts));
             }
         }
-        for (k, v) in &c.writes {
-            model.insert(k.clone(), v.clone());
-        }
+        return Err(format!("serializability: no serial order of the transactions committed at {}", c.ts));
     }
     // The final state equals the model.
     for i in 0..w.cfg.accounts {
@@ -1006,6 +1126,24 @@ fn check(w: &mut World) -> Result<(), String> {
         // An unresolved intent of a committed transaction counts as its value.
         let want = model.get(&k).cloned().flatten();
         if committed != want && mk.intent.is_none() {
+            if std::env::var("STORINE_SIM_DEBUG").is_ok() {
+                for s in &nodes {
+                    for r in s.driver.ranges() {
+                        let Some(x) = s.driver.replica(r) else { continue };
+                        if x.span().contains_id(id) {
+                            eprintln!(
+                                "n{} r{r} leader {} frozen {} term {} applied {} has {}",
+                                s.driver.id(),
+                                s.driver.is_leader(r),
+                                x.is_frozen(),
+                                x.current_term(),
+                                x.last_applied(),
+                                s.driver.engine().get_owned(id).is_ok()
+                            );
+                        }
+                    }
+                }
+            }
             return Err(format!("final state: {k:?} holds {committed:?}, serial order gives {want:?}"));
         }
     }

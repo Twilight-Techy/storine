@@ -998,6 +998,8 @@ This document defines the strict chronological execution order for building the 
     - **Quiescence**: an idle leader sends `Quiesce` and goes silent; followers then drop their election timers while the leader's node keeps sending (possibly empty) batches.
     - A node restart (new incarnation), a silent leader node, or a campaign by the quiesced-on node wakes the range. Pre-votes are refused while a leader is live (thesis §9.6).
   - **Bugs found by the simulator and fixed**:
+    - (2026-11-03) **an acknowledged write that was lost**: Raft matched apply outcomes to waiters by log index alone. After a leader change replaced a proposal, the same node could later propose again at that index, and the earlier waiter took the new entry's outcome as its own success (zones seed 166: a write of key 5 acknowledged, never applied, then a stale read). Proposals now return `(index, term)` and `wait_applied` takes both, so a waiter only ever gets its own entry's outcome; every caller (single-group runtime, range servers, simulators) passes the term;
+    - (2026-11-03) a split proposed twice at one key (the allocator plans again before the first applies) applied twice: the replay check took any split at the span's current end for a replay of itself, and announced a second right-hand range over keys another range already held. Only the entry that set the span now counts as a replay (`a_repeated_split_splits_once`, zones seed 39);
     - a new Raft log file's directory entry was never synced, so acknowledged entries were lost on a power cut;
     - a range's first configuration lived only in memory, so after a restart its replicas never campaigned;
     - a split-created group started in term 0 below its snapshot term, which broke leader completeness;
@@ -1007,7 +1009,7 @@ This document defines the strict chronological execution order for building the 
     - **3 nodes**: 300 seeds with splits during writes, crashes with power cuts and partitions, checked for per-range election safety, log matching, leader completeness, state-machine safety, convergence and linearizability across splits.
     - **3 regions**: 300 more seeds on 5 nodes with region latencies and outages.
     - **Totals**: 1,127 splits, 1,143 crashes and about 26,700 acknowledged writes; all pass.
-- [~] **TASK-138: Meta Range, Routing & Rebalancing (`F-GEO-02`)** — replicated range descriptors; leaseholder routing in servers and SDKs; splits, merges and replica moves balanced by count, disk and load.
+- [x] **TASK-138: Meta Range, Routing & Rebalancing (`F-GEO-02`)** — replicated range descriptors; leaseholder routing in servers and SDKs; splits, merges and replica moves balanced by count, disk and load.
   - **Done (replica moves and lease transfers)**: `NodeDriver::add_learner` / `promote` / `remove_member` / `transfer_lease` (`TimeoutNow`), simulated with 5 nodes, replication 3 and faults (`replicas_move_and_leases_transfer_safely`). Bugs found and fixed:
     - a learner created after a split replayed it against the narrower current span: snapshots (format 3) now carry the span in force at their index, and installing one adopts it;
     - destroying a replica deleted keys of an overlapping local replica (`destroy_keeping`);
@@ -1024,6 +1026,7 @@ This document defines the strict chronological execution order for building the 
     - repair (promote, replace dead replicas, up/down to the replication factor);
     - count and bytes rebalancing: nodes take turns, nothing starts while any store reports a move in progress, and a move always relieves the store that motivated it;
     - lease balancing;
+    - (2026-11-03) turns leave an idle interval between them: in back-to-back turns, two nodes 15 ms apart (less than the cross-region latency) each moved a replica onto the same store before the other's move was gossiped, overshot, and swung back forever (zones seed 89);
     - size and load splits (median key / median of sampled written keys);
     - merges of small neighbours (lease co-location, replica alignment by the left range only, freeze, merge).
     - `allocator_splits_merges_and_rebalances_safely` runs 5 nodes with no simulator-driven changes. Over 400 seeds it applied 4,587 splits and 7,158 merges; every seed stayed linearizable, settled (allocators idle for 2 s) and balanced.
@@ -1039,7 +1042,17 @@ This document defines the strict chronological execution order for building the 
     - learners without a leader for 10 s probe their members;
     - orphan learners are collected without deleting keys other local replicas own;
     - WAL syncs before span changes (split, freeze).
-  - **Open**: descriptor publication to the meta range and range-cache routing in servers / SDKs (`dist/meta.rs` holds descriptors, the meta index and the cache).
+  - **Done (meta range and routing)**:
+    - Leaseholders publish their range's descriptor to the meta range when its generation or lease changes, over the per-node-pair batches (`RaftMsg::App`), and retry until acknowledged. A merged range's descriptor names the ranges it absorbed, which the meta range drops.
+    - The meta range serves `MetaOp::Lookup` / `MetaOp::Publish`. Its index is rebuilt from the descriptor records on each new lease, and older generations change nothing.
+    - Frozen ranges serve nothing (the client re-routes), and timestamp caches start over after a split or merge.
+    - Clients in the transaction simulator route through their own range caches (`meta_routing`) while the allocator splits, merges and moves ranges under them (`bank_transfers_with_meta_routing_and_allocator`).
+    - Routing in the SDKs and the SQL gateway needs the range server over TCP and moves to `TASK-143`.
+  - **Bugs fixed while finishing it** (2026-11-03):
+    - **Merge chains could strand a frozen range**: a range that had frozen its right neighbour later acted as the small right half of its own left neighbour, handed its lease away and never merged; and a left neighbour aligned the replicas of a range that was mid-merge, so the two ranges' voters could never match again. Now a pending merge comes first, a merging range is never aligned by its neighbour, and a merging range whose replicas drifted (aligned before the neighbour saw the freeze) moves them back to the frozen range's. Found as seeds 10 (`txn_simulation`, an account unreadable at the end) and 266 (`multi_range_simulation`, a range stuck at four voters).
+    - **Latch holders** were request ids alone; requests from different clients (and the server's own publications) can share one. They are now (client, request id).
+    - The serializability checker ordered transactions committed at one timestamp arbitrarily. A read at `ts` sees writes at `ts`, so it now looks for any order the reads allow (seed 12 was this false alarm, not an engine bug).
+  - **Exit Criteria (met)**: 300 seeds of every multi-range and transaction simulation, including meta routing with the allocator.
 - [x] **TASK-139: Hybrid Logical Clocks & Uncertainty (`F-GEO-03`)** — HLC timestamps, maximum-offset enforcement with self-fencing, uncertainty-interval reads, optional commit-wait.
   - `dist/hlc.rs`:
     - `Timestamp (wall ns, logical)`, which sorts as 12 big-endian bytes;
@@ -1075,14 +1088,50 @@ This document defines the strict chronological execution order for building the 
     - a re-sent intent of an implicitly committed transaction moved to a later timestamp, splitting the commit;
     - a late replayed write of an already resolved transaction became a zombie intent, which resurrected an old value (writes now remember their committer, and resolution drops intents above the commit timestamp);
     - post-commit failures were reported as "nothing committed".
+  - **Bug found later (2026-11-03, by the 300-seed sweeps)**: after a parallel commit, coordinators sent the explicit commit to the record and resolved the intents without checking that the record write succeeded. When it failed (crash, partition), an intent became a plain version while the record still read "staging". A later recovery saw that intent missing, concluded the commit never completed, and aborted the rest: a committed transfer was half undone, and audits saw a total that was not conserved (seeds regions 106, meta 33, follower 232, scan 58, global 127; the first two reproduce on the code before `TASK-141`). Coordinators now resolve intents only once the record is confirmed final, and as it says; otherwise the intents stay for a push to recover. `abort` had the same flaw. The seeds are replayed by `regression_seeds`.
+  - **Bug found later (2026-11-03, meta seed 146)**: range servers proposed each record write conditioned on the leaseholder's engine version of the record. Engine versions are node-local (each node's engine is shared by many ranges and numbers versions from its own history), so the same write applied on one replica and failed its condition on another: replicas of a range diverged, and a committed transaction record read "staging" on the next leaseholder, which aborted it. Writes are now conditioned on existence, which is replicated state (per-key latches and read-index ordering already keep evaluations from interleaving). The transaction simulator now also checks state-machine safety directly: replicas that applied the same index must hold identical records.
   - **Exit Criteria (met)**:
     - 400 seeds: calm, faults, and 5 nodes in 3 regions with outages.
     - About 10,600 committed transfers and 3,400 snapshot audits, all serializable, under 1,175 crashes (power cuts) and 2,559 partitions.
-- [ ] **TASK-141: Locality, Zone Configurations & Survival Goals (`F-GEO-05`)** — region / zone labels, constraints, lease preferences, zone / region survival; closed-timestamp follower reads; global and regional-by-row tables.
+- [x] **TASK-141: Locality, Zone Configurations & Survival Goals (`F-GEO-05`)** — region / zone labels, constraints, lease preferences, zone / region survival; closed-timestamp follower reads; global and regional-by-row tables.
+  - **Zone configurations** (`dist/zone.rs`): nodes declare a region and zone (`NodeConfig::localities`). A configuration per key span sets the voter count, required / prohibited regions and zones, ordered lease preferences, a survival goal (zone or region) and a closed-timestamp policy. `ZoneConfig::validate` refuses what the cluster cannot meet (too few eligible nodes, a survival goal no spread achieves, a lag below or a lead not above twice the clock offset). `NodeDriver::set_zones` validates and applies changes at runtime.
+  - **Allocator** (`dist/alloc.rs`, through a `Placement` per range):
+    - a range straddling two configurations splits at the boundary, and neighbours under different configurations never merge;
+    - replicas go only to allowed stores, spread over regions then zones before load;
+    - a replica on a disallowed store, or a failure domain holding a quorum against the survival goal, is moved (the leaseholder hands its lease over first if it is the one to move);
+    - over-replicated ranges drop disallowed, then dead, then the most crowded domain's replicas;
+    - rebalancing by load never lowers diversity;
+    - the lease goes to the most preferred region with a live, caught-up voter, and lease balancing stays among equally preferred voters.
+  - **Closed timestamps and follower reads**:
+    - Each heartbeat round, a leaseholder picks a candidate (its clock minus the lag, or plus the lead) at its last log index. It is confirmed once a quorum acknowledges that round: those voters saw the round's batch clock, and every later leader's election quorum shares one of them, so its clock is above the candidate. Confirmed values travel on appends of the current term and are usable once the index is applied.
+    - Writes land above the closed timestamp. A new leaseholder, or a range just split or merged, starts above the largest lead configured plus the clock offset, so a lagging replica of a key's old range can never serve a read that a later write lands under. Dropping a global span keeps its promises as a floor until they pass.
+    - Any replica serves a `Get` whose timestamp and uncertainty window are at or below its closed timestamp, with no timestamp-cache entry (no write can land there); otherwise it redirects to the leaseholder.
+    - `Txn::begin_as_of` reads a past snapshot (no uncertainty window, writes refused), which replicas serve once it is closed.
+  - **Global tables** (`zone::global`): the span closes ahead of time (lead). Writes land in the future and their coordinators commit-wait until the timestamp has passed, so any replica serves present-time reads. The lead exceeds twice the offset, so every clock recognises such a timestamp as synthetic: servers and coordinators order by it but never absorb it into their clocks. Global ranges do not quiesce, since their followers need a closed timestamp that keeps up.
+  - **Regional-by-row tables** (`zone::regional_by_row`): a row's key starts with its home region, and each region's span prefers leases there (`zone::regional_key`, `zone::home_region`).
+  - **Exit Criteria (met)**:
+    - `zone_configs_place_replicas_and_leases`: 6 nodes in 3 regions, the allocator alone placing two configurations (constraints with a prohibited region and lease preference; 5-voter region survival) under crashes and partitions. Every settled range honours its configuration and none straddles a boundary.
+    - `follower_reads_at_closed_timestamps`: audits `AS OF` 400 ms ago from random replicas under faults. They are conserved and fit the serial order, and replicas serve hundreds of them.
+    - `global_table_reads_from_any_replica`: global accounts on 5 nodes in 3 regions with outages; present-time reads from any replica stay serializable and linearizable.
+    - `zone_changes_keep_closed_promises` and planner unit tests for every rule above.
+    - 300 seeds of each simulation.
+  - **Not verifiable here**: real multi-region latency; the simulator's latencies stand in for it.
 - [~] **TASK-142: Region-Scale Verification (`F-GEO-06`)** — simulator runs with region latencies and outages; multi-process clusters behind the fault proxy.
   - **Done (simulator)**: `dist::sim` and `dist::txn_sim` run 5 nodes in 3 regions, with per-pair latency (0.2–2 ms within a region, 20–60 ms across), clock skew within the offset bound, and whole-region outages (`three_regions_with_region_outages`, `bank_transfers_across_regions`).
   - **Open**: multi-process clusters of the range layer behind the fault proxy (needs the range server over TCP, `TASK-143`).
-- [ ] **TASK-143: SDK & SQL Integration (`F-GEO-07`)** — range-aware SDK routing in 8 languages; SQL transactions across ranges.
+- [~] **TASK-143: SDK & SQL Integration (`F-GEO-07`)** — range-aware SDK routing in 8 languages; SQL transactions across ranges.
+  - **Decision (under the master prompt's mandate)**: gateway routing, as CockroachDB does. Every node accepts any request and coordinates it, forwarding each key's work to its leaseholder through its own range cache. SDKs keep the one-address-or-list connection they already have and gain no per-language range caches, which keeps them small and alike (`RULE-DX-01`). The cost is at most one extra hop. Follower reads stay an explicit opt-in.
+  - **Done (groundwork, 2026-11-03)**:
+    - `dist/wire.rs`: versioned encodings of node batches (every `RaftMsg`) and of every KV request and response. Decoders bound every count by the bytes left, refuse unknown tags and trailing bytes, and never panic (every truncation and single-bit flip is tested). Golden bytes pin the format.
+    - **Ordered ids**: `StorageEngine::enable_ordered_ids` / `ids_in_span` keep live ids in byte order (an opt-in index in the primary index; off, the write path pays one relaxed load). Range servers enable it, so span scans cost `O(log N + |R|)`.
+    - **Span scans**: `KvRequest::Scan` pages through one range at a time and says where to resume. It waits for in-flight writes in its span and marks the scanned span in the timestamp cache, so no write lands under it (phantoms). Intents come back as `KeyConflict`. `RefreshSpan` re-validates a scanned span when the transaction's timestamp moves.
+    - `Txn::scan` overlays the transaction's own writes and refreshes scanned spans with its reads. `scan_audits_are_serializable` audits every account with one scan across ranges under faults.
+    - Range servers refuse to serve or overwrite a record whose stored key differs from the requested one (long keys hash into ids).
+  - **Open**:
+    - the document layer over transactions (versions, tombstones keeping version floors, preconditions, field operations, idempotent request ids, queries by scan, collection metadata);
+    - the TCP runtime for `NodeServer` and gateway coordinators in `storage-server --ranges`;
+    - SQL across ranges through that server;
+    - multi-process verification (`TASK-142`).
 - [ ] **TASK-144: Cluster Backups & Changefeeds (`F-GEO-08`)** — consistent cluster-wide backups at one timestamp; resumable change data capture.
 
 ## Stage 31: Enterprise SQL & Ecosystem (`TASK-145` – `TASK-152`)

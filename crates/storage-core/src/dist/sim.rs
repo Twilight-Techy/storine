@@ -97,6 +97,9 @@ impl Default for DistSimConfig {
     }
 }
 
+/// A range at the end of a run: span, members `(node, voter)`, leaseholder.
+pub type FinalRange = (KeySpan, Vec<(NodeId, bool)>, NodeId);
+
 #[derive(Clone, Debug, Default)]
 pub struct DistSimReport {
     pub seed: u64,
@@ -122,6 +125,8 @@ pub struct DistSimReport {
     pub applied_merges: u64,
     /// Replicas per node at the end.
     pub replicas_per_node: Vec<usize>,
+    /// Allocator runs: every range at the end (span, members, leaseholder).
+    pub final_ranges: Vec<FinalRange>,
 }
 
 #[derive(Clone, Debug)]
@@ -165,7 +170,7 @@ struct SimNode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
-    Write { node: usize, range: RangeId, index: u64, value: i64 },
+    Write { node: usize, range: RangeId, index: u64, term: u64, value: i64 },
     Read { node: usize, token: ReadToken },
 }
 
@@ -176,6 +181,8 @@ struct Client {
 }
 
 struct Sim<'c> {
+    /// Debugging (`STORINE_SIM_WATCHKEY`): last seen value of the watched key per node.
+    watched: BTreeMap<usize, String>,
     cfg: &'c DistSimConfig,
     seed: u64,
     rng: SweepRng,
@@ -258,6 +265,7 @@ impl<'c> Sim<'c> {
         }
         let n = cfg.nodes;
         Ok(Self {
+            watched: BTreeMap::new(),
             cfg,
             seed,
             rng,
@@ -371,6 +379,9 @@ impl<'c> Sim<'c> {
                 return Err(self.fail("event budget exhausted"));
             }
             self.handle(ev)?;
+            if let Some(k) = std::env::var("STORINE_SIM_WATCHKEY").ok().and_then(|k| k.parse::<usize>().ok()) {
+                self.watch_key(k);
+            }
             self.check()?;
             if wind_down.is_none() && self.clients.iter().all(|c| c.done) {
                 wind_down = Some(self.now);
@@ -391,6 +402,15 @@ impl<'c> Sim<'c> {
                         self.report.applied_merges += st.merges;
                         self.report.replicas_per_node.push(d.ranges().len());
                     }
+                    for d in self.nodes.iter().filter_map(|n| n.driver.as_ref()) {
+                        for r in d.ranges().into_iter().filter(|&r| d.is_leader(r)) {
+                            let Some(span) = d.replica(r).map(|x| x.span()) else { continue };
+                            if std::env::var_os("STORINE_SIM_DEBUG").is_some() {
+                                eprintln!("final r{r} leader n{} members {:?} span {span:?}", d.id(), d.members_of(r));
+                            }
+                            self.report.final_ranges.push((span, d.members_of(r), d.id()));
+                        }
+                    }
                     break;
                 }
                 if self.now - since > 60_000_000 {
@@ -403,6 +423,20 @@ impl<'c> Sim<'c> {
         self.report.end_time = self.now;
         self.report.ranges = self.nodes.iter().filter_map(|n| n.driver.as_ref()).map(|d| d.ranges().len()).max().unwrap_or(0);
         Ok(self.report.clone())
+    }
+
+    /// Debugging: prints every change of key `k` on any node, with the replicas holding it.
+    fn watch_key(&mut self, k: usize) {
+        for i in 0..self.nodes.len() {
+            let Some(d) = self.nodes[i].driver.as_ref() else { continue };
+            let v = d.engine().get_owned(key_id(k)).ok().and_then(|(_, r)| r.fields.get("v").cloned());
+            let owners: Vec<String> = d.ranges().into_iter().filter(|&r| d.replica(r).is_some_and(|x| x.span().contains_id(key_id(k)))).map(|r| format!("r{r}@{}", d.applied(r))).collect();
+            let line = format!("{v:?} {owners:?}");
+            if self.watched.get(&i) != Some(&line) {
+                eprintln!("watch t={} n{}: {line}", self.now, i + 1);
+                self.watched.insert(i, line);
+            }
+        }
     }
 
     fn handle(&mut self, ev: Ev) -> Result<(), DistSimFailure> {
@@ -506,10 +540,10 @@ impl<'c> Sim<'c> {
             let value = self.next_value;
             let rec = DocumentRecord::new("kv", key_name(k)).with("v", PropertyValue::Int64(value));
             match d.propose(range, &[WriteOp::put(key_id(k), rec)], now * 1_000) {
-                Ok(index) => {
+                Ok((index, term)) => {
                     let h = self.history.len();
                     self.history.push((k, Event { call, ret: None, op: RegisterOp::Write(value) }));
-                    self.clients[client].busy = Some((call, h, k, Op::Write { node, range, index, value }));
+                    self.clients[client].busy = Some((call, h, k, Op::Write { node, range, index, term, value }));
                     self.clients[client].issued += 1;
                 }
                 Err(_) => {
@@ -542,14 +576,18 @@ impl<'c> Sim<'c> {
         for c in 0..self.clients.len() {
             let Some((_, h, k, op)) = self.clients[c].busy else { continue };
             match op {
-                Op::Write { node: n, range, index, value } if n == node => {
+                Op::Write { node: n, range, index, term, value } if n == node => {
                     let Some(d) = self.nodes[node].driver.as_ref() else { continue };
                     if d.applied(range) < index {
                         continue;
                     }
                     let Some(rep) = d.replica(range) else { continue };
-                    match rep.wait_applied(index, std::time::Duration::ZERO) {
-                        Ok(_) => {
+                    match rep.wait_applied(index, term, std::time::Duration::ZERO) {
+                        Ok(results) => {
+                            if std::env::var_os("STORINE_SIM_DEBUG").is_some() {
+                                let now_v = d.engine().get_owned(key_id(k)).ok().map(|(v, r)| (v, r.fields.get("v").cloned()));
+                                eprintln!("write t={} n{} r{range} key {k} = {value} at index {index}: {results:?}; engine now {now_v:?}", self.now, node + 1);
+                            }
                             self.history[h].1.ret = Some(self.now);
                             self.history[h].1.op = RegisterOp::Write(value);
                             self.report.writes_ok += 1;
@@ -573,6 +611,18 @@ impl<'c> Sim<'c> {
                             Err(StorageError::RecordNotFound { .. }) => None,
                             Err(e) => return Err(self.fail(format!("read: {e}"))),
                         };
+                        if std::env::var_os("STORINE_SIM_DEBUG").is_some() {
+                            let rep = d.replica(token.range);
+                            eprintln!(
+                                "read t={} n{} r{} key {k} -> {v:?} (term {:?}, applied {:?}, members {:?})",
+                                self.now,
+                                node + 1,
+                                token.range,
+                                rep.map(|r| r.current_term()),
+                                rep.map(|r| r.last_applied()),
+                                d.members_of(token.range)
+                            );
+                        }
                         self.history[h].1.ret = Some(self.now);
                         self.history[h].1.op = RegisterOp::Read(v);
                         self.report.reads_ok += 1;

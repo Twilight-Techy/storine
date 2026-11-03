@@ -1466,7 +1466,10 @@ struct Outcomes {
     /// Index -> term of the entry the local proposer appended there. An entry applied at that
     /// index with another term replaced the proposal (leader change): its outcome is not ours.
     awaited: FastHashMap<u64, u64>,
-    done: FastHashMap<u64, ApplyOutcome>,
+    /// Index -> (term, outcome) of applied entries someone awaits. Waiters name the term they
+    /// proposed in: after a leader change this node may propose again at an index whose earlier
+    /// proposal was replaced, and the earlier waiter must never take the new entry's outcome.
+    done: FastHashMap<u64, (u64, ApplyOutcome)>,
 }
 
 impl<T: ZeroCopyRecord + Indexable> core::fmt::Debug for RaftNode<T> {
@@ -1850,6 +1853,11 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     /// Leader: appends `command` to the durable log and returns its index. The caller replicates
     /// it and waits with [`Self::wait_applied`].
     pub fn propose(&self, command: RaftCommand) -> Result<u64> {
+        self.propose_tagged(command).map(|(index, _)| index)
+    }
+
+    /// [`Self::propose`], returning `(index, term)` for [`Self::wait_applied`].
+    pub fn propose_tagged(&self, command: RaftCommand) -> Result<(u64, u64)> {
         let mut st = self.lock_state();
         if st.role != RaftRole::Leader {
             return Err(StorageError::NotLeader { leader: st.leader_id.map(u64::from) });
@@ -1864,7 +1872,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             .unwrap_or_else(|p| p.into_inner())
             .awaited
             .insert(prev + 1, term);
-        Ok(prev + 1)
+        Ok((prev + 1, term))
     }
 
     /// Leader: proposes an atomic conditional batch (see [`StorageEngine::commit`]) stamped with
@@ -1881,27 +1889,53 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         self.propose(RaftCommand::Ops(encode_raft_ops(ops, now_ns)?))
     }
 
-    /// Waits up to `timeout` until the entry at `index` is applied and returns its outcome.
-    /// On timeout the outcome is unknown ([`StorageError::CommitUnknown`]): the entry may still
-    /// commit. If another entry replaced it (leader change), the result is `CommitUnknown` too.
-    pub fn wait_applied(&self, index: u64, timeout: Duration) -> Result<Vec<WriteResult>> {
+    /// [`Self::propose_ops_at`], returning `(index, term)` for [`Self::wait_applied`].
+    pub fn propose_ops_at_tagged(&self, ops: &[WriteOp<T>], now_ns: u64) -> Result<(u64, u64)> {
+        self.propose_tagged(RaftCommand::Ops(encode_raft_ops(ops, now_ns)?))
+    }
+
+    /// [`Self::propose_ops`], returning `(index, term)` for [`Self::wait_applied`].
+    pub fn propose_ops_tagged(&self, ops: &[WriteOp<T>]) -> Result<(u64, u64)> {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        self.propose_ops_at_tagged(ops, now_ns)
+    }
+
+    /// Waits up to `timeout` until the entry proposed at `(index, term)` is applied and returns
+    /// its outcome. On timeout the outcome is unknown ([`StorageError::CommitUnknown`]): the
+    /// entry may still commit. If another entry replaced it (leader change), the result is
+    /// `CommitUnknown` too, even if this node later proposed again at the same index.
+    pub fn wait_applied(&self, index: u64, term: u64, timeout: Duration) -> Result<Vec<WriteResult>> {
         let deadline = Instant::now() + timeout;
         loop {
             // Never hold `outcomes` while taking `state` (`propose` locks `state -> outcomes`).
             let applied = self.last_applied() >= index;
             let mut out = self.outcomes.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(result) = out.done.remove(&index) {
-                out.awaited.remove(&index);
-                return result;
+            match out.done.get(&index) {
+                Some(&(t, _)) if t == term => {
+                    out.awaited.remove(&index);
+                    if let Some((_, result)) = out.done.remove(&index) {
+                        return result;
+                    }
+                }
+                // Another proposal's entry at this index: ours was replaced.
+                Some(_) => return Err(StorageError::CommitUnknown { index }),
+                None => {}
             }
+            let forget = |out: &mut Outcomes| {
+                if out.awaited.get(&index) == Some(&term) {
+                    out.awaited.remove(&index);
+                }
+            };
             if applied {
                 // Applied without an outcome for us: our entry was replaced after a leader change.
-                out.awaited.remove(&index);
+                forget(&mut out);
                 return Err(StorageError::CommitUnknown { index });
             }
             let now = Instant::now();
             if now >= deadline {
-                out.awaited.remove(&index);
+                forget(&mut out);
                 return Err(StorageError::CommitUnknown { index });
             }
             // Bounded wait: re-check `last_applied` (outside this lock) at least every 50 ms.
@@ -2111,6 +2145,11 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     /// previous change is committed, this leader has committed an entry of its own term (Raft
     /// thesis §4.1, the single-server change fix), and `next` changes at most one voter.
     pub fn propose_membership(&self, next: Membership) -> Result<u64> {
+        self.propose_membership_tagged(next).map(|(index, _)| index)
+    }
+
+    /// [`Self::propose_membership`], returning `(index, term)` for [`Self::wait_applied`].
+    pub fn propose_membership_tagged(&self, next: Membership) -> Result<(u64, u64)> {
         {
             let st = self.lock_state();
             if st.role != RaftRole::Leader {
@@ -2142,7 +2181,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             }
         }
         // `propose` re-checks leadership under the same lock it appends with.
-        self.propose(RaftCommand::Config(next))
+        self.propose_tagged(RaftCommand::Config(next))
     }
 
     /// `true` while this node believes it is the leader.
@@ -2315,7 +2354,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             {
                 let mut out = self.outcomes.lock().unwrap_or_else(|p| p.into_inner());
                 if out.awaited.get(&entry.index) == Some(&entry.term) {
-                    out.done.insert(entry.index, outcome);
+                    out.done.insert(entry.index, (entry.term, outcome));
                 }
             }
             {
@@ -2713,8 +2752,11 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     /// so a crash at any point either redoes the split or finds it complete.
     fn apply_split(&self, entry: &RaftLogEntry, at: &[u8], right: u64) -> Result<()> {
         let span = self.span();
-        if span.end.as_deref() == Some(at) && self.group.is_some() {
-            // Already applied before a restart: re-announce so the host opens the right group.
+        // Already applied before a restart (this very entry set the span): re-announce so the
+        // host opens the right group. A later split at the same key (proposed again before the
+        // first applied) is no replay: it is refused below, never announced with a new right
+        // group over keys another group already holds.
+        if span.end.as_deref() == Some(at) && self.group.is_some() && self.span_index() == entry.index {
         } else {
             let Some((_, right_span)) = span.split_at(at) else {
                 // A split at a key this group does not hold is refused identically everywhere.
@@ -3043,7 +3085,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftReplicationGroup<T> {
             .ok_or(StorageError::NotLeader { leader: None })?;
         let (entry, _prev_idx, _prev_term) = leader.append_leader_entry(id, Some(record))?;
         self.replicate_index(&leader, entry.index)?;
-        let _ = leader.wait_applied(entry.index, Duration::from_secs(5));
+        let _ = leader.wait_applied(entry.index, entry.term, Duration::from_secs(5));
         Ok(entry.index)
     }
 
@@ -3054,9 +3096,9 @@ impl<T: ZeroCopyRecord + Indexable> RaftReplicationGroup<T> {
         let leader = self
             .current_leader()
             .ok_or(StorageError::NotLeader { leader: None })?;
-        let index = leader.propose_ops(ops)?;
+        let (index, term) = leader.propose_ops_tagged(ops)?;
         self.replicate_index(&leader, index)?;
-        leader.wait_applied(index, Duration::from_secs(5))
+        leader.wait_applied(index, term, Duration::from_secs(5))
     }
 
     /// Replicates the leader's log up to `index`, commits it on a quorum and broadcasts the commit.
@@ -3140,7 +3182,7 @@ mod tests {
         let a = RaftNode::new(1, engine).unwrap();
         let req = a.start_election().unwrap();
         assert!(a.become_leader(req.term));
-        let mine = a.propose(RaftCommand::Noop).unwrap();
+        let (mine, my_term) = a.propose_tagged(RaftCommand::Noop).unwrap();
         assert_eq!(mine, 2);
         // A term-2 leader overwrites index 2 and commits it.
         let ae = AppendEntriesReq {
@@ -3153,7 +3195,7 @@ mod tests {
         };
         assert!(a.handle_append_entries(ae).unwrap().success);
         assert_eq!(a.last_applied(), 2);
-        assert!(matches!(a.wait_applied(mine, Duration::ZERO), Err(StorageError::CommitUnknown { index: 2 })));
+        assert!(matches!(a.wait_applied(mine, my_term, Duration::ZERO), Err(StorageError::CommitUnknown { index: 2 })));
         drop(a);
         let _ = std::fs::remove_dir_all(&dir);
     }

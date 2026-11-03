@@ -94,40 +94,20 @@ The latest instruction from the user is to do everything that remains, **except*
   - Six multi-range simulations pass 400 seeds each: ranges, moves, region outages, merges, the allocator, and idle quiescence.
   - Every bug found along the way is listed under TASK-138 in `TASKS.md`.
 
-## 3. In progress when work stopped
+## 3. Resumed 2026-11-03
 
-Commit `5389fd8` is marked **WIP** and is known to have failures:
-
-- **What it adds** (TASK-138, routing):
-  - Range servers publish their descriptors to the meta range, sent between nodes as `RaftMsg::App` messages and acknowledged back.
-  - The meta range serves `MetaOp::Lookup` / `MetaOp::Publish`.
-  - Range servers refuse frozen ranges (the client re-routes).
-  - Timestamp caches start over after a split or merge.
-  - In the transaction simulator, clients can route through their own range caches (`meta_routing`), with the allocator moving ranges underneath them.
-  - New test: `bank_transfers_with_meta_routing_and_allocator`.
-- **Known failures, unfixed**:
-  1. `STORINE_SIM_SEED=12 cargo test --release -p storage-core --test txn_simulation bank_transfers_are_serializable_under_faults` fails its serializability check.
-     - It passes at `cca0ed9`, and it passes with `self.publish(now_ns)` in `NodeServer::poll` disabled.
-     - So the cause is in the new publication path, or the path exposes an older bug by changing message timing.
-  2. `STORINE_SIM_SEED=10 cargo test --release -p storage-core --test txn_simulation bank_transfers_with_meta_routing_and_allocator` fails its final-state check: an account reads as absent.
-- **Last fully green commit**: `cca0ed9`.
-- **Debugging aid**: `STORINE_SIM_TRACE=1` prints replica lifecycle and allocator decisions from every node.
+- **TASK-138**: done. The two failing seeds were a checker bug (seed 12) and a merge-chain allocator bug (seed 10, and seed 266 found by the sweep). Details are in `TASKS.md`.
+- **TASK-141**: done. Zone configurations, survival goals, lease preferences, closed timestamps with follower reads, `AS OF` transactions, global tables and regional-by-row layout.
+- **TASK-143**: groundwork done (wire format, ordered ids, span scans, `Txn::scan`); the document layer, TCP runtime and SQL integration are open (see `TASKS.md`).
 
 ## 4. Left to do
 
-### Finish TASK-138
-1. Fix the two failing seeds above.
-2. Sweep `txn_simulation` and `multi_range_simulation` at 300+ seeds.
-3. Run the full `storage-core` suite and `cargo clippy --workspace --all-targets`.
-4. Commit TASK-138 as done.
-
 ### Stage 30
-- **TASK-141**: locality and zone configurations, constraints and lease preferences, zone / region survival goals, closed-timestamp follower reads, global and regional-by-row tables.
 - **TASK-142**: multi-process range clusters behind the fault proxy (needs TASK-143's TCP runtime).
 - **TASK-143**:
-  - a TCP runtime for `NodeServer` (batches already carry HLC timestamps);
-  - range-aware routing in all eight SDKs;
-  - SQL transactions across ranges.
+  - the document layer over distributed transactions;
+  - a TCP runtime for `NodeServer` with gateway coordinators (`storage-server --ranges`); SDKs route through any node (decision recorded in `TASKS.md`);
+  - SQL transactions across ranges through that server.
 - **TASK-144**: consistent cluster-wide backups at one timestamp; resumable changefeeds.
 
 ### Stage 31 — Enterprise SQL (TASK-145 – 152)

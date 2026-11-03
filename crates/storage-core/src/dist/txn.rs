@@ -35,6 +35,7 @@ use std::collections::BTreeMap;
 use crate::dist::hlc::Timestamp;
 use crate::dist::mvcc::{record_key, TxnId, TxnMeta, TxnRecord, TxnStatus, Value};
 use crate::dist::server::{Key, KvRequest, KvResponse, RecordOp};
+use crate::raft::KeySpan;
 
 /// How a coordinator reaches the cluster: requests are routed to their keys' leaseholders and
 /// sent in parallel; a result per request (in order).
@@ -58,6 +59,8 @@ pub enum TxnError {
     Unavailable(String),
     /// The commit was sent but its outcome could not be learned (`RULE-SAFE-09`).
     CommitUnknown(String),
+    /// The request cannot succeed as written (e.g. a write in a historical transaction).
+    Invalid(String),
 }
 
 impl core::fmt::Display for TxnError {
@@ -66,11 +69,15 @@ impl core::fmt::Display for TxnError {
             Self::Retry(m) => write!(f, "transaction must retry: {m}"),
             Self::Unavailable(m) => write!(f, "cluster unavailable: {m}"),
             Self::CommitUnknown(m) => write!(f, "commit outcome unknown: {m}"),
+            Self::Invalid(m) => write!(f, "invalid transaction: {m}"),
         }
     }
 }
 
 const MAX_ATTEMPTS: usize = 64;
+
+/// A document a scan returned: its key and fields.
+pub type Row = (Key, BTreeMap<String, storage_codec::PropertyValue>);
 
 /// An open transaction.
 #[derive(Debug)]
@@ -80,7 +87,11 @@ pub struct Txn {
     limit: Timestamp,
     write_ts: Timestamp,
     reads: Vec<Key>,
+    /// Scanned spans, each within one range when read (refreshed like reads).
+    scans: Vec<KeySpan>,
     writes: BTreeMap<Key, Value>,
+    /// A historical read-only transaction (`AS OF` a past timestamp).
+    as_of: bool,
 }
 
 impl Txn {
@@ -90,7 +101,16 @@ impl Txn {
         let now = s.now();
         let priority = priority.unwrap_or((now, id));
         let limit = now.add_nanos(s.max_offset_ns());
-        Txn { meta: TxnMeta { id, record_key: record_key(&id), priority, epoch: 0 }, read_ts: now, limit, write_ts: now, reads: Vec::new(), writes: BTreeMap::new() }
+        Txn { meta: TxnMeta { id, record_key: record_key(&id), priority, epoch: 0 }, read_ts: now, limit, write_ts: now, reads: Vec::new(), scans: Vec::new(), writes: BTreeMap::new(), as_of: false }
+    }
+
+    /// A read-only snapshot at a past timestamp `ts` (`AS OF SYSTEM TIME`): no uncertainty
+    /// window, so replicas serve it from their closed timestamps once `ts` is closed
+    /// (follower reads, `TASK-141`). Committing it with writes fails.
+    pub fn begin_as_of(s: &mut dyn KvSender, ts: Timestamp) -> Self {
+        let id = s.new_id();
+        let ts = ts.min(s.now());
+        Txn { meta: TxnMeta { id, record_key: record_key(&id), priority: (ts, id), epoch: 0 }, read_ts: ts, limit: ts, write_ts: ts, reads: Vec::new(), scans: Vec::new(), writes: BTreeMap::new(), as_of: true }
     }
 
     pub fn id(&self) -> TxnId {
@@ -129,6 +149,66 @@ impl Txn {
         Err(TxnError::Retry("too many read restarts".into()))
     }
 
+    /// Every document of `span` (raw id bytes) visible to this transaction, its own writes
+    /// included, in key-id order; at most `max` (a page; `0`: no limit). Serializable: the
+    /// scanned spans are protected from later writes below this transaction's timestamp and
+    /// refreshed if it moves.
+    pub fn scan(&mut self, s: &mut dyn KvSender, span: &KeySpan, max: usize) -> Result<Vec<Row>, TxnError> {
+        'attempt: for _ in 0..MAX_ATTEMPTS {
+            let mut rows: BTreeMap<Vec<u8>, (Key, BTreeMap<String, storage_codec::PropertyValue>)> = BTreeMap::new();
+            let mut pieces = Vec::new();
+            let mut cursor = span.start.clone();
+            loop {
+                let page = if max == 0 { crate::dist::server::MAX_SCAN_KEYS } else { (max - rows.len().min(max)).clamp(1, crate::dist::server::MAX_SCAN_KEYS) } as u32;
+                let req = KvRequest::Scan { span: KeySpan::new(cursor.clone(), span.end.clone()), ts: self.read_ts, limit: self.limit, txn: Some(self.meta.id), max_keys: page };
+                match one(s, req)? {
+                    KvResponse::Rows { rows: got, resume } => {
+                        pieces.push(KeySpan::new(cursor.clone(), resume.clone().or_else(|| span.end.clone())));
+                        for (k, _, v) in got {
+                            let id = crate::document::document_id(&k.0, &k.1).map_err(|e| TxnError::Unavailable(e.to_string()))?;
+                            rows.insert(id.as_bytes().to_vec(), (k, v));
+                        }
+                        match resume {
+                            Some(r) if max == 0 || rows.len() < max => cursor = r,
+                            _ => break,
+                        }
+                    }
+                    KvResponse::Uncertain { ts } => {
+                        self.advance_read_ts(s, ts)?;
+                        continue 'attempt; // rows read below the new timestamp: read again
+                    }
+                    KvResponse::KeyConflict { key, intent_txn, intent_ts } => {
+                        self.push(s, &key, &intent_txn, intent_ts)?;
+                        continue 'attempt;
+                    }
+                    other => return Err(TxnError::Unavailable(format!("unexpected reply {other:?}"))),
+                }
+            }
+            self.scans.extend(pieces);
+            // Own writes win.
+            for (k, v) in &self.writes {
+                let Ok(id) = crate::document::document_id(&k.0, &k.1) else { continue };
+                if !span.contains(id.as_bytes()) {
+                    continue;
+                }
+                match v {
+                    Some(f) => {
+                        rows.insert(id.as_bytes().to_vec(), (k.clone(), f.clone()));
+                    }
+                    None => {
+                        rows.remove(id.as_bytes());
+                    }
+                }
+            }
+            let mut out: Vec<_> = rows.into_values().collect();
+            if max != 0 {
+                out.truncate(max);
+            }
+            return Ok(out);
+        }
+        Err(TxnError::Retry("too many scan restarts".into()))
+    }
+
     pub fn put(&mut self, key: Key, fields: std::collections::BTreeMap<String, storage_codec::PropertyValue>) {
         self.writes.insert(key, Some(fields));
     }
@@ -151,14 +231,16 @@ impl Txn {
 
     /// Are all reads still valid at `to`?
     fn refresh(&self, s: &mut dyn KvSender, from: Timestamp, to: Timestamp) -> Result<bool, TxnError> {
-        if self.reads.is_empty() {
+        if self.reads.is_empty() && self.scans.is_empty() {
             return Ok(true);
         }
-        let reqs = self.reads.iter().map(|k| KvRequest::Refresh { key: k.clone(), from, to, txn: self.meta.id }).collect();
+        let mut reqs: Vec<KvRequest> = self.reads.iter().map(|k| KvRequest::Refresh { key: k.clone(), from, to, txn: self.meta.id }).collect();
+        reqs.extend(self.scans.iter().map(|sp| KvRequest::RefreshSpan { span: sp.clone(), from, to, txn: self.meta.id }));
         for r in s.send(reqs) {
             match r {
                 Ok(KvResponse::Refreshed(true)) => {}
-                Ok(KvResponse::Refreshed(false)) => return Ok(false),
+                // A scanned span split since: it cannot be checked in one piece, so restart.
+                Ok(KvResponse::Refreshed(false) | KvResponse::WrongRange) => return Ok(false),
                 Ok(other) => return Err(TxnError::Unavailable(format!("refresh: {other:?}"))),
                 Err(e) => return Err(TxnError::Unavailable(e)),
             }
@@ -203,10 +285,16 @@ impl Txn {
         if self.writes.is_empty() {
             return Ok(self.read_ts); // read-only: one consistent snapshot
         }
+        if self.as_of {
+            return Err(TxnError::Invalid("a historical (AS OF) transaction cannot write".into()));
+        }
         let id = self.meta.id;
         let keys: Vec<Key> = self.writes.keys().cloned().collect();
         match self.commit_attempts(s) {
-            Ok(ts) => Ok(ts),
+            Ok(ts) => {
+                commit_wait(s, ts);
+                Ok(ts)
+            }
             Err(TxnError::Unavailable(e)) => settle(s, id, &keys).map_err(|_| TxnError::CommitUnknown(e)).and_then(|o| o.ok_or_else(|| TxnError::Retry("aborted".into()))),
             Err(e) => Err(e),
         }
@@ -301,23 +389,33 @@ impl Txn {
 
     /// Records the final status and resolves the intents (asynchronous work in a real
     /// deployment; done inline here, best effort: anyone finding an intent can resolve it).
+    ///
+    /// Intents are resolved only once the record is confirmed final, and as the record says.
+    /// Recovery decides a staging record by finding its intents: an intent resolved while the
+    /// record still read "staging" would look missing, and a committed transaction would be
+    /// aborted. If the record write fails, the intents stay; whoever meets one pushes, which
+    /// recovers the record first.
     fn cleanup(&self, s: &mut dyn KvSender, commit_ts: Option<Timestamp>) {
         let op = match commit_ts {
             Some(ts) => RecordOp::Commit { ts, staged: None },
             None => RecordOp::Abort { staged: None },
         };
-        let _ = s.send(vec![KvRequest::Record { id: self.meta.id, op }]);
-        let reqs = self.writes.keys().map(|k| KvRequest::Resolve { key: k.clone(), txn: self.meta.id, commit_ts }).collect();
-        let _ = s.send(reqs);
+        let r = s.send(vec![KvRequest::Record { id: self.meta.id, op }]);
+        self.resolve_if_final(s, r.first());
     }
 
-    /// Abandons the transaction.
+    /// Abandons the transaction (its intents are resolved once the record is aborted, or as
+    /// committed if a recovery committed it meanwhile).
     pub fn abort(&self, s: &mut dyn KvSender) {
         let r = s.send(vec![KvRequest::Record { id: self.meta.id, op: RecordOp::Abort { staged: None } }]);
-        // If it committed meanwhile (a recovery found every intent), resolve as committed.
-        let commit_ts = match r.first() {
+        self.resolve_if_final(s, r.first());
+    }
+
+    fn resolve_if_final(&self, s: &mut dyn KvSender, record: Option<&Result<KvResponse, String>>) {
+        let commit_ts = match record {
             Some(Ok(KvResponse::Record(Some(rec)))) if rec.status == TxnStatus::Committed => Some(rec.ts),
-            _ => None,
+            Some(Ok(KvResponse::Record(Some(rec)))) if rec.status == TxnStatus::Aborted => None,
+            _ => return,
         };
         let reqs = self.writes.keys().map(|k| KvRequest::Resolve { key: k.clone(), txn: self.meta.id, commit_ts }).collect();
         let _ = s.send(reqs);
@@ -399,6 +497,19 @@ pub fn recover(s: &mut dyn KvSender, r: &TxnRecord) -> Result<Option<Timestamp>,
             _ => Err(TxnError::Retry("transaction re-staged during recovery".into())),
         },
         other => Err(TxnError::Unavailable(format!("recover: {other:?}"))),
+    }
+}
+
+/// Waits until `ts` is in the past on this clock. Only writes closed ahead of time (global
+/// ranges, `TASK-141`) commit in the future: once the wait ends, every reader whose
+/// uncertainty window starts later covers `ts`, so the commit is visible to it.
+fn commit_wait(s: &mut dyn KvSender, ts: Timestamp) {
+    for _ in 0..10_000 {
+        let now = s.now();
+        if now >= ts {
+            return;
+        }
+        s.sleep((ts.wall.saturating_sub(now.wall) / 1_000).max(1));
     }
 }
 

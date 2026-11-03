@@ -215,9 +215,9 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
     /// Replicates an atomic conditional batch and returns its applied outcome
     /// (`NotLeader` on followers, `CommitUnknown` if it could not be confirmed in time).
     pub fn commit(&self, ops: Vec<WriteOp<T>>) -> Result<Vec<WriteResult>> {
-        let index = self.shared.node.propose_ops(&ops)?;
+        let (index, term) = self.shared.node.propose_ops_tagged(&ops)?;
         self.after_propose();
-        self.shared.node.wait_applied(index, self.shared.config.commit_timeout)
+        self.shared.node.wait_applied(index, term, self.shared.config.commit_timeout)
     }
 
     /// Proposes any command (no-op, sweep) without waiting.
@@ -294,9 +294,9 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
 
     fn change(&self, f: impl FnOnce(&Membership) -> Result<Membership>) -> Result<()> {
         let next = f(&self.shared.node.membership())?;
-        let index = self.shared.node.propose_membership(next)?;
+        let (index, term) = self.shared.node.propose_membership_tagged(next)?;
         self.after_propose();
-        self.shared.node.wait_applied(index, self.shared.config.commit_timeout).map(|_| ())
+        self.shared.node.wait_applied(index, term, self.shared.config.commit_timeout).map(|_| ())
     }
 
     /// Waits until the leader knows `id` stores the whole committed log.

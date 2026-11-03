@@ -26,8 +26,9 @@ use std::sync::Arc;
 use storage_types::testing::SweepRng;
 use storage_types::{InlineId, Result, StorageError};
 
-use crate::dist::alloc::{self, Action, AllocatorConfig, LeftView, MemberView, NeighbourView, RangeView, StoreLoad, StoreView};
+use crate::dist::alloc::{self, Action, AllocatorConfig, LeftView, MemberView, NeighbourView, Placement, RangeView, StoreLoad, StoreView};
 use crate::dist::hlc::Timestamp;
+use crate::dist::zone::{ClosedTs, Locality, ZoneConfig, ZoneConfigs};
 use crate::document::DocumentRecord;
 use crate::engine::{StorageEngine, WriteOp};
 use crate::raft::{
@@ -58,6 +59,13 @@ pub struct NodeConfig {
     pub cluster: Vec<NodeId>,
     /// Leaseholder queues: repair, rebalancing, splits and merges ([`crate::dist::alloc`]).
     pub allocator: Option<AllocatorConfig>,
+    /// Region and zone of every node (`TASK-141`); nodes not listed have an unknown locality.
+    pub localities: BTreeMap<NodeId, Locality>,
+    /// Placement and closed-timestamp policy by key span ([`crate::dist::zone`]).
+    pub zones: ZoneConfigs,
+    /// The cluster's maximum clock offset (nanoseconds): closed-timestamp lags never go below
+    /// it ([`crate::dist::hlc`]).
+    pub max_offset_ns: u64,
     /// Print replica lifecycle and allocator decisions to stderr (debugging).
     pub trace: bool,
 }
@@ -76,6 +84,9 @@ impl Default for NodeConfig {
             incarnation: 0,
             cluster: Vec::new(),
             allocator: None,
+            localities: BTreeMap::new(),
+            zones: ZoneConfigs::default(),
+            max_offset_ns: 500_000_000,
             trace: false,
         }
     }
@@ -86,7 +97,9 @@ impl Default for NodeConfig {
 pub enum RaftMsg {
     Vote(RequestVoteReq),
     VoteResp { req: RequestVoteReq, resp: RequestVoteResp },
-    Append { req: AppendEntriesReq, hb: u64 },
+    /// `closed`: the leaseholder's confirmed closed timestamp and the log index a replica must
+    /// have applied to serve reads at or below it (`TASK-141`).
+    Append { req: AppendEntriesReq, hb: u64, closed: (Timestamp, u64) },
     /// `applied`: the follower's applied index (a merge waits for every replica of the
     /// absorbed range to have applied its freeze).
     AppendResp { resp: AppendEntriesResp, req_term: u64, last_sent: u64, hb: u64, applied: u64 },
@@ -194,6 +207,12 @@ struct ReplicaState {
     written: Vec<Vec<u8>>,
     /// Leader: the store a rebalance of this range relieves (removed once the new replica votes).
     planned_removal: Option<NodeId>,
+    /// Leader: a closed timestamp awaiting confirmation: (timestamp, log index, heartbeat
+    /// round a quorum must acknowledge).
+    closing: Option<(Timestamp, u64, u64)>,
+    /// Closed timestamp usable once `.1` is applied, and a newer one waiting for its index.
+    closed: (Timestamp, u64),
+    closed_next: Option<(Timestamp, u64)>,
 }
 
 /// Counters for tests and metrics.
@@ -246,6 +265,8 @@ pub struct NodeDriver {
     app_inbox: Vec<(NodeId, Vec<u8>)>,
     /// Ranges absorbed by merges into each local range (until its descriptor is published).
     absorbed: BTreeMap<RangeId, Vec<RangeId>>,
+    /// See [`Self::lead_floor`].
+    lead_floor: Timestamp,
 }
 
 impl core::fmt::Debug for NodeDriver {
@@ -295,6 +316,7 @@ impl NodeDriver {
             meta_hint: None,
             app_inbox: Vec::new(),
             absorbed: BTreeMap::new(),
+            lead_floor: Timestamp::ZERO,
         }
     }
 
@@ -313,6 +335,43 @@ impl NodeDriver {
     /// Sets the timestamp stamped on outgoing batches.
     pub fn set_clock(&mut self, ts: Timestamp) {
         self.clock = ts;
+    }
+
+    /// The signed offset (nanoseconds) from the leaseholder's clock to the timestamp `range`
+    /// closes (`None`: closed timestamps off). A lag is at least the maximum clock offset and a
+    /// lead exceeds twice it (see [`crate::dist::zone::ZoneConfig::validate`]).
+    pub fn closed_offset(&self, range: RangeId) -> Option<i64> {
+        let max = self.cfg.max_offset_ns.min(i64::MAX as u64 / 4) as i64;
+        match self.zone_config(range)?.closed_ts {
+            ClosedTs::Off => None,
+            ClosedTs::Lag(lag) => Some(-(lag.min(i64::MAX as u64 / 4) as i64).max(max)),
+            ClosedTs::Lead(lead) => Some((lead.min(i64::MAX as u64 / 4) as i64).max(2 * max + 1)),
+        }
+    }
+
+    /// The timestamp at or below which this replica of `range` serves reads without the
+    /// leaseholder: no write at or below it can still apply here (`TASK-141`).
+    pub fn closed_timestamp(&self, range: RangeId) -> Option<Timestamp> {
+        let r = self.replicas.get(&range)?;
+        let applied = r.raft.last_applied();
+        let best = [Some(r.closed), r.closed_next].into_iter().flatten().filter(|&(_, i)| i <= applied).map(|(t, _)| t).max()?;
+        (best > Timestamp::ZERO).then_some(best)
+    }
+
+    fn learn_closed(r: &mut ReplicaState, closed: (Timestamp, u64)) {
+        if closed.0 <= r.closed.0 {
+            return;
+        }
+        if closed.1 <= r.raft.last_applied() {
+            r.closed = closed;
+            r.closed_next = None;
+        } else if r.closed_next.is_none_or(|n| closed.0 > n.0) {
+            // Usable once applied; the older one serves meanwhile.
+            if let Some(n) = r.closed_next.filter(|n| n.1 <= r.raft.last_applied()) {
+                r.closed = n;
+            }
+            r.closed_next = Some(closed);
+        }
     }
 
     /// Opens (or creates) range `range` over `span`, replicated by `members` (all voters).
@@ -381,6 +440,9 @@ impl NodeDriver {
                 writes: 0,
                 written: Vec::new(),
                 planned_removal: None,
+                closing: None,
+                closed: (Timestamp::ZERO, 0),
+                closed_next: None,
             },
         );
     }
@@ -503,17 +565,22 @@ impl NodeDriver {
         self.load = StoreLoad { replicas: self.replicas.len() as u32, leases, bytes: (stats.mapped_bytes + stats.hot_dirty_bytes) as u64, moving };
         let now = self.now;
         let mut stores: BTreeMap<NodeId, StoreView> = BTreeMap::new();
-        stores.insert(self.id, StoreView { load: self.load, live: true });
+        let (region, zone) = self.locality_ids(self.id);
+        stores.insert(self.id, StoreView { load: self.load, live: true, region, zone });
         for (&n, &load) in &self.loads {
             let live = self.heard.get(&n).is_some_and(|&t| now.saturating_sub(t) < cfg.dead_after_us);
-            stores.insert(n, StoreView { load, live });
+            let (region, zone) = self.locality_ids(n);
+            stores.insert(n, StoreView { load, live, region, zone });
         }
         let led: Vec<RangeId> = self.replicas.iter().filter(|(_, r)| r.raft.is_leader() && r.lead_term == r.raft.current_term()).map(|(&id, _)| id).collect();
-        // Replica rebalancing takes turns: one live node per interval.
+        // Replica rebalancing takes turns: one live node per turn, with an idle interval between
+        // turns. A move started at the very end of one turn is gossiped (moving > 0) before the
+        // next node may start one: back-to-back turns let two nodes move replicas onto the same
+        // store at once, overshoot, and swing back forever.
         let turn = {
             let live: Vec<NodeId> = stores.iter().filter(|(_, s)| s.live).map(|(&n, _)| n).collect();
-            let slot = (self.now / cfg.interval_us.max(1)) as usize % live.len().max(1);
-            live.get(slot) == Some(&self.id) && stores.values().all(|s| !s.live || s.load.moving == 0)
+            let slot = (self.now / cfg.interval_us.max(1)) as usize;
+            slot % 2 == 0 && live.get((slot / 2) % live.len().max(1)) == Some(&self.id) && stores.values().all(|s| !s.live || s.load.moving == 0)
         };
         let mut rebalanced = !turn;
         for range in led {
@@ -644,6 +711,73 @@ impl NodeDriver {
         (h | (1 << 62)) & !(1 << 63)
     }
 
+    /// Interned (region, zone) of `node` (`0`: unknown). Ids follow the sorted names, so every
+    /// node interns alike.
+    fn locality_ids(&self, node: NodeId) -> (u32, u32) {
+        let Some(loc) = self.cfg.localities.get(&node) else { return (0, 0) };
+        let mut regions: Vec<&str> = self.cfg.localities.values().map(|l| l.region.as_str()).collect();
+        regions.sort_unstable();
+        regions.dedup();
+        let mut zones: Vec<(&str, &str)> = self.cfg.localities.values().map(|l| (l.region.as_str(), l.zone.as_str())).collect();
+        zones.sort_unstable();
+        zones.dedup();
+        let region = regions.binary_search(&loc.region.as_str()).map_or(0, |i| i as u32 + 1);
+        let zone = zones.binary_search(&(loc.region.as_str(), loc.zone.as_str())).map_or(0, |i| i as u32 + 1);
+        (region, zone)
+    }
+
+    /// Replaces the zone configurations after checking them against the cluster's localities,
+    /// the replication factor and the clock-offset bound. The allocator applies them from its
+    /// next round (splitting at new boundaries, moving replicas and leases).
+    pub fn set_zones(&mut self, zones: ZoneConfigs) -> Result<()> {
+        let replication = self.cfg.allocator.as_ref().map_or(3, |a| a.replication);
+        zones.validate(replication, self.cfg.max_offset_ns, &self.cfg.localities)?;
+        // Timestamps closed ahead of time under the old configuration stay promised: writes
+        // land above them until they pass, whatever the new configuration says.
+        let old_lead = self.cfg.zones.max_lead_ns();
+        if old_lead > 0 && zones != self.cfg.zones {
+            let until = self.clock.wall.saturating_add(old_lead).saturating_add(self.cfg.max_offset_ns);
+            self.lead_floor = self.lead_floor.max(Timestamp { wall: until, logical: 0 });
+        }
+        self.cfg.zones = zones;
+        Ok(())
+    }
+
+    /// The timestamp every write here must exceed regardless of its range's policy: promises
+    /// of leads that a configuration change removed.
+    pub fn lead_floor(&self) -> Timestamp {
+        self.lead_floor
+    }
+
+    /// Where a new leaseholder, or a range whose span just changed, starts its writes: above
+    /// anything any range may have closed ahead of time (the largest lead, plus the clock
+    /// offset its closer's clock may lead ours by).
+    pub fn fresh_floor(&self, now: Timestamp) -> Timestamp {
+        let lead = self.cfg.zones.max_lead_ns();
+        let ahead = if lead == 0 { now } else { Timestamp { wall: now.wall.saturating_add(lead).saturating_add(self.cfg.max_offset_ns), logical: 0 } };
+        ahead.max(now).max(self.lead_floor)
+    }
+
+    /// The zone configuration in force for `range` (that of its span's start).
+    pub fn zone_config(&self, range: RangeId) -> Option<&ZoneConfig> {
+        let r = self.replicas.get(&range)?;
+        Some(self.cfg.zones.get(&r.raft.span().start))
+    }
+
+    /// `range`'s zone configuration resolved against the cluster's localities.
+    fn placement(&self, span: &crate::raft::KeySpan) -> Placement {
+        let z = self.cfg.zones.get(&span.start);
+        let nodes: Vec<NodeId> = self.cfg.cluster.iter().copied().chain(self.loads.keys().copied()).chain([self.id]).collect::<BTreeSet<_>>().into_iter().collect();
+        let allowed = (!z.constraints.is_empty()).then(|| nodes.iter().copied().filter(|n| self.cfg.localities.get(n).is_some_and(|l| z.allows(l))).collect());
+        let lease_rank = if z.lease_preferences.is_empty() {
+            Vec::new()
+        } else {
+            let rank = |n: NodeId| self.cfg.localities.get(&n).and_then(|l| z.lease_preferences.iter().position(|p| *p == l.region)).unwrap_or(z.lease_preferences.len()) as u32;
+            nodes.iter().map(|&n| (n, rank(n))).collect()
+        };
+        Placement { replicas: z.replicas, allowed, lease_rank, survival: z.survival }
+    }
+
     fn member_views(&self, range: RangeId) -> Vec<MemberView> {
         let Some(r) = self.replicas.get(&range) else { return Vec::new() };
         let last = r.raft.last_log_index();
@@ -668,16 +802,26 @@ impl NodeDriver {
         let neighbour = |pred: &dyn Fn(&crate::raft::KeySpan) -> bool| self.replicas.iter().find(|(&id, x)| id != range && pred(&x.raft.span())).map(|(&id, _)| id);
         let right = span.end.as_ref().and_then(|end| neighbour(&|s| s.start == *end)).map(|id| {
             let x = &self.replicas[&id];
+            // Its frozen right neighbour is hosted here: a merge freezes only with equal
+            // voters, and neither range's replicas change until it is done.
+            let merging = x.raft.span().end.as_ref().is_some_and(|end| self.replicas.values().any(|y| y.raft.is_frozen() && y.raft.span().start == *end));
             NeighbourView {
                 range: id,
                 keys: keys.get(&id).map_or(0, Vec::len),
                 led_here: x.raft.is_leader() && x.lead_term == x.raft.current_term(),
                 frozen: x.raft.is_frozen(),
+                same_zone: self.cfg.zones.same_entry(&span.start, &x.raft.span().start),
+                merging,
                 members: self.member_views(id),
                 merge_ready: self.merge_ready(range, id),
             }
         });
-        let left = (!span.start.is_empty()).then(|| neighbour(&|s| s.end.as_deref() == Some(span.start.as_slice()))).flatten().map(|id| LeftView { keys: keys.get(&id).map_or(0, Vec::len), leader: self.leader_of(id) });
+        let left = (!span.start.is_empty()).then(|| neighbour(&|s| s.end.as_deref() == Some(span.start.as_slice()))).flatten().map(|id| LeftView {
+            keys: keys.get(&id).map_or(0, Vec::len),
+            same_zone: self.cfg.zones.same_entry(&self.replicas[&id].raft.span().start, &span.start),
+            leader: self.leader_of(id),
+        });
+        let zone_split_key = self.cfg.zones.boundary_inside(&span).filter(|k| !crate::dist::meta::splits_meta(k));
         let committed = r.raft.membership_state().1;
         Some(RangeView {
             range,
@@ -689,6 +833,8 @@ impl NodeDriver {
             writes_per_sec: r.writes.saturating_mul(1_000_000) / elapsed_us,
             size_split_key,
             load_split_key,
+            zone_split_key,
+            placement: self.placement(&span),
             right,
             left,
             planned_removal: r.planned_removal,
@@ -719,6 +865,9 @@ impl NodeDriver {
         }
         let hb = self.cfg.heartbeat_us;
         let quiesce_after = self.cfg.quiesce_after;
+        let closed_offset = self.closed_offset(range);
+        // Global ranges never quiesce: followers need a closed timestamp that keeps up.
+        let may_quiesce = !matches!(self.zone_config(range).map(|z| z.closed_ts), Some(ClosedTs::Lead(_)));
         let Some(r) = self.replicas.get_mut(&range) else { return Ok(()) };
         let raft = Arc::clone(&r.raft);
         if raft.is_leader() && r.lead_term == raft.current_term() {
@@ -727,13 +876,19 @@ impl NodeDriver {
             }
             if now.saturating_sub(r.last_heartbeat) >= hb {
                 r.last_heartbeat = now;
+                // Close a timestamp: confirmed once a quorum acknowledges this round.
+                if let (None, Some(offset)) = (r.closing, closed_offset) {
+                    let wall = if offset < 0 { self.clock.wall.saturating_sub(offset.unsigned_abs()) } else { self.clock.wall.saturating_add(offset as u64) };
+                    r.hb_seq += 1;
+                    r.closing = Some((Timestamp { wall, logical: 0 }, raft.last_log_index(), r.hb_seq));
+                }
                 let caught_up = r.progress.values().all(|p| p.matched >= raft.last_log_index()) && raft.commit_index() == raft.last_log_index();
                 if caught_up && r.reads.is_empty() {
                     r.idle_beats += 1;
                 } else {
                     r.idle_beats = 0;
                 }
-                if r.idle_beats > quiesce_after && !r.progress.is_empty() && r.removing.is_empty() {
+                if may_quiesce && r.idle_beats > quiesce_after && !r.progress.is_empty() && r.removing.is_empty() {
                     r.leader_quiet = true;
                     self.stats.quiesced += 1;
                     let (term, commit) = (raft.current_term(), raft.commit_index());
@@ -839,6 +994,7 @@ impl NodeDriver {
             .map(|&p| (p, Progress { next, matched: 0, snapshot_offset: None, force_snapshot: learners.contains(&p), snapshot_min: if learners.contains(&p) { min } else { 0 }, applied: 0 }))
             .collect();
         r.acks.clear();
+        r.closing = None;
         r.leader_quiet = false;
         r.idle_beats = 0;
         r.quiescent = None;
@@ -876,8 +1032,9 @@ impl NodeDriver {
             return;
         }
         let hb = r.hb_seq;
+        let closed = r.closed_next.unwrap_or(r.closed);
         if let Ok(req) = raft.build_append_entries_bounded(pr.next, self.cfg.max_entries_per_append, self.cfg.max_bytes_per_append) {
-            self.push(peer, range, RaftMsg::Append { req, hb });
+            self.push(peer, range, RaftMsg::Append { req, hb, closed });
         }
     }
 
@@ -988,7 +1145,7 @@ impl NodeDriver {
                 self.push(from, range, RaftMsg::VoteResp { req, resp });
             }
             RaftMsg::VoteResp { req, resp } => self.on_vote_resp(range, from, req, resp)?,
-            RaftMsg::Append { req, hb } => {
+            RaftMsg::Append { req, hb, closed } => {
                 let req_term = req.term;
                 let last_sent = req.prev_log_index + req.entries.len() as u64;
                 let resp = raft.handle_append_entries(req)?;
@@ -998,6 +1155,9 @@ impl NodeDriver {
                         r.campaign = None;
                         r.quiescent = None;
                         r.leader_contact = now;
+                        // Only from the current term's leader (an older one's promise may
+                        // already be broken by its successor).
+                        Self::learn_closed(r, closed);
                     }
                     self.reset_election(range);
                 }
@@ -1184,7 +1344,8 @@ impl NodeDriver {
 
     /// Proposes a write batch on the leaseholder of `range`; returns its log index (wait for it
     /// with the replica's `wait_applied` once [`Self::applied`] reaches it).
-    pub fn propose(&mut self, range: RangeId, ops: &[WriteOp<DocumentRecord>], now_ns: u64) -> Result<u64> {
+    /// Returns `(index, term)` for [`crate::raft::RaftNode::wait_applied`].
+    pub fn propose(&mut self, range: RangeId, ops: &[WriteOp<DocumentRecord>], now_ns: u64) -> Result<(u64, u64)> {
         let r = self.live(range)?;
         if !(r.raft.is_leader() && r.lead_term == r.raft.current_term()) {
             return Err(StorageError::NotLeader { leader: r.raft.leader_id().map(u64::from) });
@@ -1193,7 +1354,7 @@ impl NodeDriver {
         if ops.iter().any(|o| !span.contains_id(o.id)) {
             return Err(StorageError::invalid_key("key outside this range: re-route"));
         }
-        let index = r.raft.propose_ops_at(ops, now_ns)?;
+        let (index, term) = r.raft.propose_ops_at_tagged(ops, now_ns)?;
         if let Some(r) = self.replicas.get_mut(&range) {
             r.writes += 1;
             // A small sample of recently written keys (load-based split points).
@@ -1207,7 +1368,7 @@ impl NodeDriver {
         self.wake(range);
         self.broadcast(range);
         self.advance_commit(range)?;
-        Ok(index)
+        Ok((index, term))
     }
 
     /// Proposes splitting `range` at `at` into a new range `right` (same replicas).
@@ -1489,6 +1650,22 @@ impl NodeDriver {
     /// Finishes reads and starts the right-hand groups of applied splits.
     fn after_progress(&mut self) -> Result<()> {
         self.retire_merged()?;
+        // Closed timestamps a quorum acknowledged: every later leaseholder's clock is above
+        // them (its election quorum shares a member that saw this round's batch clock).
+        let me = self.id;
+        for r in self.replicas.values_mut() {
+            let Some((ts, index, round)) = r.closing else { continue };
+            if !(r.raft.is_leader() && r.lead_term == r.raft.current_term()) {
+                r.closing = None;
+                continue;
+            }
+            let vs = voters(&r.raft);
+            let acked = usize::from(vs.contains(&me)) + vs.iter().filter(|&&v| v != me && r.acks.get(&v).is_some_and(|&a| a >= round)).count();
+            if acked >= Self::quorum(vs.len()) {
+                r.closing = None;
+                Self::learn_closed(r, (ts, index));
+            }
+        }
         let ranges: Vec<RangeId> = self.replicas.keys().copied().collect();
         let mut splits = Vec::new();
         for range in ranges {

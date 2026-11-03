@@ -289,7 +289,10 @@ impl Budget {
     }
 
     fn release(&self, n: usize) {
-        let _ = self.used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |u| Some(u.saturating_sub(n)));
+        let mut u = self.used.load(Ordering::Relaxed);
+        while let Err(now) = self.used.compare_exchange_weak(u, u.saturating_sub(n), Ordering::Relaxed, Ordering::Relaxed) {
+            u = now;
+        }
     }
 
     /// Usage calls for spilling (only when spilling is possible).

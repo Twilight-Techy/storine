@@ -627,3 +627,42 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - Still 6–10× behind DuckDB on h8, h9, h12 and h15. Recorded in `BENCHMARK_REPORT.md` §6, not claimed as wins.
 - **Binary size**: `storage-server` is 2.9 MB on Linux. It was already 2.16 MB before Stage 28, against the `< 1 MiB` rule (`RULE-MEM-03`), so the breach predates this stage. This stage removed 135 KiB of duplicate unpack kernels; the analytics code adds about 0.7 MB. This needs its own task.
 
+
+### Stages 29–30: simulation, multi-Raft ranges, clocks and distributed transactions (`TASK-132` – `TASK-140`) — 2026-10-29
+
+- **Summary** (the details, bug lists and exit criteria are in `TASKS.md`):
+  - `TASK-132` / `TASK-136`: a `Vfs` seam with simulated power loss and crash-point sweeps. The durability bugs it found (missing directory syncs among them) are fixed.
+  - `TASK-133` / `TASK-134`: a deterministic Raft simulator, a linearizability checker, and process chaos against real binaries behind a fault proxy.
+  - `TASK-135`: structure-aware fuzzing of every decoder and parser, the SQL gateway's included.
+  - `TASK-137`: many Raft ranges per node over one engine and WAL, with coalesced per-node-pair batches and quiescent idle ranges.
+  - `TASK-139`: hybrid logical clocks with offset enforcement and self-fencing.
+  - `TASK-140`: serializable distributed transactions (MVCC intents, parallel commits, read refresh, wound-wait, exactly-once outcomes), checked by a bank-transfer simulator.
+  - `TASK-138` (part): replica moves, lease transfers, merges and the allocator.
+
+### Stage 30 (continued): meta routing done, zone configurations and closed timestamps (`TASK-138`, `TASK-141`) — 2026-11-03
+
+- **Resumed** from the work log (`WORK_LOG_SINCE_MAIN.md`): the work-in-progress commit `5389fd8` had two failing seeds.
+  - **Seed 12** was a checker bug, not an engine bug: an audit and a transfer committed at the same timestamp, and the audit correctly saw the transfer. The checker now finds any serial order among transactions sharing a timestamp.
+  - **Seed 10** was a real allocator bug. Chained merges could strand a frozen range: the middle range of a chain handed its lease away, and its left neighbour realigned its replicas while it was mid-merge.
+  - **Seed 266**, found by the first 300-seed sweep, was the same bug through a race: the neighbour's replica had not applied the freeze yet. Fixed by making merging ranges repair their own replicas back to the frozen range's.
+  - Latch holders are now (client, request id).
+- **`TASK-141`** (design and proofs in `TASKS.md` and `dist/zone.rs`):
+  - zone configurations with constraints, survival goals and lease preferences, applied by the allocator;
+  - closed timestamps confirmed by a quorum round, with follower reads;
+  - `AS OF` transactions;
+  - global tables with synthetic future timestamps and commit-wait;
+  - regional-by-row key layout.
+- **Audit findings fixed before commit**: a split at a zone boundary or a new leaseholder could have let a write land under a timestamp a lagging replica of the old range had closed ahead of time, and so could lowering a lead with `set_zones`. Fresh leaseholders and span changes now start above the largest lead plus the clock offset, and dropped leads leave a floor until their promises pass.
+- **Complexity and footprint**:
+  - zone lookup is `O(log Z)` per range per allocator round;
+  - closed-timestamp state is 40 bytes per replica, and 20 bytes per append;
+  - no work at all for quiescent ranges, except global ranges, which never quiesce by design;
+  - follower reads skip the timestamp cache entirely.
+- **The 300-seed sweeps found five older bugs** (they reproduce on the commit before this session):
+  - **Atomicity** (`TASK-140`): coordinators resolved intents after an explicit commit whose record write had failed. A recovery then found an intent missing and aborted a transaction its client had been told was committed. Intents are now resolved only once the record is confirmed final.
+  - **Duplicate ranges** (`TASK-137`): a split proposed twice at one key applied twice, creating two ranges over one span. Only the entry that set the span now counts as a replay.
+  - **Replica divergence** (`TASK-140`): range servers conditioned replicated writes on node-local engine versions, so a write could apply on one replica and fail on another. They now condition on existence, and every transaction simulation checks that replicas at the same applied index hold identical records.
+  - **Acknowledged writes lost** (Raft, since the single-group runtime): apply outcomes were matched to waiters by log index alone, so after a leader change a waiter whose entry was replaced could take the outcome of a later proposal at the same index. Waiters now name the term they proposed in.
+  - **Rebalancing oscillation** (`TASK-138`): back-to-back allocator turns let two nodes move replicas onto one store before either heard of the other's move. Turns now have an idle interval between them.
+  - All have regression tests, and the failing seeds are replayed on every run.
+- **Also**: the analytics budget's `fetch_update` (deprecated in the current toolchain) became a compare-exchange loop, which still builds on the 1.82 minimum Rust version.

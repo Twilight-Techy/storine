@@ -146,6 +146,21 @@ pub struct PrimaryIndex {
     /// `true` once a cold tier has been attached (never reset): the memory tier skips all tier
     /// bookkeeping with one relaxed load.
     tiered: AtomicBool,
+    /// Live ids in byte order, for span scans (`TASK-143`). Off unless enabled: the write path
+    /// then pays one relaxed load.
+    ordered_on: AtomicBool,
+    ordered: CachePadded<RwLock<std::collections::BTreeSet<ByBytes>>>,
+}
+
+/// An id ordered by its bytes, borrowable as `[u8]` so spans with any byte bounds can be
+/// looked up. Never hashed (`InlineId`'s hash is not the bytes' hash).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ByBytes(InlineId);
+
+impl std::borrow::Borrow<[u8]> for ByBytes {
+    fn borrow(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
 }
 
 impl core::fmt::Debug for PrimaryIndex {
@@ -202,6 +217,44 @@ impl PrimaryIndex {
             live_count: CachePadded::new(AtomicUsize::new(0)),
             hot_dirty_bytes: CachePadded::new(AtomicUsize::new(0)),
             tiered: AtomicBool::new(false),
+            ordered_on: AtomicBool::new(false),
+            ordered: CachePadded::new(RwLock::new(std::collections::BTreeSet::new())),
+        }
+    }
+
+    /// Keeps live ids in byte order from now on (call before serving: ids written while it
+    /// runs may be missed). `O(N log N)` once, then `O(log N)` per new or removed id.
+    pub fn enable_ordered_ids(&self) {
+        // Lock order is shard -> ordered (writes insert under their shard lock): collect first.
+        self.ordered_on.store(true, Ordering::Release);
+        let mut ids = Vec::with_capacity(self.len());
+        self.for_each_live(|e| ids.push(ByBytes(e.id)));
+        self.ordered.write().unwrap_or_else(|p| p.into_inner()).extend(ids);
+    }
+
+    /// Live ids in `[start, end)` in byte order, at most `limit`. `O(log N + limit)`.
+    /// Empty unless [`Self::enable_ordered_ids`] was called.
+    pub fn ids_in_span(&self, start: &[u8], end: Option<&[u8]>, limit: usize) -> Vec<InlineId> {
+        use std::ops::Bound;
+        let set = self.ordered.read().unwrap_or_else(|p| p.into_inner());
+        let hi = end.map_or(Bound::Unbounded, Bound::Excluded);
+        if end.is_some_and(|e| e <= start) {
+            return Vec::new();
+        }
+        set.range::<[u8], _>((Bound::Included(start), hi)).take(limit).map(|b| b.0).collect()
+    }
+
+    #[inline]
+    fn ordered_insert(&self, id: InlineId) {
+        if self.ordered_on.load(Ordering::Relaxed) {
+            self.ordered.write().unwrap_or_else(|p| p.into_inner()).insert(ByBytes(id));
+        }
+    }
+
+    #[inline]
+    fn ordered_remove(&self, id: InlineId) {
+        if self.ordered_on.load(Ordering::Relaxed) {
+            self.ordered.write().unwrap_or_else(|p| p.into_inner()).remove(&ByBytes(id));
         }
     }
 
@@ -385,6 +438,7 @@ impl PrimaryIndex {
     }
 
     fn insert_locked(&self, shard: &mut PrimaryShard, entry: PrimaryEntry, tier_alive: bool) -> Option<PrimaryEntry> {
+        let entry_id = entry.id;
         let new_dirty_len = entry.hot_dirty.as_ref().map_or(0, |b| b.len());
         let prev = shard.by_id.insert(entry.id, entry);
         match &prev {
@@ -401,6 +455,7 @@ impl PrimaryIndex {
             None => {
                 if !tier_alive {
                     self.live_count.fetch_add(1, Ordering::Relaxed);
+                    self.ordered_insert(entry_id);
                 }
                 if new_dirty_len > 0 {
                     self.hot_dirty_bytes
@@ -469,6 +524,7 @@ impl PrimaryIndex {
         };
         if let Some(ref entry) = removed {
             self.live_count.fetch_sub(1, Ordering::Relaxed);
+            self.ordered_remove(id);
             if let Some(ref dirty) = entry.hot_dirty {
                 self.hot_dirty_bytes
                     .fetch_sub(dirty.len(), Ordering::Relaxed);
