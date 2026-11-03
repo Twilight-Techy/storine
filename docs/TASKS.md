@@ -1026,6 +1026,7 @@ This document defines the strict chronological execution order for building the 
     - repair (promote, replace dead replicas, up/down to the replication factor);
     - count and bytes rebalancing: nodes take turns, nothing starts while any store reports a move in progress, and a move always relieves the store that motivated it;
     - lease balancing;
+    - (2026-11-03) a range this node just proposed to freeze counts as frozen in its own planning at once: in the same allocator round, a neighbour aligned its replicas before the freeze applied, and the merge stalled behind the resulting removal (meta seed 12);
     - (2026-11-03) turns leave an idle interval between them: in back-to-back turns, two nodes 15 ms apart (less than the cross-region latency) each moved a replica onto the same store before the other's move was gossiped, overshot, and swung back forever (zones seed 89);
     - size and load splits (median key / median of sampled written keys);
     - merges of small neighbours (lease co-location, replica alignment by the left range only, freeze, merge).

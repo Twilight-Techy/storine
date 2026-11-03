@@ -73,9 +73,7 @@ impl std::fmt::Debug for Aes {
 
 impl Drop for Aes {
     fn drop(&mut self) {
-        for k in &mut self.enc {
-            *k = [0; 16];
-        }
+        self.enc.fill([0; 16]);
     }
 }
 

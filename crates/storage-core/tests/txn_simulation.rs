@@ -130,6 +130,8 @@ fn scan_audits_are_serializable() {
 ///   (regions 106, meta 33, follower 232, scan 58, global 127).
 /// - Range servers conditioned replicated record writes on node-local engine versions, so a
 ///   write applied on one replica and failed on another: replicas diverged (meta 146).
+/// - A neighbour planned in the same allocator round as a freeze aligned the freezing
+///   range's replicas, delaying the merge past the end of the run (meta 12).
 #[test]
 fn regression_seeds() {
     let root = std::env::temp_dir().join(format!("storine_txn_regress_{}", std::process::id()));
@@ -144,7 +146,7 @@ fn regression_seeds() {
     let mut zones = ZoneConfigs::default();
     zone::global(&mut zones, "acct", 2 * base.max_offset_ns + 250_000_000, &ZoneConfig::default()).expect("zone");
     let global = TxnSimConfig { nearest_reads: true, audit_every: 2, node: NodeConfig { zones, max_offset_ns: base.max_offset_ns, ..regions.node.clone() }, ..regions.clone() };
-    for (name, cfg, seed) in [("regions", &regions, 106), ("meta", &meta, 33), ("meta", &meta, 146), ("follower", &follower, 232), ("scan", &scan, 58), ("global", &global, 127)] {
+    for (name, cfg, seed) in [("regions", &regions, 106), ("meta", &meta, 33), ("meta", &meta, 146), ("meta", &meta, 12), ("follower", &follower, 232), ("scan", &scan, 58), ("global", &global, 127)] {
         if let Err(e) = run(&root, seed, cfg) {
             panic!("{name} seed {seed}: {e}");
         }

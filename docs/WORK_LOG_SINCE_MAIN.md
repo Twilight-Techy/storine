@@ -98,6 +98,8 @@ The latest instruction from the user is to do everything that remains, **except*
 
 - **TASK-138**: done. The two failing seeds were a checker bug (seed 12) and a merge-chain allocator bug (seed 10, and seed 266 found by the sweep). Details are in `TASKS.md`.
 - **TASK-141**: done. Zone configurations, survival goals, lease preferences, closed timestamps with follower reads, `AS OF` transactions, global tables and regional-by-row layout.
+- **Six older bugs found by the 300-seed sweeps and fixed** (details in `TASKS.md` and `PROGRESS_LOG.md`): parallel-commit intents resolved before the record was final; replicas diverging on node-local version preconditions; Raft waiters taking another proposal's outcome at a reused index; a repeated split creating duplicate ranges; rebalancing oscillation in back-to-back turns; neighbours aligning a range in the round it froze. All pinned as regression seeds.
+- **Verification**: every multi-range and transaction simulation passes 300 seeds; full `storage-core`, `storage-index` and `storage-sql` suites pass; workspace clippy is clean.
 - **TASK-143**: groundwork done (wire format, ordered ids, span scans, `Txn::scan`); the document layer, TCP runtime and SQL integration are open (see `TASKS.md`).
 
 ## 4. Left to do

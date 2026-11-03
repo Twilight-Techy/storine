@@ -267,6 +267,10 @@ pub struct NodeDriver {
     absorbed: BTreeMap<RangeId, Vec<RangeId>>,
     /// See [`Self::lead_floor`].
     lead_floor: Timestamp,
+    /// Ranges this node proposed to freeze (for a merge), not yet frozen here, and when. The
+    /// allocator treats them as frozen at once: a neighbour planned in the same round must not
+    /// align replicas of a range whose merge has just begun.
+    freezing: BTreeMap<RangeId, u64>,
 }
 
 impl core::fmt::Debug for NodeDriver {
@@ -317,6 +321,7 @@ impl NodeDriver {
             app_inbox: Vec::new(),
             absorbed: BTreeMap::new(),
             lead_floor: Timestamp::ZERO,
+            freezing: BTreeMap::new(),
         }
     }
 
@@ -547,6 +552,10 @@ impl NodeDriver {
     /// One allocator round over the ranges this node leads ([`crate::dist::alloc`]).
     fn allocate(&mut self, cfg: &AllocatorConfig) -> Result<()> {
         let elapsed_us = cfg.interval_us.max(1);
+        // Freezes that applied, or that never will (leadership lost: the proposal is dropped).
+        let now = self.now;
+        let replicas = &self.replicas;
+        self.freezing.retain(|r, &mut at| replicas.get(r).is_some_and(|x| !x.raft.is_frozen()) && now.saturating_sub(at) < 10 * cfg.interval_us.max(1));
         // Keys per hosted range, in one pass over the engine.
         let mut spans: Vec<(Vec<u8>, RangeId)> = self.replicas.iter().filter(|(_, r)| !r.raft.is_frozen()).map(|(&id, r)| (r.raft.span().start, id)).collect();
         spans.sort();
@@ -804,12 +813,12 @@ impl NodeDriver {
             let x = &self.replicas[&id];
             // Its frozen right neighbour is hosted here: a merge freezes only with equal
             // voters, and neither range's replicas change until it is done.
-            let merging = x.raft.span().end.as_ref().is_some_and(|end| self.replicas.values().any(|y| y.raft.is_frozen() && y.raft.span().start == *end));
+            let merging = x.raft.span().end.as_ref().is_some_and(|end| self.replicas.iter().any(|(yid, y)| (y.raft.is_frozen() || self.freezing.contains_key(yid)) && y.raft.span().start == *end));
             NeighbourView {
                 range: id,
                 keys: keys.get(&id).map_or(0, Vec::len),
                 led_here: x.raft.is_leader() && x.lead_term == x.raft.current_term(),
-                frozen: x.raft.is_frozen(),
+                frozen: x.raft.is_frozen() || self.freezing.contains_key(&id),
                 same_zone: self.cfg.zones.same_entry(&span.start, &x.raft.span().start),
                 merging,
                 members: self.member_views(id),
@@ -828,7 +837,7 @@ impl NodeDriver {
             me: self.id,
             members: self.member_views(range),
             config_settled: committed && r.removing.is_empty(),
-            frozen: r.raft.is_frozen(),
+            frozen: r.raft.is_frozen() || self.freezing.contains_key(&range),
             keys: ids.len(),
             writes_per_sec: r.writes.saturating_mul(1_000_000) / elapsed_us,
             size_split_key,
@@ -1412,6 +1421,7 @@ impl NodeDriver {
             return Err(StorageError::NotLeader { leader: r.raft.leader_id().map(u64::from) });
         }
         let index = r.raft.propose(crate::raft::RaftCommand::Freeze)?;
+        self.freezing.insert(range, self.now);
         self.wake(range);
         self.broadcast(range);
         self.advance_commit(range)?;
