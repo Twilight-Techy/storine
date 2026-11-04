@@ -161,6 +161,7 @@ impl Tokens {
 /// The SQL Server error number for a SQLSTATE.
 fn error_number(code: &str) -> i32 {
     match code {
+        "42501" => 229,            // The permission was denied on the object
         "23505" => 2627,           // Violation of PRIMARY KEY / UNIQUE KEY constraint
         "23503" | "23514" => 547,  // conflicted with a FOREIGN KEY / CHECK constraint
         "23502" => 515,            // Cannot insert the value NULL
@@ -811,10 +812,10 @@ impl Conn {
             }
         } else {
             if !auth.users.is_empty() {
-                let ok = auth
-                    .users
-                    .get(&l.user)
-                    .is_some_and(|pw| crate::hash::ct_eq(pw.as_bytes(), l.password.as_bytes()));
+                let ok = match auth.users.get(&l.user) {
+                    Some(pw) => crate::hash::ct_eq(pw.as_bytes(), l.password.as_bytes()),
+                    None => c.session.engine.login_role(&l.user).and_then(|r| r.scram).is_some_and(|v| v.check(&l.password)),
+                };
                 if !ok {
                     return refuse(&mut c, format!("Login failed for user '{}'.", l.user));
                 }
@@ -826,6 +827,9 @@ impl Conn {
             }
         };
         c.session.user = user;
+        if let Err(e) = c.session.may_connect() {
+            return refuse(&mut c, e.message);
+        }
         if !sspi_reply.is_empty() {
             // SSPI: the server's last security token (the AP-REP of mutual authentication), in
             // a message of its own as SQL Server sends it (go-mssqldb reads nothing after it).

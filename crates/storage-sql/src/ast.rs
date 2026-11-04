@@ -2,6 +2,25 @@
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    /// Roles, users and logins (`TASK-145`).
+    Role(Box<RoleStmt>),
+    /// `GRANT`, `REVOKE`, `DENY`, `ALTER DEFAULT PRIVILEGES` (`TASK-145`).
+    Grant(Box<GrantStmt>),
+    /// `CREATE POLICY` (`TASK-145`).
+    CreatePolicy(Box<CreatePolicy>),
+    DropPolicy {
+        name: String,
+        table: String,
+        if_exists: bool,
+    },
+    AlterPolicy {
+        name: String,
+        table: String,
+        rename: Option<String>,
+        roles: Option<Vec<String>>,
+        using: Option<Expr>,
+        check: Option<Expr>,
+    },
     Query(Box<Query>),
     Insert(Box<Insert>),
     Update(Box<Update>),
@@ -153,6 +172,8 @@ pub enum Show {
     Engines,
     ProcessList,
     TableStatus { like: Option<String> },
+    /// `SHOW GRANTS [FOR user]`.
+    Grants(Option<String>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -485,6 +506,103 @@ pub enum AlterOp {
         on: bool,
         index: Option<String>,
     },
+    /// `ENABLE` / `DISABLE ROW LEVEL SECURITY`.
+    RowSecurity(bool),
+    /// `[NO] FORCE ROW LEVEL SECURITY`.
+    ForceRowSecurity(bool),
+    /// `OWNER TO role`.
+    OwnerTo(String),
+}
+
+/// A statement about roles.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RoleStmt {
+    Create { name: String, if_not_exists: bool, opts: Vec<RoleOpt> },
+    Alter { name: String, opts: Vec<RoleOpt> },
+    Rename { from: String, to: String },
+    Drop { names: Vec<String>, if_exists: bool },
+    AddMembers { roles: Vec<String>, members: Vec<String>, admin: bool },
+    DropMembers { roles: Vec<String>, members: Vec<String> },
+    /// `SET ROLE r`; `None`: back to the session's own identity.
+    SetRole(Option<String>),
+    /// `SET PASSWORD [FOR u] = 'p'`.
+    SetPassword { name: Option<String>, password: String },
+    ReassignOwned { from: String, to: String },
+    DropOwned { role: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RoleOpt {
+    Login(bool),
+    Superuser(bool),
+    CreateRole(bool),
+    CreateDb(bool),
+    BypassRls(bool),
+    /// A password or a verifier in its standard form; `None`: no password.
+    Password(Option<String>),
+    /// Member of these roles.
+    InRole(Vec<String>),
+    /// These roles become members.
+    Members(Vec<String>),
+    /// These roles become members who may add others.
+    Admins(Vec<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantKind {
+    Grant,
+    Revoke,
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GrantObject {
+    Tables(Vec<String>),
+    /// Every table existing now.
+    AllTables,
+    Sequences(Vec<String>),
+    AllSequences,
+    Functions(Vec<String>),
+    AllFunctions,
+    /// A database (`None`: the current one); table privileges here cover all its tables.
+    Database(Option<String>),
+    /// Every database of the gateway (MySQL `*.*`).
+    Server,
+    /// `ALTER DEFAULT PRIVILEGES ... ON TABLES` / `SEQUENCES`.
+    DefaultTables,
+    DefaultSequences,
+    /// No `ON`: the "privileges" are roles (`GRANT r TO u`).
+    Roles,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrantStmt {
+    pub kind: GrantKind,
+    /// Upper-case names with their columns (`ALL` for everything).
+    pub privileges: Vec<(String, Vec<String>)>,
+    pub object: GrantObject,
+    pub grantees: Vec<String>,
+    pub grant_option: bool,
+    /// `REVOKE GRANT OPTION FOR`: the privilege stays.
+    pub option_only: bool,
+    /// Role grants: `WITH ADMIN OPTION`.
+    pub admin: bool,
+    pub cascade: bool,
+    /// `ALTER DEFAULT PRIVILEGES [FOR ROLE r]`: `r`, empty for the current role.
+    pub default_for: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreatePolicy {
+    pub name: String,
+    pub table: String,
+    pub permissive: bool,
+    /// `all`, `select`, `insert`, `update` or `delete`.
+    pub command: String,
+    /// Empty: everyone.
+    pub roles: Vec<String>,
+    pub using: Option<Expr>,
+    pub check: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

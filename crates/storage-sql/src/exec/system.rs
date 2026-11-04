@@ -1000,24 +1000,18 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 ("rolconfig", T),
                 ("usesysid", I8),
             ]);
-            bd.row(vec![
-                i(10),
-                t(&user),
-                t(&user),
-                b(true),
-                b(true),
-                b(true),
-                b(true),
-                b(true),
-                b(true),
-                b(true),
-                b(false),
-                i(-1),
-                N,
-                b(false),
-                N,
-                i(10),
-            ]);
+            let acl = ex.s.engine.acl()?;
+            let mut names: Vec<(String, crate::exec::acl::Role)> = acl.roles().map(|r| (r.name.clone(), r.clone())).collect();
+            if acl.role(&user).is_none() {
+                names.push((user.clone(), crate::exec::acl::Role { name: user.clone(), login: true, superuser: acl.is_superuser(&user), ..Default::default() }));
+            }
+            names.sort_by(|a, b| a.0.cmp(&b.0));
+            for (n, (name, r)) in names.iter().enumerate() {
+                // Verifiers are never listed.
+                let su = acl.is_superuser(name);
+                let oid = 16384 + n as i64;
+                bd.row(vec![i(oid), t(name), t(name), b(su), b(su), b(true), b(su || r.createrole), b(su || r.createdb), b(su || r.createdb), b(r.login), b(false), i(-1), N, b(su || r.bypassrls), N, i(oid)]);
+            }
             bd.done()
         }
         "pg_settings" => {
@@ -2779,6 +2773,11 @@ pub fn show(s: &mut Session, what: &Show) -> SqlResult<Outcome> {
                 t("YES"),
             ]],
         ),
+        Show::Grants(who) => {
+            let who = who.clone().unwrap_or_else(|| s.current_role().to_owned());
+            let rows = crate::exec::acl::show_grants(s, &who)?.into_iter().map(|g| vec![Datum::Text(g)]).collect();
+            text_rs(&["Grants"], rows)
+        }
         Show::ProcessList => text_rs(
             &[
                 "Id", "User", "Host", "db", "Command", "Time", "State", "Info",
@@ -2856,4 +2855,54 @@ pub(crate) fn database_list(s: &crate::exec::Session) -> SqlResult<Vec<String>> 
         names.push(s.database.clone());
     }
     Ok(names)
+}
+
+/// `has_table_privilege` and its family: `([user,] object [, column], privilege)`, and
+/// `pg_has_role`. Asked about something unknown, the answer is false (never an error on names).
+pub fn has_privilege(ex: &crate::exec::eval::Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
+    use crate::exec::acl::Access;
+    let acl = ex.s.engine.acl()?;
+    let text = |d: &Datum| d.to_text(false);
+    let want_args = if name == "has_column_privilege" { 3 } else { 2 };
+    let (user, rest): (String, &[Datum]) = if args.len() > want_args {
+        (text(&args[0]), &args[1..])
+    } else {
+        (ex.s.current_role().to_owned(), args)
+    };
+    if rest.len() < want_args {
+        return Ok(Datum::Bool(false));
+    }
+    let object = text(&rest[0]);
+    let bare = object.rsplit('.').next().unwrap_or(&object).trim_matches('"').to_owned();
+    // A privilege list: `'SELECT, INSERT'`, each maybe `WITH GRANT OPTION`.
+    let privileges: Vec<String> = text(&rest[want_args - 1]).split(',').map(|p| p.split_whitespace().next().unwrap_or("").to_ascii_uppercase()).collect();
+    let one = |p: &str| -> SqlResult<bool> {
+        Ok(match name {
+            "pg_has_role" => acl.is_superuser(&user) || acl.closure(&user).contains(&crate::exec::acl::role_key(&bare)),
+            "has_table_privilege" | "has_column_privilege" => {
+                let Some(t) = ex.s.engine.find_table(&bare)? else { return Ok(false) };
+                match (acl.table_access(&user, &t, p), name) {
+                    (Access::All, _) => true,
+                    (Access::None, _) => false,
+                    (Access::Columns(_), "has_table_privilege") => false,
+                    (Access::Columns(c), _) => c.contains(&text(&rest[1]).to_ascii_lowercase()),
+                }
+            }
+            "has_schema_privilege" => p == "USAGE" || acl.database_allows(&user, p),
+            "has_database_privilege" => match p {
+                "CONNECT" => acl.may_connect(&user),
+                "TEMP" => acl.database_allows(&user, "TEMPORARY") || acl.may_connect(&user),
+                other => acl.database_allows(&user, other),
+            },
+            "has_sequence_privilege" => acl.is_superuser(&user) || acl.database_allows(&user, p) || acl.grants().iter().any(|g| g.object == format!("seq:{bare}") && g.privilege == p && !g.deny && acl.closure(&user).contains(&g.grantee)),
+            // Functions are `EXECUTE`-able by everyone unless revoked, as in PostgreSQL.
+            _ => true,
+        })
+    };
+    for p in &privileges {
+        if one(p)? {
+            return Ok(Datum::Bool(true));
+        }
+    }
+    Ok(Datum::Bool(false))
 }

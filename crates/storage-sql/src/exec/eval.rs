@@ -39,6 +39,13 @@ pub struct Exec<'a> {
     /// Columns each FROM table of the running `select` needs, by qualifier (lowercase): its
     /// scans read only those (`TASK-130`). `None`: whole rows.
     pub(crate) projection: RefCell<Option<Projection>>,
+    /// While a view runs: its owner, whose rights apply (`exec/acl.rs`).
+    pub(crate) acting_as: RefCell<Option<String>>,
+    /// Restrictions by (role, table, command), kept alive for the statement: the subquery cache
+    /// is keyed by node address, and policies are expressions.
+    #[allow(clippy::type_complexity)]
+    pub(crate) restrictions: RefCell<HashMap<(String, String, String), Option<(Rc<crate::exec::acl::Restriction>, bool)>>>,
+    pub(crate) rls_depth: std::cell::Cell<u32>,
 }
 
 /// `(table qualifier, columns read)` of each FROM table of a select.
@@ -207,6 +214,9 @@ impl<'a> Exec<'a> {
             vector_hint: RefCell::new(None),
             vector_hint_used: std::cell::Cell::new(false),
             projection: RefCell::new(None),
+            acting_as: RefCell::new(None),
+            restrictions: RefCell::new(HashMap::new()),
+            rls_depth: std::cell::Cell::new(0),
         }
     }
 
@@ -982,6 +992,11 @@ pub fn find_column(cols: &[ColMeta], qual: Option<&str>, name: &str) -> SqlResul
                 }
                 found = Some(i);
             }
+        }
+    }
+    if let Some(i) = found {
+        if cols[i].denied {
+            return Err(SqlError::new("42501", format!("permission denied for column {}", cols[i].name)));
         }
     }
     if found.is_none() && qual.is_none() {

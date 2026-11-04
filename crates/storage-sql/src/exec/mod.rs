@@ -9,9 +9,10 @@
 //! `40001` (serialization failure), which clients and ORMs retry. Unique constraints, primary
 //! keys and foreign-key parents are verified by preconditions in the same batch.
 
+pub mod acl;
 pub(crate) mod advisory;
-mod ddl;
-mod dml;
+pub(crate) mod ddl;
+pub(crate) mod dml;
 mod eval;
 pub(crate) mod func;
 mod merge;
@@ -47,6 +48,8 @@ pub struct EngineConfig {
     pub lock_timeout: Duration,
     /// How many times an autocommit statement is re-run after losing a write race.
     pub max_retries: u32,
+    /// The `--user` accounts, superusers by configuration; `None`: trust mode (`exec/acl.rs`).
+    pub bootstrap_users: Option<std::collections::HashSet<String>>,
 }
 
 impl Default for EngineConfig {
@@ -55,6 +58,7 @@ impl Default for EngineConfig {
             database: "storine".into(),
             lock_timeout: Duration::from_secs(10),
             max_retries: 64,
+            bootstrap_users: None,
         }
     }
 }
@@ -67,6 +71,8 @@ pub struct Engine {
     pub config: EngineConfig,
     next_session: Arc<AtomicU64>,
     databases: Arc<Databases>,
+    /// Roles and grants, as last read.
+    pub(crate) acl_cache: std::sync::RwLock<Option<(std::time::Instant, Arc<acl::Acl>)>>,
 }
 
 /// The databases of a gateway: the default one (`EngineConfig::database`) and those made by
@@ -118,7 +124,23 @@ impl Engine {
             catalog: Catalog::default(),
             config,
             next_session: Arc::new(AtomicU64::new(1)),
+            acl_cache: std::sync::RwLock::new(None),
         })
+    }
+
+    /// The store of what is global to the gateway (roles, the database registry).
+    pub(crate) fn root_store(&self) -> &Store {
+        &self.databases.root
+    }
+
+    /// Whether `name` names this database.
+    pub(crate) fn is_same_database(&self, name: &str) -> bool {
+        name.eq_ignore_ascii_case(&self.config.database) || (self.is_default_name(name) && self.is_default_name(&self.config.database))
+    }
+
+    /// A view's owner: `None` no such view; `Some(None)`: made before roles existed.
+    pub(crate) fn view_owner(&self, name: &str) -> SqlResult<Option<Option<String>>> {
+        Ok(self.store.get(crate::catalog::VIEWS, &name.to_lowercase())?.map(|d| d.fields.get("owner").and_then(storine::Value::as_str).map(str::to_owned)))
     }
 
     fn default_engine(&self) -> SqlResult<Arc<Engine>> {
@@ -163,6 +185,7 @@ impl Engine {
             },
             next_session: Arc::clone(&self.next_session),
             databases: Arc::clone(&self.databases),
+            acl_cache: std::sync::RwLock::new(None),
         });
         open.insert(key, Arc::downgrade(&e));
         Ok(e)
@@ -296,6 +319,7 @@ impl Engine {
             engine,
             dialect,
             user: user.to_owned(),
+            role: None,
             database: database
                 .filter(|d| !d.is_empty())
                 .unwrap_or(&self.config.database)
@@ -651,6 +675,8 @@ pub struct Session {
     pub engine: Arc<Engine>,
     pub dialect: Dialect,
     pub user: String,
+    /// `SET ROLE` / `EXECUTE AS`: the role privileges are checked for instead of `user`.
+    pub role: Option<String>,
     pub database: String,
     pub vars: HashMap<String, String>,
     /// Session defaults (`RESET ALL` / `DISCARD ALL` return to them): the dialect's defaults
@@ -702,6 +728,9 @@ impl Session {
                 "cannot switch databases inside a transaction",
             ));
         }
+        if !engine.acl()?.may_connect(&self.user) {
+            return Err(SqlError::new("42501", format!("permission denied for database \"{name}\"")));
+        }
         self.engine = engine;
         self.database = name.to_owned();
         Ok(())
@@ -710,6 +739,9 @@ impl Session {
     /// `DROP DATABASE`: drops every table and sequence of the database. A created database
     /// is also unregistered; the default one stays (empty).
     fn drop_database(&mut self, name: &str, if_exists: bool) -> SqlResult<Outcome> {
+        if !self.engine.acl()?.is_superuser(self.current_role()) {
+            return Err(SqlError::new("42501", "must be a superuser to drop a database"));
+        }
         let default = self.engine.is_default_name(name);
         if !default && !self.engine.is_created(name)? {
             if if_exists {
@@ -1106,6 +1138,11 @@ impl Session {
                 let out = dml::delete(self, d, params);
                 self.count_changes(out)
             }
+            Statement::Role(r) => acl::role_statement(self, r),
+            Statement::Grant(g) => acl::grant_statement(self, g),
+            Statement::CreatePolicy(p) => ddl::create_policy(self, p),
+            Statement::DropPolicy { name, table, if_exists } => ddl::drop_policy(self, name, table, *if_exists),
+            Statement::AlterPolicy { name, table, rename, roles, using, check } => ddl::alter_policy(self, name, table, rename.as_deref(), roles.as_deref(), using.as_ref(), check.as_ref()),
             Statement::CreateTable(c) => ddl::create_table(self, c, params),
             Statement::CreateIndex(c) => ddl::create_index(self, c),
             Statement::DropTable {
@@ -1134,8 +1171,12 @@ impl Session {
                 start,
                 increment,
                 if_not_exists,
-            } => dml::create_sequence(self, name, *start, *increment, *if_not_exists),
+            } => {
+                self.require_database("CREATE", "create sequences")?;
+                dml::create_sequence(self, name, *start, *increment, *if_not_exists)
+            },
             Statement::DropSequence { names, if_exists } => {
+                self.require_database("CREATE", "drop sequences")?;
                 dml::drop_sequences(self, names, *if_exists)
             }
             Statement::Set { name, value } => self.set_var(name, value.as_ref(), params),
@@ -1253,6 +1294,11 @@ impl Session {
                 if_not_exists,
                 database: true,
             } => {
+                let acl = self.engine.acl()?;
+                let me = self.current_role();
+                if !acl.is_superuser(me) && !acl.role(me).is_some_and(|r| r.createdb) {
+                    return Err(SqlError::new("42501", "permission denied to create database"));
+                }
                 if !self.engine.create_database(name)? && !if_not_exists {
                     return Err(SqlError::new(
                         "42P04",
@@ -1268,6 +1314,14 @@ impl Session {
                 or_replace,
                 if_not_exists,
             } => {
+                self.require_database("CREATE", "create views")?;
+                if let Some(owner) = self.engine.view_owner(name)? {
+                    let acl = self.engine.acl()?;
+                    let me = self.current_role();
+                    if *or_replace && !acl.is_superuser(me) && !acl.owns(me, owner.as_deref()) {
+                        return Err(SqlError::new("42501", format!("must be owner of view {name}")));
+                    }
+                }
                 if self.engine.find_table(name)?.is_some() {
                     return Err(SqlError::new(
                         "42P07",
@@ -1276,6 +1330,7 @@ impl Session {
                 }
                 let mut doc = Doc::new();
                 doc.insert("name".into(), storine::Value::Text(name.clone()));
+                doc.insert("owner".into(), storine::Value::Text(self.current_role().to_owned()));
                 doc.insert("sql".into(), storine::Value::Text(sql.clone()));
                 doc.insert(
                     "dialect".into(),
@@ -1327,6 +1382,12 @@ impl Session {
                             format!("view \"{n}\" does not exist"),
                         ));
                     }
+                    let acl = self.engine.acl()?;
+                    let me = self.current_role();
+                    if !acl.is_superuser(me) && !acl.owns(me, self.engine.view_owner(n)?.flatten().as_deref()) {
+                        return Err(SqlError::new("42501", format!("must be owner of view {n}")));
+                    }
+                    self.drop_grants(&format!("table:{}", n.to_lowercase()))?;
                     let w = Write {
                         collection: crate::catalog::VIEWS.into(),
                         key: n.to_lowercase(),
@@ -1404,6 +1465,7 @@ impl Session {
                     self.prepared.clear();
                     advisory::release_all(self, None, "");
                     self.vars = self.base_vars.clone();
+                    self.role = None;
                     self.user_vars.clear();
                     self.table_vars.clear();
                 }
@@ -1411,6 +1473,7 @@ impl Session {
             }
             Statement::ResetAll => {
                 self.vars = self.base_vars.clone();
+                self.role = None;
                 Ok(Outcome::command("RESET"))
             }
             Statement::NoOp(tag) => Ok(Outcome::command(*tag)),

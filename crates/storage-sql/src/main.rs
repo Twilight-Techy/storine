@@ -151,6 +151,10 @@ fn run() -> Result<(), String> {
         None if keep_realm => return Err("--kerberos-keep-realm needs --kerberos-keytab".into()),
         None => None,
     };
+    if !users.is_empty() {
+        // Authentication on: the configured accounts are the superusers (`exec/acl.rs`).
+        config.bootstrap_users = Some(users.keys().cloned().collect());
+    }
     let (engine, _embedded) = match (data, url) {
         (Some(dir), None) => {
             let e = storage_sql::embedded::start(&dir, config).map_err(|e| e.to_string())?;

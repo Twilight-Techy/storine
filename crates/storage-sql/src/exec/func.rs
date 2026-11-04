@@ -871,11 +871,15 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             Datum::Text("pg_catalog".into()),
             Datum::Text("public".into()),
         ]),
-        "current_user" | "session_user" | "user" | "system_user" | "current_role"
-        | "suser_sname" => Datum::Text(if mysql && name != "current_role" {
+        "session_user" | "system_user" | "suser_sname" => Datum::Text(if mysql {
             format!("{}@%", ex.s.user)
         } else {
             ex.s.user.clone()
+        }),
+        "current_user" | "user" | "current_role" => Datum::Text(if mysql && name != "current_role" {
+            format!("{}@%", ex.s.current_role())
+        } else {
+            ex.s.current_role().to_owned()
         }),
         "current_catalog" => Datum::Text(ex.s.database.clone()),
         "pg_backend_pid" | "connection_id" => Datum::Int(ex.s.id as i64),
@@ -893,9 +897,13 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             }
         }
         "pg_typeof" => Datum::Text(a0.type_name().into()),
-        "nextval" => Datum::Int(crate::exec::dml::nextval(&ex.s.engine, &text(&a0))?),
+        "nextval" => {
+            ex.s.require_sequence(&text(&a0))?;
+            Datum::Int(crate::exec::dml::nextval(&ex.s.engine, &text(&a0))?)
+        }
         "currval" => Datum::Int(ex.s.last_insert_id),
         "setval" => {
+            ex.s.require_sequence(&text(&a0))?;
             let v = int(arg(args, 1))?;
             crate::exec::dml::setval(&ex.s.engine, &text(&a0), v)?;
             Datum::Int(v)
@@ -917,13 +925,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
         "inet_server_port" => Datum::Int(5432),
         "pg_encoding_to_char" => Datum::Text("UTF8".into()),
         "pg_get_userbyid" => Datum::Text(ex.s.user.clone()),
-        "has_table_privilege"
-        | "has_schema_privilege"
-        | "has_database_privilege"
-        | "has_column_privilege"
-        | "has_sequence_privilege"
-        | "has_function_privilege"
-        | "pg_has_role" => Datum::Bool(true),
+        "has_table_privilege" | "has_column_privilege" | "has_schema_privilege" | "has_database_privilege" | "has_sequence_privilege" | "has_function_privilege" | "pg_has_role" => crate::exec::system::has_privilege(ex, name, args)?,
         "obj_description" | "col_description" | "shobj_description" | "pg_get_viewdef"
         | "pg_get_triggerdef" => Datum::Null,
         n if n.starts_with("pg_") && n.ends_with("_is_visible") => Datum::Bool(true),

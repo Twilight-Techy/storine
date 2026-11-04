@@ -267,7 +267,11 @@ impl Conn {
             .unwrap_or_else(|| "storine".into());
         let database = params.get("database").cloned();
         if !auth.users.is_empty() {
-            match scram(&mut r, &mut w, auth.users.get(&user).map(String::as_str)) {
+            let creds = match auth.users.get(&user) {
+                Some(p) => Some(crate::exec::acl::Scram::from_password(p)),
+                None => engine.login_role(&user).and_then(|r| r.scram),
+            };
+            match scram(&mut r, &mut w, creds.as_ref()) {
                 Ok(true) => {}
                 Ok(false) => {
                     let e = SqlError::auth(format!(
@@ -282,6 +286,11 @@ impl Conn {
         }
         send_raw(&mut w, Msg::new(b'R').i32(0))?;
         let mut session = engine.new_session(Dialect::Postgres, &user, database.as_deref());
+        if let Err(e) = session.may_connect() {
+            send_raw(&mut w, error_msg(&e, "FATAL"))?;
+            w.flush()?;
+            return Ok(());
+        }
         if let Some(app) = params.get("application_name") {
             session.vars.insert("application_name".into(), app.clone());
             session
@@ -570,6 +579,16 @@ impl Conn {
         } else {
             c.columns.clone()
         };
+        {
+            // COPY FROM is an INSERT, with its rights and (row-level security) refused outright.
+            let names: Vec<&str> = columns.iter().map(String::as_str).collect();
+            self.session.require_table(&table, "INSERT", &names)?;
+            let acl = self.session.engine.acl()?;
+            let me = self.session.current_role();
+            if table.row_security && !acl.is_superuser(me) && !(acl.owns(me, table.owner.as_deref()) && !table.force_row_security) {
+                return Err(SqlError::unsupported("COPY FROM into a table with row-level security: use INSERT"));
+            }
+        }
         let oids: Vec<u32> = columns
             .iter()
             .map(|n| {
@@ -744,6 +763,16 @@ impl Conn {
         } else {
             c.columns.clone()
         };
+        {
+            // COPY FROM is an INSERT, with its rights and (row-level security) refused outright.
+            let names: Vec<&str> = columns.iter().map(String::as_str).collect();
+            self.session.require_table(&table, "INSERT", &names)?;
+            let acl = self.session.engine.acl()?;
+            let me = self.session.current_role();
+            if table.row_security && !acl.is_superuser(me) && !(acl.owns(me, table.owner.as_deref()) && !table.force_row_security) {
+                return Err(SqlError::unsupported("COPY FROM into a table with row-level security: use INSERT"));
+            }
+        }
         for n in &columns {
             table.column(n)?;
         }
@@ -1137,7 +1166,7 @@ fn error_msg(e: &SqlError, severity: &str) -> Msg {
 }
 
 /// SCRAM-SHA-256 (RFC 5802 / 7677) exchange; `Ok(false)`: wrong password or unknown user.
-fn scram(r: &mut impl Read, w: &mut impl Write, password: Option<&str>) -> io::Result<bool> {
+fn scram(r: &mut impl Read, w: &mut impl Write, creds: Option<&crate::exec::acl::Scram>) -> io::Result<bool> {
     send_raw(w, Msg::new(b'R').i32(10).cstr("SCRAM-SHA-256").u8(0))?;
     w.flush()?;
     let read_msg = |r: &mut dyn Read| -> io::Result<Vec<u8>> {
@@ -1169,10 +1198,11 @@ fn scram(r: &mut impl Read, w: &mut impl Write, password: Option<&str>) -> io::R
         .find_map(|kv| kv.strip_prefix("r="))
         .unwrap_or("")
         .to_owned();
-    let salt = hash::random_bytes(16);
+    // Unknown users get a random salt like any other: nothing tells them apart.
+    let salt = creds.map_or_else(|| hash::random_bytes(16), |c| c.salt.clone());
     let snonce = hash::base64_encode(&hash::random_bytes(18));
     let nonce = format!("{cnonce}{snonce}");
-    let iterations = 4096;
+    let iterations = creds.map_or(4096, |c| c.iterations);
     let server_first = format!("r={nonce},s={},i={iterations}", hash::base64_encode(&salt));
     send_raw(w, Msg::new(b'R').i32(11).bytes(server_first.as_bytes()))?;
     w.flush()?;
@@ -1191,17 +1221,15 @@ fn scram(r: &mut impl Read, w: &mut impl Write, password: Option<&str>) -> io::R
         .split(',')
         .find_map(|kv| kv.strip_prefix("r="))
         .unwrap_or("");
-    let Some(password) = password else {
+    let Some(creds) = creds else {
         return Ok(false);
     };
     if got_nonce != nonce || channel != expected_channel {
         return Ok(false);
     }
-    let salted = hash::pbkdf2_sha256(password.as_bytes(), &salt, iterations);
-    let client_key = hash::hmac_sha256(&salted, b"Client Key");
-    let stored_key = hash::sha256(&client_key);
+    let stored_key = &creds.stored_key;
     let auth_message = format!("{bare},{server_first},{without_proof}");
-    let client_sig = hash::hmac_sha256(&stored_key, auth_message.as_bytes());
+    let client_sig = hash::hmac_sha256(stored_key, auth_message.as_bytes());
     let Some(proof) = hash::base64_decode(proof_b64) else {
         return Ok(false);
     };
@@ -1213,11 +1241,10 @@ fn scram(r: &mut impl Read, w: &mut impl Write, password: Option<&str>) -> io::R
         .zip(client_sig.iter())
         .map(|(a, b)| a ^ b)
         .collect();
-    if !hash::ct_eq(&hash::sha256(&recovered), &stored_key) {
+    if !hash::ct_eq(&hash::sha256(&recovered), stored_key) {
         return Ok(false);
     }
-    let server_key = hash::hmac_sha256(&salted, b"Server Key");
-    let server_sig = hash::hmac_sha256(&server_key, auth_message.as_bytes());
+    let server_sig = hash::hmac_sha256(&creds.server_key, auth_message.as_bytes());
     send_raw(
         w,
         Msg::new(b'R')
@@ -2015,9 +2042,10 @@ mod fuzz_tests {
             base.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
             base.extend_from_slice(body);
         }
+        let creds = crate::exec::acl::Scram::from_password("pw");
         for _ in 0..fz::iters(20_000) {
             let input = fz::variant(&mut rng, &base);
-            let password = (rng.below(2) == 0).then_some("pw");
+            let password = (rng.below(2) == 0).then_some(&creds);
             fz::bounded(&input, || {
                 let mut out = Vec::new();
                 let _ = scram(&mut &input[..], &mut out, password);

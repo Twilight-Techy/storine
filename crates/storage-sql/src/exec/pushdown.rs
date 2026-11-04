@@ -345,6 +345,10 @@ impl Exec<'_> {
         let Some(table) = self.s.engine.find_table(name)? else {
             return Ok(None);
         };
+        // Restricted reads go through the row path, which applies (or refuses) them.
+        if !matches!(self.read_restriction(&table), Ok(None)) {
+            return Ok(None);
+        }
         // An open transaction's own writes (or validated reads) need row-level reads.
         if let Some(t) = self.s.txn.as_ref() {
             if t.validate_reads || t.entries(&table.collection).next().is_some() {

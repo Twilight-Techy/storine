@@ -769,9 +769,12 @@ pub fn lock_query_rows(s: &mut Session, q: &Query, params: &[Datum]) -> SqlResul
         return Ok(());
     };
     let qual = alias.as_ref().map_or(name.clone(), |a| a.name.clone());
+    // Locks are taken before the query runs: it needs the rights first (PostgreSQL: UPDATE too).
+    s.require_table(&table, "UPDATE", &[])?;
     let keys = {
         let ex = Exec::new(s, params);
-        target_rows(&ex, &table, &qual, sel.where_.as_ref())?
+        ex.read_restriction(&table)?;
+        target_rows(&ex, &table, &qual, sel.where_.as_ref(), "update")?
             .into_iter()
             .map(|t| t.key)
             .collect::<Vec<_>>()
@@ -785,14 +788,25 @@ fn target_rows(
     table: &Table,
     qual: &str,
     where_: Option<&Expr>,
+    command: &str,
 ) -> SqlResult<Vec<TableRow>> {
-    let conjs: Vec<&Expr> = where_.map(conjuncts).unwrap_or_default();
+    let restriction = ex.dml_restriction(table, command)?;
+    let conjs: Vec<&Expr> = if restriction.is_some() { Vec::new() } else { where_.map(conjuncts).unwrap_or_default() };
     let mut cols = table_cols(table);
     for c in &mut cols {
         c.qual = Some(qual.to_owned());
     }
+    if let Some(r) = &restriction {
+        Exec::mark_denied(&mut cols, r);
+    }
+    let policy_cols = table_cols(table);
     let mut out = Vec::new();
     for tr in ex.scan_rows(table, Some(qual), &conjs, Vec::new(), None)? {
+        if let Some(r) = &restriction {
+            if !ex.row_visible(r, &policy_cols, &tr.row)? {
+                continue;
+            }
+        }
         let ok = match where_ {
             None => true,
             Some(w) => ex.eval_bool(w, &Env::new(&cols, &tr.row))?,
@@ -822,10 +836,23 @@ fn project_returning(
 ) -> SqlResult<Rel> {
     let mut out_cols = Vec::new();
     let mut exprs = Vec::new();
+    // RETURNING reads: the columns a role may not read stay out of reach.
+    let mut marked = cols.to_vec();
+    for c in &mut marked {
+        if let Some(t) = c.table.clone().and_then(|t| ex.s.engine.find_table(&t).ok().flatten()) {
+            if let Some(r) = ex.dml_restriction(&t, "select")? {
+                c.denied = r.denied_columns.contains(&c.name.to_ascii_lowercase());
+            }
+        }
+    }
+    let cols: &[ColMeta] = &marked;
     for it in items {
         match it {
             SelectItem::Wildcard(_) => {
                 for c in cols {
+                    if c.denied {
+                        return Err(SqlError::new("42501", format!("permission denied for column {}", c.name)));
+                    }
                     out_cols.push(ColMeta {
                         qual: None,
                         ..c.clone()
@@ -845,6 +872,7 @@ fn project_returning(
                     ty,
                     table,
                     hidden: false,
+                    denied: false,
                 });
                 exprs.push(expr.clone());
             }
@@ -914,6 +942,7 @@ fn build_row(
         }
     }
     check_row(ex, table, &row)?;
+    ex.check_new_row(table, &row, "insert")?;
     Ok(row)
 }
 
@@ -944,6 +973,14 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
         });
     }
     let table = s.engine.table(&ins.table)?;
+    {
+        let names: Vec<&str> = if ins.columns.is_empty() { table.columns.iter().map(|c| c.name.as_str()).collect() } else { ins.columns.iter().map(String::as_str).collect() };
+        s.require_table(&table, "INSERT", &names)?;
+        if let Some(OnConflict::DoUpdate { sets, .. }) = &ins.on_conflict {
+            let names: Vec<&str> = sets.iter().map(|(c, _)| c.as_str()).collect();
+            s.require_table(&table, "UPDATE", &names)?;
+        }
+    }
     let target: Vec<usize> = if ins.columns.is_empty() {
         if matches!(ins.source, InsertSource::DefaultValues) {
             Vec::new()
@@ -1117,6 +1154,7 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
                                 new[i] = table.columns[i].fit(cast(&v, &table.columns[i].ty)?);
                             }
                             check_row(&ex, &table, &new)?;
+                            ex.check_new_row(&table, &new, "update")?;
                             new
                         };
                         let changed = new != existing;
@@ -1415,21 +1453,32 @@ fn dml_targets(
     qual: &str,
     from: &[TableRef],
     where_: Option<&Expr>,
+    command: &str,
 ) -> SqlResult<Targets> {
+    let restriction = ex.dml_restriction(table, command)?;
     let mut cols = table_cols(table);
     for c in &mut cols {
         c.qual = Some(qual.to_owned());
     }
+    if let Some(r) = &restriction {
+        Exec::mark_denied(&mut cols, r);
+    }
+    let policy_cols = table_cols(table);
     if from.is_empty() {
-        let rows = target_rows(ex, table, qual, where_)?;
+        let rows = target_rows(ex, table, qual, where_, command)?;
         return Ok((cols, rows.into_iter().map(|t| (t, Vec::new())).collect()));
     }
     let other = ex.eval_from(from, &[], None)?;
     let mut all = cols.clone();
     all.extend(other.cols.iter().cloned());
-    let conjs: Vec<&Expr> = where_.map(conjuncts).unwrap_or_default();
+    let conjs: Vec<&Expr> = if restriction.is_some() { Vec::new() } else { where_.map(conjuncts).unwrap_or_default() };
     let mut out = Vec::new();
     for tr in ex.scan_rows(table, Some(qual), &conjs, Vec::new(), None)? {
+        if let Some(r) = &restriction {
+            if !ex.row_visible(r, &policy_cols, &tr.row)? {
+                continue;
+            }
+        }
         for orow in &other.rows {
             let mut row = tr.row.clone();
             row.extend(orow.iter().cloned());
@@ -1486,22 +1535,29 @@ fn order_and_limit(
 
 pub fn update(s: &mut Session, upd: &Update, params: &[Datum]) -> SqlResult<Outcome> {
     let table = s.engine.table(&upd.table)?;
-    if let Some(o) = try_atomic_update(s, upd, &table, params)? {
-        return Ok(o);
+    {
+        let names: Vec<&str> = upd.sets.iter().map(|(c, _)| c.as_str()).collect();
+        s.require_table(&table, "UPDATE", &names)?;
+    }
+    let unrestricted = Exec::new(s, params).dml_restriction(&table, "update")?.is_none();
+    if unrestricted {
+        if let Some(o) = try_atomic_update(s, upd, &table, params)? {
+            return Ok(o);
+        }
     }
     let qual = upd.alias.clone().unwrap_or_else(|| table.name.clone());
     // In a transaction, lock the target rows first so their values are current.
     if s.in_transaction() {
         let keys = {
             let ex = Exec::new(s, params);
-            let (_, t) = dml_targets(&ex, &table, &qual, &upd.from, upd.where_.as_ref())?;
+            let (_, t) = dml_targets(&ex, &table, &qual, &upd.from, upd.where_.as_ref(), "update")?;
             t.into_iter().map(|(t, _)| t.key).collect::<Vec<_>>()
         };
         lock_rows(s, &table, &keys, false)?;
     }
     let (changes, matched) = {
         let ex = Exec::new(s, params);
-        let (cols, mut targets) = dml_targets(&ex, &table, &qual, &upd.from, upd.where_.as_ref())?;
+        let (cols, mut targets) = dml_targets(&ex, &table, &qual, &upd.from, upd.where_.as_ref(), "update")?;
         order_and_limit(&ex, &cols, &mut targets, &upd.order_by, upd.limit.as_ref())?;
         let matched = targets.len() as u64;
         let mut changes = Vec::with_capacity(targets.len());
@@ -1530,6 +1586,7 @@ pub fn update(s: &mut Session, upd: &Update, params: &[Datum]) -> SqlResult<Outc
                     })?;
             }
             check_row(&ex, &table, &new)?;
+            ex.check_new_row(&table, &new, "update")?;
             changes.push((t, new));
         }
         (changes, matched)
@@ -1571,18 +1628,19 @@ pub fn update(s: &mut Session, upd: &Update, params: &[Datum]) -> SqlResult<Outc
 
 pub fn delete(s: &mut Session, del: &Delete, params: &[Datum]) -> SqlResult<Outcome> {
     let table = s.engine.table(&del.table)?;
+    s.require_table(&table, "DELETE", &[])?;
     let qual = del.alias.clone().unwrap_or_else(|| table.name.clone());
     if s.in_transaction() {
         let keys = {
             let ex = Exec::new(s, params);
-            let (_, t) = dml_targets(&ex, &table, &qual, &del.using, del.where_.as_ref())?;
+            let (_, t) = dml_targets(&ex, &table, &qual, &del.using, del.where_.as_ref(), "delete")?;
             t.into_iter().map(|(t, _)| t.key).collect::<Vec<_>>()
         };
         lock_rows(s, &table, &keys, false)?;
     }
     let targets = {
         let ex = Exec::new(s, params);
-        let (cols, mut targets) = dml_targets(&ex, &table, &qual, &del.using, del.where_.as_ref())?;
+        let (cols, mut targets) = dml_targets(&ex, &table, &qual, &del.using, del.where_.as_ref(), "delete")?;
         order_and_limit(&ex, &cols, &mut targets, &del.order_by, del.limit.as_ref())?;
         targets
     };
@@ -1720,6 +1778,11 @@ pub fn drop_sequences(s: &mut Session, names: &[String], if_exists: bool) -> Sql
             .map_err(|e| e.to_sql(std::slice::from_ref(&w)))?;
     }
     Ok(Outcome::command("DROP SEQUENCE"))
+}
+
+/// Names of the sequences of this database.
+pub fn sequence_names(engine: &Engine) -> SqlResult<Vec<String>> {
+    Ok(engine.store.scan(SEQUENCES, None)?.into_iter().map(|d| d.key.strip_prefix("seq:").unwrap_or(&d.key).to_owned()).collect())
 }
 
 /// `nextval('name')`.

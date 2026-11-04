@@ -92,6 +92,13 @@ fn add_constraint(t: &mut Table, c: &TableConstraint, s: &Session) -> SqlResult<
             }
         }
         TableConstraint::ForeignKey { name, fk } => {
+            // A foreign key probes the parent's values: that takes REFERENCES on them.
+            if !fk.table.eq_ignore_ascii_case(&t.name) {
+                if let Some(parent) = s.engine.find_table(&fk.table)? {
+                    let names: Vec<&str> = fk.ref_columns.iter().map(String::as_str).collect();
+                    s.require_table(&parent, "REFERENCES", &names)?;
+                }
+            }
             let cols = positions(t, &fk.columns)?;
             if !fk.table.eq_ignore_ascii_case(&t.name) && s.engine.find_table(&fk.table)?.is_none()
             {
@@ -255,7 +262,70 @@ fn save_schema(s: &Session, t: &Table, pre: Pre) -> SqlResult<()> {
     }
 }
 
+/// Saves a changed schema over its current version.
+pub(crate) fn save_table(s: &Session, t: &Table) -> SqlResult<()> {
+    save_schema(s, t, Pre::Version(t.version))
+}
+
+pub fn create_policy(s: &mut Session, p: &crate::ast::CreatePolicy) -> SqlResult<Outcome> {
+    let mut t = (*s.engine.table(&p.table)?).clone();
+    s.require_owner(&t, "ALTER")?;
+    if t.policies.iter().any(|x| x.name.eq_ignore_ascii_case(&p.name)) {
+        return Err(SqlError::new("42710", format!("policy \"{}\" for table \"{}\" already exists", p.name, t.name)));
+    }
+    for r in &p.roles {
+        s.check_role_known(r)?;
+    }
+    t.policies.push(crate::catalog::Policy { name: p.name.clone(), permissive: p.permissive, command: p.command.clone(), roles: p.roles.clone(), using: p.using.clone(), check: p.check.clone() });
+    save_table(s, &t)?;
+    Ok(Outcome::command("CREATE POLICY"))
+}
+
+pub fn drop_policy(s: &mut Session, name: &str, table: &str, if_exists: bool) -> SqlResult<Outcome> {
+    let mut t = (*s.engine.table(table)?).clone();
+    s.require_owner(&t, "ALTER")?;
+    let before = t.policies.len();
+    t.policies.retain(|p| !p.name.eq_ignore_ascii_case(name));
+    if t.policies.len() == before {
+        if if_exists {
+            return Ok(Outcome::command("DROP POLICY"));
+        }
+        return Err(SqlError::new("42704", format!("policy \"{name}\" for table \"{table}\" does not exist")));
+    }
+    save_table(s, &t)?;
+    Ok(Outcome::command("DROP POLICY"))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn alter_policy(s: &mut Session, name: &str, table: &str, rename: Option<&str>, roles: Option<&[String]>, using: Option<&Expr>, check: Option<&Expr>) -> SqlResult<Outcome> {
+    let mut t = (*s.engine.table(table)?).clone();
+    s.require_owner(&t, "ALTER")?;
+    if let Some(rs) = roles {
+        for r in rs {
+            s.check_role_known(r)?;
+        }
+    }
+    let Some(p) = t.policies.iter_mut().find(|p| p.name.eq_ignore_ascii_case(name)) else {
+        return Err(SqlError::new("42704", format!("policy \"{name}\" for table \"{table}\" does not exist")));
+    };
+    if let Some(n) = rename {
+        p.name = n.to_owned();
+    }
+    if let Some(rs) = roles {
+        p.roles = rs.to_vec();
+    }
+    if let Some(e) = using {
+        p.using = Some(e.clone());
+    }
+    if let Some(e) = check {
+        p.check = Some(e.clone());
+    }
+    save_table(s, &t)?;
+    Ok(Outcome::command("ALTER POLICY"))
+}
+
 pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlResult<Outcome> {
+    s.require_database("CREATE", "create tables")?;
     if s.engine.find_table(&ct.name)?.is_some() {
         if ct.if_not_exists {
             return Ok(Outcome::command("CREATE TABLE"));
@@ -332,6 +402,10 @@ pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlR
         checks: Vec::new(),
         pk_name: None,
         columnar: ct.columnar.then(String::new),
+        owner: Some(s.current_role().to_owned()),
+        row_security: false,
+        force_row_security: false,
+        policies: Vec::new(),
         version: 0,
     };
     {
@@ -398,6 +472,7 @@ pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlR
         }
     }
     save_schema(s, &t, Pre::Absent)?;
+    s.apply_default_privileges(&format!("table:{}", t.name), "tables")?;
     sync_storage_indexes(s, &t)?;
     if t.columnar.is_some() {
         s.engine.store.set_columnar(&t.collection, true)?;
@@ -491,6 +566,7 @@ fn delete_markers(s: &Session, collection: &str, constraint: Option<&str>) -> Sq
 }
 
 pub fn create_index(s: &mut Session, ci: &CreateIndex) -> SqlResult<Outcome> {
+    s.require_owner(&*s.engine.table(&ci.table)?, "INDEX")?;
     let mut t = (*s.engine.table(&ci.table)?).clone();
     let cols = positions(&t, &ci.columns)?;
     let name = ci.name.clone().unwrap_or_else(|| {
@@ -561,6 +637,9 @@ pub fn drop_tables(
             None => return Err(SqlError::undefined_table(n)),
         }
     }
+    for t in &tables {
+        s.require_owner(t, "DROP")?;
+    }
     let dropping: HashSet<String> = tables.iter().map(|t| t.name.to_ascii_lowercase()).collect();
     for t in &tables {
         for (child, fk) in s.engine.catalog.referencing(&t.name) {
@@ -587,6 +666,7 @@ pub fn drop_tables(
         }
     }
     for t in &tables {
+        s.drop_grants(&format!("table:{}", t.name))?;
         let w = Write {
             collection: TABLES.into(),
             key: t.name.clone(),
@@ -648,6 +728,9 @@ pub fn drop_indexes(
                     || t.uniques.iter().any(|u| u.name.eq_ignore_ascii_case(n))
             }),
         };
+        if let Some(t) = &owner {
+            s.require_owner(t, "INDEX")?;
+        }
         // SQL Server: dropping the columnstore index turns columnar storage off.
         let columnstore = match table {
             Some(t) => Some(s.engine.table(t)?).filter(|t| {
@@ -661,6 +744,9 @@ pub fn drop_indexes(
                     .is_some_and(|c| !c.is_empty() && c.eq_ignore_ascii_case(n))
             }),
         };
+        if let Some(t) = &columnstore {
+            s.require_owner(t, "INDEX")?;
+        }
         if let Some(t) = columnstore {
             let mut t = (*t).clone();
             let version = t.version;
@@ -714,7 +800,21 @@ pub fn alter_table(s: &mut Session, table: &str, ops: &[AlterOp]) -> SqlResult<O
         let current = s.engine.table(table)?;
         let mut t = (*current).clone();
         let version = t.version;
+        s.require_owner(&t, "ALTER")?;
         match op {
+            AlterOp::RowSecurity(on) => t.row_security = *on,
+            AlterOp::ForceRowSecurity(on) => t.force_row_security = *on,
+            AlterOp::OwnerTo(role) => {
+                s.check_role_known(role)?;
+                // Handing a table to a role you are not in would hide what you did from yourself;
+                // PostgreSQL refuses it too.
+                let acl = s.engine.acl()?;
+                let me = s.current_role();
+                if !acl.is_superuser(me) && !acl.closure(me).contains(&crate::exec::acl::role_key(role)) {
+                    return Err(SqlError::new("42501", format!("must be able to SET ROLE \"{role}\"")));
+                }
+                t.owner = Some(role.clone());
+            }
             AlterOp::SetColumnar { on, index } => {
                 // Analytics storage (`TASK-130`): the store keeps column segments; the schema
                 // remembers it (and a SQL Server columnstore index name for DROP INDEX).
@@ -867,6 +967,7 @@ pub fn alter_table(s: &mut Session, table: &str, ops: &[AlterOp]) -> SqlResult<O
                 let old = t.name.clone();
                 t.name = new.clone();
                 save_schema(s, &t, Pre::Absent)?;
+                s.rename_grants(&format!("table:{old}"), &format!("table:{new}"))?;
                 let w = Write {
                     collection: TABLES.into(),
                     key: old.clone(),
@@ -1143,6 +1244,7 @@ fn change_type(s: &Session, t: &Table, i: usize, ty: &DataType) -> SqlResult<Opt
 pub fn truncate(s: &mut Session, tables: &[String]) -> SqlResult<Outcome> {
     for n in tables {
         let t = s.engine.table(n)?;
+        s.require_table(&t, "TRUNCATE", &[]).or_else(|e| s.require_owner(&t, "DROP").map_err(|_| e))?;
         s.engine.store.drop_collection(&t.collection)?;
         delete_markers(s, &t.collection, None)?;
         if s.dialect == Dialect::MySql {

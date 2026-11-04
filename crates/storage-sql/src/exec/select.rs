@@ -29,6 +29,8 @@ pub struct ColMeta {
     pub table: Option<String>,
     /// Not visible to `*` or unqualified names (merged `USING` columns).
     pub hidden: bool,
+    /// The running role may not read it: resolving it fails (`exec/acl.rs`).
+    pub denied: bool,
 }
 
 impl ColMeta {
@@ -39,6 +41,7 @@ impl ColMeta {
             ty,
             table: None,
             hidden: false,
+            denied: false,
         }
     }
 }
@@ -612,12 +615,29 @@ impl Exec<'_> {
                     },
                 };
                 let qual = alias.as_ref().map_or(name.as_str(), |a| a.name.as_str());
-                let rows = self.scan_rows(&table, Some(qual), pushable, Vec::new(), outer)?;
-                let rel = Rel {
-                    cols: table_cols(&table),
-                    rows: rows.into_iter().map(|r| r.row).collect(),
-                };
-                rel.requalify(alias, Some(&table.name))
+                let restriction = self.read_restriction(&table)?;
+                // With a restriction nothing is pushed down: see `exec/acl.rs`.
+                let filters: &[&Expr] = if restriction.is_some() { &[] } else { pushable };
+                // Policies read columns the query itself may not ask for.
+                let projection = if restriction.is_some() { self.projection.borrow_mut().take() } else { None };
+                let rows = self.scan_rows(&table, Some(qual), filters, Vec::new(), outer);
+                if restriction.is_some() {
+                    *self.projection.borrow_mut() = projection;
+                }
+                let rows = rows?;
+                let mut cols = table_cols(&table);
+                let mut rows: Vec<Row> = rows.into_iter().map(|r| r.row).collect();
+                if let Some(r) = &restriction {
+                    let mut kept = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        if self.row_visible(r, &cols, &row)? {
+                            kept.push(row);
+                        }
+                    }
+                    rows = kept;
+                    Self::mark_denied(&mut cols, r);
+                }
+                Rel { cols, rows }.requalify(alias, Some(&table.name))
             }
             TableRef::Derived {
                 query,
@@ -687,7 +707,7 @@ impl Exec<'_> {
                         JoinConstraint::On(on),
                     ) if self.cte(name).is_none()
                         && !system::is_system(None, name)
-                        && self.s.engine.find_table(name).ok().flatten().is_some()
+                        && self.s.engine.find_table(name).ok().flatten().is_some_and(|t| matches!(self.read_restriction(&t), Ok(None)))
                         && l.rows.len() <= 2000
                         && matches!(kind, JoinKind::Inner | JoinKind::Left) =>
                     {
@@ -729,6 +749,17 @@ impl Exec<'_> {
                 d
             }
         };
+        // The caller needs SELECT on the view; what it reads, its owner does (`Some(None)`: a view
+        // from before roles, whose owner is unknown: only superusers may read it).
+        let (owner, grant_name) = (self.s.engine.view_owner(name)?.flatten(), name.to_lowercase());
+        {
+            let acl = self.s.engine.acl()?;
+            let me = self.effective_user();
+            let view_table = crate::catalog::Table::view_stub(&grant_name, owner.clone());
+            if acl.table_access(&me, &view_table, "SELECT") != crate::exec::acl::Access::All {
+                return Err(SqlError::new("42501", format!("permission denied for view {name}")));
+            }
+        }
         let depth = self.view_depth.get();
         if depth >= 32 {
             return Err(SqlError::new(
@@ -737,7 +768,9 @@ impl Exec<'_> {
             ));
         }
         self.view_depth.set(depth + 1);
+        let outer_actor = self.acting_as.replace(Some(owner.unwrap_or_else(|| self.effective_user())));
         let rel = self.query(&def.0, None);
+        self.acting_as.replace(outer_actor);
         self.view_depth.set(depth);
         let mut rel = rel?;
         // Column names: the alias's, else the view's declared ones.
@@ -1173,6 +1206,9 @@ impl Exec<'_> {
         let Some(table) = self.s.engine.find_table(name)? else {
             return Ok(None);
         };
+        if !matches!(self.read_restriction(&table), Ok(None)) {
+            return Ok(None);
+        }
         let Some(ci) = table
             .columns
             .iter()
@@ -1869,6 +1905,7 @@ impl Exec<'_> {
                     ty,
                     table,
                     hidden: false,
+            denied: false,
                 }
             })
             .collect();
@@ -2641,6 +2678,7 @@ pub fn table_cols(t: &Table) -> Vec<ColMeta> {
             ty: Some(c.ty.clone()),
             table: Some(t.name.clone()),
             hidden: false,
+            denied: false,
         })
         .collect()
 }

@@ -33,6 +33,19 @@ pub const REFS: &str = "_sql_refs";
 /// View definitions: `{name, sql, dialect, columns}` keyed by the lower-case name.
 pub const VIEWS: &str = "_sql_views";
 
+/// A row-level security policy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Policy {
+    pub name: String,
+    pub permissive: bool,
+    /// `all`, `select`, `insert`, `update` or `delete`.
+    pub command: String,
+    /// Empty: everyone.
+    pub roles: Vec<String>,
+    pub using: Option<Expr>,
+    pub check: Option<Expr>,
+}
+
 /// Collections the gateway keeps for itself (hidden from table listings).
 pub fn is_internal(collection: &str) -> bool {
     collection.starts_with("_sql_") || collection.starts_with('$')
@@ -145,6 +158,12 @@ pub struct Table {
     /// Kept as column segments for analytics (`TASK-130`): `Some` with the SQL Server
     /// columnstore index name (empty in the other dialects).
     pub columnar: Option<String>,
+    /// The owning role (`None`: made before roles existed; only superusers have it).
+    pub owner: Option<String>,
+    /// `ENABLE ROW LEVEL SECURITY`, `FORCE ROW LEVEL SECURITY`, and the policies.
+    pub row_security: bool,
+    pub force_row_security: bool,
+    pub policies: Vec<Policy>,
     /// Version of the schema document.
     pub version: u64,
 }
@@ -152,6 +171,17 @@ pub struct Table {
 pub type Row = Vec<Datum>;
 
 impl Table {
+    /// What privileges on a view are checked against.
+    pub(crate) fn view_stub(name: &str, owner: Option<String>) -> Table {
+        Table { name: name.to_owned(), collection: String::new(), columns: Vec::new(), primary_key: Vec::new(), uniques: Vec::new(), indexes: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new(), pk_name: None, columnar: None, owner, row_security: false, force_row_security: false, policies: Vec::new(), version: 0 }
+    }
+
+    /// An empty table (tests).
+    #[cfg(test)]
+    pub(crate) fn test_table() -> Table {
+        Self::view_stub("", None)
+    }
+
     /// Column position by name (exact, then case-insensitive).
     pub fn column_index(&self, name: &str) -> Option<usize> {
         self.columns
@@ -367,6 +397,33 @@ impl Table {
                     .collect(),
             ),
         );
+        if let Some(o) = &self.owner {
+            d.insert("owner".into(), Value::Text(o.clone()));
+        }
+        d.insert("row_security".into(), Value::Bool(self.row_security));
+        d.insert("force_row_security".into(), Value::Bool(self.force_row_security));
+        d.insert(
+            "policies".into(),
+            Value::List(
+                self.policies
+                    .iter()
+                    .map(|p| {
+                        let mut m = Doc::new();
+                        m.insert("name".into(), Value::Text(p.name.clone()));
+                        m.insert("permissive".into(), Value::Bool(p.permissive));
+                        m.insert("command".into(), Value::Text(p.command.clone()));
+                        m.insert("roles".into(), Value::List(p.roles.iter().map(|r| Value::Text(r.clone())).collect()));
+                        if let Some(e) = &p.using {
+                            m.insert("using".into(), Value::Text(e.to_string()));
+                        }
+                        if let Some(e) = &p.check {
+                            m.insert("check".into(), Value::Text(e.to_string()));
+                        }
+                        Value::Map(m)
+                    })
+                    .collect(),
+            ),
+        );
         d
     }
 
@@ -426,6 +483,10 @@ impl Table {
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             checks: Vec::new(),
+            owner: doc.get("owner").and_then(Value::as_str).map(str::to_owned),
+            row_security: matches!(doc.get("row_security"), Some(Value::Bool(true))),
+            force_row_security: matches!(doc.get("force_row_security"), Some(Value::Bool(true))),
+            policies: Vec::new(),
             pk_name: doc
                 .get("pk_name")
                 .and_then(Value::as_str)
@@ -484,6 +545,26 @@ impl Table {
             t.checks.push(CheckDef {
                 name: text(m, "name")?,
                 expr: parse_expr(&text(m, "sql")?, Dialect::Postgres)?,
+            });
+        }
+        for p in list(doc, "policies") {
+            let m = p.as_map().ok_or_else(bad)?;
+            let expr = |k: &str| -> SqlResult<Option<Expr>> {
+                match m.get(k).and_then(Value::as_str) {
+                    Some(sql) => parse_expr(sql, Dialect::Postgres).map(Some),
+                    None => Ok(None),
+                }
+            };
+            t.policies.push(Policy {
+                name: text(m, "name")?,
+                permissive: matches!(m.get("permissive"), Some(Value::Bool(true))),
+                command: text(m, "command")?,
+                roles: match m.get("roles") {
+                    Some(Value::List(l)) => l.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+                    _ => Vec::new(),
+                },
+                using: expr("using")?,
+                check: expr("check")?,
             });
         }
         Ok(t)
@@ -727,6 +808,10 @@ mod tests {
                 on_delete: RefAction::Cascade,
                 on_update: RefAction::NoAction,
             }],
+            owner: None,
+            row_security: false,
+            force_row_security: false,
+            policies: Vec::new(),
             checks: vec![CheckDef {
                 name: "positive".into(),
                 expr: parse_expr("balance >= 0", Dialect::Postgres).unwrap(),

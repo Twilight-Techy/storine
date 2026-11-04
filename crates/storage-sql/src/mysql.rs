@@ -485,7 +485,7 @@ impl Conn {
         if !auth.users.is_empty() {
             let good = match auth.users.get(&user) {
                 Some(pw) => native_check(pw, &nonce, &token),
-                None => false,
+                None => engine.login_role(&user).and_then(|r| r.native).is_some_and(|h| native_check_hash(&h, &nonce, &token)),
             };
             if !good {
                 c.err(&SqlError::auth(format!("Access denied for user '{user}'")))?;
@@ -494,6 +494,10 @@ impl Conn {
             }
         }
         c.session.user = if user.is_empty() { "root".into() } else { user };
+        if let Err(e) = c.session.may_connect() {
+            c.err(&e)?;
+            return c.w.flush();
+        }
         if let Some(db) = database.filter(|d| !d.is_empty()) {
             if let Err(e) = c.session.use_database(&db) {
                 c.err(&e)?;
@@ -557,6 +561,7 @@ impl Conn {
                 0x1b => self.eof(false),
                 0x1f => {
                     self.session.rollback();
+                    self.session.role = None;
                     self.stmts.clear();
                     self.ok(0, 0, false, "")
                 }
@@ -769,6 +774,18 @@ impl Conn {
             Err(e) => self.err(&e),
         }
     }
+}
+
+/// The check against a stored `SHA1(SHA1(pw))`: `token XOR SHA1(nonce + stored)` must hash to it.
+fn native_check_hash(stored: &[u8], nonce: &[u8], token: &[u8]) -> bool {
+    if token.len() != 20 || stored.len() != 20 {
+        return false;
+    }
+    let mut seed = nonce.to_vec();
+    seed.extend_from_slice(stored);
+    let mask = hash::sha1(&seed);
+    let h1: Vec<u8> = token.iter().zip(mask.iter()).map(|(a, b)| a ^ b).collect();
+    hash::ct_eq(&hash::sha1(&h1), stored)
 }
 
 /// `SHA1(pw) XOR SHA1(nonce + SHA1(SHA1(pw)))` (an empty password sends an empty token).
@@ -1080,6 +1097,25 @@ fn describe(s: &mut Session, stmt: &Statement, nparams: usize) -> SqlResult<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_check_against_a_stored_hash_agrees_with_the_password() {
+        let nonce = b"12345678901234567890";
+        let h1 = hash::sha1(b"secret");
+        let stored = hash::sha1(&h1);
+        let mut seed = nonce.to_vec();
+        seed.extend_from_slice(&stored);
+        let mask = hash::sha1(&seed);
+        let token: Vec<u8> = h1.iter().zip(mask.iter()).map(|(a, b)| a ^ b).collect();
+        assert!(native_check("secret", nonce, &token));
+        assert!(native_check_hash(&stored, nonce, &token));
+        assert!(!native_check_hash(&stored, b"00000000000000000000", &token));
+        let mut bad = token.clone();
+        bad[0] ^= 1;
+        assert!(!native_check_hash(&stored, nonce, &bad));
+        assert!(!native_check_hash(&stored, nonce, &[]), "an empty token is no password");
+        assert!(!native_check_hash(&[], nonce, &token));
+    }
 
     #[test]
     fn native_password_scramble() {

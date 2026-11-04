@@ -1654,9 +1654,8 @@ fn call(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Option<Datum>> {
             "isautoclose" | "isautoshrink" | "isfulltextenabled" => i(0),
             _ => N,
         },
-        "user_name" | "suser_name" | "original_login" | "session_user" | "system_user" => {
-            t(&ex.s.user)
-        }
+        "user_name" | "session_user" => t(ex.s.current_role()),
+        "suser_name" | "original_login" | "system_user" => t(&ex.s.user),
         "user_id" | "suser_id" => i(1),
         "host_name" => t("storine"),
         "app_name" => t(ex
@@ -1665,8 +1664,29 @@ fn call(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Option<Datum>> {
             .get("application_name")
             .cloned()
             .unwrap_or_default()),
-        "is_member" | "is_srvrolemember" | "is_rolemember" | "has_dbaccess"
-        | "has_perms_by_name" => i(1),
+        "is_member" | "is_srvrolemember" | "is_rolemember" => {
+            let acl = ex.s.engine.acl()?;
+            let who = match args.get(1) {
+                Some(d) if !d.is_null() => d.to_text(false),
+                _ => ex.s.current_role().to_owned(),
+            };
+            let role = args.first().map(|d| d.to_text(false)).unwrap_or_default();
+            let k = crate::exec::acl::role_key(&role);
+            i(i64::from(acl.closure(&who).contains(&k) || ((k == "sysadmin" || k == "db_owner") && acl.is_superuser(&who))))
+        }
+        "has_perms_by_name" => {
+            let (object, class, privilege) = (args.first().map(|d| d.to_text(false)).unwrap_or_default(), args.get(1).map(|d| d.to_text(false)).unwrap_or_default(), args.get(2).map(|d| d.to_text(false)).unwrap_or_default());
+            let acl = ex.s.engine.acl()?;
+            let me = ex.s.current_role();
+            let bare = object.rsplit('.').next().unwrap_or(&object).trim_matches(['[', ']']).to_owned();
+            let yes = if class.eq_ignore_ascii_case("object") {
+                ex.s.engine.find_table(&bare)?.is_some_and(|t| acl.table_access(me, &t, &privilege.to_ascii_uppercase()) == crate::exec::acl::Access::All)
+            } else {
+                acl.database_allows(me, &privilege.to_ascii_uppercase()) || privilege.eq_ignore_ascii_case("connect")
+            };
+            i(i64::from(yes))
+        }
+        "has_dbaccess" => i(1),
         "permissions" => i(-1),
         "@@microsoftversion" => i(0x1000_03e8),
         "sysutcdatetime" | "sysdatetimeoffset" | "getutcdate" => {
@@ -2099,8 +2119,11 @@ pub fn exec_proc(
             let ex = Exec::new(s, params);
             metadata(&ex, name, &|n: &str, pos: usize| arg(n, pos))
         }
+        "sp_reset_connection" => {
+            s.role = None; // a pooled connection's next user is not who the last one impersonated
+            ok()
+        }
         "sp_set_session_context"
-        | "sp_reset_connection"
         | "sp_addextendedproperty"
         | "sp_updateextendedproperty"
         | "sp_dropextendedproperty"

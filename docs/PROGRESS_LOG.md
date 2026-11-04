@@ -703,3 +703,11 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Audit**: 300 seeds of both new simulations, three mutations caught, the TCP test, the real binaries, clippy. One mutation's Modal run hit my 270 s command limit before reporting, so that mutation (no timestamp-cache mark) was confirmed locally instead: 5 of 8 seed ranges failed with a wrong feed state.
 - **Known limits, not hidden**: feeds and backups are `O(keys)` per pass; a node restart loses protection (detected, not silent); expiry is not a change event; no incremental backups.
 
+### Stage 31: enforced access control (`TASK-145`) — 2026-11-04
+
+- **What exists now**: `GRANT` and `REVOKE` were accepted and ignored until this task, which the plan called a security defect. Roles, users with verifiers, grants down to columns, `DENY` and row-level security are enforced on every statement in the PostgreSQL, MySQL and T-SQL dialects.
+- **Decision**: enforcement sits where rows are reached rather than in a statement walker. A walker would need every AST node right forever; a scan cannot be reached without passing the check.
+- **Behaviour change for existing deployments**: a table made before this task has no owner, so only superusers have rights on it until `ALTER TABLE ... OWNER TO`. With `--user`, those accounts are superusers, so they notice nothing; SSO principals now hold nothing until granted.
+- **Found by testing**: row policies read columns the scan's projection had dropped, so a policy on an unselected column saw NULLs and hid every row. Fail-closed, but wrong; scans under a restriction now read whole rows.
+- **Audit**: `RESET ROLE` was a silent no-op, and pool resets (`DISCARD ALL`, `sp_reset_connection`, `COM_RESET_CONNECTION`) did not end impersonation; foreign keys, `DROP INDEX`, sequences and `CREATE OR REPLACE VIEW` were unchecked. All fixed and tested.
+

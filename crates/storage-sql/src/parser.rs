@@ -4,6 +4,8 @@ use crate::ast::*;
 use crate::error::{SqlError, SqlResult};
 use crate::lexer::{tokenize, Dialect, Token};
 
+mod acl;
+
 /// Words that end an expression or a table reference, so they cannot be bare aliases.
 pub(crate) const RESERVED: &[&str] = &[
     "select",
@@ -805,6 +807,17 @@ impl Parser {
             }
             "execute" | "exec" if self.dialect == Dialect::MsSql => {
                 self.pos += 1;
+                if self.eat_kw("as") {
+                    if !(self.eat_kw("user") || self.eat_kw("login")) {
+                        return Err(SqlError::unsupported("EXECUTE AS other than USER or LOGIN"));
+                    }
+                    self.expect_op("=")?;
+                    let Some(Token::Str(name)) = self.peek().cloned() else {
+                        return Err(self.unexpected("a string"));
+                    };
+                    self.pos += 1;
+                    return Ok(Statement::Role(Box::new(RoleStmt::SetRole(Some(name)))));
+                }
                 if self.eat_op("(") {
                     let sql = self.expr()?;
                     self.expect_op(")")?;
@@ -900,6 +913,9 @@ impl Parser {
             }
             "reset" if self.dialect == Dialect::Postgres => {
                 self.pos += 1;
+                if self.eat_kw("role") || self.eat_kws(&["session", "authorization"]) {
+                    return Ok(Statement::Role(Box::new(RoleStmt::SetRole(None))));
+                }
                 if self.eat_kw("all") {
                     return Ok(Statement::ResetAll);
                 }
@@ -923,9 +939,17 @@ impl Parser {
                     format!("cursor \"{name}\" does not exist"),
                 ))
             }
+            "grant" | "revoke" => self.grant(),
+            "deny" if self.dialect == Dialect::MsSql => self.grant(),
+            "reassign" => self.reassign(),
+            "revert" if self.dialect == Dialect::MsSql => {
+                self.pos += 1;
+                self.skip_to_end();
+                Ok(Statement::Role(Box::new(RoleStmt::SetRole(None))))
+            }
             "discard" | "listen" | "unlisten" | "notify" | "reset" | "lock" | "unlock"
-            | "analyze" | "vacuum" | "checkpoint" | "flush" | "pragma" | "comment" | "grant"
-            | "revoke" | "optimize" | "kill" | "load" => {
+            | "analyze" | "vacuum" | "checkpoint" | "flush" | "pragma" | "comment"
+            | "optimize" | "kill" | "load" => {
                 self.pos += 1;
                 self.skip_to_end();
                 Ok(Statement::NoOp(static_tag(&kw)))
@@ -1017,6 +1041,9 @@ impl Parser {
 
     fn set(&mut self) -> SqlResult<Statement> {
         self.pos += 1; // SET
+        if let Some(st) = self.set_access()? {
+            return Ok(st);
+        }
                        // SET TRANSACTION ... (this / the next transaction) and the session-wide forms.
         let next_only = self.is_kw("transaction");
         if next_only
@@ -1193,6 +1220,8 @@ impl Parser {
                 full,
                 like: like(self)?,
             }
+        } else if self.eat_kw("grants") {
+            Show::Grants(if self.eat_kw("for") { Some(self.role_name()?) } else { None })
         } else if self.eat_kw("columns") || self.eat_kw("fields") {
             let _ = self.eat_kw("from") || self.eat_kw("in");
             let table = self.table_name()?;
@@ -1258,6 +1287,9 @@ impl Parser {
 
     fn create(&mut self) -> SqlResult<Statement> {
         self.pos += 1; // CREATE
+        if let Some(st) = self.create_access()? {
+            return Ok(st);
+        }
         let or_replace = self.eat_kws(&["or", "replace"]);
         let _ = self.eat_kw("temporary") || self.eat_kw("temp") || self.eat_kw("unlogged");
         if self.eat_kw("table") {
@@ -2110,6 +2142,9 @@ impl Parser {
 
     fn drop(&mut self) -> SqlResult<Statement> {
         self.pos += 1;
+        if let Some(st) = self.drop_access()? {
+            return Ok(st);
+        }
         let _ = self.eat_kw("temporary");
         if self.eat_kw("view") {
             let if_exists = self.eat_kws(&["if", "exists"]);
@@ -2183,6 +2218,9 @@ impl Parser {
 
     fn alter(&mut self) -> SqlResult<Statement> {
         self.pos += 1;
+        if let Some(st) = self.alter_access()? {
+            return Ok(st);
+        }
         if !self.eat_kw("table") {
             if self.eat_kw("sequence") || self.eat_kw("database") || self.eat_kw("schema") {
                 self.skip_to_end();
@@ -2267,6 +2305,21 @@ impl Parser {
     }
 
     fn alter_op(&mut self) -> SqlResult<AlterOp> {
+        if self.eat_kws(&["enable", "row", "level", "security"]) {
+            return Ok(AlterOp::RowSecurity(true));
+        }
+        if self.eat_kws(&["disable", "row", "level", "security"]) {
+            return Ok(AlterOp::RowSecurity(false));
+        }
+        if self.eat_kws(&["force", "row", "level", "security"]) {
+            return Ok(AlterOp::ForceRowSecurity(true));
+        }
+        if self.eat_kws(&["no", "force", "row", "level", "security"]) {
+            return Ok(AlterOp::ForceRowSecurity(false));
+        }
+        if self.eat_kws(&["owner", "to"]) {
+            return Ok(AlterOp::OwnerTo(self.ident()?));
+        }
         if self.eat_kw("add") {
             return self.add_item();
         }
@@ -4307,8 +4360,6 @@ fn static_tag(kw: &str) -> &'static str {
         "flush" => "FLUSH",
         "pragma" => "PRAGMA",
         "comment" => "COMMENT",
-        "grant" => "GRANT",
-        "revoke" => "REVOKE",
         "optimize" => "OPTIMIZE",
         "kill" => "KILL",
         _ => "OK",

@@ -126,6 +126,7 @@ impl SqlError {
             "42P07" => 1050, // ER_TABLE_EXISTS_ERROR
             "42702" => 1052, // ER_NON_UNIQ_ERROR
             "23505" => 1062, // ER_DUP_ENTRY
+            "42501" => 1142, // ER_TABLEACCESS_DENIED_ERROR
             "23502" => 1048, // ER_BAD_NULL_ERROR
             "23503" => 1452, // ER_NO_REFERENCED_ROW_2
             "23514" => 3819, // ER_CHECK_CONSTRAINT_VIOLATED
