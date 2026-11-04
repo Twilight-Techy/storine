@@ -158,10 +158,93 @@ impl Tokens {
     }
 }
 
+/// Notices an attention signal while a request runs. A client sends nothing else then (no MARS
+/// here), and a request's reader is busy running it, so any byte arriving means attention, and end
+/// of stream means the client is gone: either way the statement stops. Only a look at the socket
+/// (`peek`), so it works under TLS too; the attention packet itself is read and acknowledged after
+/// the request, as before.
+struct AttentionWatch {
+    socket: TcpStream,
+    state: Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
+}
+
+impl std::fmt::Debug for AttentionWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AttentionWatch")
+    }
+}
+
+/// How often a running request's socket is looked at.
+const ATTENTION_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+impl AttentionWatch {
+    fn start(socket: TcpStream, control: Arc<crate::exec::control::Control>) -> Self {
+        // Odd: a request is running.
+        let state = Arc::new((std::sync::Mutex::new(0u64), std::sync::Condvar::new()));
+        let (shared, peek) = (Arc::clone(&state), socket.try_clone());
+        if let Ok(peek) = peek {
+            let _ = std::thread::Builder::new().name("tds-attention".into()).spawn(move || {
+                let mut byte = [0u8; 1];
+                loop {
+                    let generation = {
+                        let (m, cv) = &*shared;
+                        let mut g = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        while *g % 2 == 0 {
+                            // The connection is gone when nobody else holds the state.
+                            if Arc::strong_count(&shared) == 1 {
+                                return;
+                            }
+                            let (next, _) = cv.wait_timeout(g, std::time::Duration::from_secs(1)).unwrap_or_else(std::sync::PoisonError::into_inner);
+                            g = next;
+                        }
+                        *g
+                    };
+                    let seen = peek.peek(&mut byte);
+                    let still = *shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) == generation;
+                    match seen {
+                        // The request ended meanwhile: those bytes are the next request.
+                        _ if !still => {}
+                        Ok(_) => {
+                            control.cancel();
+                            // Nothing more to learn until this request ends.
+                            let (m, cv) = &*shared;
+                            let mut g = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            while *g == generation {
+                                let (next, _) = cv.wait_timeout(g, std::time::Duration::from_secs(1)).unwrap_or_else(std::sync::PoisonError::into_inner);
+                                g = next;
+                            }
+                        }
+                        Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted) => {}
+                        Err(_) => control.cancel(),
+                    }
+                }
+            });
+        }
+        AttentionWatch { socket, state }
+    }
+
+    /// A request starts running: only now does the shared socket get a read timeout.
+    fn begin(&self) {
+        let _ = self.socket.set_read_timeout(Some(ATTENTION_POLL));
+        let (m, cv) = &*self.state;
+        *m.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        cv.notify_all();
+    }
+
+    fn end(&self) {
+        let (m, cv) = &*self.state;
+        *m.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        cv.notify_all();
+        let _ = self.socket.set_read_timeout(None);
+    }
+}
+
 /// The SQL Server error number for a SQLSTATE.
 fn error_number(code: &str) -> i32 {
     match code {
         "42501" => 229,            // The permission was denied on the object
+        "57014" => 3621,           // The statement has been terminated
+        "53200" => 701,            // There is insufficient system memory
         "23505" => 2627,           // Violation of PRIMARY KEY / UNIQUE KEY constraint
         "23503" | "23514" => 547,  // conflicted with a FOREIGN KEY / CHECK constraint
         "23502" => 515,            // Cannot insert the value NULL
@@ -627,6 +710,7 @@ impl Write for Output {
 }
 
 struct Conn {
+    attention: AttentionWatch,
     r: Input,
     w: Output,
     session: Session,
@@ -649,7 +733,10 @@ struct Prepared {
 impl Conn {
     fn run(engine: Arc<Engine>, stream: TcpStream, auth: &Auth) -> io::Result<()> {
         let session = engine.new_session(Dialect::MsSql, "", None);
+        session.control.attach_socket(&stream);
+        let attention = AttentionWatch::start(stream.try_clone()?, Arc::clone(&session.control));
         let mut c = Conn {
+            attention,
             r: Input::Plain(BufReader::new(stream.try_clone()?)),
             w: Output::Plain(BufWriter::new(stream)),
             session,
@@ -928,9 +1015,14 @@ impl Conn {
         loop {
             let (kind, msg) = match self.read_message() {
                 Ok(m) => m,
+                Err(e) if self.session.control.fatal().is_some() => {
+                    let _ = e;
+                    return Ok(());
+                }
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return Err(e),
             };
+            self.attention.begin();
             let mut t = Tokens {
                 b: Vec::new(),
                 room: self.packet_size - 8,
@@ -940,7 +1032,7 @@ impl Conn {
                 PT_RPC => self.rpc(&msg, &mut t),
                 PT_TRANSACTION => self.transaction_request(&msg, &mut t),
                 PT_ATTENTION => {
-                    // Requests run to completion before the next one is read: just acknowledge.
+                    // What it asked for has stopped (see `AttentionWatch`): acknowledge it.
                     self.done(&mut t, TK_DONE, DONE_ATTN, 0, 0);
                 }
                 other => {
@@ -952,6 +1044,7 @@ impl Conn {
                     self.done(&mut t, TK_DONE, DONE_ERROR, 0, 0);
                 }
             }
+            self.attention.end();
             self.send(PT_REPLY, &t.b)?;
         }
     }

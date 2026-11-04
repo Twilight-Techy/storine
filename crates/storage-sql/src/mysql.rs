@@ -375,6 +375,7 @@ impl Conn {
     }
 
     fn run(engine: Arc<Engine>, stream: TcpStream, auth: &Auth) -> io::Result<()> {
+        let socket = stream.try_clone()?;
         let r = Input::Plain(BufReader::new(stream.try_clone()?));
         let w = Output::Plain(BufWriter::new(stream));
         let server_caps = SERVER_CAPS | if auth.tls.is_some() { CLIENT_SSL } else { 0 };
@@ -498,6 +499,7 @@ impl Conn {
             c.err(&e)?;
             return c.w.flush();
         }
+        c.session.control.attach_socket(&socket);
         if let Some(db) = database.filter(|d| !d.is_empty()) {
             if let Err(e) = c.session.use_database(&db) {
                 c.err(&e)?;
@@ -513,8 +515,16 @@ impl Conn {
         loop {
             let pkt = match self.read_packet() {
                 Ok(p) => p,
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if let Some(why) = self.session.control.fatal() {
+                        self.err(&why)?;
+                        return self.w.flush();
+                    }
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        return Ok(());
+                    }
+                    return Err(e);
+                }
             };
             let Some((&cmd, body)) = pkt.split_first() else {
                 continue;
@@ -528,6 +538,14 @@ impl Conn {
                 0x03 => self.query(body),
                 0x04 => self.eof(false),
                 0x09 => self.write_packet(b"Uptime: 1  Threads: 1  Questions: 0"),
+                // COM_PROCESS_KILL.
+                0x0c => match body.get(..4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])) {
+                    Some(id) => match self.session.signal_session(u64::from(id), true) {
+                        Ok(_) => self.ok(0, 0, false, ""),
+                        Err(e) => self.err(&e),
+                    },
+                    None => self.err(&SqlError::syntax("COM_PROCESS_KILL takes an id".into())),
+                },
                 0x0e => self.ok(0, 0, false, ""),
                 0x16 => self.prepare(body),
                 0x17 => self.execute(body),

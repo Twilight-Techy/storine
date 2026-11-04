@@ -176,6 +176,7 @@ impl Msg {
 
 impl Conn {
     fn run(engine: Arc<Engine>, stream: TcpStream, auth: &Auth) -> io::Result<()> {
+        let socket = stream.try_clone()?;
         // Encryption negotiation: SSLRequest -> 'S' and a TLS handshake when TLS is configured,
         // 'N' otherwise (and always for GSSENCRequest); the startup packet follows.
         let mut plain_r = BufReader::new(stream.try_clone()?);
@@ -227,7 +228,17 @@ impl Conn {
                     w.write_all(b"N")?;
                     w.flush()?;
                 }
-                80_877_102 => return Ok(()), // cancel request: not supported, just close
+                80_877_102 => {
+                    // CancelRequest: a connection of its own, answered by closing it.
+                    if let (Some(pid), Some(secret)) = (body.get(4..8), body.get(8..12)) {
+                        let mut p = [0u8; 4];
+                        p.copy_from_slice(pid);
+                        let mut k = [0u8; 4];
+                        k.copy_from_slice(secret);
+                        engine.registry.cancel_request(i32::from_be_bytes(p), u32::from_be_bytes(k));
+                    }
+                    return Ok(());
+                }
                 196_608 => {
                     let mut p = HashMap::new();
                     let mut b = Body {
@@ -291,6 +302,7 @@ impl Conn {
             w.flush()?;
             return Ok(());
         }
+        session.control.attach_socket(&socket);
         if let Some(app) = params.get("application_name") {
             session.vars.insert("application_name".into(), app.clone());
             session
@@ -317,7 +329,7 @@ impl Conn {
         }
         send_raw(
             &mut w,
-            Msg::new(b'K').i32(session.id as i32).i32(0x5354_4f52),
+            Msg::new(b'K').i32(session.id as i32).i32(session.control.secret as i32),
         )?;
         let mut c = Conn {
             r,
@@ -357,7 +369,14 @@ impl Conn {
     fn loop_messages(&mut self) -> io::Result<()> {
         loop {
             let mut tag = [0u8; 1];
-            self.r.read_exact(&mut tag)?;
+            if let Err(e) = self.r.read_exact(&mut tag) {
+                // Woken by a terminate or the idle-transaction timeout: say why, then close.
+                if let Some(why) = self.session.control.fatal() {
+                    send_raw(&mut self.w, error_msg(&why, "FATAL"))?;
+                    return self.w.flush();
+                }
+                return Err(e);
+            }
             let len = read_i32(&mut self.r)? as usize;
             if !(4..=MAX_MESSAGE).contains(&len) {
                 return Err(bad_input("bad message length"));
@@ -393,6 +412,10 @@ impl Conn {
             };
             match r {
                 Ok(()) => {}
+                Err(e) if self.session.control.fatal().is_some() => {
+                    send_raw(&mut self.w, error_msg(&e, "FATAL"))?;
+                    return self.w.flush();
+                }
                 Err(e) => {
                     self.error(&e)?;
                     if tag[0] == b'Q' {

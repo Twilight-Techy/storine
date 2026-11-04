@@ -883,6 +883,14 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
         }),
         "current_catalog" => Datum::Text(ex.s.database.clone()),
         "pg_backend_pid" | "connection_id" => Datum::Int(ex.s.id as i64),
+        "pg_cancel_backend" | "pg_terminate_backend" => {
+            let terminate = name == "pg_terminate_backend";
+            // Permission errors surface; an unknown session is `false`.
+            Datum::Bool(match u64::try_from(a0.as_i64()?) {
+                Ok(id) => ex.s.signal_session(id, terminate)?,
+                Err(_) => false,
+            })
+        }
         "last_insert_id" | "lastval" | "scope_identity" => Datum::Int(ex.s.last_insert_id),
         "row_count" => Datum::Int(ex.s.last_row_count),
         "found_rows" => Datum::Int(ex.s.last_found_rows as i64),

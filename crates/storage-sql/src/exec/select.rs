@@ -141,6 +141,15 @@ pub(super) fn has_subquery(e: &Expr) -> bool {
 
 impl Exec<'_> {
     pub fn query(&self, q: &Query, outer: Option<&Env<'_>>) -> SqlResult<Rel> {
+        // What a query read on the way is gone when it returns; its result stays.
+        let held = self.memory.get();
+        let rel = self.query_inner(q, outer)?;
+        self.memory.set(held);
+        self.charge(rel_size(&rel))?;
+        Ok(rel)
+    }
+
+    fn query_inner(&self, q: &Query, outer: Option<&Env<'_>>) -> SqlResult<Rel> {
         let pushed = !q.ctes.is_empty();
         if pushed {
             let mut scope = HashMap::new();
@@ -1079,6 +1088,7 @@ impl Exec<'_> {
             };
             let mut matched = false;
             for &ri in candidates {
+                self.tick()?;
                 let mut row = lrow.clone();
                 row.extend(r.rows[ri].iter().cloned());
                 let env = Env {
@@ -1097,6 +1107,7 @@ impl Exec<'_> {
                 if ok {
                     matched = true;
                     r_matched[ri] = true;
+                    self.charge(row.iter().map(datum_size).sum())?;
                     out.push(row);
                     if out.len() > MAX_JOIN_ROWS {
                         // Refuse rather than exhaust the server's memory.
@@ -1383,7 +1394,17 @@ impl Exec<'_> {
                         }
                         return Ok(out);
                     }
-                    None => store.scan(&table.collection, filter)?,
+                    None => {
+                        // Document by document: a long scan stops when told to, and when too big.
+                        let mut docs = Vec::new();
+                        store.scan_while(&table.collection, filter, |d| {
+                            self.tick()?;
+                            self.charge(doc_size(&d.fields))?;
+                            docs.push(d);
+                            Ok(true)
+                        })?;
+                        docs
+                    }
                 }
             }
         };
@@ -2669,6 +2690,38 @@ fn resolves(cols: &[ColMeta], p: &[String]) -> bool {
 }
 
 /// Columns of a base table as an intermediate relation.
+/// Rough bytes of a value in memory (budgets, not a format).
+pub(crate) fn datum_size(d: &Datum) -> u64 {
+    32 + match d {
+        Datum::Text(s) | Datum::Json(s) => s.len() as u64,
+        Datum::Bytes(b) => b.len() as u64,
+        Datum::Array(a) => a.iter().map(datum_size).sum(),
+        Datum::Vector(v) => v.len() as u64 * 4,
+        _ => 0,
+    }
+}
+
+fn rel_size(r: &Rel) -> u64 {
+    // Rows of one plan look alike: a sample is enough, and the cost stays out of the hot path.
+    let n = r.rows.len() as u64;
+    let sample = r.rows.iter().take(32);
+    let (bytes, seen) = sample.fold((0u64, 0u64), |(b, c), row| (b + row.iter().map(datum_size).sum::<u64>(), c + 1));
+    bytes.checked_div(seen).map_or(0, |per_row| per_row * n)
+}
+
+fn doc_size(d: &storine::Doc) -> u64 {
+    fn value(v: &storine::Value) -> u64 {
+        32 + match v {
+            storine::Value::Text(s) => s.len() as u64,
+            storine::Value::Bytes(b) => b.len() as u64,
+            storine::Value::List(l) => l.iter().map(value).sum(),
+            storine::Value::Map(m) => doc_size(m),
+            _ => 0,
+        }
+    }
+    d.iter().map(|(k, v)| k.len() as u64 + value(v)).sum()
+}
+
 pub fn table_cols(t: &Table) -> Vec<ColMeta> {
     t.columns
         .iter()

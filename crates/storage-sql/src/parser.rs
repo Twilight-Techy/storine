@@ -939,6 +939,18 @@ impl Parser {
                     format!("cursor \"{name}\" does not exist"),
                 ))
             }
+            "kill" if self.dialect != Dialect::Postgres => {
+                self.pos += 1;
+                let query_only = self.dialect == Dialect::MySql && self.eat_kw("query");
+                let _ = self.eat_kw("connection");
+                match self.next() {
+                    Some(Token::Number(n)) => match n.parse() {
+                        Ok(id) => Ok(Statement::Kill { id, query_only }),
+                        Err(_) => Err(SqlError::syntax(format!("KILL takes a session id, not {n}"))),
+                    },
+                    _ => Err(self.unexpected("a session id")),
+                }
+            }
             "grant" | "revoke" => self.grant(),
             "deny" if self.dialect == Dialect::MsSql => self.grant(),
             "reassign" => self.reassign(),
@@ -949,7 +961,7 @@ impl Parser {
             }
             "discard" | "listen" | "unlisten" | "notify" | "reset" | "lock" | "unlock"
             | "analyze" | "vacuum" | "checkpoint" | "flush" | "pragma" | "comment"
-            | "optimize" | "kill" | "load" => {
+            | "optimize" | "load" => {
                 self.pos += 1;
                 self.skip_to_end();
                 Ok(Statement::NoOp(static_tag(&kw)))
@@ -1123,6 +1135,14 @@ impl Parser {
         };
         if !self.eat_op("=") && !self.eat_kw("to") {
             if self.dialect == Dialect::MsSql {
+                // SET LOCK_TIMEOUT n (`-1` forever), in milliseconds.
+                if name == "lock_timeout" {
+                    let neg = self.eat_op("-");
+                    if let Some(Token::Number(n)) = self.next() {
+                        return Ok(Statement::Set { name, value: Some(Expr::Str(if neg { format!("-{n}") } else { n })) });
+                    }
+                    return Err(self.unexpected("a number of milliseconds"));
+                }
                 // SET NOCOUNT ON, SET IMPLICIT_TRANSACTIONS OFF ...: one option keeps its value;
                 // option lists (SET ANSI_NULLS, QUOTED_IDENTIFIER ON) do not apply.
                 if let Some(on) = ["on", "off"].into_iter().find(|w| self.is_kw(w)) {
@@ -4361,7 +4381,6 @@ fn static_tag(kw: &str) -> &'static str {
         "pragma" => "PRAGMA",
         "comment" => "COMMENT",
         "optimize" => "OPTIMIZE",
-        "kill" => "KILL",
         _ => "OK",
     }
 }

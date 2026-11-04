@@ -314,7 +314,7 @@ impl Acl {
     pub fn owns(&self, user: &str, owner: Option<&str>) -> bool {
         let Some(owner) = owner else { return false };
         let owner = role_key(owner);
-        self.closure(user).iter().any(|r| *r == owner)
+        self.closure(user).contains(&owner)
     }
 
     /// The access `user` has to `table` for `privilege`.
@@ -1008,7 +1008,7 @@ pub fn grant_statement(s: &mut Session, g: &GrantStmt) -> SqlResult<Outcome> {
     // The objects, each with the owner who may always grant on it.
     let mut objects: Vec<(String, Option<String>)> = Vec::new();
     s.engine.refresh_catalog(true)?;
-    let view_owner = |name: &str| -> SqlResult<Option<Option<String>>> { Ok(s.engine.view_owner(name)?) };
+    let view_owner = |name: &str| -> SqlResult<Option<Option<String>>> { s.engine.view_owner(name) };
     match &g.object {
         GrantObject::Tables(names) => {
             for n in names {

@@ -2,6 +2,11 @@
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    /// MySQL `KILL [QUERY | CONNECTION] id`, T-SQL `KILL id` (`TASK-146`).
+    Kill {
+        id: u64,
+        query_only: bool,
+    },
     /// Roles, users and logins (`TASK-145`).
     Role(Box<RoleStmt>),
     /// `GRANT`, `REVOKE`, `DENY`, `ALTER DEFAULT PRIVILEGES` (`TASK-145`).

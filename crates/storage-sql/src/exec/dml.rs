@@ -682,15 +682,16 @@ fn lock_owner(s: &Session) -> String {
 /// Locks rows of `table` for this transaction, waiting for other holders (`nowait`: fail at once).
 pub fn lock_rows(s: &mut Session, table: &Table, keys: &[String], nowait: bool) -> SqlResult<()> {
     let owner = lock_owner(s);
-    let timeout = s.engine.config.lock_timeout;
+    let timeout = s.lock_wait();
     for key in keys {
         let lock_key = format!("{}/{}", table.collection, key);
         if s.txn.as_ref().is_some_and(|t| t.locks.contains(&lock_key)) {
             continue;
         }
-        let deadline = Instant::now() + timeout;
+        let deadline = timeout.map(|t| Instant::now() + t);
         let mut delay = Duration::from_millis(1);
         loop {
+            s.control.check()?;
             let mut doc = Doc::new();
             doc.insert("owner".into(), Value::Text(owner.clone()));
             doc.insert(
@@ -731,7 +732,7 @@ pub fn lock_rows(s: &mut Session, table: &Table, keys: &[String], nowait: bool) 
                     } else {
                         continue;
                     }
-                    if nowait || Instant::now() >= deadline {
+                    if nowait || deadline.is_some_and(|d| Instant::now() >= d) {
                         return Err(SqlError::lock_timeout(&format!(
                             "row in relation \"{}\"",
                             table.name

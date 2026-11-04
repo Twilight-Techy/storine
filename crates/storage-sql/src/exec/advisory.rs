@@ -301,6 +301,7 @@ pub fn acquire(
         if deadline.is_some_and(|d| Instant::now() >= d) {
             return Ok(false);
         }
+        s.control.check()?;
         std::thread::sleep(delay);
         delay = (delay * 2).min(Duration::from_millis(50));
     }
@@ -356,21 +357,7 @@ pub fn holder(s: &Session, key: &str) -> SqlResult<Option<Option<u64>>> {
 
 /// How long a blocking PostgreSQL lock waits: the session's `lock_timeout` (`0`: forever).
 pub fn pg_lock_timeout(s: &Session) -> Option<Duration> {
-    let v = s.vars.get("lock_timeout")?.trim().to_ascii_lowercase();
-    let (num, unit) = v.split_at(
-        v.find(|c: char| !c.is_ascii_digit() && c != '.')
-            .unwrap_or(v.len()),
-    );
-    let n: f64 = num.parse().ok()?;
-    let ms = match unit.trim() {
-        "" | "ms" => n,
-        "s" => n * 1e3,
-        "min" => n * 60e3,
-        "h" => n * 3600e3,
-        "us" => n / 1e3,
-        _ => return None,
-    };
-    (ms > 0.0).then(|| Duration::from_secs_f64(ms / 1e3))
+    crate::exec::control::parse_duration(s.vars.get("lock_timeout")?, 1.0)
 }
 
 #[cfg(test)]

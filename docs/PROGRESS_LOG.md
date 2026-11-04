@@ -711,3 +711,10 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Found by testing**: row policies read columns the scan's projection had dropped, so a policy on an unselected column saw NULLs and hid every row. Fail-closed, but wrong; scans under a restriction now read whole rows.
 - **Audit**: `RESET ROLE` was a silent no-op, and pool resets (`DISCARD ALL`, `sp_reset_connection`, `COM_RESET_CONNECTION`) did not end impersonation; foreign keys, `DROP INDEX`, sequences and `CREATE OR REPLACE VIEW` were unchecked. All fixed and tested.
 
+### Stage 31: cancellation, timeouts and limits (`TASK-146`) — 2026-11-04
+
+- **What exists now**: a running statement can be stopped from outside in all three protocols. Before this, `CancelRequest` closed the connection without acting and sessions shared a fixed "secret"; `KILL` parsed and did nothing; attention was acknowledged only after the request finished.
+- **Decision**: TDS attention is detected by `peek` rather than by reading the packet. A second reader would break TLS framing and needs a thread handing bytes back; while a request runs nothing else may arrive, so one byte is enough.
+- **Bug found by testing**: a join with no residual filter never evaluated an expression, so it could not notice a cancel, and its output was only counted after it finished. Join candidates now tick and charge.
+- **Test note**: the first python-tds run appeared to hang because the driver is not thread-safe, not because of the server. Driven from one thread, attention is acknowledged in 0.43 s.
+

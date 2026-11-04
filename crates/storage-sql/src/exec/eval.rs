@@ -46,7 +46,15 @@ pub struct Exec<'a> {
     #[allow(clippy::type_complexity)]
     pub(crate) restrictions: RefCell<HashMap<(String, String, String), Option<(Rc<crate::exec::acl::Restriction>, bool)>>>,
     pub(crate) rls_depth: std::cell::Cell<u32>,
+    /// Evaluations since the last look at the session's control (`exec/control.rs`).
+    ticks: std::cell::Cell<u32>,
+    /// Bytes of rows this statement holds, and the most it may.
+    pub(crate) memory: std::cell::Cell<u64>,
+    memory_limit: u64,
 }
+
+/// How many evaluations pass between looks at the session's control.
+const CHECK_EVERY: u32 = 1024;
 
 /// `(table qualifier, columns read)` of each FROM table of a select.
 pub(crate) type Projection = Vec<(String, Vec<usize>)>;
@@ -217,6 +225,9 @@ impl<'a> Exec<'a> {
             acting_as: RefCell::new(None),
             restrictions: RefCell::new(HashMap::new()),
             rls_depth: std::cell::Cell::new(0),
+            ticks: std::cell::Cell::new(0),
+            memory: std::cell::Cell::new(0),
+            memory_limit: s.memory_limit(),
         }
     }
 
@@ -280,7 +291,28 @@ impl<'a> Exec<'a> {
         }
     }
 
+    /// Counts `bytes` more of held rows, failing beyond the statement's limit.
+    pub(crate) fn charge(&self, bytes: u64) -> SqlResult<()> {
+        let used = self.memory.get().saturating_add(bytes);
+        self.memory.set(used);
+        if used > self.memory_limit {
+            return Err(SqlError::new("53200", format!("the statement needs more than its {} bytes of memory (max_query_memory)", self.memory_limit)));
+        }
+        Ok(())
+    }
+
+    /// A look at the session's control every so often.
+    pub(crate) fn tick(&self) -> SqlResult<()> {
+        let t = self.ticks.get().wrapping_add(1);
+        self.ticks.set(t);
+        if t % CHECK_EVERY == 0 {
+            self.s.control.check()?;
+        }
+        Ok(())
+    }
+
     pub fn eval(&self, e: &Expr, env: &Env<'_>) -> SqlResult<Datum> {
+        self.tick()?;
         Ok(match e {
             Expr::Null => Datum::Null,
             Expr::Bool(b) => Datum::Bool(*b),

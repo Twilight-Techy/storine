@@ -11,6 +11,7 @@
 
 pub mod acl;
 pub(crate) mod advisory;
+pub mod control;
 pub(crate) mod ddl;
 pub(crate) mod dml;
 mod eval;
@@ -50,6 +51,8 @@ pub struct EngineConfig {
     pub max_retries: u32,
     /// The `--user` accounts, superusers by configuration; `None`: trust mode (`exec/acl.rs`).
     pub bootstrap_users: Option<std::collections::HashSet<String>>,
+    /// Most bytes of rows one statement may hold (`max_query_memory`, `exec/control.rs`).
+    pub max_query_memory: u64,
 }
 
 impl Default for EngineConfig {
@@ -59,6 +62,7 @@ impl Default for EngineConfig {
             lock_timeout: Duration::from_secs(10),
             max_retries: 64,
             bootstrap_users: None,
+            max_query_memory: 4 << 30,
         }
     }
 }
@@ -73,6 +77,8 @@ pub struct Engine {
     databases: Arc<Databases>,
     /// Roles and grants, as last read.
     pub(crate) acl_cache: std::sync::RwLock<Option<(std::time::Instant, Arc<acl::Acl>)>>,
+    /// The gateway's sessions.
+    pub registry: Arc<control::Registry>,
 }
 
 /// The databases of a gateway: the default one (`EngineConfig::database`) and those made by
@@ -125,6 +131,7 @@ impl Engine {
             config,
             next_session: Arc::new(AtomicU64::new(1)),
             acl_cache: std::sync::RwLock::new(None),
+            registry: Arc::default(),
         })
     }
 
@@ -186,6 +193,7 @@ impl Engine {
             next_session: Arc::clone(&self.next_session),
             databases: Arc::clone(&self.databases),
             acl_cache: std::sync::RwLock::new(None),
+            registry: Arc::clone(&self.registry),
         });
         open.insert(key, Arc::downgrade(&e));
         Ok(e)
@@ -316,6 +324,8 @@ impl Engine {
             None => Arc::clone(self),
         };
         Session {
+            control: self.registry.register(id),
+            depth: 0,
             engine,
             dialect,
             user: user.to_owned(),
@@ -677,6 +687,10 @@ pub struct Session {
     pub user: String,
     /// `SET ROLE` / `EXECUTE AS`: the role privileges are checked for instead of `user`.
     pub role: Option<String>,
+    /// How others reach this session (`exec/control.rs`).
+    pub control: Arc<control::Control>,
+    /// Nesting of `execute` (a statement's limits are set by the outermost).
+    pub(crate) depth: u32,
     pub database: String,
     pub vars: HashMap<String, String>,
     /// Session defaults (`RESET ALL` / `DISCARD ALL` return to them): the dialect's defaults
@@ -707,6 +721,56 @@ pub fn now_ns() -> i64 {
 }
 
 impl Session {
+    fn statement_timeout(&self) -> Option<Duration> {
+        let (name, unit) = if self.dialect == Dialect::MySql { ("max_execution_time", 1.0) } else { ("statement_timeout", 1.0) };
+        control::parse_duration(self.vars.get(name)?, unit)
+    }
+
+    fn idle_transaction_timeout(&self) -> Option<Duration> {
+        control::parse_duration(self.vars.get("idle_in_transaction_session_timeout")?, 1.0)
+    }
+
+    /// How long a row lock is waited for: `Some(ZERO)` not at all, `None` until cancelled.
+    pub(crate) fn lock_wait(&self) -> Option<Duration> {
+        let default = Some(self.engine.config.lock_timeout);
+        match self.dialect {
+            // SET LOCK_TIMEOUT: milliseconds, -1 forever, 0 not at all.
+            Dialect::MsSql => match self.vars.get("lock_timeout").map(|v| v.trim().parse::<i64>()) {
+                Some(Ok(n)) if n < 0 => None,
+                Some(Ok(n)) => Some(Duration::from_millis(n as u64)),
+                _ => default,
+            },
+            Dialect::MySql => self.vars.get("innodb_lock_wait_timeout").and_then(|v| control::parse_duration(v, 1000.0)).or(default),
+            // PostgreSQL: 0 means forever.
+            _ => match self.vars.get("lock_timeout") {
+                Some(v) => control::parse_duration(v, 1.0),
+                None => default,
+            },
+        }
+    }
+
+    /// Most bytes of rows one statement may hold.
+    pub(crate) fn memory_limit(&self) -> u64 {
+        self.vars.get("max_query_memory").and_then(|v| control::parse_bytes(v)).unwrap_or(self.engine.config.max_query_memory)
+    }
+
+    /// `KILL`, `pg_cancel_backend`, `pg_terminate_backend`: a superuser's right, or the session's
+    /// own user's. `false`: no such session.
+    pub(crate) fn signal_session(&self, id: u64, terminate: bool) -> SqlResult<bool> {
+        let Some(target) = self.engine.registry.get(id) else { return Ok(false) };
+        let acl = self.engine.acl()?;
+        let me = self.current_role();
+        if !acl.is_superuser(me) && acl::role_key(&target.user()) != acl::role_key(me) {
+            return Err(SqlError::new("42501", "must be a superuser or the session's own user to signal it"));
+        }
+        if terminate {
+            target.terminate();
+        } else {
+            target.cancel();
+        }
+        Ok(true)
+    }
+
     /// MySQL `SET FOREIGN_KEY_CHECKS = 0` turns foreign-key enforcement off for the session.
     pub fn foreign_key_checks(&self) -> bool {
         !self
@@ -841,7 +905,19 @@ impl Session {
 
     /// Runs one statement with bound parameters.
     pub fn execute(&mut self, stmt: &Statement, params: &[Datum]) -> SqlResult<Outcome> {
-        let out = self.execute_one(stmt, params);
+        if self.depth == 0 {
+            self.control.begin_statement(self.statement_timeout());
+            let mut id = self.control.identity.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if id.user != self.user {
+                id.user.clone_from(&self.user);
+            }
+        }
+        self.depth += 1;
+        let out = self.control.check().and_then(|()| self.execute_one(stmt, params));
+        self.depth -= 1;
+        if self.depth == 0 {
+            self.control.end_statement(self.in_transaction(), self.idle_transaction_timeout());
+        }
         // Transaction-scoped advisory locks end with the transaction (an autocommit statement
         // is a transaction of its own).
         if !self.in_transaction() {
@@ -1137,6 +1213,12 @@ impl Session {
             Statement::Delete(d) => {
                 let out = dml::delete(self, d, params);
                 self.count_changes(out)
+            }
+            Statement::Kill { id, query_only } => {
+                if !self.signal_session(*id, !*query_only)? {
+                    return Err(SqlError::new("42704", format!("Unknown thread id: {id}")));
+                }
+                Ok(Outcome::command("KILL"))
             }
             Statement::Role(r) => acl::role_statement(self, r),
             Statement::Grant(g) => acl::grant_statement(self, g),
