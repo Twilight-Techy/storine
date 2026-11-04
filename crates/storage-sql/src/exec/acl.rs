@@ -1043,7 +1043,14 @@ pub fn grant_statement(s: &mut Session, g: &GrantStmt) -> SqlResult<Outcome> {
                 objects.push((format!("seq:{name}"), None));
             }
         }
-        GrantObject::Functions(names) => objects.extend(names.iter().map(|n| (format!("func:{n}"), None))),
+        GrantObject::Functions(names) => {
+            for n in names {
+                let Some(r) = crate::exec::routine::load_routine(s, n)? else {
+                    return Err(SqlError::new("42883", format!("function {n} does not exist")));
+                };
+                objects.push((format!("func:{}", r.name), r.owner.clone()));
+            }
+        }
         GrantObject::AllFunctions => objects.push(("db".into(), None)),
         GrantObject::Database(name) => {
             if let Some(n) = name {
@@ -1075,6 +1082,12 @@ pub fn grant_statement(s: &mut Session, g: &GrantStmt) -> SqlResult<Outcome> {
             for col in columns {
                 for grantee in &g.grantees {
                     let row = GrantRow { grantee: role_key(grantee), object: object.clone(), privilege: p.clone(), column: col.to_ascii_lowercase(), grant_option: g.grant_option, deny: g.kind == GrantKind::Deny, grantor: role_key(&me) };
+                    // `EXECUTE` is open by default too: closing it from `public` is a mark.
+                    if object.starts_with("func:") && p == "EXECUTE" && role_key(grantee) == "public" {
+                        let mark = GrantRow { privilege: "NOEXECUTE".into(), grant_option: false, deny: false, ..row.clone() };
+                        writes.push(if g.kind == GrantKind::Revoke { put_grant(&mark) } else { del_grant(&mark) });
+                        continue;
+                    }
                     if object == "db" && p == "CONNECT" && role_key(grantee) == "public" {
                         let mark = GrantRow { privilege: "NOCONNECT".into(), grant_option: false, deny: false, ..row.clone() };
                         writes.push(if g.kind == GrantKind::Revoke { put_grant(&mark) } else { del_grant(&mark) });

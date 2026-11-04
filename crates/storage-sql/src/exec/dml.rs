@@ -976,6 +976,19 @@ fn build_row(
 }
 
 pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outcome> {
+    // Statement triggers around it; table variables have none.
+    let table = if ins.table.starts_with('@') { None } else { s.engine.find_table(&ins.table)? };
+    if let Some(t) = &table {
+        s.fire_statement_triggers(t, true, "insert")?;
+    }
+    let out = insert_rows(s, ins, params)?;
+    if let Some(t) = &table {
+        s.fire_statement_triggers(t, false, "insert")?;
+    }
+    Ok(out)
+}
+
+fn insert_rows(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outcome> {
     if ins.table.starts_with('@') {
         // T-SQL table variable.
         let rows: Vec<Vec<Datum>> = {
@@ -1105,7 +1118,17 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
     let mut affected = 0u64;
     let mut returned: Vec<Row> = Vec::new();
     let mut statement_keys = HashSet::new();
+    let row_triggers = table.triggers.iter().any(|t| t.for_each_row);
     for (row, gen) in built {
+        let row = if row_triggers {
+            let Some(Some(mut changed)) = s.fire_row_triggers(&table, true, "insert", None, Some(row))? else { continue };
+            let ex = Exec::new(s, params);
+            compute_generated(&ex, &table, &mut changed)?;
+            check_row(&ex, &table, &changed)?;
+            changed
+        } else {
+            row
+        };
         let key = match table.row_key(&row)? {
             Some(k) => k,
             None => format!("r{}", next_sequence(&s.engine, &rowid_sequence(&table))?),
@@ -1140,6 +1163,9 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
         match conflict {
             None => {
                 apply_insert(s, &table, &key, &row)?;
+                if row_triggers {
+                    s.fire_row_triggers(&table, false, "insert", None, Some(row.clone()))?;
+                }
                 statement_keys.insert(key);
                 affected += 1;
                 if first_generated.is_none() {
@@ -1241,6 +1267,9 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
                             }
                         }
                         apply_insert(s, &table, &key, &row)?;
+                        if row_triggers {
+                            s.fire_row_triggers(&table, false, "insert", None, Some(row.clone()))?;
+                        }
                         affected += 2;
                         returned.push(row);
                     }
@@ -1585,6 +1614,14 @@ fn order_and_limit(
 
 pub fn update(s: &mut Session, upd: &Update, params: &[Datum]) -> SqlResult<Outcome> {
     let table = s.engine.table(&upd.table)?;
+    s.fire_statement_triggers(&table, true, "update")?;
+    let out = update_rows(s, upd, params)?;
+    s.fire_statement_triggers(&table, false, "update")?;
+    Ok(out)
+}
+
+fn update_rows(s: &mut Session, upd: &Update, params: &[Datum]) -> SqlResult<Outcome> {
+    let table = s.engine.table(&upd.table)?;
     {
         let names: Vec<&str> = upd.sets.iter().map(|(c, _)| c.as_str()).collect();
         s.require_table(&table, "UPDATE", &names)?;
@@ -1592,7 +1629,7 @@ pub fn update(s: &mut Session, upd: &Update, params: &[Datum]) -> SqlResult<Outc
     for (c, e) in &upd.sets {
         refuse_generated(&table, table.column(c)?, e)?;
     }
-    let unrestricted = Exec::new(s, params).dml_restriction(&table, "update")?.is_none() && !table.columns.iter().any(|c| c.generated.is_some());
+    let unrestricted = Exec::new(s, params).dml_restriction(&table, "update")?.is_none() && !table.columns.iter().any(|c| c.generated.is_some()) && table.triggers.is_empty();
     if unrestricted {
         if let Some(o) = try_atomic_update(s, upd, &table, params)? {
             return Ok(o);
@@ -1647,11 +1684,24 @@ pub fn update(s: &mut Session, upd: &Update, params: &[Datum]) -> SqlResult<Outc
     };
     let mut changed = 0u64;
     let mut returned = Vec::new();
+    let row_triggers = table.triggers.iter().any(|t| t.for_each_row);
     for (t, new) in changes {
+        let new = if row_triggers {
+            let Some(Some(mut after)) = s.fire_row_triggers(&table, true, "update", Some(&t.row), Some(new))? else { continue };
+            let ex = Exec::new(s, params);
+            compute_generated(&ex, &table, &mut after)?;
+            check_row(&ex, &table, &after)?;
+            after
+        } else {
+            new
+        };
         if new != t.row {
             changed += 1;
             // Rows referenced by foreign keys keep their key (key changes cascade / restrict).
             apply_update(s, &table, &t.key, t.version, &t.row, &new)?;
+        }
+        if row_triggers {
+            s.fire_row_triggers(&table, false, "update", Some(&t.row), Some(new.clone()))?;
         }
         returned.push(new);
     }
@@ -1683,6 +1733,14 @@ pub fn update(s: &mut Session, upd: &Update, params: &[Datum]) -> SqlResult<Outc
 pub fn delete(s: &mut Session, del: &Delete, params: &[Datum]) -> SqlResult<Outcome> {
     let table = s.engine.table(&del.table)?;
     s.require_table(&table, "DELETE", &[])?;
+    s.fire_statement_triggers(&table, true, "delete")?;
+    let out = delete_rows(s, del, params)?;
+    s.fire_statement_triggers(&table, false, "delete")?;
+    Ok(out)
+}
+
+fn delete_rows(s: &mut Session, del: &Delete, params: &[Datum]) -> SqlResult<Outcome> {
+    let table = s.engine.table(&del.table)?;
     let qual = del.alias.clone().unwrap_or_else(|| table.name.clone());
     if s.in_transaction() {
         let keys = {
@@ -1702,11 +1760,18 @@ pub fn delete(s: &mut Session, del: &Delete, params: &[Datum]) -> SqlResult<Outc
         s.foreign_key_checks() && !s.engine.catalog.referencing(&table.name).is_empty();
     let mut returned = Vec::new();
     let n = targets.len() as u64;
+    let row_triggers = table.triggers.iter().any(|t| t.for_each_row);
     for (t, _) in targets {
+        if row_triggers && s.fire_row_triggers(&table, true, "delete", Some(&t.row), None)?.is_none() {
+            continue;
+        }
         if referenced {
             plan_and_apply_delete(s, &table, &t.key, t.version, &t.row, false)?;
         } else {
             apply_delete(s, &table, &t.key, t.version, &t.row)?;
+        }
+        if row_triggers {
+            s.fire_row_triggers(&table, false, "delete", Some(&t.row), None)?;
         }
         returned.push(t.row);
     }

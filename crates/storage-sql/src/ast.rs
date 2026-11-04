@@ -2,6 +2,30 @@
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    /// `CREATE FUNCTION` / `CREATE PROCEDURE` (`TASK-149`).
+    CreateFunction(Box<CreateFunction>),
+    DropFunction {
+        names: Vec<String>,
+        if_exists: bool,
+    },
+    /// `CALL p(...)`.
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
+    CreateTrigger(Box<CreateTrigger>),
+    DropTrigger {
+        name: String,
+        table: String,
+        if_exists: bool,
+    },
+    Listen(String),
+    /// `None`: `UNLISTEN *`.
+    Unlisten(Option<String>),
+    Notify {
+        channel: String,
+        payload: String,
+    },
     /// `DECLARE c CURSOR ... FOR query` (`TASK-149`).
     DeclareCursor {
         name: String,
@@ -569,6 +593,42 @@ pub enum AlterOp {
     OwnerTo(String),
 }
 
+/// What a function returns.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FuncReturn {
+    Void,
+    Trigger,
+    Scalar(DataType),
+    Set(DataType),
+    Table(Vec<(String, DataType)>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateFunction {
+    pub name: String,
+    pub or_replace: bool,
+    /// Name (may be empty), type, default.
+    pub args: Vec<(String, DataType, Option<Expr>)>,
+    pub returns: FuncReturn,
+    pub language: String,
+    pub body: String,
+    pub is_procedure: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTrigger {
+    pub name: String,
+    pub or_replace: bool,
+    pub table: String,
+    pub before: bool,
+    /// `insert`, `update`, `delete`.
+    pub events: Vec<String>,
+    pub for_each_row: bool,
+    pub when: Option<Expr>,
+    pub function: String,
+    pub args: Vec<String>,
+}
+
 /// What `FETCH` / `MOVE` do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchDirection {
@@ -760,6 +820,22 @@ pub enum DataType {
     /// pgvector `vector(n)` (`None`: any dimension).
     Vector(Option<u32>),
     Array(Box<DataType>),
+    /// `inet`, `cidr`, `macaddr` and the built-in ranges: canonical text (`nettypes.rs`).
+    Inet,
+    Cidr,
+    MacAddr,
+    Range(RangeKind),
+}
+
+/// A built-in range type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeKind {
+    Int4,
+    Int8,
+    Num,
+    Ts,
+    TsTz,
+    Date,
 }
 
 /// `OVER (PARTITION BY ... ORDER BY ...)` of a window function.

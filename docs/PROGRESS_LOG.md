@@ -733,3 +733,11 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - **Fix**: `RaftNode::applied_own_term` gates lease reads and `read_barrier`. Regression test added. The chaos test also now reports where a failing history stops, instead of dumping tens of thousands of operations.
 - **Two older correctness bugs found by the differential test**: see `TASK-148`.
 
+### Stage 31: the SQL surface for tools (`TASK-149`), and the stale-read fix confirmed — 2026-11-04
+
+- **What exists now**: cursors, private temporary tables, materialized views, generated columns, SQL and PL/pgSQL functions, triggers, `LISTEN` / `NOTIFY`, network and range types. Until now `CREATE TEMP TABLE` quietly made a shared, permanent table, and `LISTEN` was accepted and did nothing.
+- **Decision**: a function called inside a larger query cannot write, and says so. Expressions evaluate over a shared session; letting them write would have meant restructuring the executor, and tools rarely depend on it.
+- **Bug in new code, caught by the trigger test**: a statement inside a trigger started its own implicit transaction, replacing the one in progress, so the row that fired the trigger was lost. Routine bodies now run in the caller's transaction.
+- **Older bug found**: wire messages were written as a header and a body in two calls, which a second writer could split. Messages are one write now.
+- **Stale-read fix confirmed**: 80 of 80 process-chaos runs pass on the fixed code, against 3 failures in about 53 unfixed runs (at that rate, a clean 80 by chance is about 1%).
+

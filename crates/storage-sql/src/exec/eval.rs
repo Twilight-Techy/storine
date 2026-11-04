@@ -293,6 +293,10 @@ impl<'a> Exec<'a> {
             None => match env.outer {
                 Some(o) => self.column(parts, o),
                 None => {
+                    // A variable of the routine running here.
+                    if let Some(v) = self.s.variable(parts) {
+                        return Ok(v);
+                    }
                     // MySQL / SQL Server accept "string" in double quotes / [x] style in places;
                     // a bare unknown name is an error everywhere.
                     Err(SqlError::undefined_column(&parts.join(".")))
@@ -837,6 +841,12 @@ impl<'a> Exec<'a> {
                 }
             }
             BitAnd | BitOr | BitXor | ShiftLeft | ShiftRight => {
+                // `inet << cidr`: is it inside the network? (`>>` the other way round.)
+                if matches!(op, ShiftLeft | ShiftRight) {
+                    if let (Datum::Text(x), Datum::Text(y)) = (&a, &b) {
+                        return Ok(Datum::Bool(if op == ShiftLeft { crate::nettypes::net_within(x, y, false)? } else { crate::nettypes::net_within(y, x, false)? }));
+                    }
+                }
                 if a.is_null() || b.is_null() {
                     Datum::Null
                 } else {
@@ -891,6 +901,16 @@ impl<'a> Exec<'a> {
                         y.iter()
                             .all(|i| x.iter().any(|j| self.equals(i, j) == Some(true))),
                     ),
+                    (Datum::Text(x), small) if crate::nettypes::guess_range(&x).is_some() && (crate::nettypes::is_element(&small) || matches!(small, Datum::Text(_))) => {
+                        let r = crate::nettypes::guess_range(&x).unwrap_or(crate::nettypes::Range { empty: true, lo: None, hi: None, lo_inclusive: false, hi_inclusive: false });
+                        match &small {
+                            Datum::Text(y) => match crate::nettypes::guess_range(y) {
+                                Some(o) => Datum::Bool(crate::nettypes::contains_range(&r, &o)),
+                                None => Datum::Bool(func::json_contains(&x, y)?),
+                            },
+                            other => Datum::Bool(crate::nettypes::contains_element(&r, other)),
+                        }
+                    }
                     (Datum::Json(x) | Datum::Text(x), Datum::Json(y) | Datum::Text(y)) => {
                         Datum::Bool(func::json_contains(&x, &y)?)
                     }
@@ -898,6 +918,10 @@ impl<'a> Exec<'a> {
                 }
             }
             Overlap => match (a, b) {
+                (Datum::Text(x), Datum::Text(y)) if crate::nettypes::guess_range(&x).is_some() && crate::nettypes::guess_range(&y).is_some() => {
+                    let (r, o) = (crate::nettypes::guess_range(&x), crate::nettypes::guess_range(&y));
+                    Datum::Bool(r.zip(o).is_some_and(|(r, o)| crate::nettypes::overlaps(&r, &o)))
+                }
                 (Datum::Array(x), Datum::Array(y)) => Datum::Bool(
                     x.iter()
                         .any(|i| y.iter().any(|j| self.equals(i, j) == Some(true))),

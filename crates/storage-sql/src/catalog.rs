@@ -35,6 +35,18 @@ pub const VIEWS: &str = "_sql_views";
 /// Materialized views: `{name, sql, dialect}`; their rows are an ordinary table.
 pub const MATVIEWS: &str = "_sql_matviews";
 
+/// A trigger on a table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trigger {
+    pub name: String,
+    pub before: bool,
+    pub events: Vec<String>,
+    pub for_each_row: bool,
+    pub when: Option<Expr>,
+    pub function: String,
+    pub args: Vec<String>,
+}
+
 /// A row-level security policy.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Policy {
@@ -170,6 +182,7 @@ pub struct Table {
     pub policies: Vec<Policy>,
     /// A temporary table of this session (`exec/temp.rs`), and what ends it.
     pub temp: Option<crate::ast::OnCommit>,
+    pub triggers: Vec<Trigger>,
     /// Version of the schema document.
     pub version: u64,
 }
@@ -179,7 +192,7 @@ pub type Row = Vec<Datum>;
 impl Table {
     /// What privileges on a view are checked against.
     pub(crate) fn view_stub(name: &str, owner: Option<String>) -> Table {
-        Table { name: name.to_owned(), collection: String::new(), columns: Vec::new(), primary_key: Vec::new(), uniques: Vec::new(), indexes: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new(), pk_name: None, columnar: None, owner, row_security: false, force_row_security: false, policies: Vec::new(), temp: None, version: 0 }
+        Table { name: name.to_owned(), collection: String::new(), columns: Vec::new(), primary_key: Vec::new(), uniques: Vec::new(), indexes: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new(), pk_name: None, columnar: None, owner, row_security: false, force_row_security: false, policies: Vec::new(), temp: None, triggers: Vec::new(), version: 0 }
     }
 
     /// An empty table (tests).
@@ -409,6 +422,27 @@ impl Table {
         if let Some(o) = &self.owner {
             d.insert("owner".into(), Value::Text(o.clone()));
         }
+        d.insert(
+            "triggers".into(),
+            Value::List(
+                self.triggers
+                    .iter()
+                    .map(|t| {
+                        let mut m = Doc::new();
+                        m.insert("name".into(), Value::Text(t.name.clone()));
+                        m.insert("before".into(), Value::Bool(t.before));
+                        m.insert("events".into(), Value::List(t.events.iter().map(|e| Value::Text(e.clone())).collect()));
+                        m.insert("row".into(), Value::Bool(t.for_each_row));
+                        if let Some(w) = &t.when {
+                            m.insert("when".into(), Value::Text(w.to_string()));
+                        }
+                        m.insert("function".into(), Value::Text(t.function.clone()));
+                        m.insert("args".into(), Value::List(t.args.iter().map(|e| Value::Text(e.clone())).collect()));
+                        Value::Map(m)
+                    })
+                    .collect(),
+            ),
+        );
         d.insert("row_security".into(), Value::Bool(self.row_security));
         d.insert("force_row_security".into(), Value::Bool(self.force_row_security));
         d.insert(
@@ -501,6 +535,7 @@ impl Table {
             force_row_security: matches!(doc.get("force_row_security"), Some(Value::Bool(true))),
             policies: Vec::new(),
             temp: None,
+            triggers: Vec::new(),
             pk_name: doc
                 .get("pk_name")
                 .and_then(Value::as_str)
@@ -559,6 +594,27 @@ impl Table {
             t.checks.push(CheckDef {
                 name: text(m, "name")?,
                 expr: parse_expr(&text(m, "sql")?, Dialect::Postgres)?,
+            });
+        }
+        for p in list(doc, "triggers") {
+            let m = p.as_map().ok_or_else(bad)?;
+            let strings = |k: &str| -> Vec<String> {
+                match m.get(k) {
+                    Some(Value::List(l)) => l.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+                    _ => Vec::new(),
+                }
+            };
+            t.triggers.push(Trigger {
+                name: text(m, "name")?,
+                before: matches!(m.get("before"), Some(Value::Bool(true))),
+                events: strings("events"),
+                for_each_row: matches!(m.get("row"), Some(Value::Bool(true))),
+                when: match m.get("when").and_then(Value::as_str) {
+                    Some(sql) => Some(parse_expr(sql, Dialect::Postgres)?),
+                    None => None,
+                },
+                function: text(m, "function")?,
+                args: strings("args"),
             });
         }
         for p in list(doc, "policies") {
@@ -828,6 +884,7 @@ mod tests {
             force_row_security: false,
             policies: Vec::new(),
             temp: None,
+            triggers: Vec::new(),
             checks: vec![CheckDef {
                 name: "positive".into(),
                 expr: parse_expr("balance >= 0", Dialect::Postgres).unwrap(),

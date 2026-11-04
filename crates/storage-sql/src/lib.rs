@@ -14,6 +14,7 @@ pub mod hash;
 pub mod kerberos;
 pub mod lexer;
 pub mod mysql;
+pub mod nettypes;
 pub mod oidc;
 pub mod parser;
 pub mod pg;

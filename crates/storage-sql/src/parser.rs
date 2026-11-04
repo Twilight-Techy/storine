@@ -5,6 +5,7 @@ use crate::error::{SqlError, SqlResult};
 use crate::lexer::{tokenize, Dialect, Token};
 
 mod acl;
+pub(crate) mod plpgsql;
 
 /// Words that end an expression or a table reference, so they cannot be bare aliases.
 pub(crate) const RESERVED: &[&str] = &[
@@ -1046,6 +1047,44 @@ impl Parser {
                 }
                 Ok(Statement::Analyze(tables))
             }
+            "listen" if self.dialect == Dialect::Postgres => {
+                self.pos += 1;
+                Ok(Statement::Listen(self.ident()?))
+            }
+            "unlisten" if self.dialect == Dialect::Postgres => {
+                self.pos += 1;
+                if self.eat_op("*") {
+                    return Ok(Statement::Unlisten(None));
+                }
+                Ok(Statement::Unlisten(Some(self.ident()?)))
+            }
+            "notify" if self.dialect == Dialect::Postgres => {
+                self.pos += 1;
+                let channel = self.ident()?;
+                let payload = if self.eat_op(",") {
+                    match self.next() {
+                        Some(Token::Str(s)) => s,
+                        _ => return Err(self.unexpected("a payload string")),
+                    }
+                } else {
+                    String::new()
+                };
+                Ok(Statement::Notify { channel, payload })
+            }
+            "call" if self.dialect == Dialect::Postgres => {
+                self.pos += 1;
+                let name = self.table_name()?.to_ascii_lowercase();
+                self.expect_op("(")?;
+                let mut args = Vec::new();
+                while !self.is_op(")") {
+                    args.push(self.expr()?);
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+                self.expect_op(")")?;
+                Ok(Statement::Call { name, args })
+            }
             "grant" | "revoke" => self.grant(),
             "deny" if self.dialect == Dialect::MsSql => self.grant(),
             "reassign" => self.reassign(),
@@ -1054,7 +1093,7 @@ impl Parser {
                 self.skip_to_end();
                 Ok(Statement::Role(Box::new(RoleStmt::SetRole(None))))
             }
-            "discard" | "listen" | "unlisten" | "notify" | "reset" | "lock" | "unlock"
+            "discard" | "reset" | "lock" | "unlock"
             | "vacuum" | "checkpoint" | "flush" | "pragma" | "comment"
             | "optimize" | "load" => {
                 self.pos += 1;
@@ -1423,6 +1462,14 @@ impl Parser {
             return Ok(st);
         }
         let or_replace = self.eat_kws(&["or", "replace"]);
+        if self.is_kw("function") || self.is_kw("procedure") {
+            let is_procedure = self.is_kw("procedure");
+            self.pos += 1;
+            return self.create_function(or_replace, is_procedure);
+        }
+        if self.eat_kw("trigger") {
+            return self.create_trigger(or_replace);
+        }
         let _ = self.eat_kw("global") || self.eat_kw("local");
         let temporary = self.eat_kw("temporary") || self.eat_kw("temp");
         let _ = self.eat_kw("unlogged");
@@ -2176,6 +2223,15 @@ impl Parser {
                 self.expect_op(")")?;
                 DataType::Enum(values)
             }
+            "inet" if self.dialect == Dialect::Postgres => DataType::Inet,
+            "cidr" if self.dialect == Dialect::Postgres => DataType::Cidr,
+            "macaddr" if self.dialect == Dialect::Postgres => DataType::MacAddr,
+            "int4range" if self.dialect == Dialect::Postgres => DataType::Range(RangeKind::Int4),
+            "int8range" if self.dialect == Dialect::Postgres => DataType::Range(RangeKind::Int8),
+            "numrange" if self.dialect == Dialect::Postgres => DataType::Range(RangeKind::Num),
+            "tsrange" if self.dialect == Dialect::Postgres => DataType::Range(RangeKind::Ts),
+            "tstzrange" if self.dialect == Dialect::Postgres => DataType::Range(RangeKind::TsTz),
+            "daterange" if self.dialect == Dialect::Postgres => DataType::Range(RangeKind::Date),
             "set" | "geometry" | "point" | "polygon" | "xml" | "tsvector" | "hstore" | "inet"
             | "cidr" | "macaddr" => {
                 return Err(SqlError::unsupported(format!(
@@ -2326,6 +2382,29 @@ impl Parser {
         self.pos += 1;
         if let Some(st) = self.drop_access()? {
             return Ok(st);
+        }
+        if self.eat_kw("function") || self.eat_kw("procedure") || self.eat_kw("routine") {
+            let if_exists = self.eat_kws(&["if", "exists"]);
+            let mut names = Vec::new();
+            loop {
+                names.push(self.table_name()?.to_ascii_lowercase());
+                if self.is_op("(") {
+                    let _ = self.pl_arg_types();
+                }
+                if !self.eat_op(",") {
+                    break;
+                }
+            }
+            self.skip_to_end();
+            return Ok(Statement::DropFunction { names, if_exists });
+        }
+        if self.eat_kw("trigger") {
+            let if_exists = self.eat_kws(&["if", "exists"]);
+            let name = self.ident()?;
+            self.expect_kw("on")?;
+            let table = self.table_name()?;
+            self.skip_to_end();
+            return Ok(Statement::DropTrigger { name, table, if_exists });
         }
         let _ = self.eat_kw("temporary");
         if self.eat_kws(&["materialized", "view"]) {
@@ -4550,9 +4629,6 @@ fn type_word(t: &str) -> bool {
 fn static_tag(kw: &str) -> &'static str {
     match kw {
         "discard" => "DISCARD ALL",
-        "listen" => "LISTEN",
-        "unlisten" => "UNLISTEN",
-        "notify" => "NOTIFY",
         "reset" => "RESET",
         "lock" => "LOCK TABLE",
         "unlock" => "UNLOCK TABLES",

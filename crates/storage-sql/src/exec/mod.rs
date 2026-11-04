@@ -12,6 +12,8 @@
 pub mod acl;
 pub mod activity;
 pub(crate) mod cursor;
+pub mod notify;
+pub(crate) mod routine;
 pub(crate) mod temp;
 pub(crate) mod advisory;
 pub mod control;
@@ -344,6 +346,9 @@ impl Engine {
             trace: None,
             temp: Arc::default(),
             cursors: HashMap::new(),
+            frames: std::sync::Mutex::new(Vec::new()),
+            listening: std::collections::HashSet::new(),
+            pending_notifies: Vec::new(),
             engine,
             dialect,
             user: user.to_owned(),
@@ -561,6 +566,7 @@ enum Undo {
 /// its row locks are released at once instead of when they expire.
 impl Drop for Session {
     fn drop(&mut self) {
+        self.engine.registry.unlisten_all(self.id);
         if self.txn.is_some() {
             self.rollback();
         }
@@ -717,6 +723,11 @@ pub struct Session {
     /// Temporary tables and cursors (`exec/temp.rs`, `exec/cursor.rs`).
     pub(crate) temp: temp::TempTables,
     pub(crate) cursors: cursor::Cursors,
+    /// Variables of routines being run (`exec/routine.rs`).
+    pub(crate) frames: routine::Frames,
+    /// Channels this session listens on, and notifications waiting for its commit.
+    pub(crate) listening: std::collections::HashSet<String>,
+    pub(crate) pending_notifies: Vec<(String, String)>,
     pub database: String,
     pub vars: HashMap<String, String>,
     /// Session defaults (`RESET ALL` / `DISCARD ALL` return to them): the dialect's defaults
@@ -849,6 +860,15 @@ impl Session {
             self.engine.store.commit(std::slice::from_ref(&w)).map_err(|e| e.to_sql(std::slice::from_ref(&w)))?;
         }
         Ok(Outcome::command("DROP MATERIALIZED VIEW"))
+    }
+
+    /// A statement of a routine body: inside the running statement's transaction.
+    pub(crate) fn run_nested(&mut self, stmt: &Statement, params: &[Datum]) -> SqlResult<Outcome> {
+        if matches!(stmt, Statement::Begin { .. } | Statement::Commit | Statement::Rollback | Statement::Savepoint(_) | Statement::ReleaseSavepoint(_) | Statement::RollbackToSavepoint(_)) {
+            return Err(SqlError::new("2D000", "transaction control is not allowed inside a function"));
+        }
+        self.control.check()?;
+        self.run(stmt, params)
     }
 
     /// Inside `BEGIN ... COMMIT` (not the implicit transaction of one statement).
@@ -1072,6 +1092,11 @@ impl Session {
             if !self.in_transaction() && (was_explicit || !self.temp.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()) {
                 self.cursors_after_transaction();
                 self.temp_after_transaction()?;
+            }
+            // Notifications go out when their transaction commits; a failure drops them.
+            if !self.in_transaction() {
+                let ok = out.is_ok() && !matches!(stmt, Statement::Rollback);
+                self.flush_notifies(ok);
             }
             self.control.end_statement(self.in_transaction(), self.idle_transaction_timeout());
             self.activity_end(&out, started);
@@ -1353,9 +1378,16 @@ impl Session {
                     dml::lock_query_rows(self, q, params)?;
                 }
                 let ex = eval::Exec::new(self, params);
-                let rel = ex.query(q, None)?;
-                let rs = ex.result_set(rel)?;
+                let first = ex.query(q, None).and_then(|rel| ex.result_set(rel));
                 drop(ex);
+                // A function that writes, called on its own, runs with the session itself.
+                let rs = match first {
+                    Err(e) if routine::needs_session(&e) => match self.select_function_with_session(q, params) {
+                        Some(out) => return out,
+                        None => return Err(e),
+                    },
+                    other => other?,
+                };
                 self.last_found_rows = rs.rows.len() as u64;
                 self.last_row_count = -1;
                 Ok(Outcome::Rows(rs))
@@ -1372,6 +1404,17 @@ impl Session {
                 let out = dml::delete(self, d, params);
                 self.count_changes(out)
             }
+            Statement::CreateFunction(f) => self.create_function(f),
+            Statement::DropFunction { names, if_exists } => self.drop_function(names, *if_exists),
+            Statement::Call { name, args } => {
+                let _ = self.call_routine(name, args, params)?;
+                Ok(Outcome::command("CALL"))
+            }
+            Statement::CreateTrigger(c) => self.create_trigger(c),
+            Statement::DropTrigger { name, table, if_exists } => self.drop_trigger(name, table, *if_exists),
+            Statement::Listen(c) => self.listen(c),
+            Statement::Unlisten(c) => self.unlisten(c.as_deref()),
+            Statement::Notify { channel, payload } => self.notify(channel, payload),
             Statement::DeclareCursor { name, query, hold } => self.declare_cursor(name, query, *hold, params),
             Statement::OpenCursor(name) => self.open_cursor(name, params),
             Statement::Fetch { name, direction, move_only, into } => self.fetch_cursor(name, direction, *move_only, into),
@@ -1699,6 +1742,8 @@ impl Session {
                     self.role = None;
                     self.cursors.clear();
                     self.drop_temp_tables();
+                    self.listening.clear();
+                    self.engine.registry.unlisten_all(self.id);
                     self.user_vars.clear();
                     self.table_vars.clear();
                 }

@@ -17,6 +17,17 @@ pub const NS_INFORMATION_SCHEMA: i64 = 13_183;
 /// PostgreSQL type OIDs.
 pub fn type_oid(ty: &DataType) -> u32 {
     match ty {
+        DataType::Inet => 869,
+        DataType::Cidr => 650,
+        DataType::MacAddr => 829,
+        DataType::Range(k) => match k {
+            crate::ast::RangeKind::Int4 => 3904,
+            crate::ast::RangeKind::Num => 3906,
+            crate::ast::RangeKind::Ts => 3908,
+            crate::ast::RangeKind::TsTz => 3910,
+            crate::ast::RangeKind::Date => 3912,
+            crate::ast::RangeKind::Int8 => 3926,
+        },
         DataType::Vector(_) => crate::vector::VECTOR_OID,
         DataType::Array(inner) if matches!(**inner, DataType::Vector(_)) => {
             crate::vector::VECTOR_ARRAY_OID
@@ -1084,15 +1095,16 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
             ("description", T),
         ])
         .done(),
-        "pg_proc" => Builder::new(&[
-            ("oid", I8),
-            ("proname", T),
-            ("pronamespace", I8),
-            ("prorettype", I8),
-            ("proargtypes", T),
-            ("prokind", CH),
-        ])
-        .done(),
+        "pg_proc" => {
+            let mut bd = Builder::new(&[("oid", I8), ("proname", T), ("pronamespace", I8), ("proowner", I8), ("prolang", I8), ("prokind", CH), ("prorettype", I8), ("proargtypes", T), ("prosrc", T), ("proretset", B)]);
+            for d in ex.s.engine.store.scan(super::routine::FUNCTIONS, None)? {
+                let text = |k: &str| d.fields.get(k).and_then(storine::Value::as_str).unwrap_or_default().to_owned();
+                let kind = if matches!(d.fields.get("procedure"), Some(storine::Value::Bool(true))) { "p" } else { "f" };
+                let set = text("returns").starts_with("setof") || text("returns").starts_with("table");
+                bd.row(vec![i(table_oid(&d.key)), t(d.key.clone()), i(NS_PUBLIC), i(10), i(0), t(kind), i(0), t(""), t(text("body")), b(set)]);
+            }
+            bd.done()
+        }
         "pg_enum" => Builder::new(&[
             ("oid", I8),
             ("enumtypid", I8),
@@ -1116,14 +1128,18 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
             ("inhdetachpending", B),
         ])
         .done(),
-        "pg_trigger" => Builder::new(&[
-            ("oid", I8),
-            ("tgrelid", I8),
-            ("tgname", T),
-            ("tgenabled", T),
-            ("tgisinternal", B),
-        ])
-        .done(),
+        "pg_trigger" => {
+            let mut bd = Builder::new(&[("oid", I8), ("tgrelid", I8), ("tgname", T), ("tgfoid", I8), ("tgtype", I4), ("tgenabled", CH), ("tgisinternal", B), ("tgattr", T), ("tgargs", T)]);
+            for x in tables.iter() {
+                for (n, tr) in x.triggers.iter().enumerate() {
+                    // As PostgreSQL packs it: row 1, before 2, insert 4, delete 8, update 16.
+                    let has = |e: &str| tr.events.iter().any(|v| v == e);
+                    let code = i64::from(tr.for_each_row) | (i64::from(tr.before) << 1) | (i64::from(has("insert")) << 2) | (i64::from(has("delete")) << 3) | (i64::from(has("update")) << 4);
+                    bd.row(vec![i(table_oid(&x.name) + n as i64 + 1), i(table_oid(&x.name)), t(tr.name.clone()), i(table_oid(&tr.function)), i(code), t("O"), b(false), t(""), t(tr.args.join(","))]);
+                }
+            }
+            bd.done()
+        }
         "pg_views" => {
             let mut bd = Builder::new(&[
                 ("schemaname", T),
@@ -1579,6 +1595,7 @@ pub fn mysql_type(ty: &DataType) -> (String, String) {
         DataType::Date => ("date".into(), "date".into()),
         DataType::Time => ("time".into(), "time(6)".into()),
         DataType::Interval => ("varchar".into(), "varchar(64)".into()),
+        DataType::Inet | DataType::Cidr | DataType::MacAddr | DataType::Range(_) => ("varchar".into(), crate::datum::type_sql(ty)),
         DataType::Uuid => ("char".into(), "char(36)".into()),
         DataType::Json => ("json".into(), "json".into()),
         DataType::Jsonb => ("jsonb".into(), "jsonb".into()),

@@ -66,9 +66,57 @@ struct Portal {
 type Reader = Box<dyn Read + Send>;
 type Writer = Box<dyn Write + Send>;
 
+/// The connection's writer, shared with the thread that sends notifications to an idle client.
+/// Each protocol message goes through in one write, so messages never interleave.
+struct SharedWriter(Arc<std::sync::Mutex<Writer>>);
+
+impl Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).write(buf)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).write_all(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).flush()
+    }
+}
+
+/// Sends a session's notifications while it is idle, until its connection is gone. Started by the
+/// first `LISTEN`; connections that never listen have no such thread.
+fn notifier(writer: Arc<std::sync::Mutex<Writer>>, inbox: Arc<crate::exec::notify::Inbox>, control: Arc<crate::exec::control::Control>) {
+    loop {
+        if Arc::strong_count(&writer) == 1 {
+            return;
+        }
+        let waiting = {
+            let q = inbox.queue.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (mut q, _) = inbox.ready.wait_timeout(q, std::time::Duration::from_millis(100)).unwrap_or_else(std::sync::PoisonError::into_inner);
+            // As PostgreSQL: not in the middle of a statement or a transaction.
+            if q.is_empty() || control.busy() {
+                continue;
+            }
+            q.drain(..).collect::<Vec<_>>()
+        };
+        let mut w = writer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for n in waiting {
+            if send_raw(&mut *w, Msg::new(b'A').i32(n.pid).cstr(&n.channel).cstr(&n.payload)).is_err() {
+                return;
+            }
+        }
+        if w.flush().is_err() {
+            return;
+        }
+    }
+}
+
 struct Conn {
     r: Reader,
-    w: Writer,
+    w: SharedWriter,
+    /// The notification thread was started.
+    notifying: bool,
     session: Session,
     prepared: HashMap<String, Prepared>,
     portals: HashMap<String, Portal>,
@@ -335,7 +383,8 @@ impl Conn {
         )?;
         let mut c = Conn {
             r,
-            w,
+            w: SharedWriter(Arc::new(std::sync::Mutex::new(w))),
+            notifying: false,
             session,
             prepared: HashMap::new(),
             portals: HashMap::new(),
@@ -358,6 +407,11 @@ impl Conn {
             b'I'
         };
         self.send(Msg::new(b'Z').u8(status))?;
+        if !self.notifying && !self.session.listening.is_empty() {
+            self.notifying = true;
+            let (writer, inbox, control) = (Arc::clone(&self.w.0), self.session.engine.registry.inbox(self.session.id), Arc::clone(&self.session.control));
+            let _ = std::thread::Builder::new().name("pg-notify".into()).spawn(move || notifier(writer, inbox, control));
+        }
         self.w.flush()
     }
 
@@ -1176,11 +1230,12 @@ fn read_startup(r: &mut impl Read) -> io::Result<Vec<u8>> {
 }
 
 fn send_raw(w: &mut impl Write, m: Msg) -> io::Result<()> {
-    let mut hdr = [0u8; 5];
-    hdr[0] = m.tag;
-    hdr[1..].copy_from_slice(&((m.b.len() + 4) as i32).to_be_bytes());
-    w.write_all(&hdr)?;
-    w.write_all(&m.b)
+    // One write: messages on a shared writer must not interleave.
+    let mut out = Vec::with_capacity(m.b.len() + 5);
+    out.push(m.tag);
+    out.extend_from_slice(&((m.b.len() + 4) as i32).to_be_bytes());
+    out.extend_from_slice(&m.b);
+    w.write_all(&out)
 }
 
 fn error_msg(e: &SqlError, severity: &str) -> Msg {

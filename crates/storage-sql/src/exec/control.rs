@@ -151,6 +151,12 @@ impl Control {
         self.socket.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() || !self.identity.lock().unwrap_or_else(std::sync::PoisonError::into_inner).user.is_empty()
     }
 
+    /// In the middle of a statement or a transaction.
+    pub fn busy(&self) -> bool {
+        let id = self.identity.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        id.running || id.in_transaction
+    }
+
     /// What this session is waiting for now.
     pub fn set_wait(&self, wait: Option<String>) {
         self.identity.lock().unwrap_or_else(std::sync::PoisonError::into_inner).wait = wait;
@@ -169,6 +175,8 @@ pub struct Registry {
     janitor: AtomicBool,
     /// Statistics of statements run (`exec/activity.rs`).
     pub statements: crate::exec::activity::Statements,
+    /// `LISTEN` / `NOTIFY` (`exec/notify.rs`).
+    pub(crate) listeners: crate::exec::notify::Listeners,
 }
 
 impl Registry {

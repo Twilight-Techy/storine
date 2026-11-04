@@ -61,6 +61,29 @@ pub fn call(
     name: &str,
     arg_exprs: &[Expr],
     star: bool,
+    distinct: bool,
+    env: &Env<'_>,
+) -> SqlResult<Datum> {
+    match call_builtin(ex, name, arg_exprs, star, distinct, env) {
+        // Not a built-in: perhaps the user's. Built-ins win a name, as `pg_catalog` does.
+        Err(e) if e.code == "42883" => {
+            if crate::exec::routine::load_routine(ex.s, name)?.is_some() {
+                let args = arg_exprs.iter().map(|a| ex.eval(a, env)).collect::<SqlResult<Vec<_>>>()?;
+                if let Some(v) = ex.call_user_function(name, args)? {
+                    return Ok(v);
+                }
+            }
+            Err(e)
+        }
+        other => other,
+    }
+}
+
+fn call_builtin(
+    ex: &Exec<'_>,
+    name: &str,
+    arg_exprs: &[Expr],
+    star: bool,
     _distinct: bool,
     env: &Env<'_>,
 ) -> SqlResult<Datum> {
@@ -130,6 +153,36 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
     let a0 = args.first().cloned().unwrap_or(Datum::Null);
     Ok(match name {
         // ── strings ──
+        "int4range" | "int8range" | "numrange" | "tsrange" | "tstzrange" | "daterange" => {
+            use crate::ast::RangeKind as K;
+            let kind = match name {
+                "int4range" => K::Int4,
+                "int8range" => K::Int8,
+                "numrange" => K::Num,
+                "tsrange" => K::Ts,
+                "tstzrange" => K::TsTz,
+                _ => K::Date,
+            };
+            crate::nettypes::construct(kind, args)?
+        }
+        "isempty" | "lower_inc" | "upper_inc" | "lower_inf" | "upper_inf" | "range_lower" | "range_upper" => {
+            let Some(r) = crate::nettypes::guess_range(&a0.as_text()) else {
+                return Err(SqlError::new("42883", format!("function {name}() needs a range")));
+            };
+            match name {
+                "isempty" => Datum::Bool(r.empty),
+                "lower_inc" => Datum::Bool(r.lo_inclusive),
+                "upper_inc" => Datum::Bool(r.hi_inclusive),
+                "lower_inf" => Datum::Bool(!r.empty && r.lo.is_none()),
+                "upper_inf" => Datum::Bool(!r.empty && r.hi.is_none()),
+                "range_lower" => r.lo.unwrap_or(Datum::Null),
+                _ => r.hi.unwrap_or(Datum::Null),
+            }
+        }
+        "host" | "masklen" | "family" | "network" | "netmask" => match crate::nettypes::net_function(name, &a0.as_text())? {
+            Some(v) => v,
+            None => Datum::Null,
+        },
         "lower" | "lcase" => map_text(&a0, |s| s.to_lowercase()),
         "upper" | "ucase" => map_text(&a0, |s| s.to_uppercase()),
         "length" | "char_length" | "character_length" | "len" => match &a0 {
@@ -882,6 +935,10 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             ex.s.current_role().to_owned()
         }),
         "current_catalog" => Datum::Text(ex.s.database.clone()),
+        "pg_notify" => {
+            ex.s.engine.registry.deliver_now(&ex.s.engine, ex.s.id, &text(&a0), &args.get(1).map(|d| d.as_text()).unwrap_or_default())?;
+            Datum::Null
+        }
         "pg_stat_statements_reset" => {
             if !ex.s.engine.acl()?.is_superuser(ex.s.current_role()) {
                 return Err(SqlError::new("42501", "permission denied for function pg_stat_statements_reset"));
@@ -1963,6 +2020,9 @@ pub fn table_function(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Re
         // A scalar function in FROM is a one-row table named after it
         // (`SELECT * FROM current_schema()`).
         other => {
+            if let Some(rel) = ex.user_table_function(other, args)? {
+                return Ok(rel);
+            }
             let v = scalar(ex, other, args).map_err(|e| {
                 if e.code == "42883" {
                     SqlError::new("42883", format!("function {other}() does not exist"))

@@ -633,6 +633,10 @@ pub fn cast(d: &Datum, ty: &DataType) -> SqlResult<Datum> {
         ))
     };
     Ok(match ty {
+        DataType::Inet => Text(crate::nettypes::canon_inet(&d.as_text())?),
+        DataType::Cidr => Text(crate::nettypes::canon_cidr(&d.as_text())?),
+        DataType::MacAddr => Text(crate::nettypes::canon_macaddr(&d.as_text())?),
+        DataType::Range(kind) => Text(crate::nettypes::range_text(&crate::nettypes::parse_range(*kind, &d.as_text())?)),
         DataType::Vector(n) => Vector(crate::vector::coerce(d, *n)?),
         DataType::Bool => match d {
             Bool(b) => Bool(*b),
@@ -833,6 +837,18 @@ pub fn fit_numeric(x: Decimal, spec: Option<(u8, u8)>) -> SqlResult<Decimal> {
 /// SQL spelling of a type (for messages and catalogs).
 pub fn type_sql(ty: &DataType) -> String {
     match ty {
+        DataType::Inet => "inet".into(),
+        DataType::Cidr => "cidr".into(),
+        DataType::MacAddr => "macaddr".into(),
+        DataType::Range(k) => match k {
+            crate::ast::RangeKind::Int4 => "int4range",
+            crate::ast::RangeKind::Int8 => "int8range",
+            crate::ast::RangeKind::Num => "numrange",
+            crate::ast::RangeKind::Ts => "tsrange",
+            crate::ast::RangeKind::TsTz => "tstzrange",
+            crate::ast::RangeKind::Date => "daterange",
+        }
+        .into(),
         DataType::Bool => "boolean".into(),
         DataType::SmallInt => "smallint".into(),
         DataType::Int => "integer".into(),

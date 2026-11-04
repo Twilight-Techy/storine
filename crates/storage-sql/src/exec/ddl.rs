@@ -425,6 +425,7 @@ pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlR
         force_row_security: false,
         policies: Vec::new(),
         temp: ct.temporary,
+        triggers: Vec::new(),
         version: 0,
     };
     {

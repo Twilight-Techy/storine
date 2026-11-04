@@ -110,7 +110,8 @@ The latest instruction from the user is to do everything that remains, **except*
 - **TASK-145**: done. `exec/acl.rs`, `parser/acl.rs`, `tests/access_control.rs`.
 - **TASK-146**: done. `exec/control.rs`, `tests/control.rs`.
 - **TASK-147**: done. `exec/activity.rs`, `exec/explain.rs`, `tests/activity.rs`.
-- **TASK-148**: done. `exec/stats.rs`, `exec/optimizer.rs`, `tests/optimizer.rs`. Fixed a Raft §8 stale read in single-group mode. Next: `TASK-149`.
+- **TASK-148**: done. `exec/stats.rs`, `exec/optimizer.rs`, `tests/optimizer.rs`. Fixed a Raft §8 stale read in single-group mode.
+- **TASK-149**: done. `exec/temp.rs`, `exec/cursor.rs`, `exec/routine.rs`, `exec/notify.rs`, `parser/plpgsql.rs`, `nettypes.rs`, `tests/sql_surface.rs`. Next: `TASK-150`.
 
 ### Stage 31 — Enterprise SQL (TASK-145 – 152)
 - Enforced `GRANT` / `REVOKE` and row-level security.
