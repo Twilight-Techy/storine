@@ -76,6 +76,10 @@ pub struct TxnSimConfig {
     /// between documents with conservation audits, and per-client counters retried with one
     /// request id (acknowledged <= final value <= attempted: applied at most once).
     pub doc_workload: bool,
+    /// One client takes cluster backups and follows a changefeed at its audit points
+    /// (`TASK-144`): every backup and every resolved feed state must equal the serial order at
+    /// its timestamp, and a backup must hold every commit acknowledged before it began.
+    pub backup_audits: bool,
 }
 
 impl Default for TxnSimConfig {
@@ -105,6 +109,7 @@ impl Default for TxnSimConfig {
             audit_staleness_ns: 0,
             scan_audits: false,
             doc_workload: false,
+            backup_audits: false,
         }
     }
 }
@@ -132,6 +137,12 @@ pub struct TxnSimReport {
     pub follower_reads: u64,
     /// Document writes committed in one phase.
     pub one_phase: usize,
+    /// Backups finished; backups failed by faults; changefeed passes resolved; feeds restarted
+    /// from a backup after losing history.
+    pub backups: usize,
+    pub backups_failed: usize,
+    pub feed_passes: usize,
+    pub feeds_lost: usize,
 }
 
 /// A transaction with an unknown outcome: id, reads, writes.
@@ -209,6 +220,8 @@ struct World {
     /// Transactions whose outcome their coordinator could not learn: (id, reads, writes).
     unknown: Vec<Unknown>,
     audits: Vec<(Timestamp, i64)>,
+    /// Account states read by backups and changefeeds, at their timestamps.
+    snapshots: Vec<(&'static str, Timestamp, BTreeMap<Key, Value>)>,
     report: TxnSimReport,
     failure: Option<String>,
     processed: u64,
@@ -720,6 +733,16 @@ impl KvSender for ClientHandle {
         w.slots[self.i].sleeping_until = None;
     }
 
+    fn protect(&mut self, id: u64, ts: Timestamp, expires: u64) {
+        let shared = Arc::clone(&self.shared);
+        let mut w = shared.0.lock().unwrap_or_else(|p| p.into_inner());
+        for n in &mut w.nodes {
+            if let Some(srv) = n.server.as_mut() {
+                srv.protect(id, ts, expires);
+            }
+        }
+    }
+
     fn collection_is_plain(&mut self, collection: &str) -> bool {
         self.plain.contains(collection)
     }
@@ -828,6 +851,119 @@ fn doc_client(h: &mut ClientHandle, cfg: &TxnSimConfig, rng: &mut SweepRng) {
     }
 }
 
+/// A changefeed consumer's state: its cursor (kept encoded, as a consumer would) and everything
+/// delivered so far.
+#[derive(Default)]
+struct FeedConsumer {
+    cursor: Option<Vec<u8>>,
+    log: BTreeMap<(Key, Timestamp), Value>,
+}
+
+impl FeedConsumer {
+    /// The state at `at`: each key's newest change at or below it.
+    fn state(&self, at: Timestamp) -> BTreeMap<Key, Value> {
+        let mut out = BTreeMap::new();
+        for ((k, t), v) in &self.log {
+            if *t <= at {
+                out.insert(k.clone(), v.clone());
+            }
+        }
+        out
+    }
+}
+
+/// One backup, then the changefeed up to its next resolved timestamp.
+fn backup_and_feed(h: &mut ClientHandle, feed: &mut FeedConsumer, rng: &mut SweepRng) {
+    use crate::dist::{backup, feed as cdc};
+    let shared = Arc::clone(&h.shared);
+    let acked = shared.0.lock().unwrap_or_else(|p| p.into_inner()).committed.iter().map(|c| c.ts).max().unwrap_or(Timestamp::ZERO);
+    let mut store = backup::MemoryStore::default();
+    let taken = backup::backup(h, &mut store).and_then(|_| backup::verify(&store));
+    let mut base = None;
+    {
+        let mut w = shared.0.lock().unwrap_or_else(|p| p.into_inner());
+        match taken {
+            Ok(m) => {
+                if m.ts < acked {
+                    w.failure.get_or_insert(format!("backup at {} misses a commit acknowledged before it began, at {acked}", m.ts));
+                }
+                let mut rows = BTreeMap::new();
+                for i in 0..m.segments.len() {
+                    let seg = store.segments.get(&(i as u64)).cloned().unwrap_or_default();
+                    match backup::decode_segment(&seg) {
+                        Ok(r) => rows.extend(r.into_iter().map(|(k, v)| (k, Some(v)))),
+                        Err(e) => {
+                            w.failure.get_or_insert(format!("backup segment: {e}"));
+                        }
+                    }
+                }
+                w.report.backups += 1;
+                w.snapshots.push(("backup", m.ts, rows.clone()));
+                base = Some((m.ts, rows));
+            }
+            Err(_) => w.report.backups_failed += 1,
+        }
+    }
+    if feed.cursor.is_none() {
+        // First the whole history, later from a backup after losing it.
+        let start = if feed.log.is_empty() { Timestamp::ZERO } else { match &base { Some((t, _)) => *t, None => return } };
+        feed.cursor = Some(cdc::Cursor::at(h, start).encode());
+    }
+    for _ in 0..64 {
+        let Some(cursor) = feed.cursor.as_ref().and_then(|b| cdc::Cursor::decode(b).ok()) else { return };
+        match cdc::poll(h, &cursor, Some("acct"), 2) {
+            Ok(page) => {
+                let page = match cdc::FeedPage::decode(&page.encode()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        shared.0.lock().unwrap_or_else(|p| p.into_inner()).failure.get_or_insert(format!("feed page: {e}"));
+                        return;
+                    }
+                };
+                let mut w = shared.0.lock().unwrap_or_else(|p| p.into_inner());
+                for c in &page.changes {
+                    let k = ((c.collection.clone(), c.key.clone()), c.ts);
+                    // Delivered again after a lost cursor: it must be the same change.
+                    if let Some(prev) = feed.log.insert(k.clone(), c.value.clone()) {
+                        if prev != c.value {
+                            w.failure.get_or_insert(format!("feed delivered two values of {k:?}: {prev:?} and {:?}", c.value));
+                        }
+                    }
+                }
+                if rng.below(5) == 0 {
+                    continue; // "crashed" before saving the cursor: this page comes again
+                }
+                feed.cursor = Some(page.cursor.encode());
+                if let Some(at) = page.resolved {
+                    w.report.feed_passes += 1;
+                    w.snapshots.push(("changefeed", at, feed.state(at)));
+                    return;
+                }
+            }
+            Err(TxnError::HistoryLost(_)) => {
+                // Start over from the backup just taken, as a consumer would.
+                let mut w = shared.0.lock().unwrap_or_else(|p| p.into_inner());
+                w.report.feeds_lost += 1;
+                feed.cursor = None;
+                feed.log.clear();
+                if let Some((t, rows)) = base {
+                    for (k, v) in rows {
+                        feed.log.insert((k, t), v);
+                    }
+                    drop(w);
+                    feed.cursor = Some(cdc::Cursor::at(h, t).encode());
+                }
+                return;
+            }
+            Err(TxnError::Invalid(e)) => {
+                shared.0.lock().unwrap_or_else(|p| p.into_inner()).failure.get_or_insert(format!("feed: {e}"));
+                return;
+            }
+            Err(_) => return, // faults: the cursor is still good, try at the next audit point
+        }
+    }
+}
+
 /// What a client thread does.
 fn client_main(mut h: ClientHandle, cfg: TxnSimConfig) {
     // Wait for the first turn.
@@ -848,7 +984,12 @@ fn client_main(mut h: ClientHandle, cfg: TxnSimConfig) {
         shared.1.notify_all();
         return;
     }
+    let mut feed = FeedConsumer::default();
     for n in 0..cfg.txns_per_client {
+        if cfg.backup_audits && h.i == 0 && n % cfg.audit_every == cfg.audit_every - 1 {
+            backup_and_feed(&mut h, &mut feed, &mut rng);
+            continue;
+        }
         if n % cfg.audit_every == cfg.audit_every - 1 {
             // Audit: every account in one snapshot.
             let read_all = |t: &mut txn::Txn, s: &mut dyn KvSender| -> Result<(i64, Vec<(Key, Value)>), TxnError> {
@@ -933,7 +1074,7 @@ fn client_main(mut h: ClientHandle, cfg: TxnSimConfig) {
                 w.report.unavailable += 1;
                 w.report.first_error.get_or_insert(e);
             }
-            Err(TxnError::Invalid(e)) => w.failure = Some(format!("coordinator: {e}")),
+            Err(TxnError::Invalid(e) | TxnError::HistoryLost(e)) => w.failure = Some(format!("coordinator: {e}")),
         }
     }
     let shared = Arc::clone(&h.shared);
@@ -973,6 +1114,7 @@ pub fn run(root: &Path, seed: u64, cfg: &TxnSimConfig) -> Result<TxnSimReport, S
         committed: Vec::new(),
         unknown: Vec::new(),
         audits: Vec::new(),
+        snapshots: Vec::new(),
         watched: BTreeMap::new(),
         report: TxnSimReport { seed, ..TxnSimReport::default() },
         failure: None,
@@ -1243,6 +1385,19 @@ fn check(w: &mut World) -> Result<(), String> {
             }
         }
         return Err(format!("serializability: no serial order of the transactions committed at {}", c.ts));
+    }
+    // Every backup and resolved feed state equals the serial order at its timestamp.
+    for (what, at, rows) in &w.snapshots {
+        let mut at_ts: BTreeMap<Key, Value> = (0..w.cfg.accounts).map(|i| (account(i), Some(bal(w.cfg.initial_balance)))).collect();
+        for c in txns.iter().filter(|c| c.ts <= *at) {
+            for (k, v) in &c.writes {
+                at_ts.insert(k.clone(), v.clone());
+            }
+        }
+        if rows != &at_ts {
+            let fmt = |m: &BTreeMap<Key, Value>| m.iter().map(|(k, v)| format!("{}={}", k.1, balance(v))).collect::<Vec<_>>().join(" ");
+            return Err(format!("{what} at {at} holds [{}], the serial order gives [{}]", fmt(rows), fmt(&at_ts)));
+        }
     }
     // The final state equals the model.
     for i in 0..w.cfg.accounts {

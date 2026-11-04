@@ -33,29 +33,29 @@ fn bad(what: &'static str) -> StorageError {
 
 // ── Writers ─────────────────────────────────────────────────────────────────────────────
 
-fn put_u32(out: &mut Vec<u8>, v: u32) {
+pub(crate) fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
-fn put_u64(out: &mut Vec<u8>, v: u64) {
+pub(crate) fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
-fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
+pub(crate) fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
     put_u32(out, b.len() as u32);
     out.extend_from_slice(b);
 }
 
-fn put_ts(out: &mut Vec<u8>, ts: Timestamp) {
+pub(crate) fn put_ts(out: &mut Vec<u8>, ts: Timestamp) {
     out.extend_from_slice(&ts.to_bytes());
 }
 
-fn put_key(out: &mut Vec<u8>, k: &Key) {
+pub(crate) fn put_key(out: &mut Vec<u8>, k: &Key) {
     put_bytes(out, k.0.as_bytes());
     put_bytes(out, k.1.as_bytes());
 }
 
-fn put_value(out: &mut Vec<u8>, v: &Value) {
+pub(crate) fn put_value(out: &mut Vec<u8>, v: &Value) {
     match v {
         None => out.push(0),
         Some(m) => {
@@ -110,7 +110,7 @@ fn put_record(out: &mut Vec<u8>, r: &TxnRecord) {
 
 // ── Readers ─────────────────────────────────────────────────────────────────────────────
 
-fn ts(r: &mut SveReader<'_>) -> Result<Timestamp> {
+pub(crate) fn ts(r: &mut SveReader<'_>) -> Result<Timestamp> {
     Timestamp::from_bytes(r.take(12)?).ok_or_else(|| bad("bad timestamp"))
 }
 
@@ -120,15 +120,15 @@ fn txn_id(r: &mut SveReader<'_>) -> Result<TxnId> {
     Ok(id)
 }
 
-fn string(r: &mut SveReader<'_>) -> Result<String> {
+pub(crate) fn string(r: &mut SveReader<'_>) -> Result<String> {
     Ok(r.str()?.to_string())
 }
 
-fn key(r: &mut SveReader<'_>) -> Result<Key> {
+pub(crate) fn key(r: &mut SveReader<'_>) -> Result<Key> {
     Ok((string(r)?, string(r)?))
 }
 
-fn value(r: &mut SveReader<'_>) -> Result<Value> {
+pub(crate) fn value(r: &mut SveReader<'_>) -> Result<Value> {
     match r.u8()? {
         0 => Ok(None),
         1 => Ok(Some(r.map_body()?)),
@@ -136,7 +136,7 @@ fn value(r: &mut SveReader<'_>) -> Result<Value> {
     }
 }
 
-fn flag(r: &mut SveReader<'_>) -> Result<bool> {
+pub(crate) fn flag(r: &mut SveReader<'_>) -> Result<bool> {
     match r.u8()? {
         0 => Ok(false),
         1 => Ok(true),
@@ -173,7 +173,7 @@ fn record(r: &mut SveReader<'_>) -> Result<TxnRecord> {
     Ok(TxnRecord { id, status, ts: ts(r)?, epoch: r.u32()?, heartbeat: ts(r)?, priority: priority(r)? })
 }
 
-fn finish<T>(r: &SveReader<'_>, v: T) -> Result<T> {
+pub(crate) fn finish<T>(r: &SveReader<'_>, v: T) -> Result<T> {
     if r.remaining() != 0 {
         return Err(bad("trailing bytes"));
     }
@@ -460,6 +460,19 @@ pub fn encode_request(req: &KvRequest) -> Vec<u8> {
             put_ts(o, *to);
             o.extend_from_slice(txn);
         }
+        KvRequest::Versions { span, from, to, max_keys } => {
+            o.push(12);
+            span.encode(o);
+            put_ts(o, *from);
+            put_ts(o, *to);
+            put_u32(o, *max_keys);
+        }
+        KvRequest::Protect { id, ts, expires } => {
+            o.push(13);
+            put_u64(o, *id);
+            put_ts(o, *ts);
+            put_u64(o, *expires);
+        }
     }
     out
 }
@@ -505,6 +518,8 @@ pub fn decode_request(bytes: &[u8]) -> Result<KvRequest> {
         }
         9 => KvRequest::Scan { span: KeySpan::decode(r)?, ts: ts(r)?, limit: ts(r)?, txn: opt_txn(r)?, max_keys: r.u32()? },
         10 => KvRequest::RefreshSpan { span: KeySpan::decode(r)?, from: ts(r)?, to: ts(r)?, txn: txn_id(r)? },
+        12 => KvRequest::Versions { span: KeySpan::decode(r)?, from: ts(r)?, to: ts(r)?, max_keys: r.u32()? },
+        13 => KvRequest::Protect { id: r.u64()?, ts: ts(r)?, expires: r.u64()? },
         11 => {
             let n = r.count(4)?;
             let ids = (0..n).map(|_| r.bytes().map(<[u8]>::to_vec)).collect::<Result<Vec<_>>>()?;
@@ -603,6 +618,27 @@ pub fn encode_response(resp: &KvResponse) -> Vec<u8> {
             put_ts(o, *ts);
         }
         KvResponse::NotOnePhase => o.push(16),
+        KvResponse::Versions { rows, resume } => {
+            o.push(17);
+            put_u32(o, rows.len() as u32);
+            for (k, ver, v) in rows {
+                put_key(o, k);
+                put_ts(o, *ver);
+                put_value(o, v);
+            }
+            match resume {
+                None => o.push(0),
+                Some(k) => {
+                    o.push(1);
+                    put_bytes(o, k);
+                }
+            }
+        }
+        KvResponse::HistoryLost { key, below } => {
+            o.push(18);
+            put_key(o, key);
+            put_ts(o, *below);
+        }
         KvResponse::KeyConflict { key, intent_txn, intent_ts } => {
             o.push(14);
             put_key(o, key);
@@ -676,6 +712,16 @@ pub fn decode_response(bytes: &[u8]) -> Result<KvResponse> {
             KvResponse::Atomic { versions, duplicate: flag(r)?, ts: ts(r)? }
         }
         16 => KvResponse::NotOnePhase,
+        17 => {
+            let n = r.count(21)?;
+            let mut rows = Vec::with_capacity(n);
+            for _ in 0..n {
+                rows.push((key(r)?, ts(r)?, value(r)?));
+            }
+            let resume = if flag(r)? { Some(r.bytes()?.to_vec()) } else { None };
+            KvResponse::Versions { rows, resume }
+        }
+        18 => KvResponse::HistoryLost { key: key(r)?, below: ts(r)? },
         _ => return Err(bad("unknown kv response tag")),
     };
     finish(r, resp)
@@ -718,6 +764,8 @@ mod tests {
             KvRequest::Scan { span: KeySpan::new(b"acct/".to_vec(), Some(b"acct0".to_vec())), ts: t(10, 0), limit: t(20, 0), txn: None, max_keys: 100 },
             KvRequest::RefreshSpan { span: KeySpan::all(), from: t(1, 0), to: t(2, 0), txn: [6; 16] },
             KvRequest::Atomic { ids: vec![b"c/a".to_vec(), b"c/b".to_vec()], body: vec![1, 2, 3] },
+            KvRequest::Versions { span: KeySpan::new(b"a".to_vec(), None), from: t(1, 0), to: t(2, 1), max_keys: 64 },
+            KvRequest::Protect { id: 9, ts: t(3, 0), expires: 77 },
         ]
     }
 
@@ -751,6 +799,9 @@ mod tests {
             KvResponse::Rows { rows: Vec::new(), resume: None },
             KvResponse::Atomic { versions: vec![Some(3), None], duplicate: true, ts: t(9, 1) },
             KvResponse::NotOnePhase,
+            KvResponse::Versions { rows: vec![(("acct".into(), "a".into()), t(1, 0), Some(BTreeMap::from([("x".to_string(), PropertyValue::Int64(1))]))), (("acct".into(), "a".into()), t(2, 0), None)], resume: Some(b"acct/b".to_vec()) },
+            KvResponse::Versions { rows: Vec::new(), resume: None },
+            KvResponse::HistoryLost { key: ("acct".into(), "a".into()), below: t(4, 0) },
             KvResponse::KeyConflict { key: ("acct".into(), "b".into()), intent_txn: TxnMeta { id: [2; 16], record_key: "r".into(), priority: (t(1, 0), [2; 16]), epoch: 0 }, intent_ts: t(7, 0) },
         ]
     }

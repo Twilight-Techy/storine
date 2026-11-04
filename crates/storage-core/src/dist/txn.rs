@@ -55,6 +55,10 @@ pub trait KvSender {
     }
     /// Remembers what [`Self::collection_is_plain`] answers.
     fn note_collection(&mut self, _collection: &str, _plain: bool) {}
+    /// Asks every node to keep history at and above `ts` until HLC wall time `expires`
+    /// (`expires == 0` releases protection `id`). Best effort: what it fails to keep is detected
+    /// when read.
+    fn protect(&mut self, _id: u64, _ts: Timestamp, _expires: u64) {}
 }
 
 /// Why a transaction did not commit.
@@ -68,6 +72,8 @@ pub enum TxnError {
     CommitUnknown(String),
     /// The request cannot succeed as written (e.g. a write in a historical transaction).
     Invalid(String),
+    /// A historical read needed history that was already trimmed.
+    HistoryLost(String),
 }
 
 impl core::fmt::Display for TxnError {
@@ -77,6 +83,7 @@ impl core::fmt::Display for TxnError {
             Self::Unavailable(m) => write!(f, "cluster unavailable: {m}"),
             Self::CommitUnknown(m) => write!(f, "commit outcome unknown: {m}"),
             Self::Invalid(m) => write!(f, "invalid transaction: {m}"),
+            Self::HistoryLost(m) => write!(f, "history no longer retained: {m}"),
         }
     }
 }
@@ -85,6 +92,9 @@ const MAX_ATTEMPTS: usize = 64;
 
 /// A document a scan returned: its key and fields.
 pub type Row = (Key, BTreeMap<String, storage_codec::PropertyValue>);
+
+/// A page of a historical read: rows, and where to continue (`None`: the span is done).
+pub type HistoryPage<V> = (Vec<(Key, Timestamp, V)>, Option<Vec<u8>>);
 
 /// An open transaction.
 #[derive(Debug)]
@@ -220,6 +230,41 @@ impl Txn {
             return Ok(out);
         }
         Err(TxnError::Retry("too many scan restarts".into()))
+    }
+
+    /// One page of `span` at this historical transaction's timestamp, for reads too large for
+    /// one call: nothing is remembered per page, and no read may ever move this timestamp.
+    pub fn snapshot_page(&mut self, s: &mut dyn KvSender, span: &KeySpan, max_keys: u32) -> Result<HistoryPage<BTreeMap<String, storage_codec::PropertyValue>>, TxnError> {
+        if !self.as_of {
+            return Err(TxnError::Invalid("a snapshot page needs a historical transaction".into()));
+        }
+        for _ in 0..MAX_ATTEMPTS {
+            let req = KvRequest::Scan { span: span.clone(), ts: self.read_ts, limit: self.limit, txn: Some(self.meta.id), max_keys };
+            match one(s, req)? {
+                KvResponse::Rows { rows, resume } => return Ok((rows, resume)),
+                KvResponse::Uncertain { ts } => return Err(TxnError::HistoryLost(format!("a key is trimmed up to {ts}, above the snapshot at {}", self.read_ts))),
+                KvResponse::KeyConflict { key, intent_txn, intent_ts } => self.push(s, &key, &intent_txn, intent_ts)?,
+                other => return Err(TxnError::Unavailable(format!("unexpected reply {other:?}"))),
+            }
+        }
+        Err(TxnError::Retry("a key stayed locked by concurrent transactions".into()))
+    }
+
+    /// One page of the versions of `span` in `(from, this transaction's timestamp]`.
+    pub fn versions_page(&mut self, s: &mut dyn KvSender, span: &KeySpan, from: Timestamp, max_keys: u32) -> Result<HistoryPage<Value>, TxnError> {
+        if !self.as_of {
+            return Err(TxnError::Invalid("a version scan needs a historical transaction".into()));
+        }
+        for _ in 0..MAX_ATTEMPTS {
+            let req = KvRequest::Versions { span: span.clone(), from, to: self.read_ts, max_keys };
+            match one(s, req)? {
+                KvResponse::Versions { rows, resume } => return Ok((rows, resume)),
+                KvResponse::HistoryLost { key, below } => return Err(TxnError::HistoryLost(format!("{}/{} is trimmed up to {below}, above {from}", key.0, key.1))),
+                KvResponse::KeyConflict { key, intent_txn, intent_ts } => self.push(s, &key, &intent_txn, intent_ts)?,
+                other => return Err(TxnError::Unavailable(format!("unexpected reply {other:?}"))),
+            }
+        }
+        Err(TxnError::Retry("a key stayed locked by concurrent transactions".into()))
     }
 
     pub fn put(&mut self, key: Key, fields: std::collections::BTreeMap<String, storage_codec::PropertyValue>) {

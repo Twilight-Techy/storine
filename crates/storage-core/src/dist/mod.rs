@@ -7,6 +7,8 @@
 //! - [`alloc`]: the allocator's planning rules (`TASK-138`).
 //! - [`meta`]: range descriptors, the meta range and range caches (`TASK-138`).
 //! - [`docs`]: the document API over distributed transactions (`TASK-143`).
+//! - [`backup`]: cluster-wide backups at one timestamp, and restore (`TASK-144`).
+//! - [`feed`]: resumable change data capture (`TASK-144`).
 //! - [`runtime`]: each node's real-time event loop, transports and the routing gateway
 //!   (`TASK-143`).
 //! - [`wire`]: encodings of node batches and KV requests between processes (`TASK-143`).
@@ -20,7 +22,9 @@ pub const fn range_wal_policy() -> storage_wal::SyncPolicy {
 }
 
 pub mod alloc;
+pub mod backup;
 pub mod docs;
+pub mod feed;
 pub mod hlc;
 pub mod meta;
 pub mod mvcc;

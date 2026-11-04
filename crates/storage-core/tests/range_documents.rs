@@ -298,3 +298,52 @@ fn a_batch_may_write_one_key_twice() {
         assert_eq!(docs::get(&mut g, collection, "other").unwrap().unwrap().fields.get("n"), Some(&PropertyValue::Int64(2)));
     }
 }
+
+/// A key rewritten beyond its history bounds: a protected feed gets every version; an unprotected
+/// one is told it lost history, never handed a gap (`TASK-144`).
+#[test]
+fn changefeeds_get_every_version_or_fail_loudly() {
+    use storage_core::dist::feed;
+    use storage_core::dist::txn::{KvSender, TxnError};
+    let c = start("feed");
+    let mut g = c.gateway();
+    let put = |n: i64| DocWrite { collection: "hot".into(), key: "k".into(), op: DocOp::Put(BTreeMap::from([("n".to_string(), PropertyValue::Int64(n))])), precondition: Precondition::None };
+    docs::write(&mut g, vec![put(-1)], None).unwrap();
+    let start_ts = g.now();
+    let protected = feed::Cursor::at(&mut g, start_ts);
+    // A first poll asks for protection...
+    let first = feed::poll(&mut g, &protected, Some("hot"), 16).unwrap();
+    // ...and this one claims to have just renewed it, so it never does.
+    let mut bare = feed::Cursor::at(&mut g, start_ts);
+    bare.renewed = g.now().wall;
+    for n in 0..150 {
+        docs::write(&mut g, vec![put(n)], None).unwrap();
+    }
+    // Protection covers every key of these nodes, so the bare cursor still works for now.
+    assert!(feed::poll(&mut g, &bare, Some("hot"), 16).is_ok());
+    let mut seen = Vec::new();
+    let mut cur = first.cursor;
+    loop {
+        let page = feed::poll(&mut g, &cur, Some("hot"), 16).unwrap();
+        for ch in &page.changes {
+            seen.push(ch.fields().and_then(|f| f.get("n").cloned()));
+        }
+        cur = page.cursor;
+        if page.resolved.is_some() {
+            break;
+        }
+    }
+    let want: Vec<_> = (0..150).map(|n| Some(PropertyValue::Int64(n))).collect();
+    assert_eq!(seen, want, "a protected feed saw every version, in order");
+
+    // Released, the next rewrite trims: a feed from before that is refused.
+    g.protect(protected.id, start_ts, 0);
+    for n in 150..160 {
+        docs::write(&mut g, vec![put(n)], None).unwrap();
+    }
+    match feed::poll(&mut g, &bare, Some("hot"), 16) {
+        Err(TxnError::HistoryLost(m)) => assert!(m.contains("hot/k"), "{m}"),
+        other => panic!("expected lost history, got {other:?}"),
+    }
+    drop(c);
+}

@@ -291,6 +291,9 @@ impl Transport for LocalTransport {
 /// Requests of one call in flight at once.
 const MAX_PARALLEL_REQUESTS: usize = 32;
 
+/// One node's budget to acknowledge a history protection.
+const PROTECT_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Gateway knobs.
 #[derive(Clone, Debug)]
 pub struct GatewayConfig {
@@ -482,6 +485,20 @@ impl KvSender for Gateway {
 
     fn sleep(&mut self, us: u64) {
         std::thread::sleep(Duration::from_micros(us));
+    }
+
+    fn protect(&mut self, id: u64, ts: Timestamp, expires: u64) {
+        let req = wire::encode_request(&KvRequest::Protect { id, ts, expires });
+        let me: &Self = self;
+        // Together: an unreachable node costs one timeout, not one per node.
+        std::thread::scope(|s| {
+            for &to in &me.cfg.nodes {
+                let req = &req;
+                s.spawn(move || {
+                    let _ = me.transport.call(to, req.clone(), PROTECT_TIMEOUT);
+                });
+            }
+        });
     }
 
     fn collection_is_plain(&mut self, collection: &str) -> bool {

@@ -72,6 +72,10 @@ pub struct MvccKey {
 pub const HISTORY_RETENTION_NS: u64 = 60_000_000_000;
 /// Most old versions one key keeps: its record is rewritten whole on every write.
 pub const HISTORY_MAX_VERSIONS: usize = 64;
+/// Most old versions one key keeps while a backup or changefeed protects its history.
+pub const HISTORY_PROTECTED_MAX_VERSIONS: usize = 1024;
+/// Most bytes of old versions one key keeps, protected or not (the newest does not count).
+pub const HISTORY_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// How many committing transactions a key remembers for replay detection. Older replays are
 /// still harmless: their intent lands above the commit and resolution drops it.
@@ -202,12 +206,23 @@ impl MvccKey {
         self.versions.first().map(|(t, _)| *t)
     }
 
-    /// Bounds the key's history at time `now`: versions older than the retention go, and at most
-    /// [`HISTORY_MAX_VERSIONS`] stay. Reads below what remains restart above it.
-    pub fn trim(&mut self, now: Timestamp) {
+    /// Bounds the key's history at time `now`: versions older than the retention (or than
+    /// `protect`, if that is older) go, and at most [`HISTORY_MAX_VERSIONS`] stay
+    /// ([`HISTORY_PROTECTED_MAX_VERSIONS`] under protection), in at most [`HISTORY_MAX_BYTES`].
+    /// Reads below what remains restart above it.
+    pub fn trim(&mut self, now: Timestamp, protect: Option<Timestamp>) {
         let before = self.versions.len();
-        self.gc(Timestamp { wall: now.wall.saturating_sub(HISTORY_RETENTION_NS), logical: 0 });
-        self.versions.truncate(HISTORY_MAX_VERSIONS);
+        let retained = Timestamp { wall: now.wall.saturating_sub(HISTORY_RETENTION_NS), logical: 0 };
+        self.gc(protect.map_or(retained, |p| p.min(retained)));
+        self.versions.truncate(if protect.is_some() { HISTORY_PROTECTED_MAX_VERSIONS } else { HISTORY_MAX_VERSIONS });
+        let mut bytes = 0usize;
+        let over = self.versions.iter().enumerate().skip(1).find_map(|(i, (_, v))| {
+            bytes = bytes.saturating_add(v.as_ref().map_or(0, fields_size));
+            (bytes > HISTORY_MAX_BYTES).then_some(i)
+        });
+        if let Some(i) = over {
+            self.versions.truncate(i);
+        }
         // Only the newest version answers for request ids (`dist::docs`).
         for (_, v) in self.versions.iter_mut().skip(1) {
             if let Some(m) = v {
@@ -225,12 +240,32 @@ impl MvccKey {
     pub fn gc(&mut self, threshold: Timestamp) {
         if let Some(pos) = self.versions.iter().position(|(t, _)| *t <= threshold) {
             self.versions.truncate(pos + 1);
-            // A tombstone that is the oldest remaining version is invisible at every timestamp.
-            if matches!(self.versions.last(), Some((t, None)) if *t <= threshold) {
-                self.versions.pop();
+            // A tombstone that is the oldest remaining version is invisible at every timestamp
+            // at or above it. Below it, the versions it hid are gone: such reads must restart.
+            if let Some((t, None)) = self.versions.last() {
+                if *t <= threshold {
+                    self.trimmed_below = self.trimmed_below.max(*t);
+                    self.versions.pop();
+                }
             }
         }
     }
+}
+
+/// Rough encoded size of a value (budgets, not a format).
+pub fn value_size(v: &PropertyValue) -> usize {
+    match v {
+        PropertyValue::Text(s) => s.len() + 8,
+        PropertyValue::Bytes(b) => b.len() + 8,
+        PropertyValue::List(l) => l.iter().map(value_size).sum::<usize>() + 8,
+        PropertyValue::Map(m) => fields_size(m),
+        _ => 24,
+    }
+}
+
+/// Rough encoded size of a map of fields.
+pub fn fields_size(m: &BTreeMap<String, PropertyValue>) -> usize {
+    m.iter().map(|(k, v)| k.len() + 8 + value_size(v)).sum::<usize>() + 8
 }
 
 /// The outcome of a read.
@@ -541,9 +576,49 @@ mod tests {
     }
 
     #[test]
+    fn trimming_a_last_tombstone_remembers_what_it_hid() {
+        // Regression: the value below a deleted key was forgotten, with no mark, so a historical
+        // read below the delete reported the key as never having existed.
+        let mut k = MvccKey { versions: vec![(t(50), None), (t(10), Some(BTreeMap::new()))], ..MvccKey::default() };
+        k.trim(Timestamp { wall: HISTORY_RETENTION_NS + 1_000_000, logical: 0 }, None);
+        assert!(k.versions.is_empty());
+        assert_eq!(k.trimmed_below, t(50));
+        assert_eq!(eval_read(&k, t(20), t(20), None), ReadOutcome::Uncertain { ts: t(50) });
+        assert_eq!(eval_read(&k, t(50), t(50), None), ReadOutcome::Value(None, None));
+    }
+
+    #[test]
+    fn protection_keeps_history_within_its_bounds() {
+        let now = Timestamp { wall: HISTORY_RETENTION_NS * 2, logical: 0 };
+        let many = |n: u64, size: usize| MvccKey {
+            versions: (0..n).rev().map(|i| (t(i + 1), Some(BTreeMap::from([("b".to_string(), PropertyValue::Bytes(vec![0; size]))])))).collect(),
+            ..MvccKey::default()
+        };
+        // Older than the retention, and more than the plain bound: gone without protection.
+        let mut k = many(100, 1);
+        k.trim(now, None);
+        assert_eq!(k.versions.len(), 1);
+        assert_eq!(k.trimmed_below, t(100));
+        // Kept from the protected timestamp on (and the newest at or below it).
+        let mut k = many(100, 1);
+        k.trim(now, Some(t(40)));
+        assert_eq!(k.versions.len(), 61);
+        assert_eq!(k.trimmed_below, t(40));
+        // The bounds still hold: versions, then bytes.
+        let mut k = many(3_000, 1);
+        k.trim(now, Some(t(1)));
+        assert_eq!(k.versions.len(), HISTORY_PROTECTED_MAX_VERSIONS);
+        assert_eq!(k.trimmed_below, k.versions.last().unwrap().0);
+        let mut k = many(100, 1024 * 1024);
+        k.trim(now, Some(t(1)));
+        assert!(k.versions.len() < 20 && k.versions.len() > 10, "{}", k.versions.len());
+        assert!(k.trimmed_below > t(1));
+    }
+
+    #[test]
     fn trimming_bounds_history_and_never_answers_wrongly() {
         let mut k = committed(&(1..=100).rev().map(|i| (i, i as i64)).collect::<Vec<_>>());
-        k.trim(t(101));
+        k.trim(t(101), None);
         assert_eq!(k.versions.len(), HISTORY_MAX_VERSIONS);
         let oldest = k.versions.last().map(|v| v.0).unwrap();
         assert_eq!(k.trimmed_below, oldest);

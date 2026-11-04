@@ -17,12 +17,15 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use storage_codec::PropertyValue;
 use storage_core::analytics::{AggregateQuery, AggregateResult, ScanPage, ScanQuery};
-use storage_core::dist::docs;
+use storage_core::dist::backup::{self, BackupStore};
+use storage_core::dist::txn::{KvSender, TxnError};
+use storage_core::dist::{docs, feed};
 use storage_core::dist::hlc::Hlc;
 use storage_core::dist::meta::RangeIndex;
 use storage_core::dist::runtime::{Gateway, GatewayConfig, RangeNode, Transport};
@@ -161,6 +164,17 @@ pub struct RangeContext {
     hlc: Arc<Hlc>,
     cache: Arc<RwLock<RangeIndex>>,
     plain: Arc<RwLock<BTreeMap<String, std::time::Instant>>>,
+    /// A backup or restore is running on this node.
+    backup_running: Arc<AtomicBool>,
+}
+
+/// Holds this node's backup slot until dropped.
+pub(crate) struct BackupSlot(Arc<AtomicBool>);
+
+impl Drop for BackupSlot {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl core::fmt::Debug for RangeContext {
@@ -185,7 +199,13 @@ impl core::fmt::Debug for RangeOptions {
 
 impl RangeContext {
     pub(crate) fn new(o: RangeOptions, workers: usize) -> Self {
-        Self { node: o.node, pool: WorkerPool::new(workers, 16_384), transport: o.transport, gateway: o.gateway, hlc: o.hlc, cache: Arc::new(RwLock::new(RangeIndex::new())), plain: Arc::default() }
+        Self { node: o.node, pool: WorkerPool::new(workers, 16_384), transport: o.transport, gateway: o.gateway, hlc: o.hlc, cache: Arc::new(RwLock::new(RangeIndex::new())), plain: Arc::default(), backup_running: Arc::default() }
+    }
+
+    /// The node's backup slot, unless a backup or restore holds it (each occupies a worker for as
+    /// long as it runs).
+    pub(crate) fn backup_slot(&self) -> Option<BackupSlot> {
+        (!self.backup_running.swap(true, Ordering::AcqRel)).then(|| BackupSlot(Arc::clone(&self.backup_running)))
     }
 
     pub(crate) fn backend(&self) -> RangeBackend {
@@ -231,6 +251,169 @@ impl RangeBackend {
     fn with<R>(&self, f: impl FnOnce(&mut Gateway) -> Result<R>) -> Result<R> {
         let mut g = self.gw.lock().unwrap_or_else(|p| p.into_inner());
         f(&mut g)
+    }
+}
+
+/// A backup as a directory: `seg-<n>` files and, last, `MANIFEST`.
+#[derive(Debug)]
+pub struct FileBackupStore {
+    dir: std::path::PathBuf,
+}
+
+impl FileBackupStore {
+    /// A new backup in a directory that must not exist yet.
+    pub fn create(dir: &std::path::Path) -> Result<Self> {
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| StorageError::io("create backup parent", e))?;
+        }
+        std::fs::create_dir(dir).map_err(|e| StorageError::io("create backup directory (the name must be new)", e))?;
+        Ok(Self { dir: dir.to_path_buf() })
+    }
+
+    /// An existing backup.
+    pub fn open(dir: &std::path::Path) -> Self {
+        Self { dir: dir.to_path_buf() }
+    }
+
+    fn segment_path(&self, index: u64) -> std::path::PathBuf {
+        self.dir.join(format!("seg-{index:08}"))
+    }
+
+    fn sync_dir(&self) -> Result<()> {
+        std::fs::File::open(&self.dir).and_then(|d| d.sync_all()).map_err(|e| StorageError::io("sync backup directory", e))
+    }
+}
+
+impl BackupStore for FileBackupStore {
+    fn put_segment(&mut self, index: u64, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(self.segment_path(index)).map_err(|e| StorageError::io("create backup segment", e))?;
+        f.write_all(bytes).and_then(|()| f.sync_all()).map_err(|e| StorageError::io("write backup segment", e))?;
+        self.sync_dir()
+    }
+
+    fn put_manifest(&mut self, bytes: &[u8]) -> Result<()> {
+        storage_mmap::atomic_write_replace(&self.dir.join("MANIFEST"), bytes, true)
+    }
+
+    fn segment(&self, index: u64) -> Result<Vec<u8>> {
+        std::fs::read(self.segment_path(index)).map_err(|e| StorageError::io("read backup segment", e))
+    }
+
+    fn manifest(&self) -> Result<Vec<u8>> {
+        std::fs::read(self.dir.join("MANIFEST")).map_err(|e| StorageError::io("read backup manifest", e))
+    }
+}
+
+type Reply = (u8, u64, Vec<u8>);
+
+/// Takes a cluster backup into the new directory `path`; a failed attempt leaves nothing there.
+pub(crate) fn run_backup(backend: &RangeBackend, path: &std::path::Path) -> Reply {
+    let mut store = match FileBackupStore::create(path) {
+        Ok(s) => s,
+        Err(e) => return crate::documents::error_reply(&e),
+    };
+    match backend.with(|g| backup::backup(g, &mut store)) {
+        Ok(m) => (STATUS_OK, m.rows, format!("cluster backup created: ts={}.{} rows={} segments={}", m.ts.wall, m.ts.logical, m.rows, m.segments.len()).into_bytes()),
+        Err(e) => {
+            // Our own directory, created above; without a manifest it is not a backup.
+            let _ = std::fs::remove_dir_all(path);
+            crate::documents::error_reply(&e)
+        }
+    }
+}
+
+/// Restores the backup in `path` into this cluster.
+pub(crate) fn run_restore(backend: &RangeBackend, path: &std::path::Path) -> Reply {
+    let store = FileBackupStore::open(path);
+    match backend.with(|g| backup::restore(g, &store)) {
+        Ok(m) => (STATUS_OK, m.rows, format!("cluster backup restored: ts={}.{} rows={}", m.ts.wall, m.ts.logical, m.rows).into_bytes()),
+        Err(e) => crate::documents::error_reply(&e),
+    }
+}
+
+/// One page of a changefeed.
+pub(crate) fn run_changefeed(backend: &RangeBackend, body: &[u8]) -> Reply {
+    use crate::{STATUS_INVALID, STATUS_OVERLOADED};
+    let (cursor, collection, max_keys) = match feed::decode_request(body) {
+        Ok(r) => r,
+        Err(e) => return (STATUS_INVALID, 0, e.to_string().into_bytes()),
+    };
+    if let Some(c) = &collection {
+        if let Err(e) = storage_core::document::validate_collection_name(c, false) {
+            return (STATUS_INVALID, 0, e.to_string().into_bytes());
+        }
+    }
+    let max_keys = if max_keys == 0 { feed::DEFAULT_PAGE_KEYS } else { max_keys };
+    let mut g = backend.gw.lock().unwrap_or_else(|p| p.into_inner());
+    let cursor = cursor.unwrap_or_else(|| {
+        let now = g.now();
+        feed::Cursor::at(&mut *g, now)
+    });
+    match feed::poll(&mut *g, &cursor, collection.as_deref(), max_keys) {
+        Ok(page) => (STATUS_OK, 0, page.encode()),
+        Err(e @ (TxnError::HistoryLost(_) | TxnError::Invalid(_))) => (STATUS_INVALID, 0, e.to_string().into_bytes()),
+        // Nothing was consumed: the same cursor works again.
+        Err(e @ TxnError::Retry(_)) => (STATUS_OVERLOADED, 0, e.to_string().into_bytes()),
+        Err(_) => crate::documents::error_reply(&StorageError::NotLeader { leader: None }),
+    }
+}
+
+/// A changefeed sink: changes as JSON lines in `file`, the cursor beside it. Each page is durable
+/// before its cursor is saved. On open, a line torn by a crash is cut off; the page it belonged
+/// to is delivered again.
+#[derive(Debug)]
+pub struct JsonlSink {
+    file: std::fs::File,
+    cursor_path: std::path::PathBuf,
+}
+
+impl JsonlSink {
+    pub fn open(file: &std::path::Path, cursor_path: &std::path::Path) -> Result<Self> {
+        let existing = match std::fs::read(file) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(StorageError::io("read changefeed file", e)),
+        };
+        let f = std::fs::OpenOptions::new().create(true).append(true).open(file).map_err(|e| StorageError::io("open changefeed file", e))?;
+        if !existing.is_empty() && existing.last() != Some(&b'\n') {
+            let keep = existing.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            f.set_len(keep as u64).map_err(|e| StorageError::io("cut torn changefeed line", e))?;
+        }
+        Ok(Self { file: f, cursor_path: cursor_path.to_path_buf() })
+    }
+
+    /// The saved cursor, if any.
+    pub fn load_cursor(&self) -> Result<Option<feed::Cursor>> {
+        match std::fs::read(&self.cursor_path) {
+            Ok(b) => feed::Cursor::decode(&b).map(Some),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StorageError::io("read changefeed cursor", e)),
+        }
+    }
+
+    fn append(&mut self, text: &str) -> Result<()> {
+        use std::io::Write;
+        self.file.write_all(text.as_bytes()).and_then(|()| self.file.sync_data()).map_err(|e| StorageError::io("write changefeed file", e))
+    }
+}
+
+impl feed::Sink for JsonlSink {
+    fn deliver(&mut self, changes: &[feed::Change]) -> Result<()> {
+        let mut text = String::new();
+        for c in changes {
+            text.push_str(&c.to_json());
+            text.push('\n');
+        }
+        self.append(&text)
+    }
+
+    fn save_cursor(&mut self, cursor: &feed::Cursor) -> Result<()> {
+        storage_mmap::atomic_write_replace(&self.cursor_path, &cursor.encode(), true)
+    }
+
+    fn resolved(&mut self, ts: storage_core::dist::hlc::Timestamp) -> Result<()> {
+        self.append(&format!("{{\"resolved\":\"{}.{}\"}}\n", ts.wall, ts.logical))
     }
 }
 

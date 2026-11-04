@@ -52,6 +52,9 @@ fn print_usage() {
          \x20 remote-health <addr>                              Health check a remote StorageServer\n\
          \x20 remote-compact <addr>                             Trigger remote arena compaction (admin)\n\
          \x20 remote-backup <addr> <backup_name>                Trigger remote backup under the server's backup root (admin)\n\
+         \x20 remote-restore <addr> <backup_name>               Restore a range-cluster backup into an empty cluster (admin)\n\
+         \x20 changefeed <addr> <out.jsonl> <cursor_file> [--collection <c>] [--from <wall.logical>] [--once] [--interval-ms <n>]\n\
+         \x20                                                   Follow a range cluster's changes into a JSON-lines file (admin), resumable\n\
          \x20 remote-checkpoint <addr>                          Trigger remote incremental checkpoint (admin)\n\
          \x20 remote-metrics <addr>                             Scrape Prometheus metrics from remote server\n\
          \x20 cluster <addr> members                            List cluster members, roles and the leader\n\
@@ -345,6 +348,16 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
             println!("{msg}");
             Ok(())
         }
+        "remote-restore" => {
+            if args.len() < 3 {
+                print_usage();
+                return Err(storage_types::StorageError::invalid_key("missing required <addr> and <backup_name> for 'remote-restore'"));
+            }
+            let mut client = connect_remote(parse_addr(Some(&args[1]))?)?;
+            println!("{}", client.admin_restore(&args[2])?);
+            Ok(())
+        }
+        "changefeed" => changefeed_command(args),
         "remote-checkpoint" => {
             let addr = parse_addr(args.get(1))?;
             let mut client = connect_remote(addr)?;
@@ -363,6 +376,62 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
         _ => {
             print_usage();
             Err(storage_types::StorageError::invalid_key("unknown CLI command"))
+        }
+    }
+}
+
+/// Follows a range cluster's changes into a JSON-lines file (`TASK-144`): at least once, resuming
+/// from the cursor file. `--once` stops at the first resolved timestamp.
+fn changefeed_command(args: &[String]) -> storage_types::Result<()> {
+    use storage_core::dist::feed::{self, Cursor};
+    use storage_core::dist::hlc::Timestamp;
+    use storage_server::ranges::JsonlSink;
+
+    if args.len() < 4 {
+        print_usage();
+        return Err(storage_types::StorageError::invalid_key("missing required <addr>, <out.jsonl> and <cursor_file> for 'changefeed'"));
+    }
+    let addr = parse_addr(Some(&args[1]))?;
+    let (mut collection, mut from, mut once, mut interval_ms) = (None, None, false, 1000u64);
+    let mut opts = args[4..].iter();
+    let bad = || storage_types::StorageError::invalid_key("changefeed options: --collection <c> --from <wall.logical> --once --interval-ms <n>");
+    while let Some(o) = opts.next() {
+        match o.as_str() {
+            "--collection" => collection = Some(opts.next().ok_or_else(bad)?.clone()),
+            "--from" => {
+                let (w, l) = opts.next().ok_or_else(bad)?.split_once('.').ok_or_else(bad)?;
+                from = Some(Timestamp::new(w.parse().map_err(|_| bad())?, l.parse().map_err(|_| bad())?));
+            }
+            "--once" => once = true,
+            "--interval-ms" => interval_ms = opts.next().ok_or_else(bad)?.parse().map_err(|_| bad())?,
+            _ => return Err(bad()),
+        }
+    }
+    let mut sink = JsonlSink::open(Path::new(&args[2]), Path::new(&args[3]))?;
+    let mut cursor = sink.load_cursor()?;
+    if let (None, Some(ts)) = (&cursor, from) {
+        let id = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64) ^ u64::from(std::process::id()).rotate_left(32);
+        cursor = Some(Cursor::with_id(id, ts));
+    }
+    let mut client = connect_remote(addr)?;
+    loop {
+        let page = match client.changefeed_poll(cursor.as_ref(), collection.as_deref(), 0) {
+            Ok(p) => p,
+            // Elections and overload pass; the cursor still holds. History lost does not.
+            Err(storage_types::StorageError::NotLeader { .. }) => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                client = connect_remote(addr)?;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        feed::deliver(&mut sink, &page)?;
+        cursor = Some(page.cursor);
+        if page.resolved.is_some() {
+            if once {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(interval_ms));
         }
     }
 }

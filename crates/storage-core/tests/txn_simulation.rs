@@ -151,6 +151,26 @@ fn documents_with_ranges_moving() {
     assert!(reports.iter().map(|r| r.committed).sum::<usize>() > 0);
 }
 
+#[test]
+fn backups_and_changefeeds_under_faults() {
+    let cfg = TxnSimConfig { backup_audits: true, audit_every: 3, ..TxnSimConfig::default() };
+    let reports = sweep("backup", &cfg, 8);
+    let sum = |f: fn(&storage_core::dist::txn_sim::TxnSimReport) -> usize| reports.iter().map(f).sum::<usize>();
+    eprintln!("backup: {} backups, {} failed by faults, {} feed passes, {} feeds lost", sum(|r| r.backups), sum(|r| r.backups_failed), sum(|r| r.feed_passes), sum(|r| r.feeds_lost));
+    assert!(sum(|r| r.backups) > 0);
+    assert!(sum(|r| r.feed_passes) > 0);
+}
+
+#[test]
+fn backups_and_changefeeds_with_ranges_moving() {
+    let alloc = AllocatorConfig { replication: 3, split_keys: 6, split_writes_per_sec: 30, merge_keys: 5, interval_us: 400_000, dead_after_us: 3_000_000, rebalance_slack: 2 };
+    let base = TxnSimConfig::default();
+    let node = NodeConfig { cluster: vec![1, 2, 3, 4, 5], allocator: Some(alloc), ..base.node.clone() };
+    let cfg = TxnSimConfig { nodes: 5, regions: vec![0; 5], ranges: 2, accounts: 12, meta_routing: true, backup_audits: true, audit_every: 3, node, ..base };
+    let reports = sweep("backup-moving", &cfg, 6);
+    assert!(reports.iter().map(|r| r.backups).sum::<usize>() > 0);
+}
+
 /// Seeds that once failed, replayed on every run (`RULE-TEST-03`).
 /// - Coordinators resolved intents after a failed explicit commit while the record still read
 ///   "staging"; a later recovery saw an intent missing and aborted a committed transfer

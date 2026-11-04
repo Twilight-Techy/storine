@@ -127,6 +127,11 @@ pub const OP_RANGE_BATCH: u8 = 0x2B;
 /// Range cluster (`TASK-143`, Admin role): one encoded KV request; replies with the encoded
 /// response.
 pub const OP_KV: u8 = 0x2C;
+/// Restores a cluster backup taken with `OP_ADMIN_BACKUP` (range clusters, `TASK-144`).
+pub const OP_ADMIN_RESTORE: u8 = 0x2D;
+/// One page of a changefeed (range clusters, `TASK-144`). Admin: it reads every collection, and
+/// holds history back on every node.
+pub const OP_CHANGEFEED: u8 = 0x2E;
 
 /// `OP_CLUSTER_CHANGE` actions.
 pub const CLUSTER_ADD_VOTER: u8 = 1;
@@ -169,7 +174,8 @@ const fn required_role(op: u8) -> Option<RbacRole> {
         OP_PUT_RAW_FRAME | OP_DELETE | OP_CAS_PUT | OP_BATCH_PUT | OP_TXN | OP_DOC_WRITE
         | OP_DOC_ADMIN => Some(RbacRole::ReadWrite),
         OP_RAFT_VOTE | OP_RAFT_APPEND | OP_RAFT_SNAPSHOT | OP_MIGRATE_VSHARD | OP_ADMIN_BACKUP
-        | OP_ADMIN_COMPACT | OP_ADMIN_CHECKPOINT | OP_CLUSTER_CHANGE | OP_RANGE_BATCH | OP_KV => Some(RbacRole::Admin),
+        | OP_ADMIN_COMPACT | OP_ADMIN_CHECKPOINT | OP_CLUSTER_CHANGE | OP_RANGE_BATCH | OP_KV
+        | OP_ADMIN_RESTORE | OP_CHANGEFEED => Some(RbacRole::Admin),
         _ => None,
     }
 }
@@ -179,7 +185,8 @@ const fn required_role(op: u8) -> Option<RbacRole> {
 const fn max_body_len(op: u8) -> usize {
     match op {
         OP_AUTH => MAX_AUTH_BODY,
-        OP_ADMIN_BACKUP => 4096,
+        OP_ADMIN_BACKUP | OP_ADMIN_RESTORE => 4096,
+        OP_CHANGEFEED => 64 * 1024,
         OP_QUERY_HYBRID => 64,
         OP_RAFT_VOTE => 64,
         OP_PUT_RAW_FRAME | OP_CAS_PUT | OP_BATCH_GET | OP_BATCH_PUT | OP_RAFT_APPEND
@@ -1218,6 +1225,8 @@ const fn op_name(op: u8) -> &'static str {
         OP_CLUSTER_CHANGE => "cluster_change",
         OP_RANGE_BATCH => "range_batch",
         OP_KV => "kv",
+        OP_ADMIN_RESTORE => "admin_restore",
+        OP_CHANGEFEED => "changefeed",
         _ => "unknown",
     }
 }
@@ -1232,7 +1241,7 @@ fn execute_request<T: ZeroCopyRecord + Indexable>(
     body: Vec<u8>,
 ) -> ConnStep {
     if let Some(ref rc) = shared.ranges {
-        return route_ranges(conn, rc, shard, op, body);
+        return route_ranges(conn, rc, &shared.security, shard, op, body);
     }
     match route_cluster(conn, shared, shard, op, raw_id, body) {
         Ok(step) => step,
@@ -1243,7 +1252,7 @@ fn execute_request<T: ZeroCopyRecord + Indexable>(
 /// Range-cluster serving (`TASK-143`): range traffic between nodes, and the document API as
 /// distributed transactions on the worker pool (never on a reactor thread). Opcodes of a single
 /// engine (typed frames, aggregates over local columns) are refused precisely.
-fn route_ranges(conn: &mut NonBlockingConn, rc: &ranges::RangeContext, shard: &Arc<ReactorShard>, op: u8, body: Vec<u8>) -> ConnStep {
+fn route_ranges(conn: &mut NonBlockingConn, rc: &ranges::RangeContext, security: &SecurityConfig, shard: &Arc<ReactorShard>, op: u8, body: Vec<u8>) -> ConnStep {
     let reply = |conn: &mut NonBlockingConn, (st, v, b): (u8, u64, Vec<u8>)| {
         if conn.send_or_queue_response(st, v, &b).is_err() {
             ConnStep::Closed
@@ -1272,6 +1281,30 @@ fn route_ranges(conn: &mut NonBlockingConn, rc: &ranges::RangeContext, shard: &A
                 OP_DOC_SCAN_COLUMNS => documents::doc_scan_columns(&backend, &body),
                 _ => documents::doc_admin(&backend, &body, true),
             })
+        }
+        OP_ADMIN_BACKUP | OP_ADMIN_RESTORE => {
+            if security.backup_root.is_none() {
+                return reply(conn, (STATUS_UNAUTHORIZED, 0, b"admin backups are disabled (no SecurityConfig::backup_root configured)".to_vec()));
+            }
+            let Some(path) = core::str::from_utf8(&body).ok().and_then(|name| security.resolve_backup_path(name)) else {
+                return reply(conn, (STATUS_ERROR, 0, b"backup name must be a relative path without '..', ':' or '\\\\'".to_vec()));
+            };
+            let Some(guard) = rc.backup_slot() else {
+                return reply(conn, (STATUS_OVERLOADED, 0, b"a backup or restore is already running on this node".to_vec()));
+            };
+            let backend = rc.backend();
+            Box::new(move || {
+                let _guard = guard;
+                if op == OP_ADMIN_BACKUP {
+                    ranges::run_backup(&backend, &path)
+                } else {
+                    ranges::run_restore(&backend, &path)
+                }
+            })
+        }
+        OP_CHANGEFEED => {
+            let backend = rc.backend();
+            Box::new(move || ranges::run_changefeed(&backend, &body))
         }
         OP_SET_OPTIONS => {
             conn.follower_reads = body.first().is_some_and(|f| f & 1 != 0);
@@ -2424,6 +2457,27 @@ impl StorageClient {
             STATUS_OK => Ok(String::from_utf8_lossy(&resp).into_owned()),
             STATUS_UNAUTHORIZED => Err(StorageError::invalid_key("unauthorized AdminBackup")),
             _ => Err(StorageError::corrupted_header("AdminBackup failed")),
+        }
+    }
+
+    /// Restores a cluster backup into an empty range cluster (`OP_ADMIN_RESTORE`). May take as
+    /// long as the backup is large: connect without a read timeout.
+    pub fn admin_restore(&mut self, backup_name: &str) -> Result<String> {
+        let (status, version, resp) = self.rpc(OP_ADMIN_RESTORE, NO_KEY, backup_name.as_bytes())?;
+        match status {
+            STATUS_OK => Ok(String::from_utf8_lossy(&resp).into_owned()),
+            s => Err(remote_error(s, version, &resp)),
+        }
+    }
+
+    /// One page of a changefeed (`OP_CHANGEFEED`): from `cursor` (`None`: start now), of
+    /// `collection` (`None`: all). Save the returned cursor once its changes are safe.
+    pub fn changefeed_poll(&mut self, cursor: Option<&storage_core::dist::feed::Cursor>, collection: Option<&str>, max_keys: u32) -> Result<storage_core::dist::feed::FeedPage> {
+        use storage_core::dist::feed;
+        let (status, version, resp) = self.rpc(OP_CHANGEFEED, NO_KEY, &feed::encode_request(cursor, collection, max_keys))?;
+        match status {
+            STATUS_OK => feed::FeedPage::decode(&resp),
+            s => Err(remote_error(s, version, &resp)),
         }
     }
 

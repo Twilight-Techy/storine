@@ -64,7 +64,7 @@ fn txn_err(e: TxnError) -> StorageError {
         TxnError::Retry(_) => StorageError::resource_exhausted("the transaction kept conflicting with concurrent writes; retry"),
         TxnError::Unavailable(_) => StorageError::NotLeader { leader: None },
         TxnError::CommitUnknown(_) => StorageError::CommitUnknown { index: 0 },
-        TxnError::Invalid(_) => StorageError::invalid_value("invalid transaction"),
+        TxnError::Invalid(_) | TxnError::HistoryLost(_) => StorageError::invalid_value("invalid transaction"),
     }
 }
 
@@ -357,7 +357,7 @@ pub fn write(s: &mut dyn KvSender, writes: Vec<DocWrite>, request_id: Option<[u8
 /// Spans holding a collection's documents: its prefix, and (for names of 6 or more bytes) the
 /// prefix long keys hash into (`InlineId::from_any_str` keeps the first 6 bytes of
 /// `collection/key`, then `~`).
-fn collection_spans(collection: &str) -> Vec<KeySpan> {
+pub(crate) fn collection_spans(collection: &str) -> Vec<KeySpan> {
     let mut spans = vec![collection_span(collection)];
     let full = format!("{collection}/");
     if full.len() > 6 {

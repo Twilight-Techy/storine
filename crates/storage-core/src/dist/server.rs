@@ -68,6 +68,16 @@ pub enum KvRequest {
     /// One-phase commit of a document write batch (`document_wire` encoding), if all of it can
     /// commit in one Raft entry of this range: `ids` are the raw ids of its keys.
     Atomic { ids: Vec<Vec<u8>>, body: Vec<u8> },
+    /// Every committed version in `(from, to]` of the keys of `span`, from the range holding
+    /// `span.start` (`TASK-144`). Evaluated like a read at `to`: an intent at or below `to` is
+    /// reported as a conflict, and later writes land above `to`, so once a pass over a span
+    /// finishes, its versions up to `to` are final.
+    Versions { span: KeySpan, from: Timestamp, to: Timestamp, max_keys: u32 },
+    /// Keeps history at and above `ts` on this node (not routed: sent to every node) until HLC
+    /// wall time `expires`; `expires == 0` releases it. In memory and advisory: what it fails to
+    /// keep (a restart, a node it never reached) is detected by whoever needed it, through
+    /// `trimmed_below` (`TASK-144`).
+    Protect { id: u64, ts: Timestamp, expires: u64 },
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +129,10 @@ pub enum KvResponse {
     KeyConflict { key: Key, intent_txn: TxnMeta, intent_ts: Timestamp },
     /// Scan rows (key, version timestamp, fields) and where to resume (`None`: done).
     Rows { rows: Vec<(Key, Timestamp, BTreeMap<String, storage_codec::PropertyValue>)>, resume: Option<Vec<u8>> },
+    /// Versions of a span, oldest first per key, and where to resume (`None`: done).
+    Versions { rows: Vec<(Key, Timestamp, Value)>, resume: Option<Vec<u8>> },
+    /// History `key` needed was trimmed: nothing below `below` is known any more.
+    HistoryLost { key: Key, below: Timestamp },
     /// Not the leaseholder here (try `leader`), or the key moved to another range.
     NotLeader { leader: Option<NodeId> },
     WrongRange,
@@ -242,6 +256,8 @@ pub struct NodeServer {
     next_internal: u64,
     /// Reads served from closed timestamps (tests, metrics).
     follower_reads: u64,
+    /// History protections in force on this node: id -> (keep from, HLC wall expiry).
+    protections: BTreeMap<u64, (Timestamp, u64)>,
 }
 
 /// Client id of requests the server makes itself (descriptor publications).
@@ -313,7 +329,7 @@ impl KvRequest {
     /// Raw id bytes the request is routed by: its key's id, or a scan's start.
     pub fn anchor(&self) -> Vec<u8> {
         match self {
-            Self::Scan { span, .. } | Self::RefreshSpan { span, .. } => span.start.clone(),
+            Self::Scan { span, .. } | Self::RefreshSpan { span, .. } | Self::Versions { span, .. } => span.start.clone(),
             Self::Atomic { ids, .. } => ids.first().cloned().unwrap_or_default(),
             _ => key_id(&self.key()).map(|i| i.as_bytes().to_vec()).unwrap_or_default(),
         }
@@ -322,7 +338,7 @@ impl KvRequest {
     /// The span a scan covers (`None` for single-key requests).
     pub fn span(&self) -> Option<&KeySpan> {
         match self {
-            Self::Scan { span, .. } | Self::RefreshSpan { span, .. } => Some(span),
+            Self::Scan { span, .. } | Self::RefreshSpan { span, .. } | Self::Versions { span, .. } => Some(span),
             _ => None,
         }
     }
@@ -330,7 +346,7 @@ impl KvRequest {
     /// The key of a single-key request (scans have none: see [`Self::anchor`]).
     pub fn key(&self) -> Key {
         match self {
-            Self::Scan { .. } | Self::RefreshSpan { .. } | Self::Atomic { .. } => (String::new(), String::new()),
+            Self::Scan { .. } | Self::RefreshSpan { .. } | Self::Atomic { .. } | Self::Versions { .. } | Self::Protect { .. } => (String::new(), String::new()),
             Self::Get { key, .. } | Self::Put { key, .. } | Self::Resolve { key, .. } | Self::Refresh { key, .. } | Self::QueryIntent { key, .. } => key.clone(),
             Self::Record { id, .. } => record_key_of(id),
             // Serialized on one key inside the meta prefix.
@@ -339,7 +355,7 @@ impl KvRequest {
     }
 
     fn is_write(&self) -> bool {
-        !matches!(self, Self::Get { .. } | Self::Refresh { .. } | Self::Record { op: RecordOp::Get, .. } | Self::Meta(MetaOp::Lookup { .. }) | Self::Scan { .. } | Self::RefreshSpan { .. })
+        !matches!(self, Self::Get { .. } | Self::Refresh { .. } | Self::Record { op: RecordOp::Get, .. } | Self::Meta(MetaOp::Lookup { .. }) | Self::Scan { .. } | Self::RefreshSpan { .. } | Self::Versions { .. } | Self::Protect { .. })
     }
 
     /// The timestamp the request carries (moves the server's clock forward: causality).
@@ -351,8 +367,8 @@ impl KvRequest {
             Self::Record { op: RecordOp::Heartbeat { now, .. } | RecordOp::Push { now, .. }, .. } => Some(*now),
             Self::Record { op: RecordOp::Stage { ts, .. } | RecordOp::Commit { ts, .. }, .. } => Some(*ts),
             Self::Scan { ts, .. } => Some(*ts),
-            Self::RefreshSpan { to, .. } => Some(*to),
-            Self::Record { .. } | Self::Meta(_) | Self::Atomic { .. } => None,
+            Self::RefreshSpan { to, .. } | Self::Versions { to, .. } => Some(*to),
+            Self::Record { .. } | Self::Meta(_) | Self::Atomic { .. } | Self::Protect { .. } => None,
         }
     }
 }
@@ -361,7 +377,7 @@ impl NodeServer {
     pub fn new(driver: NodeDriver, hlc: Arc<Hlc>) -> Self {
         // Scans walk ids in key order.
         driver.engine().enable_ordered_ids();
-        Self { driver, hlc, pending: Vec::new(), latches: BTreeMap::new(), tscache: BTreeMap::new(), replies: VecDeque::new(), trace: None, meta: None, published: BTreeMap::new(), meta_waiting: BTreeMap::new(), next_internal: 0, follower_reads: 0 }
+        Self { driver, hlc, pending: Vec::new(), latches: BTreeMap::new(), tscache: BTreeMap::new(), replies: VecDeque::new(), trace: None, meta: None, published: BTreeMap::new(), meta_waiting: BTreeMap::new(), next_internal: 0, follower_reads: 0, protections: BTreeMap::new() }
     }
 
     /// Records every evaluation (tests and debugging).
@@ -388,8 +404,35 @@ impl NodeServer {
         self.driver.ranges().into_iter().find(|&r| self.driver.replica(r).is_some_and(|x| !x.is_frozen() && x.span().contains(at)))
     }
 
+    /// Sets or (with `expires == 0`) releases a history protection.
+    pub fn protect(&mut self, id: u64, ts: Timestamp, expires: u64) {
+        if expires == 0 {
+            self.protections.remove(&id);
+            return;
+        }
+        // Bounded memory: the entry expiring first gives way.
+        if self.protections.len() >= MAX_PROTECTIONS && !self.protections.contains_key(&id) {
+            if let Some(first) = self.protections.iter().min_by_key(|(_, p)| p.1).map(|(i, _)| *i) {
+                self.protections.remove(&first);
+            }
+        }
+        self.protections.insert(id, (ts, expires));
+    }
+
+    /// The oldest history a protection in force still needs.
+    fn protect_floor(&mut self) -> Option<Timestamp> {
+        let wall = self.hlc.now().wall;
+        self.protections.retain(|_, p| p.1 > wall);
+        self.protections.values().map(|p| p.0).min()
+    }
+
     /// Accepts request `id` from `client`.
     pub fn submit(&mut self, id: u64, client: u64, req: KvRequest) {
+        if let KvRequest::Protect { id: pid, ts, expires } = req {
+            self.protect(pid, ts, expires);
+            self.replies.push_back(Reply { id, client, resp: KvResponse::Resolved });
+            return;
+        }
         if let Some(ts) = req.ts() {
             // A timestamp further ahead than any clock may be is synthetic (a write closed
             // ahead of time on a global range, `TASK-141`), not a clock reading: it orders the
@@ -765,6 +808,7 @@ impl NodeServer {
             KvRequest::Scan { span, ts, limit, txn, max_keys } => return self.eval_scan(range, span, *ts, *limit, txn.as_ref(), *max_keys).map(Eval::Done),
             KvRequest::RefreshSpan { span, from, to, txn } => return self.eval_refresh_span(range, span, *from, *to, txn).map(Eval::Done),
             KvRequest::Atomic { ids, body } => return Ok(self.eval_atomic(range, ids, body)),
+            KvRequest::Versions { span, from, to, max_keys } => return self.eval_versions(range, span, *from, *to, *max_keys).map(Eval::Done),
             _ => {}
         }
         let key = req.key();
@@ -813,7 +857,8 @@ impl NodeServer {
                 let (k, pre) = self.load(&key)?;
                 match eval_resolve(&k, txn, *commit_ts) {
                     Some(mut nk) => {
-                        nk.trim(self.hlc.now());
+                        let floor = self.protect_floor();
+                        nk.trim(self.hlc.now(), floor);
                         Eval::Propose(vec![put(&nk, pre)], KvResponse::Resolved)
                     }
                     None => Eval::Done(KvResponse::Resolved),
@@ -944,7 +989,7 @@ impl NodeServer {
                     },
                 }
             }
-            KvRequest::Scan { .. } | KvRequest::RefreshSpan { .. } | KvRequest::Atomic { .. } => return Err(StorageError::invalid_value("evaluated separately")),
+            KvRequest::Scan { .. } | KvRequest::RefreshSpan { .. } | KvRequest::Atomic { .. } | KvRequest::Versions { .. } | KvRequest::Protect { .. } => return Err(StorageError::invalid_value("evaluated separately")),
         })
     }
 
@@ -1006,10 +1051,11 @@ impl NodeServer {
             }
         }
         let now = self.hlc.now();
+        let floor = self.protect_floor();
         let mut ops = Vec::new();
         for (key, (k, changed)) in &mut keys {
             if *changed {
-                k.trim(now);
+                k.trim(now, floor);
                 let Some(kid) = key_id(key) else { return not() };
                 ops.push(WriteOp::put(kid, k.to_record(&key.0, &key.1)));
             }
@@ -1029,15 +1075,19 @@ impl NodeServer {
         let ids = self.driver.engine().ids_in_span(&lo, hi.as_deref(), max + 1);
         let mut rows = Vec::new();
         let mut resume = None;
+        let mut bytes = 0usize;
         for (i, id) in ids.iter().enumerate() {
-            if i == max {
+            if i == max || bytes >= MAX_SCAN_BYTES {
                 resume = Some(id.as_bytes().to_vec());
                 break;
             }
             let Ok((_, rec)) = self.driver.engine().get_owned(*id) else { continue };
             let k = MvccKey::from_record(Some(&rec))?;
             match eval_read(&k, ts, limit, txn) {
-                ReadOutcome::Value(Some(v), vts) => rows.push(((rec.collection.clone(), rec.key.clone()), vts.unwrap_or(ts), v)),
+                ReadOutcome::Value(Some(v), vts) => {
+                    bytes = bytes.saturating_add(crate::dist::mvcc::fields_size(&v));
+                    rows.push(((rec.collection.clone(), rec.key.clone()), vts.unwrap_or(ts), v));
+                }
                 ReadOutcome::Value(None, _) => {}
                 ReadOutcome::Uncertain { ts } => return Ok(KvResponse::Uncertain { ts }),
                 ReadOutcome::Conflict(i) => return Ok(KvResponse::KeyConflict { key: (rec.collection.clone(), rec.key.clone()), intent_txn: i.txn, intent_ts: i.ts }),
@@ -1058,6 +1108,46 @@ impl NodeServer {
     }
 
     /// Whether nothing in `span` (which must lie within this range) changed in `(from, to]`.
+    /// One page of a version scan within this range (see [`KvRequest::Versions`]).
+    fn eval_versions(&mut self, range: RangeId, span: &KeySpan, from: Timestamp, to: Timestamp, max_keys: u32) -> Result<KvResponse, StorageError> {
+        let rspan = self.driver.replica(range).map(|r| r.span()).ok_or_else(|| StorageError::invalid_key("range not hosted here"))?;
+        let (lo, hi) = clip(span, &rspan);
+        let max = (max_keys as usize).clamp(1, MAX_SCAN_KEYS);
+        let ids = self.driver.engine().ids_in_span(&lo, hi.as_deref(), max + 1);
+        let mut rows = Vec::new();
+        let mut resume = None;
+        let mut bytes = 0usize;
+        for (i, id) in ids.iter().enumerate() {
+            if i == max || bytes >= MAX_SCAN_BYTES {
+                resume = Some(id.as_bytes().to_vec());
+                break;
+            }
+            let Ok((_, rec)) = self.driver.engine().get_owned(*id) else { continue };
+            let k = MvccKey::from_record(Some(&rec))?;
+            let key = || (rec.collection.clone(), rec.key.clone());
+            if from < k.trimmed_below {
+                return Ok(KvResponse::HistoryLost { key: key(), below: k.trimmed_below });
+            }
+            if let Some(intent) = k.intent.as_ref().filter(|i| i.ts <= to) {
+                return Ok(KvResponse::KeyConflict { key: key(), intent_txn: intent.txn.clone(), intent_ts: intent.ts });
+            }
+            for (t, v) in k.versions.iter().rev().filter(|(t, _)| *t > from && *t <= to) {
+                bytes = bytes.saturating_add(v.as_ref().map_or(0, crate::dist::mvcc::fields_size));
+                rows.push((key(), *t, v.clone()));
+            }
+        }
+        if resume.is_none() {
+            if let Some(end) = &rspan.end {
+                if span.end.as_ref().is_none_or(|e| e > end) {
+                    resume = Some(end.clone());
+                }
+            }
+        }
+        let covered = resume.clone().or(hi);
+        self.cache(range).bump_span(lo, covered, to, None);
+        Ok(KvResponse::Versions { rows, resume })
+    }
+
     fn eval_refresh_span(&mut self, range: RangeId, span: &KeySpan, from: Timestamp, to: Timestamp, txn: &TxnId) -> Result<KvResponse, StorageError> {
         let rspan = self.driver.replica(range).map(|r| r.span()).ok_or_else(|| StorageError::invalid_key("range not hosted here"))?;
         let inside = span.start >= rspan.start && match (&span.end, &rspan.end) {
@@ -1094,6 +1184,10 @@ const MAX_INTENT_WAIT_NS: u64 = 250_000_000;
 
 /// Most rows one scan page returns.
 pub const MAX_SCAN_KEYS: usize = 10_000;
+/// A scan page ends once it holds about this many bytes.
+const MAX_SCAN_BYTES: usize = 8 * 1024 * 1024;
+/// Most history protections one node holds.
+const MAX_PROTECTIONS: usize = 1024;
 
 /// `span` clipped to `range`: `(start, end)`.
 fn clip(span: &KeySpan, range: &KeySpan) -> (Vec<u8>, Option<Vec<u8>>) {
