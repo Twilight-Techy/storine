@@ -132,6 +132,29 @@ fn observed(v: Option<u64>) -> Option<u64> {
 
 // ── constraint checks ──
 
+/// Fills the generated columns of a row, in order: one may read another declared before it.
+pub(crate) fn compute_generated(ex: &Exec<'_>, table: &Table, row: &mut Row) -> SqlResult<()> {
+    if !table.columns.iter().any(|c| c.generated.is_some()) {
+        return Ok(());
+    }
+    let cols = table_cols(table);
+    for (i, c) in table.columns.iter().enumerate() {
+        if let Some(g) = &c.generated {
+            let v = ex.eval(g, &Env::new(&cols, row))?;
+            row[i] = c.fit(cast(&v, &c.ty)?);
+        }
+    }
+    Ok(())
+}
+
+/// A generated column takes no value of its own (`DEFAULT` is fine).
+fn refuse_generated(table: &Table, i: usize, given: &Expr) -> SqlResult<()> {
+    if table.columns[i].generated.is_some() && !matches!(given, Expr::Default) {
+        return Err(SqlError::new("428C9", format!("column \"{}\" can only be updated to DEFAULT", table.columns[i].name)));
+    }
+    Ok(())
+}
+
 fn check_row(ex: &Exec<'_>, table: &Table, row: &Row) -> SqlResult<()> {
     for (i, c) in table.columns.iter().enumerate() {
         if c.not_null && row[i].is_null() {
@@ -946,6 +969,7 @@ fn build_row(
             }
         }
     }
+    compute_generated(ex, table, &mut row)?;
     check_row(ex, table, &row)?;
     ex.check_new_row(table, &row, "insert")?;
     Ok(row)
@@ -990,7 +1014,8 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
         if matches!(ins.source, InsertSource::DefaultValues) {
             Vec::new()
         } else {
-            (0..table.columns.len()).collect()
+            // Generated columns take no value, and a list that omits the columns omits them.
+            (0..table.columns.len()).filter(|i| table.columns[*i].generated.is_none()).collect()
         }
     } else {
         let mut seen = HashSet::new();
@@ -1007,6 +1032,25 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
         }
         v
     };
+    if !ins.columns.is_empty() {
+        for c in &ins.columns {
+            let i = table.column(c)?;
+            if table.columns[i].generated.is_some() {
+                if let InsertSource::Values(rows) = &ins.source {
+                    let at = ins.columns.iter().position(|x| x == c).unwrap_or(0);
+                    for r in rows {
+                        if let Some(v) = r.get(at) {
+                            if !matches!(v, Expr::Default) {
+                                return Err(SqlError::new("428C9", format!("cannot insert a non-DEFAULT value into column \"{c}\"")));
+                            }
+                        }
+                    }
+                } else {
+                    return Err(SqlError::new("428C9", format!("cannot insert a non-DEFAULT value into column \"{c}\"")));
+                }
+            }
+        }
+    }
     let qual = ins.alias.clone().unwrap_or_else(|| table.name.clone());
     // Evaluate every source row first (reads only).
     let mut built: Vec<(Row, Option<i64>)> = Vec::new();
@@ -1158,6 +1202,7 @@ pub fn insert(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Outc
                                 };
                                 new[i] = table.columns[i].fit(cast(&v, &table.columns[i].ty)?);
                             }
+                            compute_generated(&ex, &table, &mut new)?;
                             check_row(&ex, &table, &new)?;
                             ex.check_new_row(&table, &new, "update")?;
                             new
@@ -1544,7 +1589,10 @@ pub fn update(s: &mut Session, upd: &Update, params: &[Datum]) -> SqlResult<Outc
         let names: Vec<&str> = upd.sets.iter().map(|(c, _)| c.as_str()).collect();
         s.require_table(&table, "UPDATE", &names)?;
     }
-    let unrestricted = Exec::new(s, params).dml_restriction(&table, "update")?.is_none();
+    for (c, e) in &upd.sets {
+        refuse_generated(&table, table.column(c)?, e)?;
+    }
+    let unrestricted = Exec::new(s, params).dml_restriction(&table, "update")?.is_none() && !table.columns.iter().any(|c| c.generated.is_some());
     if unrestricted {
         if let Some(o) = try_atomic_update(s, upd, &table, params)? {
             return Ok(o);
@@ -1590,6 +1638,7 @@ pub fn update(s: &mut Session, upd: &Update, params: &[Datum]) -> SqlResult<Outc
                         )
                     })?;
             }
+            compute_generated(&ex, &table, &mut new)?;
             check_row(&ex, &table, &new)?;
             ex.check_new_row(&table, &new, "update")?;
             changes.push((t, new));

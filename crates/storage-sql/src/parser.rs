@@ -747,6 +747,36 @@ impl Parser {
             }
             "set" => self.set(),
             "declare" if self.dialect == Dialect::MsSql => self.declare(),
+            "declare" if self.dialect == Dialect::Postgres => self.declare_cursor(),
+            "fetch" | "move" if self.dialect != Dialect::MySql => self.fetch_cursor(kw == "move"),
+            "open" if self.dialect == Dialect::MsSql => {
+                self.pos += 1;
+                let _ = self.eat_kw("global");
+                Ok(Statement::OpenCursor(self.ident()?))
+            }
+            "close" if self.dialect == Dialect::MsSql => {
+                self.pos += 1;
+                let _ = self.eat_kw("global");
+                Ok(Statement::CloseCursor(Some(self.ident()?)))
+            }
+            "deallocate" if self.dialect == Dialect::MsSql && !self.is_kw_at(1, "prepare") => {
+                self.pos += 1;
+                let _ = self.eat_kw("global");
+                Ok(Statement::DeallocateCursor(self.ident()?))
+            }
+            "refresh" if self.dialect == Dialect::Postgres => {
+                self.pos += 1;
+                self.expect_kw("materialized")?;
+                self.expect_kw("view")?;
+                let _ = self.eat_kw("concurrently");
+                let name = self.table_name()?;
+                let mut with_data = true;
+                if self.eat_kw("with") {
+                    with_data = !self.eat_kw("no");
+                    self.expect_kw("data")?;
+                }
+                Ok(Statement::RefreshMatView { name, with_data })
+            }
             "if" if self.dialect == Dialect::MsSql => {
                 self.pos += 1;
                 let cond = self.expr()?;
@@ -983,18 +1013,12 @@ impl Parser {
                 }
                 Ok(Statement::Set { name, value: None })
             }
-            // No cursors exist (DECLARE ... CURSOR is not supported), so `CLOSE ALL` has nothing to
-            // close and any named cursor does not exist.
             "close" if self.dialect == Dialect::Postgres => {
                 self.pos += 1;
                 if self.eat_kw("all") {
-                    return Ok(Statement::NoOp("CLOSE CURSOR ALL"));
+                    return Ok(Statement::CloseCursor(None));
                 }
-                let name = self.ident()?;
-                Err(SqlError::new(
-                    "34000",
-                    format!("cursor \"{name}\" does not exist"),
-                ))
+                Ok(Statement::CloseCursor(Some(self.ident()?)))
             }
             "kill" if self.dialect != Dialect::Postgres => {
                 self.pos += 1;
@@ -1073,13 +1097,16 @@ impl Parser {
         self.pos += 1; // DECLARE
         let mut vars = Vec::new();
         loop {
+            // `DECLARE c CURSOR ...`: a cursor is named without an `@`.
             let name = match self.next() {
                 Some(Token::Variable {
                     name,
                     system: false,
                 }) => name,
+                Some(Token::Word { text, quoted }) => self.fold(text, quoted),
                 _ => return Err(self.unexpected("a @variable")),
             };
+            let is_cursor = !matches!(self.tokens.get(self.pos - 1), Some(Token::Variable { .. }));
             let _ = self.eat_kw("as");
             if self.eat_kw("table") {
                 // DECLARE @t TABLE (col type [constraints], ...)
@@ -1105,8 +1132,22 @@ impl Parser {
                     columns,
                 });
             }
-            if self.is_kw("cursor") {
-                return Err(SqlError::unsupported("cursors"));
+            // `DECLARE c [options] CURSOR [options] FOR query` (no `@`: a cursor name).
+            if self.is_kw("cursor") || is_cursor {
+                while !self.eat_kw("cursor") {
+                    if self.statement_end() {
+                        return Err(self.unexpected("CURSOR"));
+                    }
+                    self.pos += 1;
+                }
+                while !self.eat_kw("for") {
+                    if self.statement_end() {
+                        return Err(self.unexpected("FOR"));
+                    }
+                    self.pos += 1;
+                }
+                let query = Box::new(self.query()?);
+                return Ok(Statement::DeclareCursor { name, query, hold: true });
             }
             let (ty, _) = self.data_type()?;
             let value = if self.eat_op("=") {
@@ -1382,9 +1423,20 @@ impl Parser {
             return Ok(st);
         }
         let or_replace = self.eat_kws(&["or", "replace"]);
-        let _ = self.eat_kw("temporary") || self.eat_kw("temp") || self.eat_kw("unlogged");
+        let _ = self.eat_kw("global") || self.eat_kw("local");
+        let temporary = self.eat_kw("temporary") || self.eat_kw("temp");
+        let _ = self.eat_kw("unlogged");
+        if self.eat_kws(&["materialized", "view"]) {
+            return self.create_matview();
+        }
         if self.eat_kw("table") {
-            return self.create_table();
+            let mut st = self.create_table()?;
+            if let Statement::CreateTable(ct) = &mut st {
+                if temporary || ct.name.starts_with('#') {
+                    ct.temporary = Some(ct.temporary.unwrap_or(OnCommit::PreserveRows));
+                }
+            }
+            return Ok(st);
         }
         // MySQL view options: ALGORITHM = x, DEFINER = user, SQL SECURITY x.
         let start = self.pos;
@@ -1580,6 +1632,22 @@ impl Parser {
         )))
     }
 
+    /// `ON COMMIT { PRESERVE ROWS | DELETE ROWS | DROP }`.
+    fn on_commit(&mut self) -> SqlResult<Option<OnCommit>> {
+        if !self.eat_kws(&["on", "commit"]) {
+            return Ok(None);
+        }
+        Ok(Some(if self.eat_kw("drop") {
+            OnCommit::Drop
+        } else if self.eat_kws(&["delete", "rows"]) {
+            OnCommit::DeleteRows
+        } else if self.eat_kws(&["preserve", "rows"]) {
+            OnCommit::PreserveRows
+        } else {
+            return Err(self.unexpected("PRESERVE ROWS, DELETE ROWS or DROP"));
+        }))
+    }
+
     fn create_table(&mut self) -> SqlResult<Statement> {
         let if_not_exists = self.eat_kws(&["if", "not", "exists"]);
         let name = self.table_name()?;
@@ -1589,8 +1657,10 @@ impl Parser {
             columns: Vec::new(),
             constraints: Vec::new(),
             as_query: None,
+            temporary: None,
             columnar: false,
         };
+        ct.temporary = self.on_commit()?;
         if self.eat_kw("as") {
             ct.as_query = Some(Box::new(self.query()?));
             return Ok(Statement::CreateTable(Box::new(ct)));
@@ -1624,6 +1694,9 @@ impl Parser {
         self.expect_op(")")?;
         // Table options (ENGINE=..., WITHOUT ROWID, WITH (...), INHERITS ...): only columnar
         // storage has a meaning here.
+        if let Some(o) = self.on_commit()? {
+            ct.temporary = Some(o);
+        }
         ct.columnar = self.columnar_option() == Some(true);
         Ok(Statement::CreateTable(Box::new(ct)))
     }
@@ -1760,8 +1833,23 @@ impl Parser {
         }
     }
 
+    /// `(expr) [STORED | VIRTUAL | PERSISTED]`: virtual columns are stored too (same answers).
+    fn generated_expr(&mut self) -> SqlResult<Expr> {
+        self.expect_op("(")?;
+        let e = self.expr()?;
+        self.expect_op(")")?;
+        let _ = self.eat_kw("stored") || self.eat_kw("virtual") || self.eat_kw("persisted");
+        Ok(e)
+    }
+
     fn column_def(&mut self) -> SqlResult<ColumnDef> {
         let name = self.ident()?;
+        // T-SQL computed column: `name AS expr`, with no type.
+        if self.dialect == Dialect::MsSql && self.eat_kw("as") {
+            let e = self.expr()?;
+            let _ = self.eat_kw("persisted");
+            return Ok(ColumnDef { name, ty: DataType::Text, precision: None, not_null: false, default: None, primary_key: false, unique: false, auto_increment: false, references: None, check: None, generated: Some(e), declared: None, names: ConstraintNames::default() });
+        }
         let start = self.pos;
         let (ty, serial) = self.data_type()?;
         let precision = self.temporal_precision(&ty, start);
@@ -1776,6 +1864,7 @@ impl Parser {
             auto_increment: serial,
             references: None,
             check: None,
+            generated: None,
             declared: (self.dialect == Dialect::MsSql)
                 .then(|| tokens_sql(&self.tokens[start..self.pos], self.dialect).ok())
                 .flatten()
@@ -1829,8 +1918,10 @@ impl Parser {
                     col.auto_increment = true;
                     col.not_null = true;
                 } else {
-                    return Err(SqlError::unsupported("generated (computed) columns"));
+                    col.generated = Some(self.generated_expr()?);
                 }
+            } else if self.dialect == Dialect::MySql && self.eat_kw("as") {
+                col.generated = Some(self.generated_expr()?);
             } else if self.is_kw("references") || self.is_kw("foreign") {
                 if self.eat_kw("foreign") {
                     self.expect_kw("key")?;
@@ -2237,6 +2328,15 @@ impl Parser {
             return Ok(st);
         }
         let _ = self.eat_kw("temporary");
+        if self.eat_kws(&["materialized", "view"]) {
+            let if_exists = self.eat_kws(&["if", "exists"]);
+            let mut names = vec![self.table_name()?];
+            while self.eat_op(",") {
+                names.push(self.table_name()?);
+            }
+            self.skip_to_end();
+            return Ok(Statement::DropMatView { names, if_exists });
+        }
         if self.eat_kw("view") {
             let if_exists = self.eat_kws(&["if", "exists"]);
             let mut names = vec![self.table_name()?];

@@ -935,6 +935,7 @@ impl<'a> Exec<'a> {
             "wait_timeout" | "interactive_timeout" => Datum::Int(28_800),
             "spid" => Datum::Int(self.s.id as i64),
             "servername" | "hostname" => Datum::Text("storine".into()),
+            "fetch_status" => self.s.user_vars.get("@fetch_status").cloned().unwrap_or(Datum::Int(-1)),
             "trancount" => Datum::Int(i64::from(self.s.in_transaction())),
             "rowcount" if self.s.last_row_count >= 0 => Datum::Int(self.s.last_row_count),
             "rowcount" => Datum::Int(self.s.last_found_rows as i64),

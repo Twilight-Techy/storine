@@ -32,6 +32,8 @@ pub const LOCKS: &str = "_sql_locks";
 pub const REFS: &str = "_sql_refs";
 /// View definitions: `{name, sql, dialect, columns}` keyed by the lower-case name.
 pub const VIEWS: &str = "_sql_views";
+/// Materialized views: `{name, sql, dialect}`; their rows are an ordinary table.
+pub const MATVIEWS: &str = "_sql_matviews";
 
 /// A row-level security policy.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,6 +71,8 @@ pub struct Column {
     pub declared: Option<String>,
     /// Name of the default constraint (T-SQL `CONSTRAINT DF_x DEFAULT ...`).
     pub default_name: Option<String>,
+    /// Computed from the row's other columns, and stored.
+    pub generated: Option<Expr>,
 }
 
 impl Column {
@@ -164,6 +168,8 @@ pub struct Table {
     pub row_security: bool,
     pub force_row_security: bool,
     pub policies: Vec<Policy>,
+    /// A temporary table of this session (`exec/temp.rs`), and what ends it.
+    pub temp: Option<crate::ast::OnCommit>,
     /// Version of the schema document.
     pub version: u64,
 }
@@ -173,7 +179,7 @@ pub type Row = Vec<Datum>;
 impl Table {
     /// What privileges on a view are checked against.
     pub(crate) fn view_stub(name: &str, owner: Option<String>) -> Table {
-        Table { name: name.to_owned(), collection: String::new(), columns: Vec::new(), primary_key: Vec::new(), uniques: Vec::new(), indexes: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new(), pk_name: None, columnar: None, owner, row_security: false, force_row_security: false, policies: Vec::new(), version: 0 }
+        Table { name: name.to_owned(), collection: String::new(), columns: Vec::new(), primary_key: Vec::new(), uniques: Vec::new(), indexes: Vec::new(), foreign_keys: Vec::new(), checks: Vec::new(), pk_name: None, columnar: None, owner, row_security: false, force_row_security: false, policies: Vec::new(), temp: None, version: 0 }
     }
 
     /// An empty table (tests).
@@ -300,6 +306,9 @@ impl Table {
                         }
                         if let Some(d) = &c.default_name {
                             m.insert("default_name".into(), Value::Text(d.clone()));
+                        }
+                        if let Some(g) = &c.generated {
+                            m.insert("generated".into(), Value::Text(g.to_string()));
                         }
                         m.insert("auto_increment".into(), Value::Bool(c.auto_increment));
                         m.insert(
@@ -472,6 +481,10 @@ impl Table {
                     .get("default_name")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                generated: match m.get("generated").and_then(Value::as_str) {
+                    Some(sql) => Some(parse_expr(sql, Dialect::Postgres)?),
+                    None => None,
+                },
             });
         }
         let mut t = Table {
@@ -487,6 +500,7 @@ impl Table {
             row_security: matches!(doc.get("row_security"), Some(Value::Bool(true))),
             force_row_security: matches!(doc.get("force_row_security"), Some(Value::Bool(true))),
             policies: Vec::new(),
+            temp: None,
             pk_name: doc
                 .get("pk_name")
                 .and_then(Value::as_str)
@@ -772,6 +786,7 @@ mod tests {
             missing: None,
             declared: None,
             default_name: None,
+            generated: None,
         };
         Table {
             name: "Accounts".into(),
@@ -812,6 +827,7 @@ mod tests {
             row_security: false,
             force_row_security: false,
             policies: Vec::new(),
+            temp: None,
             checks: vec![CheckDef {
                 name: "positive".into(),
                 expr: parse_expr("balance >= 0", Dialect::Postgres).unwrap(),

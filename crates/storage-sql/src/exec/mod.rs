@@ -11,6 +11,8 @@
 
 pub mod acl;
 pub mod activity;
+pub(crate) mod cursor;
+pub(crate) mod temp;
 pub(crate) mod advisory;
 pub mod control;
 pub mod explain;
@@ -303,6 +305,9 @@ impl Engine {
 
     /// The schema of `name`, re-reading the catalog once if it is unknown.
     pub fn table(&self, name: &str) -> SqlResult<Arc<Table>> {
+        if let Some(t) = temp::lookup(name) {
+            return Ok(t);
+        }
         self.refresh_catalog(false)?;
         if let Some(t) = self.catalog.get(name) {
             return Ok(t);
@@ -337,6 +342,8 @@ impl Engine {
             depth: 0,
             sql_text: None,
             trace: None,
+            temp: Arc::default(),
+            cursors: HashMap::new(),
             engine,
             dialect,
             user: user.to_owned(),
@@ -557,6 +564,7 @@ impl Drop for Session {
         if self.txn.is_some() {
             self.rollback();
         }
+        self.drop_temp_tables();
         advisory::release_all(self, None, "");
     }
 }
@@ -706,6 +714,9 @@ pub struct Session {
     pub(crate) sql_text: Option<Arc<str>>,
     /// `EXPLAIN ANALYZE` is running.
     pub(crate) trace: Option<explain::Trace>,
+    /// Temporary tables and cursors (`exec/temp.rs`, `exec/cursor.rs`).
+    pub(crate) temp: temp::TempTables,
+    pub(crate) cursors: cursor::Cursors,
     pub database: String,
     pub vars: HashMap<String, String>,
     /// Session defaults (`RESET ALL` / `DISCARD ALL` return to them): the dialect's defaults
@@ -736,6 +747,115 @@ pub fn now_ns() -> i64 {
 }
 
 impl Session {
+    /// `CREATE MATERIALIZED VIEW`: a table holding the query's rows, and the query to refresh it.
+    #[allow(clippy::too_many_arguments)]
+    fn create_matview(&mut self, name: &str, columns: &[String], query: &crate::ast::Query, sql: &str, with_data: bool, if_not_exists: bool, params: &[Datum]) -> SqlResult<Outcome> {
+        use crate::ast::{ColumnDef, ConstraintNames, CreateTable};
+        self.require_database("CREATE", "create materialized views")?;
+        if self.engine.find_table(name)?.is_some() {
+            if if_not_exists {
+                return Ok(Outcome::command("SELECT 0"));
+            }
+            return Err(SqlError::duplicate_table(name));
+        }
+        let rs = {
+            let ex = eval::Exec::new(self, params);
+            let rel = ex.query(query, None)?;
+            ex.result_set(rel)?
+        };
+        if !columns.is_empty() && columns.len() != rs.columns.len() {
+            return Err(SqlError::new("42601", "the column list does not match the query"));
+        }
+        let cols = rs
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ColumnDef { name: columns.get(i).unwrap_or(&c.name).clone(), ty: c.ty.clone(), precision: None, not_null: false, default: None, primary_key: false, unique: false, auto_increment: false, references: None, check: None, generated: None, declared: None, names: ConstraintNames::default() })
+            .collect();
+        ddl::create_table(self, &CreateTable { name: name.to_owned(), if_not_exists: false, columns: cols, constraints: Vec::new(), as_query: None, temporary: None, columnar: false }, params)?;
+        let mut doc = Doc::new();
+        doc.insert("name".into(), storine::Value::Text(name.to_owned()));
+        doc.insert("sql".into(), storine::Value::Text(sql.to_owned()));
+        doc.insert("dialect".into(), storine::Value::Text(if self.dialect == Dialect::MySql { "mysql".into() } else { "postgres".into() }));
+        let w = Write { collection: crate::catalog::MATVIEWS.into(), key: name.to_lowercase(), op: Op::Put(doc), pre: Pre::None, tag: Tag::Internal };
+        self.engine.store.commit(std::slice::from_ref(&w)).map_err(|e| e.to_sql(std::slice::from_ref(&w)))?;
+        let n = if with_data { self.replace_rows(name, rs.rows, params)? } else { 0 };
+        Ok(Outcome::Command { tag: format!("SELECT {n}"), affected: n, last_insert_id: None })
+    }
+
+    /// Replaces a table's rows, atomically when no transaction is open.
+    fn replace_rows(&mut self, name: &str, rows: Vec<Vec<Datum>>, params: &[Datum]) -> SqlResult<u64> {
+        use crate::ast::{Delete, Insert, InsertSource};
+        let n = rows.len() as u64;
+        let own_txn = !self.in_explicit_transaction();
+        if own_txn {
+            self.txn = Some(Txn { explicit: true, ..Txn::default() });
+        }
+        let run = (|| -> SqlResult<()> {
+            dml::delete(self, &Delete { table: name.to_owned(), alias: None, using: Vec::new(), where_: None, returning: Vec::new(), order_by: Vec::new(), limit: None }, params)?;
+            for chunk in rows.chunks(500) {
+                let values = chunk.iter().map(|r| r.iter().map(ddl::datum_expr).collect()).collect();
+                dml::insert(self, &Insert { table: name.to_owned(), alias: None, columns: Vec::new(), source: InsertSource::Values(values), on_conflict: None, returning: Vec::new(), ignore: false, replace: false }, params)?;
+            }
+            Ok(())
+        })();
+        if own_txn {
+            match run {
+                Ok(()) => self.commit()?,
+                Err(e) => {
+                    self.rollback();
+                    return Err(e);
+                }
+            }
+        } else {
+            run?;
+        }
+        Ok(n)
+    }
+
+    fn refresh_matview(&mut self, name: &str, with_data: bool, params: &[Datum]) -> SqlResult<Outcome> {
+        let t = self.engine.table(name)?;
+        self.require_owner(&t, "ALTER")?;
+        let Some(d) = self.engine.store.get(crate::catalog::MATVIEWS, &name.to_lowercase())? else {
+            return Err(SqlError::new("42809", format!("\"{name}\" is not a materialized view")));
+        };
+        let sql = d.fields.get("sql").and_then(storine::Value::as_str).unwrap_or_default().to_owned();
+        let dialect = if d.fields.get("dialect").and_then(storine::Value::as_str) == Some("mysql") { Dialect::MySql } else { Dialect::Postgres };
+        let (stmts, _) = crate::parser::parse(&sql, dialect)?;
+        let Some(Statement::Query(q)) = stmts.into_iter().next() else {
+            return Err(SqlError::internal("a materialized view's query did not parse"));
+        };
+        let rows = if with_data {
+            let ex = eval::Exec::new(self, params);
+            let rel = ex.query(&q, None)?;
+            ex.result_set(rel)?.rows
+        } else {
+            Vec::new()
+        };
+        self.replace_rows(&t.name, rows, params)?;
+        Ok(Outcome::command("REFRESH MATERIALIZED VIEW"))
+    }
+
+    fn drop_matview(&mut self, names: &[String], if_exists: bool) -> SqlResult<Outcome> {
+        for n in names {
+            if self.engine.store.get(crate::catalog::MATVIEWS, &n.to_lowercase())?.is_none() {
+                if if_exists {
+                    continue;
+                }
+                return Err(SqlError::new("42P01", format!("materialized view \"{n}\" does not exist")));
+            }
+            ddl::drop_tables(self, std::slice::from_ref(n), false, false)?;
+            let w = Write { collection: crate::catalog::MATVIEWS.into(), key: n.to_lowercase(), op: Op::Delete, pre: Pre::None, tag: Tag::Internal };
+            self.engine.store.commit(std::slice::from_ref(&w)).map_err(|e| e.to_sql(std::slice::from_ref(&w)))?;
+        }
+        Ok(Outcome::command("DROP MATERIALIZED VIEW"))
+    }
+
+    /// Inside `BEGIN ... COMMIT` (not the implicit transaction of one statement).
+    pub(crate) fn in_explicit_transaction(&self) -> bool {
+        self.txn.as_ref().is_some_and(|t| t.explicit)
+    }
+
     /// T-SQL `SET SHOWPLAN_TEXT | SHOWPLAN_ALL ON`: statements are planned, not run.
     fn showplan(&self) -> Option<crate::ast::ExplainOptions> {
         if self.dialect != Dialect::MsSql {
@@ -935,6 +1055,8 @@ impl Session {
     /// Runs one statement with bound parameters.
     pub fn execute(&mut self, stmt: &Statement, params: &[Datum]) -> SqlResult<Outcome> {
         let started = now_ns();
+        temp::enter(&self.temp);
+        let was_explicit = self.in_explicit_transaction();
         if self.depth == 0 {
             self.control.begin_statement(self.statement_timeout());
             self.activity_start();
@@ -946,6 +1068,11 @@ impl Session {
         });
         self.depth -= 1;
         if self.depth == 0 {
+            // A transaction just ended (or a statement was one): what lives only that long goes.
+            if !self.in_transaction() && (was_explicit || !self.temp.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()) {
+                self.cursors_after_transaction();
+                self.temp_after_transaction()?;
+            }
             self.control.end_statement(self.in_transaction(), self.idle_transaction_timeout());
             self.activity_end(&out, started);
         }
@@ -1245,6 +1372,14 @@ impl Session {
                 let out = dml::delete(self, d, params);
                 self.count_changes(out)
             }
+            Statement::DeclareCursor { name, query, hold } => self.declare_cursor(name, query, *hold, params),
+            Statement::OpenCursor(name) => self.open_cursor(name, params),
+            Statement::Fetch { name, direction, move_only, into } => self.fetch_cursor(name, direction, *move_only, into),
+            Statement::CloseCursor(name) => self.close_cursor(name.as_deref()),
+            Statement::DeallocateCursor(name) => self.deallocate_cursor(name),
+            Statement::CreateMatView { name, columns, query, sql, with_data, if_not_exists } => self.create_matview(name, columns, query, sql, *with_data, *if_not_exists, params),
+            Statement::RefreshMatView { name, with_data } => self.refresh_matview(name, *with_data, params),
+            Statement::DropMatView { names, if_exists } => self.drop_matview(names, *if_exists),
             Statement::Analyze(tables) => {
                 stats::analyze(self, tables)?;
                 Ok(Outcome::command("ANALYZE"))
@@ -1562,6 +1697,8 @@ impl Session {
                     advisory::release_all(self, None, "");
                     self.vars = self.base_vars.clone();
                     self.role = None;
+                    self.cursors.clear();
+                    self.drop_temp_tables();
                     self.user_vars.clear();
                     self.table_vars.clear();
                 }

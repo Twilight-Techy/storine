@@ -1137,13 +1137,6 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
             }
             bd.done()
         }
-        "pg_matviews" => Builder::new(&[
-            ("schemaname", T),
-            ("matviewname", T),
-            ("matviewowner", T),
-            ("definition", T),
-        ])
-        .done(),
         "pg_sequence" | "pg_sequences" => Builder::new(&[
             ("seqrelid", I8),
             ("schemaname", T),
@@ -1241,6 +1234,15 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                     query,
                     t("client backend"),
                 ]);
+            }
+            bd.done()
+        }
+        "pg_matviews" => {
+            let mut bd = Builder::new(&[("schemaname", T), ("matviewname", T), ("matviewowner", T), ("tablespace", T), ("hasindexes", B), ("ispopulated", B), ("definition", T)]);
+            for d in ex.s.engine.store.scan(crate::catalog::MATVIEWS, None)? {
+                let name = d.fields.get("name").and_then(storine::Value::as_str).unwrap_or_default().to_owned();
+                let owner = tables.iter().find(|x| x.name.eq_ignore_ascii_case(&name)).and_then(|x| x.owner.clone()).unwrap_or_default();
+                bd.row(vec![t("public"), t(name), t(owner), N, b(false), b(true), t(d.fields.get("sql").and_then(storine::Value::as_str).unwrap_or_default())]);
             }
             bd.done()
         }

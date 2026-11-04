@@ -638,4 +638,106 @@ impl Parser {
         }
         Ok(Statement::CreatePolicy(Box::new(CreatePolicy { name, table, permissive, command, roles, using, check })))
     }
+
+    /// `DECLARE name [BINARY] [INSENSITIVE | ASENSITIVE] [[NO] SCROLL] CURSOR [WITH[OUT] HOLD] FOR query`.
+    pub(super) fn declare_cursor(&mut self) -> SqlResult<Statement> {
+        self.pos += 1;
+        let name = self.ident()?;
+        while !self.eat_kw("cursor") {
+            if !(self.eat_kw("binary") || self.eat_kw("insensitive") || self.eat_kw("asensitive") || self.eat_kw("scroll") || self.eat_kw("no")) {
+                return Err(self.unexpected("CURSOR"));
+            }
+        }
+        let mut hold = false;
+        if self.eat_kws(&["with", "hold"]) {
+            hold = true;
+        } else {
+            let _ = self.eat_kws(&["without", "hold"]);
+        }
+        self.expect_kw("for")?;
+        let query = Box::new(self.query()?);
+        Ok(Statement::DeclareCursor { name, query, hold })
+    }
+
+    /// `FETCH | MOVE [direction] [FROM | IN] name`, T-SQL `... INTO @a, @b`.
+    pub(super) fn fetch_cursor(&mut self, move_only: bool) -> SqlResult<Statement> {
+        self.pos += 1;
+        let number = |p: &mut Self| -> Option<i64> {
+            let neg = p.eat_op("-");
+            match p.peek().cloned() {
+                Some(Token::Number(n)) => {
+                    p.pos += 1;
+                    n.parse::<i64>().ok().map(|x| if neg { -x } else { x })
+                }
+                Some(Token::Variable { .. }) => None,
+                _ => None,
+            }
+        };
+        let direction = if self.eat_kw("next") {
+            FetchDirection::Next
+        } else if self.eat_kw("prior") {
+            FetchDirection::Prior
+        } else if self.eat_kw("first") {
+            FetchDirection::First
+        } else if self.eat_kw("last") {
+            FetchDirection::Last
+        } else if self.eat_kw("absolute") {
+            FetchDirection::Absolute(number(self).ok_or_else(|| self.unexpected("a count"))?)
+        } else if self.eat_kw("relative") {
+            FetchDirection::Relative(number(self).ok_or_else(|| self.unexpected("a count"))?)
+        } else if self.eat_kw("all") {
+            FetchDirection::ForwardAll
+        } else if self.eat_kw("forward") {
+            if self.eat_kw("all") {
+                FetchDirection::ForwardAll
+            } else {
+                FetchDirection::Forward(number(self).unwrap_or(1))
+            }
+        } else if self.eat_kw("backward") {
+            if self.eat_kw("all") {
+                FetchDirection::BackwardAll
+            } else {
+                FetchDirection::Backward(number(self).unwrap_or(1))
+            }
+        } else {
+            match number(self) {
+                Some(n) if n < 0 => FetchDirection::Backward(-n),
+                Some(n) => FetchDirection::Forward(n),
+                None => FetchDirection::Next,
+            }
+        };
+        let _ = self.eat_kw("from") || self.eat_kw("in") || self.eat_kw("global");
+        let _ = self.eat_kw("global");
+        let name = self.ident()?;
+        let mut into = Vec::new();
+        if self.dialect == Dialect::MsSql && self.eat_kw("into") {
+            loop {
+                match self.next() {
+                    Some(Token::Variable { name, system: false }) => into.push(name),
+                    _ => return Err(self.unexpected("a variable")),
+                }
+                if !self.eat_op(",") {
+                    break;
+                }
+            }
+        }
+        Ok(Statement::Fetch { name, direction, move_only, into })
+    }
+
+    /// After `CREATE MATERIALIZED VIEW`.
+    pub(super) fn create_matview(&mut self) -> SqlResult<Statement> {
+        let if_not_exists = self.eat_kws(&["if", "not", "exists"]);
+        let name = self.table_name()?;
+        let columns = if self.is_op("(") { self.ident_list()? } else { Vec::new() };
+        self.expect_kw("as")?;
+        let from = self.pos;
+        let query = Box::new(self.query()?);
+        let sql = super::tokens_sql(&self.tokens[from..self.pos], self.dialect)?;
+        let mut with_data = true;
+        if self.eat_kw("with") {
+            with_data = !self.eat_kw("no");
+            self.expect_kw("data")?;
+        }
+        Ok(Statement::CreateMatView { name, columns, query, sql, with_data, if_not_exists })
+    }
 }

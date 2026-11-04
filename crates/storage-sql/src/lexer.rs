@@ -289,8 +289,12 @@ pub fn tokenize(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Token>, Params)> 
             continue;
         }
         // Words.
-        if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 {
+        // T-SQL temporary tables: `#name`, `##name`.
+        if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 || (c == b'#' && dialect == Dialect::MsSql) {
             let start = i;
+            while b.get(i) == Some(&b'#') {
+                i += 1;
+            }
             while i < b.len()
                 && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$' || b[i] >= 0x80)
             {

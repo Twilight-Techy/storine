@@ -44,6 +44,7 @@ fn column_from_def(ex: &Exec<'_>, d: &ColumnDef) -> SqlResult<Column> {
         missing: None,
         declared: d.declared.clone(),
         default_name: d.names.default.clone(),
+        generated: d.generated.clone(),
     })
 }
 
@@ -240,6 +241,10 @@ fn sync_storage_indexes(s: &Session, t: &Table) -> SqlResult<()> {
 
 /// Writes a schema document (`pre`: absent for a new table, its version otherwise).
 fn save_schema(s: &Session, t: &Table, pre: Pre) -> SqlResult<()> {
+    if t.temp.is_some() {
+        crate::exec::temp::save(t);
+        return Ok(());
+    }
     let w = Write {
         collection: TABLES.into(),
         key: t.name.clone(),
@@ -325,8 +330,19 @@ pub fn alter_policy(s: &mut Session, name: &str, table: &str, rename: Option<&st
 }
 
 pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlResult<Outcome> {
-    s.require_database("CREATE", "create tables")?;
-    if s.engine.find_table(&ct.name)?.is_some() {
+    if ct.temporary.is_some() {
+        // Anyone connected may (PostgreSQL's default `TEMP` right); it reaches nobody else.
+        s.engine.sweep_temp_tables()?;
+        if crate::exec::temp::lookup(&ct.name).is_some() {
+            if ct.if_not_exists {
+                return Ok(Outcome::command("CREATE TABLE"));
+            }
+            return Err(SqlError::duplicate_table(&ct.name));
+        }
+    } else {
+        s.require_database("CREATE", "create tables")?;
+    }
+    if ct.temporary.is_none() && s.engine.find_table(&ct.name)?.is_some() {
         if ct.if_not_exists {
             return Ok(Outcome::command("CREATE TABLE"));
         }
@@ -353,6 +369,7 @@ pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlR
                 auto_increment: false,
                 references: None,
                 check: None,
+                generated: None,
                 declared: None,
                 names: Default::default(),
             })
@@ -361,6 +378,7 @@ pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlR
             name: ct.name.clone(),
             if_not_exists: false,
             columns: defs,
+            temporary: ct.temporary,
             constraints: Vec::new(),
             as_query: None,
             columnar: ct.columnar,
@@ -393,7 +411,7 @@ pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlR
     }
     let mut t = Table {
         name: ct.name.clone(),
-        collection: collection_name(&ct.name),
+        collection: if ct.temporary.is_some() { crate::exec::temp::collection(s.id, &ct.name) } else { collection_name(&ct.name) },
         columns: Vec::new(),
         primary_key: Vec::new(),
         uniques: Vec::new(),
@@ -406,6 +424,7 @@ pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlR
         row_security: false,
         force_row_security: false,
         policies: Vec::new(),
+        temp: ct.temporary,
         version: 0,
     };
     {
@@ -471,8 +490,13 @@ pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlR
             }
         }
     }
+    if t.temp.is_some() {
+        crate::exec::temp::check_create(&t)?;
+    }
     save_schema(s, &t, Pre::Absent)?;
-    s.apply_default_privileges(&format!("table:{}", t.name), "tables")?;
+    if t.temp.is_none() {
+        s.apply_default_privileges(&format!("table:{}", t.name), "tables")?;
+    }
     sync_storage_indexes(s, &t)?;
     if t.columnar.is_some() {
         s.engine.store.set_columnar(&t.collection, true)?;
@@ -480,7 +504,7 @@ pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlR
     Ok(Outcome::command("CREATE TABLE"))
 }
 
-fn datum_expr(d: &Datum) -> Expr {
+pub(crate) fn datum_expr(d: &Datum) -> Expr {
     match d {
         Datum::Null => Expr::Null,
         Datum::Bool(b) => Expr::Bool(*b),
@@ -537,7 +561,7 @@ fn backfill_unique(s: &Session, t: &Table, uk: &KeyDef) -> SqlResult<()> {
     Ok(())
 }
 
-fn delete_markers(s: &Session, collection: &str, constraint: Option<&str>) -> SqlResult<()> {
+pub(crate) fn delete_markers(s: &Session, collection: &str, constraint: Option<&str>) -> SqlResult<()> {
     let prefix = match constraint {
         Some(c) => format!("{collection}/{c}/"),
         None => format!("{collection}/"),
@@ -666,6 +690,12 @@ pub fn drop_tables(
         }
     }
     for t in &tables {
+        if t.temp.is_some() {
+            s.engine.store.drop_collection(&t.collection)?;
+            delete_markers(s, &t.collection, None)?;
+            crate::exec::temp::remove(&t.name);
+            continue;
+        }
         s.drop_grants(&format!("table:{}", t.name))?;
         let w = Write {
             collection: TABLES.into(),
@@ -963,6 +993,9 @@ pub fn alter_table(s: &mut Session, table: &str, ops: &[AlterOp]) -> SqlResult<O
             AlterOp::RenameTable(new) => {
                 if s.engine.find_table(new)?.is_some() {
                     return Err(SqlError::duplicate_table(new));
+                }
+                if t.temp.is_some() {
+                    return Err(SqlError::unsupported("renaming a temporary table"));
                 }
                 let old = t.name.clone();
                 t.name = new.clone();

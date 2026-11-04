@@ -2,6 +2,43 @@
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    /// `DECLARE c CURSOR ... FOR query` (`TASK-149`).
+    DeclareCursor {
+        name: String,
+        query: Box<Query>,
+        hold: bool,
+    },
+    /// T-SQL `OPEN c`.
+    OpenCursor(String),
+    /// `FETCH` / `MOVE`; T-SQL `INTO @a, @b`.
+    Fetch {
+        name: String,
+        direction: FetchDirection,
+        move_only: bool,
+        into: Vec<String>,
+    },
+    /// `CLOSE c`; `None`: `CLOSE ALL`.
+    CloseCursor(Option<String>),
+    /// T-SQL `DEALLOCATE c`.
+    DeallocateCursor(String),
+    /// `CREATE MATERIALIZED VIEW`.
+    CreateMatView {
+        name: String,
+        columns: Vec<String>,
+        query: Box<Query>,
+        sql: String,
+        with_data: bool,
+        if_not_exists: bool,
+    },
+    /// `REFRESH MATERIALIZED VIEW`.
+    RefreshMatView {
+        name: String,
+        with_data: bool,
+    },
+    DropMatView {
+        names: Vec<String>,
+        if_exists: bool,
+    },
     /// `ANALYZE [tables]`, MySQL `ANALYZE TABLE`, T-SQL `UPDATE STATISTICS` (`TASK-148`).
     Analyze(Vec<String>),
     /// MySQL `KILL [QUERY | CONNECTION] id`, T-SQL `KILL id` (`TASK-146`).
@@ -413,6 +450,8 @@ pub struct CreateTable {
     pub columns: Vec<ColumnDef>,
     pub constraints: Vec<TableConstraint>,
     pub as_query: Option<Box<Query>>,
+    /// `CREATE TEMP TABLE` (`TASK-149`).
+    pub temporary: Option<OnCommit>,
     /// Kept as column segments for analytics (`TASK-130`): PostgreSQL `WITH (columnar = on)`,
     /// MySQL `ENGINE = COLUMNAR`.
     pub columnar: bool,
@@ -431,6 +470,8 @@ pub struct ColumnDef {
     pub auto_increment: bool,
     pub references: Option<ForeignKey>,
     pub check: Option<Expr>,
+    /// `GENERATED ALWAYS AS (expr)`, MySQL `AS (expr)`, T-SQL `name AS expr`.
+    pub generated: Option<Expr>,
     /// The type as written (T-SQL only: `datetime`, `varchar(50)`), for the catalogs.
     pub declared: Option<String>,
     /// Names given with `CONSTRAINT name` to the column's inline constraints.
@@ -526,6 +567,29 @@ pub enum AlterOp {
     ForceRowSecurity(bool),
     /// `OWNER TO role`.
     OwnerTo(String),
+}
+
+/// What `FETCH` / `MOVE` do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchDirection {
+    Next,
+    Prior,
+    First,
+    Last,
+    Absolute(i64),
+    Relative(i64),
+    Forward(i64),
+    ForwardAll,
+    Backward(i64),
+    BackwardAll,
+}
+
+/// `CREATE TEMP TABLE ... ON COMMIT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnCommit {
+    PreserveRows,
+    DeleteRows,
+    Drop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
