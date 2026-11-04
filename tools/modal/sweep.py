@@ -17,6 +17,7 @@ Usage (from the repository root):
     modal run tools/modal/sweep.py --suite-args "-p storage-core -p storage-index"   # a whole `cargo test`
     modal run tools/modal/sweep.py --suite-args "-p storage-server --test process_chaos -- --nocapture" --env STORINE_CHAOS_SECS=90
     modal run tools/modal/sweep.py --suite-args "-p storage-server --test process_chaos" --repeat 12  # hunt a rare failure
+    modal run tools/modal/sweep.py --tools all           # BI and GUI tools against the SQL gateway
     modal run tools/modal/sweep.py --sdks all            # all 8 SDK suites against range clusters
     modal run tools/modal/sweep.py --sdks python --plain # against a plain server
 
@@ -78,14 +79,14 @@ EXCLUDE = (
 OTHER_SDKS = re.compile(r"^sdks/(?!rust/)")
 
 
-def source_tarball(root: str, all_sdks: bool = False) -> bytes:
+def source_tarball(root: str, all_sdks: bool = False, clients: bool = False) -> bytes:
     """Tracked and untracked-but-not-ignored files, with their mtimes (cargo's fingerprints)."""
     out = subprocess.run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=root, capture_output=True, check=True).stdout
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for path in sorted(set(p for p in out.decode().split("\0") if p)):
             full = os.path.join(root, path)
-            if any(e.match(path) for e in EXCLUDE) or not os.path.isfile(full) or (not all_sdks and OTHER_SDKS.match(path)):
+            if (not clients and any(e.match(path) for e in EXCLUDE)) or not os.path.isfile(full) or (not all_sdks and OTHER_SDKS.match(path)):
                 continue
             tar.add(full, arcname=path)
     return buf.getvalue()
@@ -159,7 +160,7 @@ def run_shard(binary: bytes, name: str, test: str, lo: int, hi: int) -> list[dic
         lo = seed + 1
 
 
-@app.function(image=image, cpu=16, memory=32768, timeout=7200, volumes={"/target": target_vol})
+@app.function(image=image, cpu=16, memory=32768, timeout=14400, volumes={"/target": target_vol})
 def suite(src: bytes, cargo_args: str, env: dict[str, str], repeat: int = 1) -> tuple[int, str]:
     """Runs `cargo test --release <cargo_args>` with `env` up to `repeat` times, stopping at the
     first failure; returns (exit code, summary, with the end of the output on a failure)."""
@@ -168,7 +169,7 @@ def suite(src: bytes, cargo_args: str, env: dict[str, str], repeat: int = 1) -> 
     for attempt in range(1, repeat + 1):
         proc = subprocess.run(f"cargo test --release --no-fail-fast {cargo_args} 2>&1", shell=True, cwd="/src", capture_output=True, text=True, env={**os.environ, **env})
         target_vol.commit()
-        lines = [l for l in proc.stdout.splitlines() if l.startswith("test result") or "FAILED" in l or "panicked" in l or l.startswith("error") or "process chaos" in l or "range cluster" in l or l.startswith("bench:")]
+        lines = [l for l in proc.stdout.splitlines() if l.startswith("test result") or "FAILED" in l or "panicked" in l or l.startswith("error") or "process chaos" in l or "range cluster" in l or l.startswith("bench:") or l.startswith("soak")]
         summary.append(f"--- run {attempt}/{repeat}: exit {proc.returncode}")
         summary.extend(lines[-200:])
         if proc.returncode != 0:
@@ -188,6 +189,36 @@ def build_server(src: bytes) -> bytes:
         raise RuntimeError("build failed:\n" + proc.stdout[-6000:])
     with open("/target/t/release/storage-server", "rb") as f:
         return f.read()
+
+
+# Real clients of the SQL gateway: tool suites (`TASK-150`).
+tools_image = image.apt_install("postgresql-client", "default-jdk-headless", "unixodbc", "unixodbc-dev", "odbc-postgresql", "python3", "python3-pip", "libpq-dev").run_commands(
+    "python3 -m pip install --break-system-packages --quiet sqlalchemy psycopg2-binary 'psycopg[binary]' pymysql pyodbc"
+)
+
+
+@app.function(image=image, cpu=16, memory=32768, timeout=3600, volumes={"/target": target_vol})
+def build_sql(src: bytes) -> bytes:
+    """Builds `storine-sql` (release); returns the executable."""
+    unpack(src)
+    proc = subprocess.run("cargo build --release -p storage-sql 2>&1", shell=True, cwd="/src", capture_output=True, text=True)
+    target_vol.commit()
+    if proc.returncode != 0:
+        raise RuntimeError("build failed:\n" + proc.stdout[-6000:])
+    with open("/target/t/release/storine-sql", "rb") as f:
+        return f.read()
+
+
+@app.function(image=tools_image, cpu=8, memory=16384, timeout=2400)
+def run_tools(src: bytes, gateway: bytes, only: str) -> tuple[int, str]:
+    """Runs the BI and GUI tool suites against a gateway; returns (exit code, their output)."""
+    unpack(src)
+    with open("/tmp/storine-sql", "wb") as f:
+        f.write(gateway)
+    os.chmod("/tmp/storine-sql", 0o755)
+    env = {**os.environ, "STORINE_SQL_BIN": "/tmp/storine-sql"}
+    proc = subprocess.run(f"bash crates/storage-sql/tests/clients/tools/run.sh {only} 2>&1", shell=True, cwd="/src", capture_output=True, text=True, env=env)
+    return proc.returncode, proc.stdout[-60000:]
 
 
 @app.function(image=sdk_image, cpu=4, memory=8192, timeout=3600, retries=1)
@@ -226,8 +257,17 @@ def seeded_tests(root: str, name: str) -> tuple[list[str], list[str]]:
 
 
 @app.local_entrypoint()
-def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300, only: str = "", shard: int = 10, suite_args: str = "", env: str = "", sdks: str = "", plain: bool = False, repeat: int = 1):
+def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300, only: str = "", shard: int = 10, suite_args: str = "", env: str = "", sdks: str = "", plain: bool = False, repeat: int = 1, tools: str = ""):
     root = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True).stdout.strip()
+    if tools:
+        # BI and GUI tools against the gateway; `all`, or suite functions of test_tools.py.
+        src = source_tarball(root, all_sdks=True, clients=True)
+        code, out = run_tools.remote(src, build_sql.remote(src), "" if tools == "all" else tools.replace(",", " "))
+        print(out)
+        print(f"tool suites exit code {code}")
+        if code:
+            raise SystemExit(1)
+        return
     if sdks:
         # SDK end-to-end suites, against range clusters unless --plain.
         src = source_tarball(root, all_sdks=True)

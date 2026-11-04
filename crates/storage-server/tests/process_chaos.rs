@@ -251,6 +251,50 @@ fn add(key: &str, delta: i64) -> DocWrite {
     }
 }
 
+/// One fault on a random node, held for a moment, then undone.
+fn one_fault(cluster: &Mutex<Cluster>, rng: &mut SweepRng, faults: &mut BTreeMap<&'static str, usize>) {
+    let node = rng.below(3);
+    let mut c = cluster.lock().unwrap();
+    match rng.below(6) {
+        0 => {
+            *faults.entry("sigkill").or_default() += 1;
+            c.kill(node);
+            drop(c);
+            thread::sleep(Duration::from_millis(300 + rng.below(1200) as u64));
+            cluster.lock().unwrap().spawn(node);
+        }
+        1 => {
+            *faults.entry("sigstop").or_default() += 1;
+            c.signal(node, "-STOP");
+            drop(c);
+            thread::sleep(Duration::from_millis(500 + rng.below(2000) as u64));
+            cluster.lock().unwrap().signal(node, "-CONT");
+        }
+        2 => {
+            *faults.entry("partition").or_default() += 1;
+            c.isolate(node, DROP);
+            drop(c);
+            thread::sleep(Duration::from_millis(500 + rng.below(1500) as u64));
+            cluster.lock().unwrap().heal();
+        }
+        3 => {
+            *faults.entry("half-open").or_default() += 1;
+            c.isolate(node, BLACKHOLE);
+            drop(c);
+            thread::sleep(Duration::from_millis(500 + rng.below(1500) as u64));
+            cluster.lock().unwrap().heal();
+        }
+        4 => {
+            *faults.entry("delay").or_default() += 1;
+            c.isolate(node, DELAY);
+            drop(c);
+            thread::sleep(Duration::from_millis(500 + rng.below(1500) as u64));
+            cluster.lock().unwrap().heal();
+        }
+        _ => {}
+    }
+}
+
 fn chaos(ranges: bool) {
     let secs: u64 = std::env::var("STORINE_CHAOS_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
     let dir = std::env::temp_dir().join(format!("storine_process_chaos_{}_{ranges}", std::process::id()));
@@ -411,46 +455,7 @@ fn chaos(ranges: bool) {
     let end = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < end {
         thread::sleep(Duration::from_millis(400 + rng.below(800) as u64));
-        let node = rng.below(3);
-        let mut c = cluster.lock().unwrap();
-        match rng.below(6) {
-            0 => {
-                *faults.entry("sigkill").or_default() += 1;
-                c.kill(node);
-                drop(c);
-                thread::sleep(Duration::from_millis(300 + rng.below(1200) as u64));
-                cluster.lock().unwrap().spawn(node);
-            }
-            1 => {
-                *faults.entry("sigstop").or_default() += 1;
-                c.signal(node, "-STOP");
-                drop(c);
-                thread::sleep(Duration::from_millis(500 + rng.below(2000) as u64));
-                cluster.lock().unwrap().signal(node, "-CONT");
-            }
-            2 => {
-                *faults.entry("partition").or_default() += 1;
-                c.isolate(node, DROP);
-                drop(c);
-                thread::sleep(Duration::from_millis(500 + rng.below(1500) as u64));
-                cluster.lock().unwrap().heal();
-            }
-            3 => {
-                *faults.entry("half-open").or_default() += 1;
-                c.isolate(node, BLACKHOLE);
-                drop(c);
-                thread::sleep(Duration::from_millis(500 + rng.below(1500) as u64));
-                cluster.lock().unwrap().heal();
-            }
-            4 => {
-                *faults.entry("delay").or_default() += 1;
-                c.isolate(node, DELAY);
-                drop(c);
-                thread::sleep(Duration::from_millis(500 + rng.below(1500) as u64));
-                cluster.lock().unwrap().heal();
-            }
-            _ => {}
-        }
+        one_fault(&cluster, &mut rng, &mut faults);
     }
     cluster.lock().unwrap().heal();
     thread::sleep(Duration::from_secs(2));
@@ -518,4 +523,330 @@ fn chaos(ranges: bool) {
     }
     drop(cluster);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Most memory one node may hold, and most descriptors it may have open, through a soak.
+const SOAK_RSS_CEILING_KB: u64 = 6 << 20;
+const SOAK_FD_CEILING: u64 = 4096;
+/// Rows the analytics read, overwritten in a cycle so the data stays one size.
+const SOAK_EVENTS: u64 = 20_000;
+
+/// (resident kB, open descriptors) of a process, if it is there.
+fn process_usage(pid: u32) -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let rss = status.lines().find(|l| l.starts_with("VmRSS:"))?.split_whitespace().nth(1)?.parse().ok()?;
+    let fds = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?.count() as u64;
+    Some((rss, fds))
+}
+
+/// Hours of mixed OLTP and analytics under faults (`TASK-151`): linearizable registers (fresh keys
+/// each window, checked at its end), atomic transfers (conserved), inserts and overwrites read by
+/// aggregates and scans, while memory and descriptors stay under their ceilings and do not climb.
+/// `STORINE_SOAK_SECS` (default 30 minutes), `STORINE_SOAK_WINDOW_SECS` (default 5 minutes).
+fn soak(ranges: bool) {
+    use storage_core::analytics::{AggFunc, Aggregate, AggregateQuery, Expr as AExpr, GroupKey};
+    let env_secs = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    let (secs, window_secs) = (env_secs("STORINE_SOAK_SECS", 1800), env_secs("STORINE_SOAK_WINDOW_SECS", 300));
+    let dir = std::env::temp_dir().join(format!("storine_soak_{}_{ranges}", std::process::id()));
+    let cluster = Arc::new(Mutex::new(Cluster::start(&dir, ranges)));
+    let addrs = cluster.lock().unwrap().addrs.clone();
+    let t0 = Instant::now();
+    let now = move || t0.elapsed().as_micros() as u64;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut seeded = false;
+    let seed: Vec<DocWrite> = (0..ACCOUNTS)
+        .map(|i| {
+            let mut f = BTreeMap::new();
+            f.insert("bal".to_string(), PropertyValue::Int64(100));
+            DocWrite { collection: "bank".into(), key: format!("a{i}"), op: DocOp::Put(f), precondition: Precondition::None }
+        })
+        .collect();
+    while !seeded {
+        assert!(Instant::now() < deadline, "the cluster never took its first write");
+        for a in &addrs {
+            if let Ok(mut c) = StorageClient::connect_timeout(*a, client_timeout(ranges)) {
+                if c.doc_write(&seed, Some([0xA6; 16])).is_ok() {
+                    seeded = true;
+                    break;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let window = Arc::new(AtomicU64::new(0));
+    let history: Arc<Mutex<History>> = Arc::new(Mutex::new(Vec::new()));
+    let next_value = Arc::new(AtomicU64::new(1));
+    // writes, reads, transfers, event writes, aggregates, scans, failures of any kind
+    let counts = Arc::new(Mutex::new([0u64; 7]));
+    let mut workers = Vec::new();
+    let client_of = move |addrs: &[SocketAddr], target: &mut usize| loop {
+        match StorageClient::connect_timeout(addrs[*target % addrs.len()], client_timeout(ranges)) {
+            Ok(c) => return c,
+            Err(_) => {
+                *target += 1;
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    // Registers: the same check as the chaos test, on keys of this window.
+    for w in 0..3u64 {
+        let (addrs, stop, window, history, next_value, counts) = (addrs.clone(), Arc::clone(&stop), Arc::clone(&window), Arc::clone(&history), Arc::clone(&next_value), Arc::clone(&counts));
+        workers.push(thread::spawn(move || {
+            let mut rng = SweepRng::new(w + 500);
+            let mut target = w as usize;
+            let mut c = None;
+            while !stop.load(Ordering::Relaxed) {
+                let client = c.get_or_insert_with(|| client_of(&addrs, &mut target));
+                let key = window.load(Ordering::Relaxed) as usize * 3 + rng.below(3);
+                let name = format!("k{key}");
+                let call = now();
+                if rng.below(2) == 0 {
+                    let v = next_value.fetch_add(1, Ordering::Relaxed) as i64;
+                    match client.doc_write(&[put(&name, v)], None) {
+                        Ok(_) => {
+                            history.lock().unwrap().push((key, Event { call, ret: Some(now()), op: RegisterOp::Write(v) }));
+                            counts.lock().unwrap()[0] += 1;
+                        }
+                        Err(e) => {
+                            if !definitely_not_applied(&e) {
+                                history.lock().unwrap().push((key, Event { call, ret: None, op: RegisterOp::Write(v) }));
+                            }
+                            counts.lock().unwrap()[6] += 1;
+                            target += 1;
+                            c = None;
+                        }
+                    }
+                } else {
+                    match client.doc_get("kv", &name) {
+                        Ok(doc) => {
+                            let v = doc.and_then(|d| match d.fields.get("v") {
+                                Some(PropertyValue::Int64(v)) => Some(*v),
+                                _ => None,
+                            });
+                            history.lock().unwrap().push((key, Event { call, ret: Some(now()), op: RegisterOp::Read(v) }));
+                            counts.lock().unwrap()[1] += 1;
+                        }
+                        Err(_) => {
+                            counts.lock().unwrap()[6] += 1;
+                            target += 1;
+                            c = None;
+                        }
+                    }
+                }
+            }
+        }));
+    }
+    // Transfers, each retried with one request id until it settles.
+    for w in 0..2u64 {
+        let (addrs, stop, counts) = (addrs.clone(), Arc::clone(&stop), Arc::clone(&counts));
+        workers.push(thread::spawn(move || {
+            let mut rng = SweepRng::new(w + 600);
+            let mut target = w as usize;
+            let mut c = None;
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let (a, b) = (rng.below(ACCOUNTS), rng.below(ACCOUNTS));
+                if a == b {
+                    continue;
+                }
+                n += 1;
+                let mut rid = [0u8; 16];
+                rid[..8].copy_from_slice(&(w * 1_000_000_000 + n).to_le_bytes());
+                let batch = [add(&format!("a{a}"), -1), add(&format!("a{b}"), 1)];
+                for _ in 0..100 {
+                    let client = c.get_or_insert_with(|| client_of(&addrs, &mut target));
+                    match client.doc_write(&batch, Some(rid)) {
+                        Ok(_) => {
+                            counts.lock().unwrap()[2] += 1;
+                            break;
+                        }
+                        Err(StorageError::Rejected { status, .. }) if status == storage_server::STATUS_CONFLICT => break,
+                        Err(_) => {
+                            counts.lock().unwrap()[6] += 1;
+                            target += 1;
+                            c = None;
+                            thread::sleep(Duration::from_millis(50));
+                        }
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        // Stopped mid-retry: the transfer is atomic whichever way it went.
+                        break;
+                    }
+                }
+            }
+        }));
+    }
+    // Rows for the analytics: overwritten in a cycle, in batches.
+    {
+        let (addrs, stop, counts) = (addrs.clone(), Arc::clone(&stop), Arc::clone(&counts));
+        workers.push(thread::spawn(move || {
+            let mut target = 0usize;
+            let mut c = None;
+            let mut i = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let batch: Vec<DocWrite> = (0..50)
+                    .map(|k| {
+                        let id = (i + k) % SOAK_EVENTS;
+                        let mut f = BTreeMap::new();
+                        f.insert("region".to_string(), PropertyValue::Int64((id % 7) as i64));
+                        f.insert("amount".to_string(), PropertyValue::Int64((id * 3 % 1000) as i64));
+                        f.insert("note".to_string(), PropertyValue::Text("x".repeat(100)));
+                        DocWrite { collection: "events".into(), key: format!("e{id}"), op: DocOp::Put(f), precondition: Precondition::None }
+                    })
+                    .collect();
+                let client = c.get_or_insert_with(|| client_of(&addrs, &mut target));
+                match client.doc_write(&batch, None) {
+                    Ok(_) => {
+                        i += 50;
+                        counts.lock().unwrap()[3] += 1;
+                    }
+                    Err(_) => {
+                        counts.lock().unwrap()[6] += 1;
+                        target += 1;
+                        c = None;
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+        }));
+    }
+    // Analytics: aggregates and filtered scans over those rows.
+    {
+        let (addrs, stop, counts) = (addrs.clone(), Arc::clone(&stop), Arc::clone(&counts));
+        workers.push(thread::spawn(move || {
+            let mut target = 2usize;
+            let mut c = None;
+            let mut rng = SweepRng::new(700);
+            while !stop.load(Ordering::Relaxed) {
+                let client = c.get_or_insert_with(|| client_of(&addrs, &mut target));
+                let q = AggregateQuery {
+                    collection: "events".into(),
+                    filter: None,
+                    group_by: vec![GroupKey::Field("region".into())],
+                    aggregates: vec![Aggregate { func: AggFunc::Count, arg: None }, Aggregate { func: AggFunc::Sum, arg: Some(AExpr::Field("amount".into())) }],
+                    order_by: Vec::new(),
+                    limit: None,
+                    memory_budget: 64 << 20,
+                    ..AggregateQuery::default()
+                };
+                let ok = if rng.below(2) == 0 {
+                    let r = client.doc_aggregate(&q).is_ok();
+                    counts.lock().unwrap()[4] += u64::from(r);
+                    r
+                } else {
+                    let q = storage_core::DocQuery { collection: "events".into(), limit: Some(100), ..storage_core::DocQuery::default() };
+                    let r = client.doc_query(&q).is_ok();
+                    counts.lock().unwrap()[5] += u64::from(r);
+                    r
+                };
+                if !ok {
+                    counts.lock().unwrap()[6] += 1;
+                    target += 1;
+                    c = None;
+                    thread::sleep(Duration::from_millis(100));
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        }));
+    }
+    // Faults, a fifth of the time: hours of constant failure would measure only recovery.
+    {
+        let (cluster, stop) = (Arc::clone(&cluster), Arc::clone(&stop));
+        workers.push(thread::spawn(move || {
+            let mut rng = SweepRng::new(0x50AC);
+            let mut faults = BTreeMap::new();
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(4000 + rng.below(8000) as u64));
+                one_fault(&cluster, &mut rng, &mut faults);
+            }
+            cluster.lock().unwrap().heal();
+            eprintln!("soak faults: {faults:?}");
+        }));
+    }
+    let end = Instant::now() + Duration::from_secs(secs);
+    let mut windows: Vec<(u64, u64)> = Vec::new();
+    let mut n = 0u64;
+    while Instant::now() < end {
+        let window_end = Instant::now() + Duration::from_secs(window_secs);
+        let (mut rss_max, mut fds_max) = (0u64, 0u64);
+        while Instant::now() < window_end && Instant::now() < end {
+            thread::sleep(Duration::from_secs(5));
+            let pids: Vec<u32> = cluster.lock().unwrap().procs.iter().flatten().map(Child::id).collect();
+            for pid in pids {
+                if let Some((rss, fds)) = process_usage(pid) {
+                    rss_max = rss_max.max(rss);
+                    fds_max = fds_max.max(fds);
+                    assert!(rss <= SOAK_RSS_CEILING_KB, "a node holds {rss} kB, beyond the ceiling");
+                    assert!(fds <= SOAK_FD_CEILING, "a node has {fds} descriptors open, beyond the ceiling");
+                }
+            }
+        }
+        n += 1;
+        window.store(n, Ordering::Relaxed);
+        // Writers move to fresh keys; what they had in flight lands within a moment.
+        thread::sleep(Duration::from_secs(2));
+        let done: History = std::mem::take(&mut *history.lock().unwrap());
+        let closed: History = done.iter().filter(|(k, _)| *k < n as usize * 3).cloned().collect();
+        history.lock().unwrap().extend(done.into_iter().filter(|(k, _)| *k >= n as usize * 3));
+        match check_keyed(&closed, 50_000_000) {
+            Ok(()) => {}
+            Err((_, CheckError::Inconclusive)) => eprintln!("soak window {n}: a key was too concurrent to decide"),
+            Err((k, e)) => panic!("window {n}: key {k} not linearizable: {:?}", matches!(e, CheckError::NotLinearizable { .. })),
+        }
+        let counted = *counts.lock().unwrap();
+        eprintln!("soak: window {n} at {}s: rss max {} MiB, fds max {fds_max}; writes {} reads {} transfers {} event batches {} aggregates {} scans {} failures {}", t0.elapsed().as_secs(), rss_max / 1024, counted[0], counted[1], counted[2], counted[3], counted[4], counted[5], counted[6]);
+        windows.push((rss_max, fds_max));
+    }
+    stop.store(true, Ordering::Relaxed);
+    for w in workers {
+        let _ = w.join();
+    }
+    cluster.lock().unwrap().heal();
+    thread::sleep(Duration::from_secs(3));
+    // Money is conserved, whatever was in flight.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let total = loop {
+        let read = (|| -> Option<i64> {
+            let mut c = StorageClient::connect_timeout(addrs[0], client_timeout(ranges)).ok()?;
+            let mut t = 0;
+            for i in 0..ACCOUNTS {
+                let d = c.doc_get("bank", &format!("a{i}")).ok()??;
+                if let Some(PropertyValue::Int64(v)) = d.fields.get("bal") {
+                    t += v;
+                }
+            }
+            Some(t)
+        })();
+        match read {
+            Some(t) => break t,
+            None if Instant::now() < deadline => thread::sleep(Duration::from_millis(500)),
+            None => panic!("accounts unreadable after the soak"),
+        }
+    };
+    assert_eq!(total, 100 * ACCOUNTS as i64, "money created or destroyed");
+    // Nothing climbs without end: the last windows hold about what the first full ones did.
+    if windows.len() >= 6 {
+        let early = windows[1..3].iter().map(|w| w.0).max().unwrap_or(0);
+        let late = windows[windows.len() - 2..].iter().map(|w| w.0).max().unwrap_or(0);
+        assert!(late <= early * 3 / 2 + (256 << 10), "memory climbed: {early} kB early, {late} kB late: {windows:?}");
+        let (early_fds, late_fds) = (windows[1..3].iter().map(|w| w.1).max().unwrap_or(0), windows[windows.len() - 2..].iter().map(|w| w.1).max().unwrap_or(0));
+        assert!(late_fds <= early_fds * 2 + 64, "descriptors climbed: {early_fds} early, {late_fds} late");
+    }
+    let counted = *counts.lock().unwrap();
+    assert!(counted[0] > 0 && counted[1] > 0 && counted[2] > 0 && counted[3] > 0 && counted[4] + counted[5] > 0, "a part of the work never ran: {counted:?}");
+    drop(cluster);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore]
+fn soak_range_cluster() {
+    soak(true);
+}
+
+#[test]
+#[ignore]
+fn soak_single_group() {
+    soak(false);
 }
