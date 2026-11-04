@@ -106,7 +106,7 @@ The latest instruction from the user is to do everything that remains, **except*
 ## 4. Left to do
 
 ### Stage 30
-- **TASK-144**: consistent cluster-wide backups at one timestamp; resumable changefeeds.
+- **TASK-144**: done. `dist/backup.rs`, `dist/feed.rs`, `OP_ADMIN_RESTORE`, `OP_CHANGEFEED`, `storage-cli changefeed`. Stage 30 is complete; Stage 31 (`TASK-145` onward) is next.
 
 ### Stage 31 — Enterprise SQL (TASK-145 – 152)
 - Enforced `GRANT` / `REVOKE` and row-level security.

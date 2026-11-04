@@ -692,3 +692,14 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - TTL values read as absent when expired but are not reclaimed until overwritten;
   - a range-mode write through the chaos run is still far behind a single Raft group's throughput.
 - **Tooling**: `modal run tools/modal/sweep.py --sdks all` runs all 8 SDK suites in an image with every toolchain.
+
+### Stage 30 complete: cluster backups and changefeeds (`TASK-144`) — 2026-11-04
+
+- **What exists now**: `storage-cli remote-backup` on a range cluster takes one backup of every range at one timestamp while writes continue. `remote-restore` loads it into a new cluster. `storage-cli changefeed` follows committed changes into a JSON-lines file and resumes from a cursor; started at a backup's timestamp, it gives a snapshot and every later change.
+- **Decision**: history protection is advisory and in memory, and correctness rests on detection through `trimmed_below`. A durable protection registry would add a replicated subsystem to avoid a failure that is already loud and recoverable.
+- **Decision**: changefeeds are Admin-only, because a feed reads every collection and holds history back on every node.
+- **Bug found by reading the trim code**: removing a key's last tombstone forgot the versions it hid without moving `trimmed_below`, so `AS OF` reads below a delete said the key never existed. Fixed, with a regression test.
+- **Weak test found by mutation**: leaving the clock offset out of the backup timestamp passed 150 seeds at first, because every simulated client shared one clock. Writers' clocks now lead the backup client's by half the offset; the mutation fails, and the unmutated code passes.
+- **Audit**: 300 seeds of both new simulations, three mutations caught, the TCP test, the real binaries, clippy. One mutation's Modal run hit my 270 s command limit before reporting, so that mutation (no timestamp-cache mark) was confirmed locally instead: 5 of 8 seed ranges failed with a wrong feed state.
+- **Known limits, not hidden**: feeds and backups are `O(keys)` per pass; a node restart loses protection (detected, not silent); expiry is not a change event; no incremental backups.
+

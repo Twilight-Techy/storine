@@ -195,6 +195,8 @@ struct ClientSlot {
     meta_node: Option<usize>,
     /// Meta lookups sent, and requests that went to a stale leaseholder or range.
     pub_lookups: usize,
+    /// How far this client's clock leads (nanoseconds, within the maximum offset).
+    skew_ns: u64,
     misroutes: usize,
 }
 
@@ -675,7 +677,7 @@ fn yield_and_wait<'a>(shared: &'a Shared, i: usize, clock: &ManualClock, w: std:
     while w.turn != Some(i) {
         w = cv.wait(w).unwrap_or_else(|p| p.into_inner());
     }
-    clock.set(w.now * 1_000);
+    clock.set(w.now * 1_000 + w.slots[i].skew_ns);
     w
 }
 
@@ -1152,6 +1154,12 @@ pub fn run(root: &Path, seed: u64, cfg: &TxnSimConfig) -> Result<TxnSimReport, S
     }
     world.schedule(cfg.fault_every, Ev::Fault);
 
+    if cfg.backup_audits {
+        // Writers' clocks lead the backup client's: their commits are ahead of what it can see.
+        for slot in world.slots.iter_mut().skip(1) {
+            slot.skew_ns = cfg.max_offset_ns / 2;
+        }
+    }
     let shared: Shared = Arc::new((Mutex::new(world), Condvar::new()));
     let mut threads = Vec::new();
     for i in 0..cfg.clients {
