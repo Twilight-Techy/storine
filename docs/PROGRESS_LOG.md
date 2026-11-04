@@ -676,3 +676,19 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Found on the way**:
   - an epoll test assumed one `wait` returns every ready socket; it gathers until both are seen now (gVisor's loopback delivers the second write a moment later);
   - a test helper's `mut` is needed only on CPU targets without AES-NI.
+
+### Stage 30 (continued): range clusters over TCP, documents, SDKs and SQL (`TASK-142`, `TASK-143`) — 2026-11-04
+
+- **What exists now**: `storage-server --ranges` runs the multi-range layer as real processes. Any node serves the whole document API, and the 8 SDKs and the SQL gateway work against it unchanged. Details are in `TASKS.md`.
+- **Decision**: gateway routing instead of range caches in 8 SDKs, keeping them small and alike (`RULE-DX-01`), at the cost of up to one extra hop.
+- **The performance work was forced by testing**: running the SDK suites showed money tests timing out. One put took 91 ms and contended writes ran at about 1 per second, though always exact. Causes and fixes:
+  - about 10 syncs per Raft entry: applied indexes and the engine WAL are now checkpointed, with the Raft log as the durable record;
+  - about 4 consensus rounds per single-document write: one-phase commits now take one;
+  - replies waiting for the next tick, an unbounded MVCC history, and a metastable collapse into the slow path.
+- **Audit**: 300 seeds of every simulation under power cuts with aggressive log compaction, 8 of 8 SDK suites, the full workspace (59 test binaries), 90 s of process chaos, clippy. Simulator coverage of the one-phase path was missing until I noticed it after the SDKs passed; it is now in `documents_under_faults`, and a mutation test shows it detects a double apply.
+- **Known limits, not hidden**:
+  - secondary indexes, vector indexes and column segments are not distributed: queries, vector search and analytics on range clusters are `O(collection)`;
+  - request-id memory is 60 s per document (24 h on a single node), enough for every SDK's retry budget;
+  - TTL values read as absent when expired but are not reclaimed until overwritten;
+  - a range-mode write through the chaos run is still far behind a single Raft group's throughput.
+- **Tooling**: `modal run tools/modal/sweep.py --sdks all` runs all 8 SDK suites in an image with every toolchain.

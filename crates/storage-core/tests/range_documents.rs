@@ -157,8 +157,43 @@ fn documents_on_a_range_cluster() {
 
     // Refused precisely, never mis-executed.
     assert!(docs::get(s, "_txn", "x").is_err());
-    let ttl = DocWrite { collection: "c".into(), key: "k".into(), op: DocOp::PutWithTtl(BTreeMap::new(), Duration::from_secs(1)), precondition: Precondition::None };
-    assert!(docs::write(s, vec![ttl], None).is_err());
+
+    // Time-to-live: readable, then absent; its version floor remains.
+    let ttl = DocWrite { collection: "c".into(), key: "k".into(), op: DocOp::PutWithTtl(BTreeMap::new(), Duration::from_millis(300)), precondition: Precondition::None };
+    let tv = docs::write(s, vec![ttl], None).unwrap().versions[0].unwrap();
+    assert!(docs::get(s, "c", "k").unwrap().is_some());
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(docs::get(s, "c", "k").unwrap().is_none(), "expired");
+    let again = docs::write(s, vec![put("c", "k", BTreeMap::new(), Precondition::Absent)], None).unwrap().versions[0].unwrap();
+    assert!(again > tv);
+
+    // Vector search: exact, filtered, and the index's dimensions bind writes.
+    docs::create_vector_index(s, "emb", "e", 2).unwrap();
+    let vec_of = |a: f64, b: f64| PropertyValue::List(vec![PropertyValue::Float64(a), PropertyValue::Float64(b)]);
+    let w = vec![put("emb", "x", fields(&[("e", vec_of(1.0, 0.0))]), Precondition::None), put("emb", "y", fields(&[("e", vec_of(0.0, 1.0))]), Precondition::None)];
+    docs::write(s, w, None).unwrap();
+    assert!(docs::write(s, vec![put("emb", "bad", fields(&[("e", PropertyValue::Int64(1))]), Precondition::None)], None).is_err());
+    let q = DocQuery { collection: "emb".into(), nearest: Some(storage_core::document::Nearest { field: "e".into(), vector: vec![0.9, 0.1], k: 1, exact: false }), ..DocQuery::default() };
+    assert_eq!(docs::query(s, &q).unwrap().documents[0].key, "x");
+}
+
+/// A range replicated on one node is its own quorum (it once never committed its first entry).
+#[test]
+fn a_single_voter_range_serves() {
+    let root = std::env::temp_dir().join(format!("storine_range_docs_single_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let transport = LocalTransport::new();
+    let engine = StorageEngine::<DocumentRecord>::open(root.join("n1"), EngineConfig { background_flush: false, collection_name: "node".into(), ..EngineConfig::default() }).unwrap();
+    let mut d = NodeDriver::new(1, Arc::new(engine), NodeConfig { seed: 1, cluster: vec![1], max_offset_ns: 500_000_000, ..NodeConfig::default() });
+    d.open_range(1, KeySpan::all(), &[1]).unwrap();
+    let node = RangeNode::start(NodeServer::new(d, hlc()), transport.clone(), RuntimeConfig::default());
+    transport.register(Arc::clone(&node));
+    let cfg = GatewayConfig { nodes: vec![1], request_timeout: Duration::from_secs(20), call_timeout: Duration::from_secs(5) };
+    let mut g = Gateway::new(transport.clone(), cfg, hlc(), Arc::new(RwLock::new(RangeIndex::new())));
+    docs::write(&mut g, vec![put("c", "k", BTreeMap::new(), Precondition::Absent)], None).unwrap();
+    assert!(docs::get(&mut g, "c", "k").unwrap().is_some());
+    node.stop();
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Concurrent transfers through gateways on several threads, while a node stops and comes
@@ -210,4 +245,56 @@ fn concurrent_transfers_conserve_money() {
         _ => 0,
     }).sum();
     assert_eq!(total, 100 * accounts as i64, "{committed} transfers committed");
+}
+
+/// Contended read-modify-writes of one document: one-phase commits queue on the key's latch, so
+/// every update lands exactly once, quickly, and retries of one request id apply once.
+#[test]
+fn contended_updates_commit_once_each() {
+    let cluster = start("contended");
+    let mut g = cluster.gateway();
+    docs::write(&mut g, vec![put("hot", "k", fields(&[("n", PropertyValue::Int64(0))]), Precondition::None)], None).unwrap();
+    let inc = || DocWrite { collection: "hot".into(), key: "k".into(), op: DocOp::Patch(vec![FieldOp::Add { path: "n".into(), delta: PropertyValue::Int64(1), min: None, max: None }]), precondition: Precondition::None };
+    let t0 = std::time::Instant::now();
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let mut g = cluster.gateway();
+            std::thread::spawn(move || {
+                for _ in 0..25 {
+                    let inc = DocWrite { collection: "hot".into(), key: "k".into(), op: DocOp::Patch(vec![FieldOp::Add { path: "n".into(), delta: PropertyValue::Int64(1), min: None, max: None }]), precondition: Precondition::None };
+                    docs::write(&mut g, vec![inc], None).unwrap();
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    eprintln!("200 contended updates in {:?}", t0.elapsed());
+    assert_eq!(docs::get(&mut g, "hot", "k").unwrap().unwrap().fields.get("n"), Some(&PropertyValue::Int64(200)));
+    // Retries of one request id, whichever path they take, apply once.
+    let rid = Some([9u8; 16]);
+    assert!(!docs::write(&mut g, vec![inc()], rid).unwrap().duplicate);
+    assert!(docs::write(&mut g, vec![inc()], rid).unwrap().duplicate);
+    assert_eq!(docs::get(&mut g, "hot", "k").unwrap().unwrap().fields.get("n"), Some(&PropertyValue::Int64(201)));
+    // History stays bounded on a hot key.
+    assert!(docs::get(&mut g, "hot", "k").unwrap().is_some());
+}
+
+/// A batch writing one key twice is not its own retry, in either commit path (a full
+/// transaction once read its own buffered request id back and dropped the whole batch).
+#[test]
+fn a_batch_may_write_one_key_twice() {
+    let cluster = start("twice");
+    let mut g = cluster.gateway();
+    let n = |v: i64| fields(&[("n", PropertyValue::Int64(v))]);
+    // A new collection: a full transaction. A known one: one phase.
+    for collection in ["fresh", "fresh"] {
+        let key = format!("k{}", docs::query(&mut g, &DocQuery { collection: collection.into(), ..DocQuery::default() }).unwrap().total);
+        let batch = vec![put(collection, &key, n(1), Precondition::None), put(collection, "other", n(2), Precondition::None), put(collection, &key, n(3), Precondition::None)];
+        let w = docs::write(&mut g, batch, Some([key.len() as u8 + key.as_bytes()[1]; 16])).unwrap();
+        assert!(!w.duplicate);
+        assert_eq!(docs::get(&mut g, collection, &key).unwrap().unwrap().fields.get("n"), Some(&PropertyValue::Int64(3)), "{key}");
+        assert_eq!(docs::get(&mut g, collection, "other").unwrap().unwrap().fields.get("n"), Some(&PropertyValue::Int64(2)));
+    }
 }

@@ -72,6 +72,10 @@ pub struct TxnSimConfig {
     /// Audits read every account with one scan of the accounts' span across ranges
     /// (`TASK-143`) instead of a read per account.
     pub scan_audits: bool,
+    /// Clients use the document API (`TASK-143`) instead of raw transactions: atomic transfers
+    /// between documents with conservation audits, and per-client counters retried with one
+    /// request id (acknowledged <= final value <= attempted: applied at most once).
+    pub doc_workload: bool,
 }
 
 impl Default for TxnSimConfig {
@@ -95,11 +99,12 @@ impl Default for TxnSimConfig {
             request_timeout: 1_500_000,
             max_offset_ns: 50_000_000,
             max_events: 5_000_000,
-            node: NodeConfig { election_min_us: 300_000, election_max_us: 600_000, heartbeat_us: 50_000, snapshot_chunk: 2048, ..NodeConfig::default() },
+            node: NodeConfig { election_min_us: 300_000, election_max_us: 600_000, heartbeat_us: 50_000, snapshot_chunk: 2048, checkpoint_us: 300_000, log_retain: 32, ..NodeConfig::default() },
             meta_routing: false,
             nearest_reads: false,
             audit_staleness_ns: 0,
             scan_audits: false,
+            doc_workload: false,
         }
     }
 }
@@ -125,6 +130,8 @@ pub struct TxnSimReport {
     pub misroutes: usize,
     /// Reads replicas served below their closed timestamps.
     pub follower_reads: u64,
+    /// Document writes committed in one phase.
+    pub one_phase: usize,
 }
 
 /// A transaction with an unknown outcome: id, reads, writes.
@@ -228,7 +235,7 @@ fn bal(b: i64) -> BTreeMap<String, PropertyValue> {
 }
 
 fn engine_config() -> EngineConfig {
-    EngineConfig { background_flush: false, collection_name: "node".into(), ..EngineConfig::default() }
+    EngineConfig { background_flush: false, collection_name: "node".into(), wal_sync_policy: storage_wal::SyncPolicy::AsyncMemoryFirst, ..EngineConfig::default() }
 }
 
 impl World {
@@ -641,6 +648,9 @@ struct ClientHandle {
     hlc: Hlc,
     clock: ManualClock,
     rng: SweepRng,
+    /// Collections known to the document layer ([`KvSender::collection_is_plain`]).
+    plain: std::collections::BTreeSet<String>,
+    one_phase: usize,
 }
 
 /// Hands the baton back to the scheduler and waits for client `i`'s next turn.
@@ -677,6 +687,9 @@ impl KvSender for ClientHandle {
         w.slots[self.i].outstanding.clear();
         drop(w);
         for r in out.iter().flatten() {
+            if matches!(r, KvResponse::Atomic { .. }) {
+                self.one_phase += 1;
+            }
             let ts = match r {
                 KvResponse::Value { ts: Some(t), .. } | KvResponse::Written { ts: t } | KvResponse::Uncertain { ts: t } => Some(*t),
                 KvResponse::Record(Some(rec)) => Some(rec.ts),
@@ -707,11 +720,111 @@ impl KvSender for ClientHandle {
         w.slots[self.i].sleeping_until = None;
     }
 
+    fn collection_is_plain(&mut self, collection: &str) -> bool {
+        self.plain.contains(collection)
+    }
+
+    fn note_collection(&mut self, collection: &str, plain: bool) {
+        if plain {
+            self.plain.insert(collection.to_string());
+        } else {
+            self.plain.remove(collection);
+        }
+    }
+
     fn new_id(&mut self) -> TxnId {
         let mut id = [0u8; 16];
         id[..8].copy_from_slice(&self.rng.next_u64().to_le_bytes());
         id[8..].copy_from_slice(&self.rng.next_u64().to_le_bytes());
         id
+    }
+}
+
+/// The document workload (see [`TxnSimConfig::doc_workload`]).
+fn doc_client(h: &mut ClientHandle, cfg: &TxnSimConfig, rng: &mut SweepRng) {
+    use crate::dist::docs;
+    use crate::document::{DocOp, DocQuery, DocWrite};
+    use crate::engine::Precondition;
+    use storage_codec::field_ops::FieldOp;
+    let add = |c: &str, k: String, d: i64, min: bool| DocWrite {
+        collection: c.into(),
+        key: k,
+        op: DocOp::Patch(vec![FieldOp::Add { path: "n".into(), delta: PropertyValue::Int64(d), min: min.then_some(PropertyValue::Int64(0)), max: None }]),
+        precondition: Precondition::None,
+    };
+    let put = |c: &str, k: String, n: i64| DocWrite { collection: c.into(), key: k, op: DocOp::Put(BTreeMap::from([("n".to_string(), PropertyValue::Int64(n))])), precondition: Precondition::None };
+    let fail = |h: &ClientHandle, msg: String| {
+        let shared = Arc::clone(&h.shared);
+        let mut w = shared.0.lock().unwrap_or_else(|p| p.into_inner());
+        w.failure.get_or_insert(msg);
+    };
+    let me = h.i;
+    let counter = format!("c{me}");
+    // One request id per logical write, reused by its retries.
+    let mut seq = 0u64;
+    let mut send = |h: &mut ClientHandle, writes: &[DocWrite], rng: &mut SweepRng| -> bool {
+        seq += 1;
+        let mut rid = [0u8; 16];
+        rid[..8].copy_from_slice(&(me as u64).to_le_bytes());
+        rid[8..].copy_from_slice(&seq.to_le_bytes());
+        for _ in 0..4 {
+            if docs::write(h, writes.to_vec(), Some(rid)).is_ok() {
+                return true;
+            }
+            h.sleep(50_000 + rng.below(100_000) as u64);
+        }
+        false
+    };
+    if me == 0 {
+        let seed: Vec<DocWrite> = (0..cfg.accounts).map(|i| put("bank", format!("a{i}"), cfg.initial_balance)).collect();
+        while !send(h, &seed, rng) {}
+    }
+    if !send(h, &[put("ctr", counter.clone(), 0)], rng) {
+        return;
+    }
+    let (mut attempted, mut acked) = (0i64, 0i64);
+    for n in 0..cfg.txns_per_client * 2 {
+        match n % 4 {
+            0 | 1 => {
+                attempted += 1;
+                if send(h, &[add("ctr", counter.clone(), 1, false)], rng) {
+                    acked += 1;
+                }
+            }
+            2 => {
+                let (a, b) = (rng.below(cfg.accounts), rng.below(cfg.accounts));
+                if a != b {
+                    let amount = 1 + rng.below(10) as i64;
+                    send(h, &[add("bank", format!("a{a}"), -amount, true), add("bank", format!("a{b}"), amount, false)], rng);
+                }
+            }
+            _ => {
+                let q = DocQuery { collection: "bank".into(), ..DocQuery::default() };
+                if let Ok(page) = docs::query(h, &q) {
+                    let total: i64 = page.documents.iter().map(|d| if let Some(PropertyValue::Int64(v)) = d.fields.get("n") { *v } else { 0 }).sum();
+                    if page.documents.len() == cfg.accounts && total != cfg.initial_balance * cfg.accounts as i64 {
+                        fail(h, format!("document audit saw total {total}: {:?}", page.documents.iter().map(|d| (d.key.clone(), d.fields.get("n").cloned())).collect::<Vec<_>>()));
+                        return;
+                    }
+                    let shared = Arc::clone(&h.shared);
+                    shared.0.lock().unwrap_or_else(|p| p.into_inner()).report.audits += 1;
+                }
+            }
+        }
+    }
+    for _ in 0..40 {
+        match docs::get(h, "ctr", &counter) {
+            Ok(Some(d)) => {
+                let v = if let Some(PropertyValue::Int64(v)) = d.fields.get("n") { *v } else { -1 };
+                if v < acked || v > attempted {
+                    fail(h, format!("client {me}: counter {v} outside acknowledged {acked} .. attempted {attempted}"));
+                }
+                let shared = Arc::clone(&h.shared);
+                shared.0.lock().unwrap_or_else(|p| p.into_inner()).report.committed += usize::try_from(acked).unwrap_or(0);
+                return;
+            }
+            _ => h.sleep(100_000),
+        }
     }
 }
 
@@ -725,6 +838,16 @@ fn client_main(mut h: ClientHandle, cfg: TxnSimConfig) {
         drop(yield_and_wait(&shared, h.i, &h.clock, w));
     }
     let mut rng = SweepRng::new(h.rng.next_u64());
+    if cfg.doc_workload {
+        doc_client(&mut h, &cfg, &mut rng);
+        let shared = Arc::clone(&h.shared);
+        let mut w = shared.0.lock().unwrap_or_else(|p| p.into_inner());
+        w.report.one_phase += h.one_phase;
+        w.slots[h.i].done = true;
+        w.turn = None;
+        shared.1.notify_all();
+        return;
+    }
     for n in 0..cfg.txns_per_client {
         if n % cfg.audit_every == cfg.audit_every - 1 {
             // Audit: every account in one snapshot.
@@ -878,10 +1001,12 @@ pub fn run(root: &Path, seed: u64, cfg: &TxnSimConfig) -> Result<TxnSimReport, S
         let srv = node.server.as_ref().ok_or("no server")?;
         for i in 0..cfg.accounts {
             let k = account(i);
-            let m = MvccKey { versions: vec![(Timestamp::new(1, 0), Some(bal(cfg.initial_balance)))], intent: None, committed_by: Vec::new() };
+            let m = MvccKey { versions: vec![(Timestamp::new(1, 0), Some(bal(cfg.initial_balance)))], intent: None, committed_by: Vec::new(), trimmed_below: Timestamp::ZERO };
             let id = document_id(&k.0, &k.1).map_err(|e| e.to_string())?;
             srv.driver.engine().install_exact(id, &m.to_record(&k.0, &k.1), storage_types::Version(1), 0).map_err(|e| e.to_string())?;
         }
+        // Not in any log, so nothing would replay it after a power cut.
+        srv.driver.engine().sync_wal().map_err(|e| e.to_string())?;
     }
     world.schedule(cfg.fault_every, Ev::Fault);
 
@@ -895,6 +1020,8 @@ pub fn run(root: &Path, seed: u64, cfg: &TxnSimConfig) -> Result<TxnSimReport, S
             hlc: Hlc::new(Arc::new(clock.clone()), std::time::Duration::from_nanos(cfg.max_offset_ns)).with_self_fencing(false),
             clock,
             rng: SweepRng::new(seed ^ ((i as u64 + 1) * 0x9E37)),
+            plain: std::collections::BTreeSet::new(),
+            one_phase: 0,
         };
         let c = cfg.clone();
         threads.push(std::thread::spawn(move || client_main(h, c)));

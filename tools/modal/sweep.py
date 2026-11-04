@@ -16,6 +16,8 @@ Usage (from the repository root):
     modal run tools/modal/sweep.py --tests txn_simulation --only bank_transfers_with_meta --seeds 1000
     modal run tools/modal/sweep.py --suite-args "-p storage-core -p storage-index"   # a whole `cargo test`
     modal run tools/modal/sweep.py --suite-args "-p storage-server --test process_chaos -- --nocapture" --env STORINE_CHAOS_SECS=90
+    modal run tools/modal/sweep.py --sdks all            # all 8 SDK suites against range clusters
+    modal run tools/modal/sweep.py --sdks python --plain # against a plain server
 
 Tests whose body calls `sweep(` are seeded: seeds 1..=N in shards (`STORINE_SIM_SEED_RANGE`),
 plus one run at their default seeds for their aggregate checks; the others run once.
@@ -44,21 +46,45 @@ image = (
           "RUSTFLAGS": "-C target-cpu=x86-64-v3"})
 )
 
+# Every SDK's toolchain, for their end-to-end suites.
+sdk_image = (
+    image.apt_install("python3", "nodejs", "npm", "default-jdk-headless", "maven", "php-cli", "libicu-dev", "libssl-dev", "libyaml-dev", "zlib1g-dev", "libffi-dev", "autoconf", "bison", "patch")
+    .run_commands(
+        # The Ruby SDK needs 3.2+ (Debian packages 3.1).
+        "git clone --depth 1 https://github.com/rbenv/ruby-build /tmp/ruby-build && /tmp/ruby-build/bin/ruby-build 3.3.6 /usr/local",
+        "curl -sSfL https://go.dev/dl/go1.23.4.linux-amd64.tar.gz | tar -C /usr/local -xz",
+        "curl -sSfL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 8.0 --install-dir /usr/local/dotnet",
+    )
+    .env({"PATH": "/usr/local/go/bin:/usr/local/dotnet:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "DOTNET_ROOT": "/usr/local/dotnet", "DOTNET_CLI_TELEMETRY_OPTOUT": "1"})
+)
+
+SDK_SUITES = {
+    "python": ("sdks/python", "python3 -m unittest tests.test_vectors tests.test_e2e"),
+    "typescript": ("sdks/typescript", "npm install --no-audit --no-fund && npm test"),
+    "go": ("sdks/go", "go test ."),
+    "java": ("sdks/java", "mvn -q -B test"),
+    "csharp": ("sdks/csharp/tests/Storine.Tests", "dotnet test --nologo"),
+    "rust": ("sdks/rust", "cargo test --release"),
+    "php": ("sdks/php", "php tests/harness.php"),
+    "ruby": ("sdks/ruby", "ruby -Ilib test/test_vectors.rb && ruby -Ilib test/test_e2e.rb"),
+}
+
 EXCLUDE = (
-    re.compile(r"^sdks/(?!rust/)"),
     re.compile(r"^crates/storage-sql/tests/clients/"),
     re.compile(r"^context/"),
 )
+# Only the Rust SDK is needed to build the workspace.
+OTHER_SDKS = re.compile(r"^sdks/(?!rust/)")
 
 
-def source_tarball(root: str) -> bytes:
+def source_tarball(root: str, all_sdks: bool = False) -> bytes:
     """Tracked and untracked-but-not-ignored files, with their mtimes (cargo's fingerprints)."""
     out = subprocess.run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"], cwd=root, capture_output=True, check=True).stdout
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for path in sorted(set(p for p in out.decode().split("\0") if p)):
             full = os.path.join(root, path)
-            if any(e.match(path) for e in EXCLUDE) or not os.path.isfile(full):
+            if any(e.match(path) for e in EXCLUDE) or not os.path.isfile(full) or (not all_sdks and OTHER_SDKS.match(path)):
                 continue
             tar.add(full, arcname=path)
     return buf.getvalue()
@@ -142,6 +168,41 @@ def suite(src: bytes, cargo_args: str, env: dict[str, str]) -> tuple[int, str]:
     return proc.returncode, "\n".join(lines[-200:])
 
 
+@app.function(image=image, cpu=16, memory=32768, timeout=3600, volumes={"/target": target_vol})
+def build_server(src: bytes) -> bytes:
+    """Builds `storage-server` (release); returns the executable."""
+    unpack(src)
+    proc = subprocess.run("cargo build --release -p storage-server 2>&1", shell=True, cwd="/src", capture_output=True, text=True)
+    target_vol.commit()
+    if proc.returncode != 0:
+        raise RuntimeError("build failed:\n" + proc.stdout[-6000:])
+    with open("/target/t/release/storage-server", "rb") as f:
+        return f.read()
+
+
+@app.function(image=sdk_image, cpu=4, memory=8192, timeout=3600, retries=1)
+def run_sdk(src: bytes, server: bytes, lang: str, ranges: bool) -> tuple[str, int, str]:
+    """Runs one SDK's conformance and end-to-end suite against `server` (range mode if asked)."""
+    unpack(src)
+    with open("/tmp/storage-server", "wb") as f:
+        f.write(server)
+    os.chmod("/tmp/storage-server", 0o755)
+    env = {**os.environ, "CARGO_TARGET_DIR": "/tmp/sdk-target"}
+    if ranges:
+        env |= {"STORINE_SERVER": "/src/tools/range-server.sh", "STORINE_RANGE_BIN": "/tmp/storage-server", "STORINE_RANGES": "1"}
+        os.chmod("/src/tools/range-server.sh", 0o755)
+    else:
+        env["STORINE_SERVER"] = "/tmp/storage-server"
+    cwd, cmd = SDK_SUITES[lang]
+    t0 = time.time()
+    try:
+        proc = subprocess.run(cmd, shell=True, cwd=f"/src/{cwd}", env=env, capture_output=True, text=True, timeout=3000)
+        code, out = proc.returncode, proc.stdout + proc.stderr
+    except subprocess.TimeoutExpired as e:
+        code, out = 124, f"timed out\n{e.stdout}"
+    return lang, code, f"[{time.time() - t0:.0f}s]\n" + out[-6000:]
+
+
 def seeded_tests(root: str, name: str) -> tuple[list[str], list[str]]:
     """(seeded, single-run) test functions of `crates/storage-core/tests/<name>.rs`."""
     text = open(os.path.join(root, "crates/storage-core/tests", f"{name}.rs")).read()
@@ -155,8 +216,23 @@ def seeded_tests(root: str, name: str) -> tuple[list[str], list[str]]:
 
 
 @app.local_entrypoint()
-def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300, only: str = "", shard: int = 10, suite_args: str = "", env: str = ""):
+def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300, only: str = "", shard: int = 10, suite_args: str = "", env: str = "", sdks: str = "", plain: bool = False):
     root = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True).stdout.strip()
+    if sdks:
+        # SDK end-to-end suites, against range clusters unless --plain.
+        src = source_tarball(root, all_sdks=True)
+        server = build_server.remote(src)
+        langs = list(SDK_SUITES) if sdks == "all" else sdks.split(",")
+        failed = []
+        for lang, code, out in run_sdk.starmap([(src, server, l, not plain) for l in langs]):
+            print(f"=== {lang}: {'ok' if code == 0 else f'FAILED ({code})'}")
+            if code != 0:
+                failed.append(lang)
+                print(out)
+        print(f"SDK SUITES: {len(langs) - len(failed)}/{len(langs)} passed; failed: {failed}")
+        if failed:
+            raise SystemExit(1)
+        return
     src = source_tarball(root)
     print(f"source: {len(src) / 1e6:.1f} MB")
     if suite_args:

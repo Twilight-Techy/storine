@@ -100,16 +100,12 @@ The latest instruction from the user is to do everything that remains, **except*
 - **TASK-141**: done. Zone configurations, survival goals, lease preferences, closed timestamps with follower reads, `AS OF` transactions, global tables and regional-by-row layout.
 - **Six older bugs found by the 300-seed sweeps and fixed** (details in `TASKS.md` and `PROGRESS_LOG.md`): parallel-commit intents resolved before the record was final; replicas diverging on node-local version preconditions; Raft waiters taking another proposal's outcome at a reused index; a repeated split creating duplicate ranges; rebalancing oscillation in back-to-back turns; neighbours aligning a range in the round it froze. All pinned as regression seeds.
 - **Verification**: every multi-range and transaction simulation passes 300 seeds; full `storage-core`, `storage-index` and `storage-sql` suites pass; workspace clippy is clean.
-- **TASK-143**: groundwork done (wire format, ordered ids, span scans, `Txn::scan`); the document layer, TCP runtime and SQL integration are open (see `TASKS.md`).
+- **TASK-142, TASK-143**: done. `storage-server --ranges`, the document layer, one-phase commits, all 8 SDK suites and SQL against range clusters, chaos with real processes. Known limits are listed in `PROGRESS_LOG.md`.
+- **Heavy compute runs on Modal**: `tools/modal/sweep.py`.
 
 ## 4. Left to do
 
 ### Stage 30
-- **TASK-142**: multi-process range clusters behind the fault proxy (needs TASK-143's TCP runtime).
-- **TASK-143**:
-  - the document layer over distributed transactions;
-  - a TCP runtime for `NodeServer` with gateway coordinators (`storage-server --ranges`); SDKs route through any node (decision recorded in `TASKS.md`);
-  - SQL transactions across ranges through that server.
 - **TASK-144**: consistent cluster-wide backups at one timestamp; resumable changefeeds.
 
 ### Stage 31 — Enterprise SQL (TASK-145 – 152)

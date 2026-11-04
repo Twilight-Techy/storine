@@ -1117,10 +1117,11 @@ This document defines the strict chronological execution order for building the 
     - `zone_changes_keep_closed_promises` and planner unit tests for every rule above.
     - 300 seeds of each simulation.
   - **Not verifiable here**: real multi-region latency; the simulator's latencies stand in for it.
-- [~] **TASK-142: Region-Scale Verification (`F-GEO-06`)** — simulator runs with region latencies and outages; multi-process clusters behind the fault proxy.
-  - **Done (simulator)**: `dist::sim` and `dist::txn_sim` run 5 nodes in 3 regions, with per-pair latency (0.2–2 ms within a region, 20–60 ms across), clock skew within the offset bound, and whole-region outages (`three_regions_with_region_outages`, `bank_transfers_across_regions`).
-  - **Open**: multi-process clusters of the range layer behind the fault proxy (needs the range server over TCP, `TASK-143`).
-- [~] **TASK-143: SDK & SQL Integration (`F-GEO-07`)** — range-aware SDK routing in 8 languages; SQL transactions across ranges.
+- [x] **TASK-142: Region-Scale Verification (`F-GEO-06`)** — simulator runs with region latencies and outages; multi-process clusters behind the fault proxy.
+  - **Simulator**: `dist::sim` and `dist::txn_sim` run 5 nodes in 3 regions, with per-pair latency (0.2–2 ms within a region, 20–60 ms across), clock skew within the offset bound, and whole-region outages (`three_regions_with_region_outages`, `bank_transfers_across_regions`).
+  - **Processes**: `range_cluster_under_kills_pauses_and_partitions` runs 3 real `storage-server --ranges` processes behind the fault proxy (drop, black-hole, delay on every directed link) with SIGKILL and SIGSTOP. Single-key operations stay linearizable, and concurrent atomic transfers conserve the total. 90 s on Modal: 3 SIGKILLs, 15 SIGSTOPs, 4 partitions, 12 half-open links, 5 delays; 2,247 writes and 2,289 transfers.
+  - **Not verifiable here**: real multi-region latency and petabyte scale.
+- [x] **TASK-143: SDK & SQL Integration (`F-GEO-07`)** — range-aware SDK routing in 8 languages; SQL transactions across ranges.
   - **Decision (under the master prompt's mandate)**: gateway routing, as CockroachDB does. Every node accepts any request and coordinates it, forwarding each key's work to its leaseholder through its own range cache. SDKs keep the one-address-or-list connection they already have and gain no per-language range caches, which keeps them small and alike (`RULE-DX-01`). The cost is at most one extra hop. Follower reads stay an explicit opt-in.
   - **Done (groundwork, 2026-11-03)**:
     - `dist/wire.rs`: versioned encodings of node batches (every `RaftMsg`) and of every KV request and response. Decoders bound every count by the bytes left, refuse unknown tags and trailing bytes, and never panic (every truncation and single-bit flip is tested). Golden bytes pin the format.
@@ -1128,11 +1129,26 @@ This document defines the strict chronological execution order for building the 
     - **Span scans**: `KvRequest::Scan` pages through one range at a time and says where to resume. It waits for in-flight writes in its span and marks the scanned span in the timestamp cache, so no write lands under it (phantoms). Intents come back as `KeyConflict`. `RefreshSpan` re-validates a scanned span when the transaction's timestamp moves.
     - `Txn::scan` overlays the transaction's own writes and refreshes scanned spans with its reads. `scan_audits_are_serializable` audits every account with one scan across ranges under faults.
     - Range servers refuse to serve or overwrite a record whose stored key differs from the requested one (long keys hash into ids).
-  - **Open**:
-    - the document layer over transactions (versions, tombstones keeping version floors, preconditions, field operations, idempotent request ids, queries by scan, collection metadata);
-    - the TCP runtime for `NodeServer` and gateway coordinators in `storage-server --ranges`;
-    - SQL across ranges through that server;
-    - multi-process verification (`TASK-142`).
+  - **Done (document layer)**: `dist/docs.rs` serves the whole document API as serializable transactions: conditional batches, field operations, idempotent request ids, TTL, queries, vector search, collection metadata. A document is `{"v": version, "f": fields}` and a delete leaves `{"v": version}`, so versions are never reused. Secondary indexes, vector indexes and column segments are metadata here: queries scan, vector search scores exactly, and analytics run on the coordinator over one snapshot. All are correct and `O(collection)` per call; distributed indexes are not built yet.
+  - **Done (one-phase commits)**: a batch whose keys share a range commits at the leaseholder in one Raft entry (`KvRequest::Atomic`), under latches on all its keys, with no intents and no transaction record. Writers of a hot key queue FIFO. A batch meeting an intent waits up to 250 ms with its latches released; anything it cannot do (keys across ranges, a lingering intent, any domain error) falls back to a full transaction, which also words the error. Request ids live inside the document's value (`"r"`, 60 s window, at most 4,096) so they are always in the write's range; a full transaction also keeps a `$req` marker.
+  - **Done (real-time runtime)**: `dist/runtime.rs` has each node's event loop (`RangeNode`), the `Transport` trait with an in-process implementation, and `Gateway`, a `KvSender` routing to leaseholders through a meta-range cache, following redirects, with bounded parallelism per call. `storage-server --ranges` adds `TcpRangeTransport` (per-peer sender threads with bounded queues, pooled KV connections) and two Admin opcodes, `OP_RANGE_BATCH` and `OP_KV`. Blocking work runs on a bounded worker pool.
+  - **Done (SDKs and SQL)**: all 8 SDK suites pass against range clusters with no SDK code changes (`tools/range-server.sh`, `modal run tools/modal/sweep.py --sdks all`). Their only range-mode condition: Python and Ruby skip waiting for column-segment pruning. `storage-sql/tests/range_cluster.rs` runs SQL across ranges: transfers, rollback, aggregates, joins, subqueries, unique / check / foreign-key constraints, and concurrent `SERIALIZABLE` updates with no lost update.
+  - **Durability redesign for range groups** (Raft logs are the durable record):
+    - the engine's WAL is not fsynced per write (`range_wal_policy`) and applied indexes are saved at checkpoints (`NodeConfig::checkpoint_us`): capture applied, sync the WAL, then save. A crash replays from the last checkpoint;
+    - range writes are unconditional whole-record puts and deletes (enforced in `NodeDriver::propose`), so replay converges whatever the engine still holds;
+    - entries below the span's last change are skipped on replay: the WAL was synced before that change was saved;
+    - logs are compacted at checkpoints (`NodeConfig::log_retain`), where before they grew without bound.
+  - **Bounded history**: keys keep versions for 60 s and at most 64 (`MvccKey::trim`), with a floor: a read below it restarts above it, a refresh across it fails, and an `AS OF` read below it is an error.
+  - **Bugs found and fixed on the way**:
+    - a single-voter range never committed its first entry, so it never served;
+    - the gateway deadlocked on a cache read guard held across a write lock, after any leadership change;
+    - replies waited for the next input or tick: the event loop now polls until nothing moves;
+    - a metastable collapse under contention (99 to 3 updates/s): a metadata refresh by write transaction put intents in everyone's way, and each writer meeting an intent joined the slow path;
+    - a batch writing one key twice read its own request id back and dropped itself, reporting success;
+    - a thread per request in `Gateway::send`.
+  - **Single-group clusters**: a field patch without a request id now gets a generated one, so a log replay after a crash (engine commit durable, applied index not) cannot apply it twice.
+  - **Measured** (on the 2-core development machine, one node, Python SDK): an uncontended put went from 91 ms to 3.5 ms; 8 writers contending on one document from about 1 to 75 updates/s, all exact. Under the same 90 s of faults on Modal, a range cluster made 2,247 writes (it was 462) against 66,887 for a single Raft group, whose writes are one local commit rather than a coordinated one: range mode is still far slower, and each entry is still one proposal with one fsync (no batching of proposals yet).
+  - **Exit Criteria (met)**: `documents_under_faults` and `documents_with_ranges_moving` (300 seeds): atomic transfers conserved, counters retried with one request id within acknowledged .. attempted. A mutation disabling request-id detection is caught (seed 65). Plus the 8 SDK suites, the SQL test and the chaos run above.
 - [ ] **TASK-144: Cluster Backups & Changefeeds (`F-GEO-08`)** — consistent cluster-wide backups at one timestamp; resumable change data capture.
 
 ## Stage 31: Enterprise SQL & Ecosystem (`TASK-145` – `TASK-152`)

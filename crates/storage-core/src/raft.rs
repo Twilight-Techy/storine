@@ -1012,6 +1012,9 @@ struct RaftState {
     /// Configuration used when neither the log nor the compaction point has one (the static
     /// member list a node is started with; empty for a node joining an existing cluster).
     bootstrap: Membership,
+    /// Range groups: the applied index the engine's durable state covers, saved instead of
+    /// `last_applied` (see [`RaftNode::checkpoint_applied`]). `None`: every apply is saved.
+    durable_applied: Option<u64>,
 }
 
 impl RaftState {
@@ -1029,6 +1032,7 @@ impl RaftState {
             base_config: None,
             configs: Vec::new(),
             bootstrap: Membership::default(),
+            durable_applied: None,
         }
     }
 
@@ -1274,7 +1278,7 @@ impl RaftStorage {
             }
         }
         payload.extend_from_slice(&st.commit_index.to_le_bytes());
-        payload.extend_from_slice(&st.last_applied.to_le_bytes());
+        payload.extend_from_slice(&st.durable_applied.unwrap_or(st.last_applied).to_le_bytes());
         // Entry count of the legacy embedded-log format: always 0 now.
         payload.extend_from_slice(&0u32.to_le_bytes());
         payload.extend_from_slice(&st.snapshot_index.to_le_bytes());
@@ -1510,7 +1514,10 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 (span, SpanState::default())
             }
         };
-        let initial_state = storage.load()?.unwrap_or_else(RaftState::new);
+        let mut initial_state = storage.load()?.unwrap_or_else(RaftState::new);
+        if group.is_some() {
+            initial_state.durable_applied = Some(initial_state.last_applied);
+        }
         let node = Self {
             node_id,
             engine,
@@ -2286,7 +2293,9 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             let match_index = last_new.min(st.last_log_index());
             if req.leader_commit > st.commit_index && req.leader_commit.min(match_index) > st.commit_index {
                 st.commit_index = req.leader_commit.min(match_index);
-                self.storage.save_hard_state(&st)?;
+                if st.durable_applied.is_none() {
+                    self.storage.save_hard_state(&st)?;
+                }
             }
             (st.current_term, match_index)
         };
@@ -2316,7 +2325,9 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 && st.term_at(quorum_index) == Some(st.current_term)
             {
                 st.commit_index = quorum_index;
-                self.storage.save_hard_state(&st)?;
+                if st.durable_applied.is_none() {
+                    self.storage.save_hard_state(&st)?;
+                }
             }
         }
         self.apply_committed()?;
@@ -2360,7 +2371,9 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             {
                 let mut st = self.lock_state();
                 st.last_applied = st.last_applied.max(entry.index);
-                self.storage.save_hard_state(&st)?;
+                if st.durable_applied.is_none() {
+                    self.storage.save_hard_state(&st)?;
+                }
             }
             // Notify under the outcomes lock so a waiter between its check and its wait cannot
             // miss the wake-up.
@@ -2395,6 +2408,10 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         // Applied entries must be durable in the engine before the log forgets them.
         self.engine.sync_wal()?;
         let mut st = self.lock_state();
+        // (`apply_lock` is held: everything applied is in the WAL just synced.)
+        if st.durable_applied.is_some() {
+            st.durable_applied = Some(st.last_applied);
+        }
         let index = index.min(st.last_applied);
         if index <= st.snapshot_index {
             return Ok(st.snapshot_index);
@@ -2415,6 +2432,25 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         st.drain_log(drop_count);
         self.storage.rewrite_log(&st.log)?;
         Ok(index)
+    }
+
+    /// Range groups persist their applied index lazily: a checkpoint takes it here, syncs the
+    /// engine's WAL, then calls [`Self::checkpoint_applied`]. A crash replays the log from the
+    /// last checkpoint; range commands are unconditional whole-record writes, so the replay
+    /// ends in the same state whatever the engine still holds (`None`: nothing new to save).
+    pub fn applied_for_checkpoint(&self) -> Option<u64> {
+        let st = self.lock_state();
+        st.durable_applied.filter(|&d| st.last_applied > d).map(|_| st.last_applied)
+    }
+
+    /// Saves `index` as durably applied (the engine's WAL was synced after it was applied).
+    pub fn checkpoint_applied(&self, index: u64) -> Result<()> {
+        let mut st = self.lock_state();
+        if st.durable_applied.is_some_and(|d| index > d) {
+            st.durable_applied = Some(index);
+            self.storage.save_hard_state(&st)?;
+        }
+        Ok(())
     }
 
     /// Last log index discarded by compaction (`0` if never compacted).
@@ -2693,6 +2729,11 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             st.snapshot_term = last_term;
             st.commit_index = st.commit_index.max(last_index);
             st.last_applied = last_index;
+            if st.durable_applied.is_some() {
+                // The installed records must be durable before the index claims them.
+                self.engine.sync_wal()?;
+                st.durable_applied = Some(last_index);
+            }
             self.storage.save_hard_state(&st)?;
             self.storage.rewrite_log(&st.log)?;
         }
@@ -2734,6 +2775,9 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             st.snapshot_term = 0;
             st.commit_index = 0;
             st.last_applied = 0;
+            if st.durable_applied.is_some() {
+                st.durable_applied = Some(0);
+            }
             self.storage.save_hard_state(&st)?;
             self.storage.rewrite_log(&st.log)?;
         }
@@ -2838,6 +2882,11 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     }
 
     fn apply_entry_to_engine(&self, entry: &RaftLogEntry) -> Result<ApplyOutcome> {
+        // A replay after a restart: the engine was synced before the span's last change was
+        // saved, so everything before it is durable (and old splits and merges are reflected).
+        if self.group.is_some() && entry.index < self.span_index() {
+            return Ok(Ok(Vec::new()));
+        }
         let min = Some(Version(entry.index));
         let now_fallback = || {
             std::time::SystemTime::now()

@@ -48,6 +48,13 @@ pub trait KvSender {
     fn sleep(&mut self, us: u64);
     /// A fresh transaction id.
     fn new_id(&mut self) -> TxnId;
+    /// Whether `collection` is known to have metadata and no vector indexes (a hint a sender
+    /// may cache: a document write then needs no metadata read).
+    fn collection_is_plain(&mut self, _collection: &str) -> bool {
+        false
+    }
+    /// Remembers what [`Self::collection_is_plain`] answers.
+    fn note_collection(&mut self, _collection: &str, _plain: bool) {}
 }
 
 /// Why a transaction did not commit.
@@ -138,6 +145,9 @@ impl Txn {
                     return Ok(value);
                 }
                 KvResponse::Uncertain { ts } => {
+                    if self.as_of {
+                        return Err(TxnError::Invalid("that history is no longer retained".into()));
+                    }
                     // Possibly written before this read in real time: read above it instead,
                     // which needs the earlier reads to still hold at the new timestamp.
                     self.advance_read_ts(s, ts)?;
@@ -174,6 +184,9 @@ impl Txn {
                         }
                     }
                     KvResponse::Uncertain { ts } => {
+                        if self.as_of {
+                            return Err(TxnError::Invalid("that history is no longer retained".into()));
+                        }
                         self.advance_read_ts(s, ts)?;
                         continue 'attempt; // rows read below the new timestamp: read again
                     }
@@ -508,7 +521,7 @@ pub fn recover(s: &mut dyn KvSender, r: &TxnRecord) -> Result<Option<Timestamp>,
 /// Waits until `ts` is in the past on this clock. Only writes closed ahead of time (global
 /// ranges, `TASK-141`) commit in the future: once the wait ends, every reader whose
 /// uncertainty window starts later covers `ts`, so the commit is visible to it.
-fn commit_wait(s: &mut dyn KvSender, ts: Timestamp) {
+pub(crate) fn commit_wait(s: &mut dyn KvSender, ts: Timestamp) {
     for _ in 0..10_000 {
         let now = s.now();
         if now >= ts {

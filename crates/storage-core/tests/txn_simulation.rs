@@ -129,6 +129,28 @@ fn scan_audits_are_serializable() {
     assert!(reports.iter().map(|r| r.audits).sum::<usize>() > 0);
 }
 
+/// The document API under faults (`TASK-143`): one-phase commits, retried request ids and
+/// fallbacks to full transactions, with ranges splitting and moving in the second run.
+#[test]
+fn documents_under_faults() {
+    let cfg = TxnSimConfig { doc_workload: true, ..TxnSimConfig::default() };
+    let reports = sweep("docs", &cfg, 8);
+    let one: usize = reports.iter().map(|r| r.one_phase).sum();
+    eprintln!("docs: {one} one-phase commits");
+    assert!(one > 0, "no write committed in one phase");
+    assert!(reports.iter().map(|r| r.committed).sum::<usize>() > 0);
+}
+
+#[test]
+fn documents_with_ranges_moving() {
+    let alloc = AllocatorConfig { replication: 3, split_keys: 6, split_writes_per_sec: 30, merge_keys: 5, interval_us: 400_000, dead_after_us: 3_000_000, rebalance_slack: 2 };
+    let base = TxnSimConfig::default();
+    let node = NodeConfig { cluster: vec![1, 2, 3, 4, 5], allocator: Some(alloc), ..base.node.clone() };
+    let cfg = TxnSimConfig { nodes: 5, regions: vec![0; 5], ranges: 2, accounts: 12, meta_routing: true, doc_workload: true, node, ..base };
+    let reports = sweep("docs-moving", &cfg, 6);
+    assert!(reports.iter().map(|r| r.committed).sum::<usize>() > 0);
+}
+
 /// Seeds that once failed, replayed on every run (`RULE-TEST-03`).
 /// - Coordinators resolved intents after a failed explicit commit while the record still read
 ///   "staging"; a later recovery saw an intent missing and aborted a committed transfer

@@ -63,7 +63,15 @@ pub struct MvccKey {
     /// replayed write of one of them (a coordinator retry arriving late) is a no-op instead of
     /// a new intent.
     pub committed_by: Vec<(TxnId, Timestamp)>,
+    /// History below this timestamp was trimmed: a read below it restarts above it, and a
+    /// refresh across it fails (it cannot tell what changed).
+    pub trimmed_below: Timestamp,
 }
+
+/// How long old versions stay readable (nanoseconds).
+pub const HISTORY_RETENTION_NS: u64 = 60_000_000_000;
+/// Most old versions one key keeps: its record is rewritten whole on every write.
+pub const HISTORY_MAX_VERSIONS: usize = 64;
 
 /// How many committing transactions a key remembers for replay detection. Older replays are
 /// still harmless: their intent lands above the commit and resolution drops it.
@@ -72,6 +80,7 @@ const COMMITTED_MEMORY: usize = 16;
 const F_VERSIONS: &str = "_mvcc_versions";
 const F_INTENT: &str = "_mvcc_intent";
 const F_COMMITTED: &str = "_mvcc_committed";
+const F_TRIMMED: &str = "_mvcc_trimmed";
 
 fn ts_val(ts: Timestamp) -> PropertyValue {
     PropertyValue::Bytes(ts.to_bytes().to_vec())
@@ -119,6 +128,9 @@ impl MvccKey {
                 }
             }
         }
+        if rec.fields.contains_key(F_TRIMMED) {
+            out.trimmed_below = val_ts(rec.fields.get(F_TRIMMED))?;
+        }
         if let Some(PropertyValue::Map(m)) = rec.fields.get(F_INTENT) {
             let id = match m.get("id") {
                 Some(PropertyValue::Bytes(b)) if b.len() == 16 => b.as_slice().try_into().map_err(|_| StorageError::corrupted_header("bad txn id"))?,
@@ -161,6 +173,9 @@ impl MvccKey {
             let cs = self.committed_by.iter().map(|(id, t)| PropertyValue::List(vec![PropertyValue::Bytes(id.to_vec()), ts_val(*t)])).collect();
             rec.fields.insert(F_COMMITTED.to_string(), PropertyValue::List(cs));
         }
+        if self.trimmed_below > Timestamp::ZERO {
+            rec.fields.insert(F_TRIMMED.to_string(), ts_val(self.trimmed_below));
+        }
         if let Some(i) = &self.intent {
             let mut m = BTreeMap::new();
             m.insert("id".to_string(), PropertyValue::Bytes(i.txn.id.to_vec()));
@@ -185,6 +200,25 @@ impl MvccKey {
 
     pub fn newest_commit(&self) -> Option<Timestamp> {
         self.versions.first().map(|(t, _)| *t)
+    }
+
+    /// Bounds the key's history at time `now`: versions older than the retention go, and at most
+    /// [`HISTORY_MAX_VERSIONS`] stay. Reads below what remains restart above it.
+    pub fn trim(&mut self, now: Timestamp) {
+        let before = self.versions.len();
+        self.gc(Timestamp { wall: now.wall.saturating_sub(HISTORY_RETENTION_NS), logical: 0 });
+        self.versions.truncate(HISTORY_MAX_VERSIONS);
+        // Only the newest version answers for request ids (`dist::docs`).
+        for (_, v) in self.versions.iter_mut().skip(1) {
+            if let Some(m) = v {
+                m.remove("r");
+            }
+        }
+        if self.versions.len() != before {
+            if let Some((t, _)) = self.versions.last() {
+                self.trimmed_below = self.trimmed_below.max(*t);
+            }
+        }
     }
 
     /// Drops versions no read at or above `threshold` can see (keeps the newest at or below).
@@ -213,6 +247,9 @@ pub enum ReadOutcome {
 
 /// Evaluates a read at `ts` with uncertainty `limit` by transaction `txn` (`None`: a plain read).
 pub fn eval_read(k: &MvccKey, ts: Timestamp, limit: Timestamp, txn: Option<&TxnId>) -> ReadOutcome {
+    if ts < k.trimmed_below {
+        return ReadOutcome::Uncertain { ts: k.trimmed_below };
+    }
     if let Some(i) = &k.intent {
         if Some(&i.txn.id) == txn {
             return ReadOutcome::Value(i.value.clone(), Some(i.ts));
@@ -305,6 +342,9 @@ pub fn eval_resolve(k: &MvccKey, txn: &TxnId, commit_ts: Option<Timestamp>) -> O
 /// Read refresh: `true` if nothing was committed or provisionally written by another
 /// transaction in `(from, to]`, so a read at `from` is still valid at `to`.
 pub fn eval_refresh(k: &MvccKey, from: Timestamp, to: Timestamp, txn: &TxnId) -> bool {
+    if from < k.trimmed_below {
+        return false;
+    }
     if let Some(i) = &k.intent {
         if &i.txn.id != txn && i.ts <= to {
             return false;
@@ -420,7 +460,7 @@ mod tests {
         TxnMeta { id, record_key: record_key(&id), priority: (t(u64::from(n)), id), epoch: 0 }
     }
     fn committed(vs: &[(u64, i64)]) -> MvccKey {
-        MvccKey { versions: vs.iter().map(|&(w, x)| (t(w), val(x))).collect(), intent: None, committed_by: Vec::new() }
+        MvccKey { versions: vs.iter().map(|&(w, x)| (t(w), val(x))).collect(), intent: None, committed_by: Vec::new(), ..MvccKey::default() }
     }
 
     #[test]
@@ -501,11 +541,29 @@ mod tests {
     }
 
     #[test]
+    fn trimming_bounds_history_and_never_answers_wrongly() {
+        let mut k = committed(&(1..=100).rev().map(|i| (i, i as i64)).collect::<Vec<_>>());
+        k.trim(t(101));
+        assert_eq!(k.versions.len(), HISTORY_MAX_VERSIONS);
+        let oldest = k.versions.last().map(|v| v.0).unwrap();
+        assert_eq!(k.trimmed_below, oldest);
+        // What remains reads normally; below it the read restarts, and a refresh fails.
+        assert!(matches!(eval_read(&k, t(100), t(100), None), ReadOutcome::Value(..)));
+        assert_eq!(eval_read(&k, t(5), t(5), None), ReadOutcome::Uncertain { ts: oldest });
+        assert!(!eval_refresh(&k, t(5), t(100), &[1; 16]));
+        assert!(eval_refresh(&k, t(100), t(200), &[1; 16]));
+        // The floor survives the round trip through a record.
+        let back = MvccKey::from_record(Some(&k.to_record("c", "k"))).unwrap();
+        assert_eq!(back.trimmed_below, oldest);
+        assert_eq!(back.versions.len(), HISTORY_MAX_VERSIONS);
+    }
+
+    #[test]
     fn gc_keeps_what_reads_above_the_threshold_can_see() {
         let mut k = committed(&[(40, 4), (30, 3), (20, 2), (10, 1)]);
         k.gc(t(25));
         assert_eq!(k.versions, vec![(t(40), val(4)), (t(30), val(3)), (t(20), val(2))]);
-        let mut k = MvccKey { versions: vec![(t(30), val(3)), (t(20), None)], intent: None, committed_by: Vec::new() };
+        let mut k = MvccKey { versions: vec![(t(30), val(3)), (t(20), None)], intent: None, committed_by: Vec::new(), ..MvccKey::default() };
         k.gc(t(25));
         assert_eq!(k.versions, vec![(t(30), val(3))], "an old tombstone goes");
     }

@@ -445,6 +445,14 @@ pub fn encode_request(req: &KvRequest) -> Vec<u8> {
             }
             put_u32(o, *max_keys);
         }
+        KvRequest::Atomic { ids, body } => {
+            o.push(11);
+            put_u32(o, ids.len() as u32);
+            for id in ids {
+                put_bytes(o, id);
+            }
+            put_bytes(o, body);
+        }
         KvRequest::RefreshSpan { span, from, to, txn } => {
             o.push(10);
             span.encode(o);
@@ -497,6 +505,11 @@ pub fn decode_request(bytes: &[u8]) -> Result<KvRequest> {
         }
         9 => KvRequest::Scan { span: KeySpan::decode(r)?, ts: ts(r)?, limit: ts(r)?, txn: opt_txn(r)?, max_keys: r.u32()? },
         10 => KvRequest::RefreshSpan { span: KeySpan::decode(r)?, from: ts(r)?, to: ts(r)?, txn: txn_id(r)? },
+        11 => {
+            let n = r.count(4)?;
+            let ids = (0..n).map(|_| r.bytes().map(<[u8]>::to_vec)).collect::<Result<Vec<_>>>()?;
+            KvRequest::Atomic { ids, body: r.bytes()?.to_vec() }
+        }
         _ => return Err(bad("unknown kv request tag")),
     };
     finish(r, req)
@@ -574,6 +587,22 @@ pub fn encode_response(resp: &KvResponse) -> Vec<u8> {
             o.push(12);
             put_bytes(o, e.as_bytes());
         }
+        KvResponse::Atomic { versions, duplicate, ts } => {
+            o.push(15);
+            put_u32(o, versions.len() as u32);
+            for v in versions {
+                match v {
+                    None => o.push(0),
+                    Some(n) => {
+                        o.push(1);
+                        put_u64(o, *n);
+                    }
+                }
+            }
+            o.push(u8::from(*duplicate));
+            put_ts(o, *ts);
+        }
+        KvResponse::NotOnePhase => o.push(16),
         KvResponse::KeyConflict { key, intent_txn, intent_ts } => {
             o.push(14);
             put_key(o, key);
@@ -638,6 +667,15 @@ pub fn decode_response(bytes: &[u8]) -> Result<KvResponse> {
             KvResponse::Rows { rows, resume }
         }
         14 => KvResponse::KeyConflict { key: key(r)?, intent_txn: meta(r)?, intent_ts: ts(r)? },
+        15 => {
+            let n = r.count(1)?;
+            let mut versions = Vec::with_capacity(n);
+            for _ in 0..n {
+                versions.push(if flag(r)? { Some(r.u64()?) } else { None });
+            }
+            KvResponse::Atomic { versions, duplicate: flag(r)?, ts: ts(r)? }
+        }
+        16 => KvResponse::NotOnePhase,
         _ => return Err(bad("unknown kv response tag")),
     };
     finish(r, resp)
@@ -679,6 +717,7 @@ mod tests {
             }),
             KvRequest::Scan { span: KeySpan::new(b"acct/".to_vec(), Some(b"acct0".to_vec())), ts: t(10, 0), limit: t(20, 0), txn: None, max_keys: 100 },
             KvRequest::RefreshSpan { span: KeySpan::all(), from: t(1, 0), to: t(2, 0), txn: [6; 16] },
+            KvRequest::Atomic { ids: vec![b"c/a".to_vec(), b"c/b".to_vec()], body: vec![1, 2, 3] },
         ]
     }
 
@@ -710,6 +749,8 @@ mod tests {
             KvResponse::Error("boom".into()),
             KvResponse::Rows { rows: vec![(("acct".into(), "a".into()), t(1, 0), fields)], resume: Some(b"acct/b".to_vec()) },
             KvResponse::Rows { rows: Vec::new(), resume: None },
+            KvResponse::Atomic { versions: vec![Some(3), None], duplicate: true, ts: t(9, 1) },
+            KvResponse::NotOnePhase,
             KvResponse::KeyConflict { key: ("acct".into(), "b".into()), intent_txn: TxnMeta { id: [2; 16], record_key: "r".into(), priority: (t(1, 0), [2; 16]), epoch: 0 }, intent_ts: t(7, 0) },
         ]
     }

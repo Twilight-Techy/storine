@@ -20,6 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -106,6 +107,17 @@ impl_archive_pod!(ArchivedDocumentRecord {
 });
 const _: () = assert!(core::mem::size_of::<ArchivedDocumentRecord>() == 56);
 
+/// A request id unique to this process's write: the clock, the process and a counter, mixed.
+fn generated_request_id() -> [u8; 16] {
+    static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&(t ^ u64::from(std::process::id()).rotate_left(40)).to_le_bytes());
+    id[8..].copy_from_slice(&n.wrapping_mul(0x9E37_79B9_7F4A_7C15).to_le_bytes());
+    id
+}
+
 /// Rejects empty, overlong or reserved-character collection names. Names starting with `$` are
 /// reserved for the system (`allow_system`).
 pub fn validate_collection_name(name: &str, allow_system: bool) -> Result<()> {
@@ -141,7 +153,7 @@ pub fn document_id(collection: &str, key: &str) -> Result<InlineId> {
 /// Index field id of `field` in `collection` (`1..=65533`; collisions only widen index hits,
 /// which are re-checked exactly).
 /// A document's vector-indexed fields must hold `dims` finite numbers (or be absent / null).
-fn check_vectors(info: &CollectionInfo, fields: &BTreeMap<String, PropertyValue>) -> Result<()> {
+pub(crate) fn check_vectors(info: &CollectionInfo, fields: &BTreeMap<String, PropertyValue>) -> Result<()> {
     for v in &info.vectors {
         match fields.get(&v.field) {
             None | Some(PropertyValue::Null) => {}
@@ -197,7 +209,7 @@ fn vector_of(value: &PropertyValueRef<'_>) -> Option<Vec<f32>> {
     (!out.is_empty() && out.len() <= MAX_VECTOR_DIMS).then_some(out)
 }
 
-fn owned_vector_of(value: &PropertyValue) -> Option<Vec<f32>> {
+pub(crate) fn owned_vector_of(value: &PropertyValue) -> Option<Vec<f32>> {
     let PropertyValue::List(items) = value else {
         return None;
     };
@@ -220,7 +232,7 @@ fn owned_vector_of(value: &PropertyValue) -> Option<Vec<f32>> {
 }
 
 /// Cosine similarity in `f64` (`None` for a zero vector or mismatched lengths).
-fn cosine(a: &[f32], b: &[f32]) -> Option<f64> {
+pub(crate) fn cosine(a: &[f32], b: &[f32]) -> Option<f64> {
     if a.len() != b.len() {
         return None;
     }
@@ -855,6 +867,8 @@ impl CommitSink for StorageEngine<DocumentRecord> {
 
 /// Collections of schema-flexible documents over one engine (`F-DOC-01`).
 pub struct DocumentStore {
+    /// Writes go through a consensus log ([`Self::set_commit_sink`]).
+    replicated: AtomicBool,
     engine: Arc<StorageEngine<DocumentRecord>>,
     sink: RwLock<Arc<dyn CommitSink>>,
     /// Collection metadata cache, validated on every use against the version of the `$meta`
@@ -897,6 +911,7 @@ impl DocumentStore {
         let sink: Arc<dyn CommitSink> = Arc::clone(&engine) as Arc<dyn CommitSink>;
         let store = Self {
             engine,
+            replicated: AtomicBool::new(false),
             sink: RwLock::new(sink),
             meta: RwLock::new(FastHashMap::default()),
             columnar: Arc::new(crate::columnar::ColumnarRegistry::default()),
@@ -909,6 +924,7 @@ impl DocumentStore {
     /// Routes all writes through `sink` (e.g. Raft consensus) from now on.
     pub fn set_commit_sink(&self, sink: Arc<dyn CommitSink>) {
         *self.sink.write().unwrap_or_else(|p| p.into_inner()) = sink;
+        self.replicated.store(true, Ordering::Release);
     }
 
     #[inline]
@@ -1247,6 +1263,10 @@ impl DocumentStore {
     /// Applies `writes` atomically. With `request_id`, a retry of an already-applied request
     /// writes nothing and reports `duplicate = true` (exactly-once within [`IDEMPOTENCY_WINDOW`]).
     pub fn write(&self, writes: Vec<DocWrite>, request_id: Option<[u8; 16]>) -> Result<WriteSummary> {
+        // A consensus log may replay an entry after a crash (its engine commit durable, its
+        // applied index not yet). Field operations are not idempotent: with a request id, the
+        // replay fails its marker's precondition and changes nothing. Generated if absent.
+        let request_id = request_id.or_else(|| (self.replicated.load(Ordering::Acquire) && writes.iter().any(|w| matches!(w.op, DocOp::Patch(_)))).then(generated_request_id));
         self.write_internal(writes, request_id, false)
     }
 

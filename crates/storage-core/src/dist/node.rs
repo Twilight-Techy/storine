@@ -66,6 +66,12 @@ pub struct NodeConfig {
     /// The cluster's maximum clock offset (nanoseconds): closed-timestamp lags never go below
     /// it ([`crate::dist::hlc`]).
     pub max_offset_ns: u64,
+    /// How often applied indexes are checkpointed (microseconds): the engine's WAL is synced,
+    /// then each changed range saves what that covers. A crash replays at most this much.
+    pub checkpoint_us: u64,
+    /// Log entries each range keeps behind its checkpoint (a follower further behind gets a
+    /// snapshot). Compacted once twice this many have built up.
+    pub log_retain: u64,
     /// Print replica lifecycle and allocator decisions to stderr (debugging).
     pub trace: bool,
 }
@@ -87,6 +93,8 @@ impl Default for NodeConfig {
             localities: BTreeMap::new(),
             zones: ZoneConfigs::default(),
             max_offset_ns: 500_000_000,
+            checkpoint_us: 1_000_000,
+            log_retain: 8_192,
             trace: false,
         }
     }
@@ -267,6 +275,7 @@ pub struct NodeDriver {
     absorbed: BTreeMap<RangeId, Vec<RangeId>>,
     /// See [`Self::lead_floor`].
     lead_floor: Timestamp,
+    last_checkpoint: u64,
     /// Ranges this node proposed to freeze (for a merge), not yet frozen here, and when. The
     /// allocator treats them as frozen at once: a neighbour planned in the same round must not
     /// align replicas of a range whose merge has just begun.
@@ -321,6 +330,7 @@ impl NodeDriver {
             app_inbox: Vec::new(),
             absorbed: BTreeMap::new(),
             lead_floor: Timestamp::ZERO,
+            last_checkpoint: 0,
             freezing: BTreeMap::new(),
         }
     }
@@ -546,6 +556,34 @@ impl NodeDriver {
                 self.allocate(&cfg)?;
             }
         }
+        if self.now.saturating_sub(self.last_checkpoint) >= self.cfg.checkpoint_us {
+            self.last_checkpoint = self.now;
+            self.checkpoint()?;
+        }
+        self.after_progress()
+    }
+
+    /// Makes what was applied durable and saves how far that goes, then trims long logs.
+    /// `O(ranges written since the last checkpoint)`: idle ranges cost nothing.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        // Taken before the sync: everything up to these indexes is in the WAL it covers.
+        let due: Vec<(Arc<Replica>, u64)> = self.replicas.values().filter_map(|r| r.raft.applied_for_checkpoint().map(|i| (Arc::clone(&r.raft), i))).collect();
+        if due.is_empty() {
+            return Ok(());
+        }
+        self.engine.sync_wal()?;
+        let retain = self.cfg.log_retain.max(1);
+        for (raft, index) in due {
+            raft.checkpoint_applied(index)?;
+            if index.saturating_sub(raft.snapshot_index()) >= retain.saturating_mul(2) {
+                raft.compact_log_through(index - retain)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Finishes what can finish without new input: confirmed reads, started splits.
+    pub fn settle(&mut self) -> Result<()> {
         self.after_progress()
     }
 
@@ -1365,6 +1403,11 @@ impl NodeDriver {
         let span = r.raft.span();
         if ops.iter().any(|o| !span.contains_id(o.id)) {
             return Err(StorageError::invalid_key("key outside this range: re-route"));
+        }
+        // The log replays from the last checkpoint after a crash: only commands whose replay
+        // converges are allowed (`NodeConfig::checkpoint_us`).
+        if ops.iter().any(|o| o.precondition != crate::engine::Precondition::None || !matches!(o.kind, crate::engine::WriteKind::Put(_) | crate::engine::WriteKind::Delete)) {
+            return Err(StorageError::invalid_value("range writes are unconditional whole-record puts and deletes"));
         }
         let (index, term) = r.raft.propose_ops_at_tagged(ops, now_ns)?;
         if let Some(r) = self.replicas.get_mut(&range) {

@@ -196,7 +196,14 @@ fn event_loop(mut srv: NodeServer, rx: Receiver<Input>, transport: Arc<dyn Trans
             last_tick = Instant::now();
             let _ = srv.driver.tick(now);
         }
-        srv.poll(now.saturating_mul(1_000));
+        // Until nothing moves: a proposal that applied or a read confirmed within this pass must
+        // not wait for the next input or tick to answer.
+        for _ in 0..16 {
+            let _ = srv.driver.settle();
+            if !srv.poll_progress(now.saturating_mul(1_000)) {
+                break;
+            }
+        }
         if trace {
             for line in srv.take_trace() {
                 eprintln!("{line}");
@@ -281,6 +288,9 @@ impl Transport for LocalTransport {
     }
 }
 
+/// Requests of one call in flight at once.
+const MAX_PARALLEL_REQUESTS: usize = 32;
+
 /// Gateway knobs.
 #[derive(Clone, Debug)]
 pub struct GatewayConfig {
@@ -298,7 +308,13 @@ pub struct Gateway {
     cfg: GatewayConfig,
     hlc: Arc<Hlc>,
     cache: Arc<RwLock<RangeIndex>>,
+    /// Collections with metadata and no vector indexes, as far as this process knows.
+    plain: Arc<RwLock<BTreeMap<String, Instant>>>,
 }
+
+/// How long a collection stays known as plain (a vector index created elsewhere is enforced by
+/// this gateway's writes after at most this long).
+const PLAIN_TTL: Duration = Duration::from_secs(5);
 
 /// Transaction ids are unique per process (a counter) and across processes (a seed from the
 /// start time, the process id and the address of a static, mixed).
@@ -318,7 +334,7 @@ impl core::fmt::Debug for Gateway {
 impl Gateway {
     /// A gateway sharing `cache` (one per process is enough; it is only ever a hint).
     pub fn new(transport: Arc<dyn Transport>, cfg: GatewayConfig, hlc: Arc<Hlc>, cache: Arc<RwLock<RangeIndex>>) -> Self {
-        Self { transport, cfg, hlc, cache }
+        Self { transport, cfg, hlc, cache, plain: Arc::default() }
     }
 
     fn call(&self, to: NodeId, req: &KvRequest) -> Result<KvResponse> {
@@ -330,6 +346,12 @@ impl Gateway {
             eprintln!("gw {}us n{to} {:.90} -> {:.60}", t0.elapsed().as_micros(), what, format!("{resp:?}"));
         }
         resp
+    }
+
+    /// Shares `other`'s collection knowledge (gateways of one process).
+    pub fn sharing_collections(mut self, plain: Arc<RwLock<BTreeMap<String, Instant>>>) -> Self {
+        self.plain = plain;
+        self
     }
 
     /// Refreshes the cache entry for `anchor` from the meta range (any node points at its
@@ -433,11 +455,21 @@ impl KvSender for Gateway {
             return reqs.iter().map(|r| self.route(r).map_err(|e| e.to_string())).collect();
         }
         // In parallel: a parallel commit is one round trip only if its parts travel together.
+        // A bounded number of threads per call: a batch of thousands must not mean thousands of
+        // threads (memory, `RULE-SCALE-01`).
         let me: &Self = self;
+        let next = AtomicU64::new(0);
+        let slots: Vec<Mutex<Option<std::result::Result<KvResponse, String>>>> = reqs.iter().map(|_| Mutex::new(None)).collect();
         std::thread::scope(|s| {
-            let handles: Vec<_> = reqs.iter().map(|r| s.spawn(move || me.route(r).map_err(|e| e.to_string()))).collect();
-            handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("request panicked".into()))).collect()
-        })
+            for _ in 0..reqs.len().min(MAX_PARALLEL_REQUESTS) {
+                s.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed) as usize;
+                    let Some(r) = reqs.get(i) else { break };
+                    *slots[i].lock().unwrap_or_else(|p| p.into_inner()) = Some(me.route(r).map_err(|e| e.to_string()));
+                });
+            }
+        });
+        slots.into_iter().map(|m| m.into_inner().unwrap_or_else(|p| p.into_inner()).unwrap_or_else(|| Err("request not sent".into()))).collect()
     }
 
     fn now(&mut self) -> Timestamp {
@@ -450,6 +482,22 @@ impl KvSender for Gateway {
 
     fn sleep(&mut self, us: u64) {
         std::thread::sleep(Duration::from_micros(us));
+    }
+
+    fn collection_is_plain(&mut self, collection: &str) -> bool {
+        self.plain.read().unwrap_or_else(|p| p.into_inner()).get(collection).is_some_and(|t| t.elapsed() < PLAIN_TTL)
+    }
+
+    fn note_collection(&mut self, collection: &str, plain: bool) {
+        let mut m = self.plain.write().unwrap_or_else(|p| p.into_inner());
+        if plain {
+            if m.len() >= 65_536 {
+                m.clear(); // bounded memory: only a hint
+            }
+            m.insert(collection.to_string(), Instant::now());
+        } else {
+            m.remove(collection);
+        }
     }
 
     fn new_id(&mut self) -> TxnId {

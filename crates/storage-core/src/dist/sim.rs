@@ -92,7 +92,7 @@ impl Default for DistSimConfig {
             tick_us: 10_000,
             client_timeout: 1_500_000,
             max_events: 2_000_000,
-            node: NodeConfig { election_min_us: 300_000, election_max_us: 600_000, heartbeat_us: 50_000, snapshot_chunk: 1024, ..NodeConfig::default() },
+            node: NodeConfig { election_min_us: 300_000, election_max_us: 600_000, heartbeat_us: 50_000, snapshot_chunk: 1024, checkpoint_us: 300_000, log_retain: 32, ..NodeConfig::default() },
         }
     }
 }
@@ -217,7 +217,7 @@ fn key_id(k: usize) -> InlineId {
 }
 
 fn engine_config() -> EngineConfig {
-    EngineConfig { background_flush: false, collection_name: "node".into(), ..EngineConfig::default() }
+    EngineConfig { background_flush: false, collection_name: "node".into(), wal_sync_policy: storage_wal::SyncPolicy::AsyncMemoryFirst, ..EngineConfig::default() }
 }
 
 /// Runs one simulation in `root` (wiped first).

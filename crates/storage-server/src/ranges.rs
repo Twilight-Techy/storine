@@ -160,6 +160,7 @@ pub struct RangeContext {
     gateway: GatewayConfig,
     hlc: Arc<Hlc>,
     cache: Arc<RwLock<RangeIndex>>,
+    plain: Arc<RwLock<BTreeMap<String, std::time::Instant>>>,
 }
 
 impl core::fmt::Debug for RangeContext {
@@ -184,11 +185,11 @@ impl core::fmt::Debug for RangeOptions {
 
 impl RangeContext {
     pub(crate) fn new(o: RangeOptions, workers: usize) -> Self {
-        Self { node: o.node, pool: WorkerPool::new(workers, 16_384), transport: o.transport, gateway: o.gateway, hlc: o.hlc, cache: Arc::new(RwLock::new(RangeIndex::new())) }
+        Self { node: o.node, pool: WorkerPool::new(workers, 16_384), transport: o.transport, gateway: o.gateway, hlc: o.hlc, cache: Arc::new(RwLock::new(RangeIndex::new())), plain: Arc::default() }
     }
 
     pub(crate) fn backend(&self) -> RangeBackend {
-        RangeBackend { gw: Mutex::new(Gateway::new(Arc::clone(&self.transport) as Arc<dyn Transport>, self.gateway.clone(), Arc::clone(&self.hlc), Arc::clone(&self.cache))) }
+        RangeBackend { gw: Mutex::new(Gateway::new(Arc::clone(&self.transport) as Arc<dyn Transport>, self.gateway.clone(), Arc::clone(&self.hlc), Arc::clone(&self.cache)).sharing_collections(Arc::clone(&self.plain))) }
     }
 
     /// `OP_CLUSTER_INFO` body: every node coordinates, so each reports itself as the node to
@@ -270,10 +271,6 @@ fn insert_path(map: &mut BTreeMap<String, PropertyValue>, parts: &[&str], v: Pro
             }
         }
     }
-}
-
-fn not_on_ranges(what: &'static str) -> StorageError {
-    StorageError::invalid_value(what)
 }
 
 impl DocBackend for RangeBackend {
@@ -358,20 +355,20 @@ impl DocBackend for RangeBackend {
         self.with(|g| docs::set_collection_extra(g, c, extra))
     }
 
-    fn create_vector_index(&self, _: &str, _: &str, _: usize) -> Result<()> {
-        Err(not_on_ranges("vector indexes are not supported on range clusters"))
+    fn create_vector_index(&self, c: &str, f: &str, dims: usize) -> Result<()> {
+        self.with(|g| docs::create_vector_index(g, c, f, dims))
     }
 
-    fn drop_vector_index(&self, _: &str, _: &str) -> Result<()> {
-        Err(not_on_ranges("vector indexes are not supported on range clusters"))
+    fn drop_vector_index(&self, c: &str, f: &str) -> Result<()> {
+        self.with(|g| docs::drop_vector_index(g, c, f))
     }
 
-    fn create_columnar(&self, _: &str) -> Result<()> {
-        Err(not_on_ranges("columnar storage is not supported on range clusters"))
+    fn create_columnar(&self, c: &str) -> Result<()> {
+        self.with(|g| docs::set_columnar(g, c, true))
     }
 
-    fn drop_columnar(&self, _: &str) -> Result<()> {
-        Err(not_on_ranges("columnar storage is not supported on range clusters"))
+    fn drop_columnar(&self, c: &str) -> Result<()> {
+        self.with(|g| docs::set_columnar(g, c, false))
     }
 }
 
@@ -404,7 +401,7 @@ pub fn start_range_server(cfg: RangeServerConfig) -> Result<crate::StorageServer
     }
     let mut ids: Vec<NodeId> = cfg.peers.keys().copied().collect();
     ids.sort_unstable();
-    let engine = Arc::new(StorageEngine::<DocumentRecord>::open(&cfg.data_dir, EngineConfig { collection_name: "ranges".into(), ..EngineConfig::default() })?);
+    let engine = Arc::new(StorageEngine::<DocumentRecord>::open(&cfg.data_dir, EngineConfig { collection_name: "ranges".into(), wal_sync_policy: storage_core::dist::range_wal_policy(), ..EngineConfig::default() })?);
     let incarnation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
     let node_cfg = NodeConfig {
         seed: u64::from(cfg.node_id),

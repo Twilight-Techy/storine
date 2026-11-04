@@ -13,6 +13,12 @@
 //! - [`zone`]: localities, zone configurations, survival goals and closed-timestamp policies
 //!   (`TASK-141`).
 
+/// WAL policy of a range node's engine: no fsync per write. The Raft logs are the durable
+/// record; the WAL is synced at checkpoints, and a crash replays the logs from the last one.
+pub const fn range_wal_policy() -> storage_wal::SyncPolicy {
+    storage_wal::SyncPolicy::AsyncMemoryFirst
+}
+
 pub mod alloc;
 pub mod docs;
 pub mod hlc;

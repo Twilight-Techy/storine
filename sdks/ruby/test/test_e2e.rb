@@ -255,7 +255,8 @@ class SingleNodeTest < Minitest::Test
     sales.enable_columnar
     check_main.() # segments are built in the background: exact either way
     deadline = Time.now + 15
-    while sales.aggregate({ "n" => Storine.count }, Storine.gt("qty", 1000)).pruned_row_groups.zero? # zone maps skip it
+    # (Range clusters compute analytics from a snapshot: same results, no segments to prune.)
+    while !ENV.key?("STORINE_RANGES") && sales.aggregate({ "n" => Storine.count }, Storine.gt("qty", 1000)).pruned_row_groups.zero? # zone maps skip it
       flunk "column segments were never built" if Time.now > deadline
       sleep 0.05
     end

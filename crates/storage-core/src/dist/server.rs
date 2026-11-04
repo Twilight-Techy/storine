@@ -65,6 +65,9 @@ pub enum KvRequest {
     Scan { span: KeySpan, ts: Timestamp, limit: Timestamp, txn: Option<TxnId>, max_keys: u32 },
     /// Is a scan of `span` (within one range) at `from` still valid at `to`?
     RefreshSpan { span: KeySpan, from: Timestamp, to: Timestamp, txn: TxnId },
+    /// One-phase commit of a document write batch (`document_wire` encoding), if all of it can
+    /// commit in one Raft entry of this range: `ids` are the raw ids of its keys.
+    Atomic { ids: Vec<Vec<u8>>, body: Vec<u8> },
 }
 
 #[derive(Clone, Debug)]
@@ -104,6 +107,12 @@ pub enum KvResponse {
     Refreshed(bool),
     IntentFound(bool),
     Record(Option<TxnRecord>),
+    /// A committed one-phase batch: each write's version afterwards, whether its request id
+    /// was seen before, and its commit timestamp.
+    Atomic { versions: Vec<Option<u64>>, duplicate: bool, ts: Timestamp },
+    /// The batch cannot commit in one phase here: run it as a full transaction (which also
+    /// reports any error precisely).
+    NotOnePhase,
     /// Range descriptors (meta lookups).
     Ranges(Vec<RangeDescriptor>),
     /// A scan met another transaction's intent on `key`.
@@ -131,6 +140,8 @@ struct Pending {
     range: RangeId,
     req: KvRequest,
     state: PendingState,
+    /// A one-phase commit waiting for another transaction's intent: since when.
+    waiting_since: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -303,6 +314,7 @@ impl KvRequest {
     pub fn anchor(&self) -> Vec<u8> {
         match self {
             Self::Scan { span, .. } | Self::RefreshSpan { span, .. } => span.start.clone(),
+            Self::Atomic { ids, .. } => ids.first().cloned().unwrap_or_default(),
             _ => key_id(&self.key()).map(|i| i.as_bytes().to_vec()).unwrap_or_default(),
         }
     }
@@ -318,7 +330,7 @@ impl KvRequest {
     /// The key of a single-key request (scans have none: see [`Self::anchor`]).
     pub fn key(&self) -> Key {
         match self {
-            Self::Scan { .. } | Self::RefreshSpan { .. } => (String::new(), String::new()),
+            Self::Scan { .. } | Self::RefreshSpan { .. } | Self::Atomic { .. } => (String::new(), String::new()),
             Self::Get { key, .. } | Self::Put { key, .. } | Self::Resolve { key, .. } | Self::Refresh { key, .. } | Self::QueryIntent { key, .. } => key.clone(),
             Self::Record { id, .. } => record_key_of(id),
             // Serialized on one key inside the meta prefix.
@@ -340,7 +352,7 @@ impl KvRequest {
             Self::Record { op: RecordOp::Stage { ts, .. } | RecordOp::Commit { ts, .. }, .. } => Some(*ts),
             Self::Scan { ts, .. } => Some(*ts),
             Self::RefreshSpan { to, .. } => Some(*to),
-            Self::Record { .. } | Self::Meta(_) => None,
+            Self::Record { .. } | Self::Meta(_) | Self::Atomic { .. } => None,
         }
     }
 }
@@ -420,7 +432,7 @@ impl NodeServer {
             self.replies.push_back(Reply { id, client, resp: KvResponse::NotLeader { leader } });
             return;
         }
-        self.pending.push(Pending { id, client, range, req, state: PendingState::New });
+        self.pending.push(Pending { id, client, range, req, state: PendingState::New, waiting_since: None });
     }
 
     /// Replies ready to send.
@@ -554,12 +566,12 @@ impl NodeServer {
         match self.driver.engine().get_owned(id) {
             // Long keys are hashed into ids: never serve or overwrite another key's record.
             Ok((_, rec)) if rec.collection != key.0 || rec.key != key.1 => Err(StorageError::invalid_key("document key hash collision with another document; use a shorter key")),
-            // Existence, never the engine version: versions come from each node's own engine
-            // (shared by many ranges), so they differ between replicas, and a version check
-            // would apply on one replica and fail on another (`RULE-SAFE-09`). Latches and
-            // read-index ordering already keep evaluations from interleaving.
-            Ok((_, rec)) => Ok((MvccKey::from_record(Some(&rec))?, Precondition::Exists)),
-            Err(StorageError::RecordNotFound { .. }) => Ok((MvccKey::default(), Precondition::Absent)),
+            // Unconditional writes: engine versions come from each node's own engine, so a
+            // version check would apply on one replica and fail on another (`RULE-SAFE-09`), and
+            // an existence check could change its answer when the log replays over newer state.
+            // Latches and read-index ordering already keep evaluations from interleaving.
+            Ok((_, rec)) => Ok((MvccKey::from_record(Some(&rec))?, Precondition::None)),
+            Err(StorageError::RecordNotFound { .. }) => Ok((MvccKey::default(), Precondition::None)),
             Err(e) => Err(e),
         }
     }
@@ -568,33 +580,53 @@ impl NodeServer {
         let key = record_key_of(id);
         let rid = key_id(&key).ok_or_else(|| StorageError::invalid_key("invalid record key"))?;
         match self.driver.engine().get_owned(rid) {
-            Ok((_, rec)) => Ok((Some(TxnRecord::from_record(*id, &rec)?), Precondition::Exists)),
-            Err(StorageError::RecordNotFound { .. }) => Ok((None, Precondition::Absent)),
+            Ok((_, rec)) => Ok((Some(TxnRecord::from_record(*id, &rec)?), Precondition::None)),
+            Err(StorageError::RecordNotFound { .. }) => Ok((None, Precondition::None)),
             Err(e) => Err(e),
         }
     }
 
     /// Makes progress on pending requests (call after every `tick` / `step` of the driver).
     pub fn poll(&mut self, now_ns: u64) {
+        self.poll_progress(now_ns);
+    }
+
+    /// [`Self::poll`], returning whether any request moved (another pass may move more).
+    pub fn poll_progress(&mut self, now_ns: u64) -> bool {
         self.publish(now_ns);
         let ready_reads = self.driver.take_ready_reads();
         let pending = std::mem::take(&mut self.pending);
         let mut keep = Vec::new();
+        let mut moved = !ready_reads.is_empty();
         for mut p in pending {
+            let before = core::mem::discriminant(&p.state);
             match self.advance(&mut p, &ready_reads, now_ns) {
                 Some(resp) => {
                     self.release(&p);
                     self.replies.push_back(Reply { id: p.id, client: p.client, resp });
+                    moved = true;
                 }
-                None => keep.push(p),
+                None => {
+                    moved |= before != core::mem::discriminant(&p.state);
+                    keep.push(p);
+                }
             }
         }
         self.pending = keep;
+        moved
     }
 
     fn release(&mut self, p: &Pending) {
         if p.req.span().is_some() {
             return; // scans read: they never hold a latch
+        }
+        if let KvRequest::Atomic { ids, .. } = &p.req {
+            for id in ids {
+                if self.latches.get(id.as_slice()) == Some(&(p.client, p.id)) {
+                    self.latches.remove(id.as_slice());
+                }
+            }
+            return;
         }
         if let Some(id) = key_id(&p.req.key()) {
             if self.latches.get(id.as_bytes()) == Some(&(p.client, p.id)) {
@@ -647,6 +679,14 @@ impl NodeServer {
             if busy {
                 return None;
             }
+        } else if let KvRequest::Atomic { ids, .. } = &p.req {
+            // All of its keys at once, or wait in line (requests are advanced in arrival order).
+            if ids.iter().any(|id| self.latches.get(id.as_slice()).is_some_and(|&holder| holder != (p.client, p.id))) {
+                return None;
+            }
+            for id in ids {
+                self.latches.insert(id.clone(), (p.client, p.id));
+            }
         } else {
             // Latch: one in-flight write per key; reads wait for it.
             if self.latches.get(anchor.as_slice()).is_some_and(|&holder| holder != (p.client, p.id)) {
@@ -655,6 +695,18 @@ impl NodeServer {
             if p.req.is_write() {
                 self.latches.insert(anchor.clone(), (p.client, p.id));
             }
+        }
+        if matches!(p.req, KvRequest::Atomic { .. }) && matches!(p.state, PendingState::New) {
+            // A write needs no read-index round: if this leader was deposed, its entry never
+            // commits. It only needs everything of earlier terms applied (its own first entry).
+            let ready = self.driver.replica(p.range).is_some_and(|r| {
+                let v = r.log_view();
+                v.term_at(v.last_applied) == Some(v.current_term)
+            });
+            if !ready {
+                return None;
+            }
+            p.state = PendingState::Confirmed;
         }
         match p.state {
             PendingState::New => {
@@ -676,6 +728,7 @@ impl NodeServer {
             let floor = self.tscache.get(&p.range).map(|c| c.floor(&anchor, None));
             let what = match &result {
                 Ok(Eval::Done(r)) => format!("done {r:?}"),
+                Ok(Eval::Wait) => "wait".to_string(),
                 Ok(Eval::Propose(_, r)) => format!("propose {r:?}"),
                 Err(e) => format!("error {e}"),
             };
@@ -686,6 +739,16 @@ impl NodeServer {
         }
         match result {
             Ok(Eval::Done(resp)) => Some(resp),
+            Ok(Eval::Wait) => {
+                let since = *p.waiting_since.get_or_insert(now_ns);
+                if now_ns.saturating_sub(since) > MAX_INTENT_WAIT_NS {
+                    // Still there (perhaps abandoned): the full transaction pushes it.
+                    return Some(KvResponse::NotOnePhase);
+                }
+                self.release(p);
+                p.state = PendingState::New;
+                None
+            }
             Ok(Eval::Propose(ops, resp)) => match self.driver.propose(p.range, &ops, now_ns) {
                 Ok((index, term)) => {
                     p.state = PendingState::Proposed { index, term, resp };
@@ -701,6 +764,7 @@ impl NodeServer {
         match req {
             KvRequest::Scan { span, ts, limit, txn, max_keys } => return self.eval_scan(range, span, *ts, *limit, txn.as_ref(), *max_keys).map(Eval::Done),
             KvRequest::RefreshSpan { span, from, to, txn } => return self.eval_refresh_span(range, span, *from, *to, txn).map(Eval::Done),
+            KvRequest::Atomic { ids, body } => return Ok(self.eval_atomic(range, ids, body)),
             _ => {}
         }
         let key = req.key();
@@ -748,7 +812,10 @@ impl NodeServer {
             KvRequest::Resolve { txn, commit_ts, .. } => {
                 let (k, pre) = self.load(&key)?;
                 match eval_resolve(&k, txn, *commit_ts) {
-                    Some(nk) => Eval::Propose(vec![put(&nk, pre)], KvResponse::Resolved),
+                    Some(mut nk) => {
+                        nk.trim(self.hlc.now());
+                        Eval::Propose(vec![put(&nk, pre)], KvResponse::Resolved)
+                    }
                     None => Eval::Done(KvResponse::Resolved),
                 }
             }
@@ -877,8 +944,81 @@ impl NodeServer {
                     },
                 }
             }
-            KvRequest::Scan { .. } | KvRequest::RefreshSpan { .. } => return Err(StorageError::invalid_value("scans are evaluated separately")),
+            KvRequest::Scan { .. } | KvRequest::RefreshSpan { .. } | KvRequest::Atomic { .. } => return Err(StorageError::invalid_value("evaluated separately")),
         })
+    }
+
+    /// One-phase commit: under latches on all its keys, the batch is evaluated against their
+    /// newest versions and committed above everything read or written there, in one Raft entry
+    /// (no intents, no transaction record). It serializes like a transaction at its timestamp:
+    /// nothing newer exists, and later writes land above it.
+    fn eval_atomic(&mut self, range: RangeId, ids: &[Vec<u8>], body: &[u8]) -> Eval {
+        let not = || Eval::Done(KvResponse::NotOnePhase);
+        let Ok((writes, rid)) = crate::document_wire::decode_write_request(body) else { return not() };
+        let Some(rspan) = self.driver.replica(range).map(|r| r.span()) else { return not() };
+        if ids.iter().any(|id| !rspan.contains(id)) {
+            return not();
+        }
+        let closed = self.driver.closed_offset(range).map_or(Timestamp::ZERO, |off| shift(self.hlc.now(), off)).max(self.driver.lead_floor());
+        let mut ts = self.hlc.now();
+        let mut keys: BTreeMap<Key, (MvccKey, bool)> = BTreeMap::new();
+        for w in &writes {
+            let key: Key = (w.collection.clone(), w.key.clone());
+            if keys.contains_key(&key) {
+                continue;
+            }
+            let Some(kid) = key_id(&key) else { return not() };
+            if !ids.iter().any(|i| i.as_slice() == kid.as_bytes()) {
+                return not();
+            }
+            let Ok((k, _)) = self.load(&key) else { return not() };
+            if k.intent.is_some() {
+                // A transaction is writing here: wait for it to finish (declining at once sends
+                // every writer of a hot key down the slow path, where they stay).
+                return Eval::Wait;
+            }
+            if let Some(n) = k.newest_commit() {
+                ts = ts.max(n.next());
+            }
+            ts = ts.max(self.cache(range).floor(kid.as_bytes(), None).next());
+            keys.insert(key, (k, false));
+        }
+        ts = ts.max(closed.next());
+        let newest = |k: &MvccKey| k.versions.first().and_then(|(_, v)| v.clone());
+        if let Some(rid) = rid {
+            if writes.iter().any(|w| keys.get(&(w.collection.clone(), w.key.clone())).is_some_and(|(k, _)| crate::dist::docs::rid_seen(&newest(k), &rid))) {
+                let versions = writes.iter().map(|w| keys.get(&(w.collection.clone(), w.key.clone())).and_then(|(k, _)| crate::dist::docs::visible_version(&newest(k), ts.wall))).collect();
+                return Eval::Done(KvResponse::Atomic { versions, duplicate: true, ts });
+            }
+        }
+        let mut versions = Vec::with_capacity(writes.len());
+        for w in &writes {
+            let Some((k, changed)) = keys.get_mut(&(w.collection.clone(), w.key.clone())) else { return not() };
+            let Ok(step) = crate::dist::docs::apply_write(w, &newest(k), ts.wall, rid.as_ref(), true) else { return not() };
+            versions.push(step.version);
+            if let Some(value) = step.value {
+                // A later write of this batch to the same key replaces this one.
+                if *changed {
+                    k.versions.remove(0);
+                }
+                k.versions.insert(0, (ts, Some(value)));
+                *changed = true;
+            }
+        }
+        let now = self.hlc.now();
+        let mut ops = Vec::new();
+        for (key, (k, changed)) in &mut keys {
+            if *changed {
+                k.trim(now);
+                let Some(kid) = key_id(key) else { return not() };
+                ops.push(WriteOp::put(kid, k.to_record(&key.0, &key.1)));
+            }
+        }
+        let resp = KvResponse::Atomic { versions, duplicate: false, ts };
+        if ops.is_empty() {
+            return Eval::Done(resp);
+        }
+        Eval::Propose(ops, resp)
     }
 
     /// One page of a scan within this range: `O(log N + max_keys)` over the ordered ids.
@@ -949,6 +1089,9 @@ impl NodeServer {
     }
 }
 
+/// How long a one-phase commit waits for an intent on its keys (nanoseconds).
+const MAX_INTENT_WAIT_NS: u64 = 250_000_000;
+
 /// Most rows one scan page returns.
 pub const MAX_SCAN_KEYS: usize = 10_000;
 
@@ -976,5 +1119,7 @@ fn shift(ts: Timestamp, off: i64) -> Timestamp {
 enum Eval {
     Done(KvResponse),
     Propose(Vec<WriteOp<DocumentRecord>>, KvResponse),
+    /// Try again shortly, without holding latches.
+    Wait,
 }
 
