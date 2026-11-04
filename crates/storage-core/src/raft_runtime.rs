@@ -334,6 +334,19 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
         if !s.node.is_leader() {
             return Err(StorageError::NotLeader { leader: s.node.leader_id().map(u64::from) });
         }
+        // A new leader first commits and applies an entry of its own term (Raft §8): only then
+        // does its commit index cover every write acknowledged before this read.
+        let deadline = Instant::now() + s.config.commit_timeout;
+        while !s.node.applied_own_term() {
+            if !s.node.is_leader() {
+                return Err(StorageError::NotLeader { leader: s.node.leader_id().map(u64::from) });
+            }
+            if Instant::now() >= deadline {
+                return Err(StorageError::NotLeader { leader: None });
+            }
+            heartbeat_round(s)?;
+            thread::sleep(Duration::from_micros(200));
+        }
         let read_index = s.node.commit_index();
         if !self.lease_valid() {
             heartbeat_round(s)?;
@@ -356,7 +369,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
     /// have been elected (lease = 90% of the minimum election timeout, `RULE-SAFE-09`).
     pub fn lease_valid(&self) -> bool {
         let s = &self.shared;
-        if !s.node.is_leader() {
+        if !s.node.is_leader() || !s.node.applied_own_term() {
             return false;
         }
         let members = s.node.membership();

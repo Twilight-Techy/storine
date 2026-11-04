@@ -687,6 +687,12 @@ impl Parser {
             "" if self.is_op("(") => Ok(Statement::Query(Box::new(self.query()?))),
             "insert" | "replace" => self.insert(),
             "merge" => self.merge(),
+            "update" if self.dialect == Dialect::MsSql && self.is_kw_at(1, "statistics") => {
+                self.pos += 2;
+                let table = self.table_name()?;
+                self.skip_to_end();
+                Ok(Statement::Analyze(vec![table]))
+            }
             "update" => self.update(),
             "delete" => self.delete(),
             "create" => self.create(),
@@ -1002,6 +1008,20 @@ impl Parser {
                     _ => Err(self.unexpected("a session id")),
                 }
             }
+            "analyze" | "analyse" => {
+                self.pos += 1;
+                let _ = self.eat_kw("verbose");
+                let _ = self.dialect == Dialect::MySql && (self.eat_kw("local") || self.eat_kw("no_write_to_binlog"));
+                let _ = self.eat_kw("table");
+                let mut tables = Vec::new();
+                while !self.statement_end() {
+                    tables.push(self.table_name()?);
+                    if !self.eat_op(",") {
+                        break;
+                    }
+                }
+                Ok(Statement::Analyze(tables))
+            }
             "grant" | "revoke" => self.grant(),
             "deny" if self.dialect == Dialect::MsSql => self.grant(),
             "reassign" => self.reassign(),
@@ -1011,7 +1031,7 @@ impl Parser {
                 Ok(Statement::Role(Box::new(RoleStmt::SetRole(None))))
             }
             "discard" | "listen" | "unlisten" | "notify" | "reset" | "lock" | "unlock"
-            | "analyze" | "vacuum" | "checkpoint" | "flush" | "pragma" | "comment"
+            | "vacuum" | "checkpoint" | "flush" | "pragma" | "comment"
             | "optimize" | "load" => {
                 self.pos += 1;
                 self.skip_to_end();
@@ -4436,7 +4456,6 @@ fn static_tag(kw: &str) -> &'static str {
         "reset" => "RESET",
         "lock" => "LOCK TABLE",
         "unlock" => "UNLOCK TABLES",
-        "analyze" => "ANALYZE",
         "vacuum" => "VACUUM",
         "checkpoint" => "CHECKPOINT",
         "flush" => "FLUSH",

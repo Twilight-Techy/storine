@@ -374,6 +374,21 @@ pub fn group_eq(a: &Datum, b: &Datum) -> bool {
     compare(a, b) == Ordering::Equal
 }
 
+/// Which values [`hash_key`] can tell equal: within one class, `=` and equal keys agree. Across
+/// classes `=` may coerce (MySQL's `1 = '1'`) where keys differ, so equalities across classes
+/// cannot use a hash.
+pub fn key_class(d: &Datum) -> u8 {
+    match d {
+        Datum::Null => 0,
+        Datum::Int(_) | Datum::Numeric(_) | Datum::Float(_) => 1,
+        Datum::Text(_) | Datum::Json(_) => 2,
+        Datum::Bytes(_) => 3,
+        Datum::Bool(_) => 4,
+        Datum::Timestamp(_) | Datum::Date(_) => 5,
+        _ => 6,
+    }
+}
+
 /// A canonical key for hashing (GROUP BY, DISTINCT, hash joins): equal values give equal keys.
 pub fn hash_key(d: &Datum) -> String {
     match d {

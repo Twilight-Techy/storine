@@ -46,6 +46,13 @@ pub struct Exec<'a> {
     #[allow(clippy::type_complexity)]
     pub(crate) restrictions: RefCell<HashMap<(String, String, String), Option<(Rc<crate::exec::acl::Restriction>, bool)>>>,
     pub(crate) rls_depth: std::cell::Cell<u32>,
+    /// The columns of each running correlated select (`None`: unknown).
+    pub(crate) scope: RefCell<Vec<Option<Vec<ColMeta>>>>,
+    /// Decorrelated subqueries of this statement, by address (`None`: runs per row).
+    #[allow(clippy::type_complexity)]
+    pub(crate) semi_joins: RefCell<HashMap<usize, Option<Rc<crate::exec::optimizer::SemiJoin>>>>,
+    #[allow(clippy::type_complexity)]
+    pub(crate) group_maps: RefCell<HashMap<usize, Option<Rc<crate::exec::optimizer::GroupMap>>>>,
     /// Evaluations since the last look at the session's control (`exec/control.rs`).
     ticks: std::cell::Cell<u32>,
     /// Bytes of rows this statement holds, and the most it may.
@@ -225,6 +232,9 @@ impl<'a> Exec<'a> {
             acting_as: RefCell::new(None),
             restrictions: RefCell::new(HashMap::new()),
             rls_depth: std::cell::Cell::new(0),
+            scope: RefCell::new(Vec::new()),
+            semi_joins: RefCell::new(HashMap::new()),
+            group_maps: RefCell::new(HashMap::new()),
             ticks: std::cell::Cell::new(0),
             memory: std::cell::Cell::new(0),
             memory_limit: s.memory_limit(),
@@ -574,10 +584,16 @@ impl<'a> Exec<'a> {
                 }
             }
             Expr::Exists { query, negated } => {
+                if let Some(found) = self.exists_decorrelated(query, env)? {
+                    return Ok(Datum::Bool(found != *negated));
+                }
                 let rel = self.subquery(query, env)?;
                 Datum::Bool(rel.rows.is_empty() == *negated)
             }
             Expr::Subquery(q) => {
+                if let Some(v) = self.scalar_decorrelated(q, env)? {
+                    return Ok(v);
+                }
                 let rel = self.subquery(q, env)?;
                 match rel.rows.len() {
                     0 => Datum::Null,

@@ -25,6 +25,7 @@
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1439,6 +1440,8 @@ pub struct RaftNode<T: ZeroCopyRecord + Indexable> {
     /// Outcomes of applied entries a local proposer is waiting for (only awaited indexes are
     /// kept, so memory stays bounded by in-flight proposals).
     outcomes: Mutex<Outcomes>,
+    /// Index of the no-op this node appended when it last became leader.
+    leader_noop: AtomicU64,
     /// Signalled whenever entries are applied.
     applied_cv: Condvar,
     /// Last time a valid leader contacted this node or this node granted a vote (election timer).
@@ -1526,6 +1529,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             apply_lock: Mutex::new(()),
             snapshot_lock: Mutex::new(()),
             outcomes: Mutex::new(Outcomes::default()),
+            leader_noop: AtomicU64::new(0),
             applied_cv: Condvar::new(),
             last_contact: Mutex::new(Instant::now()),
             vote_stickiness: Mutex::new(None),
@@ -1851,10 +1855,18 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 return false;
             }
             st.push_entry(entry);
+            self.leader_noop.store(prev + 1, Ordering::Release);
             true
         } else {
             false
         }
+    }
+
+    /// Whether this leader has applied an entry of its own term (Raft §8). Before that, its state
+    /// machine can lack writes its predecessor acknowledged, even though they are in its log: a
+    /// read served now could return a value older than one a client already saw acknowledged.
+    pub fn applied_own_term(&self) -> bool {
+        self.last_applied() >= self.leader_noop.load(Ordering::Acquire)
     }
 
     /// Leader: appends `command` to the durable log and returns its index. The caller replicates
@@ -3218,6 +3230,36 @@ mod tests {
         let v = f.log_view();
         assert_eq!((v.commit_index, v.last_index(), v.term_at(4)), (4, 4, Some(3)));
         drop(f);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A new leader may hold a predecessor's committed writes without having applied them: until
+    /// an entry of its own term is applied, it must not serve reads (Raft §8; a process chaos run
+    /// caught it serving a value older than one already acknowledged).
+    #[test]
+    fn test_a_new_leader_applies_its_own_term_before_serving_reads() {
+        let dir = std::env::temp_dir().join(format!("stge_raft_own_term_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Arc::new(StorageEngine::<AgentObjectRecord>::open(&dir, EngineConfig::default()).unwrap());
+        let a = RaftNode::new(1, engine).unwrap();
+        // A follower holds an entry of an earlier leader, not yet known to be committed.
+        let ae = AppendEntriesReq {
+            term: 1,
+            leader_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![RaftLogEntry { term: 1, index: 1, command: RaftCommand::Noop }],
+            leader_commit: 0,
+        };
+        assert!(a.handle_append_entries(ae).unwrap().success);
+        let req = a.start_election().unwrap();
+        assert!(a.become_leader(req.term));
+        assert_eq!(a.last_applied(), 0);
+        assert!(!a.applied_own_term(), "the no-op of its term is not applied");
+        a.advance_leader_commit(2).unwrap();
+        assert_eq!(a.last_applied(), 2);
+        assert!(a.applied_own_term());
+        drop(a);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -2,6 +2,8 @@
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    /// `ANALYZE [tables]`, MySQL `ANALYZE TABLE`, T-SQL `UPDATE STATISTICS` (`TASK-148`).
+    Analyze(Vec<String>),
     /// MySQL `KILL [QUERY | CONNECTION] id`, T-SQL `KILL id` (`TASK-146`).
     Kill {
         id: u64,

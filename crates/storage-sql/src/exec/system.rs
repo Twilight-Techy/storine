@@ -1244,6 +1244,29 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
             }
             bd.done()
         }
+        "pg_stats" => {
+            let mut bd = Builder::new(&[("schemaname", T), ("tablename", T), ("attname", T), ("inherited", B), ("null_frac", DataType::Double), ("avg_width", I4), ("n_distinct", DataType::Double), ("most_common_vals", T), ("most_common_freqs", T), ("histogram_bounds", T), ("correlation", DataType::Double)]);
+            let stats = ex.s.engine.stats()?;
+            let mut names: Vec<&String> = stats.keys().collect();
+            names.sort();
+            for table in names {
+                let st = &stats[table];
+                // As in PostgreSQL: only what the role may read.
+                let readable = tables.iter().find(|x| x.name.eq_ignore_ascii_case(table)).is_some_and(|x| ex.s.engine.acl().is_ok_and(|a| a.table_access(ex.s.current_role(), x, "SELECT") == crate::exec::acl::Access::All));
+                if !readable {
+                    continue;
+                }
+                let mut cols: Vec<&String> = st.columns.keys().collect();
+                cols.sort();
+                for col in cols {
+                    let c = &st.columns[col];
+                    let brace = |v: Vec<String>| if v.is_empty() { N } else { t(format!("{{{}}}", v.join(","))) };
+                    let hist = if c.numeric_bounds.is_empty() { c.text_bounds.clone() } else { c.numeric_bounds.iter().map(ToString::to_string).collect() };
+                    bd.row(vec![t("public"), t(table.clone()), t(col.clone()), b(false), Datum::Float(c.null_frac), i(0), Datum::Float(c.distinct), brace(c.common.iter().map(|x| x.0.clone()).collect()), brace(c.common.iter().map(|x| format!("{:.4}", x.1)).collect()), brace(hist), N]);
+                }
+            }
+            bd.done()
+        }
         "pg_stat_statements" => {
             let mut bd = Builder::new(&[
                 ("userid", I8),

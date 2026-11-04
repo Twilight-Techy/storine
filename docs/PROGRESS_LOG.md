@@ -724,3 +724,12 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Decision**: `EXPLAIN` calls the same decision functions as the executor rather than modelling them separately, so the two cannot drift apart for those choices. Join algorithm is the one place it mirrors a rule; `ANALYZE` shows the rows actually read.
 - **Test note**: `EXPLAIN ANALYZE` exposed that lookup joins bypass the common scan entry point, so they first read as "never executed". They now record their own rows.
 
+### Stage 31: cost-based optimizer (`TASK-148`), and a linearizability bug in single-group reads — 2026-11-04
+
+- **What exists now**: `ANALYZE` measures tables, and the gateway orders joins and decorrelates subqueries from those numbers. Answers are unchanged: every test query runs with the optimizer off and on.
+- **Decision**: no statistics means the written order. A plan that changes on a guess is hard to explain to anyone debugging a slow query.
+- **Numbers, including the loss**: see `TASK-148` in `docs/TASKS.md`. A query already written in the best order gains nothing and can lose up to about 10%.
+- **Linearizability bug (Raft §8), found by the process chaos test on Modal**: a new leader's lease became valid as soon as a quorum acknowledged it, possibly before its own no-op applied. Its state machine could lack writes its predecessor had acknowledged, so a read could return a value older than one a client had already seen acknowledged. The failed history shows a read about 1 ms after a 500 ms leader gap returning an old value. Single-group mode only: range clusters already required an own-term commit. It failed about 1 run in 10 to 27.
+  - **Fix**: `RaftNode::applied_own_term` gates lease reads and `read_barrier`. Regression test added. The chaos test also now reports where a failing history stops, instead of dumping tens of thousands of operations.
+- **Two older correctness bugs found by the differential test**: see `TASK-148`.
+

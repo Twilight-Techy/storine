@@ -110,8 +110,16 @@ pub fn conjuncts(e: &Expr) -> Vec<&Expr> {
     }
 }
 
+/// How a column of a joined relation is named in an expression.
+fn column_path(c: &ColMeta) -> Vec<String> {
+    match &c.qual {
+        Some(q) => vec![q.clone(), c.name.clone()],
+        None => vec![c.name.clone()],
+    }
+}
+
 /// Column references in `e` (not entering subqueries).
-fn column_refs(e: &Expr) -> Vec<Vec<String>> {
+pub(crate) fn column_refs(e: &Expr) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     walk(e, &mut |x| {
         if let Expr::Column(p) = x {
@@ -511,6 +519,9 @@ impl Exec<'_> {
         pushable: &[&Expr],
         outer: Option<&Env<'_>>,
     ) -> SqlResult<Rel> {
+        if let Some((flat, order)) = self.plan_join_order(from, pushable)? {
+            return self.run_planned_join(&flat, &order, pushable, outer);
+        }
         let mut acc: Option<Rel> = None;
         for item in from {
             // `FROM a, LATERAL (SELECT ... a.x ...)`: evaluated once per row of what precedes it.
@@ -574,6 +585,40 @@ impl Exec<'_> {
             cols: Vec::new(),
             rows: vec![Vec::new()],
         }))
+    }
+
+    /// One leaf of a planned join, with the WHERE conjuncts that can narrow it.
+    pub(crate) fn relation_of_filtered(&self, item: &TableRef, pushable: &[&Expr], outer: Option<&Env<'_>>) -> SqlResult<Rel> {
+        self.eval_from_entry(item, pushable, outer, None)
+    }
+
+    /// The columns a leaf has, as the query names them.
+    pub(crate) fn leaf_cols(&self, item: &TableRef) -> SqlResult<Vec<ColMeta>> {
+        match item {
+            TableRef::Named { name, alias, .. } => {
+                let t = self.s.engine.table(name)?;
+                Ok(Rel { cols: table_cols(&t), rows: Vec::new() }.requalify(alias, Some(&t.name))?.cols)
+            }
+            other => Ok(self.eval_from_entry(other, &[], None, None)?.cols),
+        }
+    }
+
+    /// The right side of one planned join step: only rows with the left's keys when that is cheap.
+    pub(crate) fn right_of_join(&self, item: &TableRef, pushable: &[&Expr], on: Option<&Expr>, l: &Rel, outer: Option<&Env<'_>>) -> SqlResult<Rel> {
+        if let (TableRef::Named { schema: None, name, alias }, Some(on)) = (item, on) {
+            if l.rows.len() <= 2000 && matches!(self.s.engine.find_table(name)?.map(|t| self.read_restriction(&t)), Some(Ok(None))) {
+                let table = self.s.engine.table(name)?;
+                let qual = alias.as_ref().map_or(name.as_str(), |a| a.name.as_str());
+                let extra = self.lookup_filters(&table, qual, on, l, outer)?;
+                let started = std::time::Instant::now();
+                let rows = self.scan_rows(&table, Some(qual), pushable, extra, outer)?;
+                if let Some(trace) = &self.s.trace {
+                    crate::exec::explain::note(trace, item as *const TableRef as usize, rows.len() as u64, started);
+                }
+                return Rel { cols: table_cols(&table), rows: rows.into_iter().map(|r| r.row).collect() }.requalify(alias, Some(&table.name));
+            }
+        }
+        self.eval_from_entry(item, pushable, outer, None)
     }
 
     /// One FROM item as a relation.
@@ -954,7 +999,7 @@ impl Exec<'_> {
         Ok(out)
     }
 
-    fn join(
+    pub(crate) fn join(
         &self,
         l: Rel,
         r: Rel,
@@ -1085,7 +1130,41 @@ impl Exec<'_> {
             }
             Ok(Some(k))
         };
-        let hashed = !eq_pairs.is_empty() || !hash_l.is_empty();
+        // Keys of different classes: `=` may coerce where keys differ, so compare each pair. Columns
+        // hold one class, so the first non-null value of each key tells.
+        let first_class = |rows: &[Row], cols: &[ColMeta], exprs: &[&Expr], index: &dyn Fn(usize) -> usize| -> SqlResult<Vec<u8>> {
+            let mut out = vec![0u8; eq_pairs.len() + exprs.len()];
+            for row in rows {
+                if out.iter().all(|c| *c != 0) {
+                    break;
+                }
+                let env = Env { cols, row, outer, aggs: None };
+                for p in 0..eq_pairs.len() {
+                    if out[p] == 0 {
+                        out[p] = datum::key_class(&row[index(p)]);
+                    }
+                }
+                for (i, e) in exprs.iter().enumerate() {
+                    let p = eq_pairs.len() + i;
+                    if out[p] == 0 {
+                        out[p] = datum::key_class(&self.eval(e, &env)?);
+                    }
+                }
+            }
+            Ok(out)
+        };
+        let lc = first_class(&l.rows, &l.cols, &hash_l, &|p| eq_pairs[p].0)?;
+        let rc = first_class(&r.rows, &r.cols, &hash_r, &|p| eq_pairs[p].1)?;
+        let coercing = lc.iter().zip(&rc).any(|(a, b)| *a != 0 && *b != 0 && a != b);
+        let hash_exprs_as_residual: Vec<Expr> = if coercing {
+            let mut v: Vec<Expr> = hash_l.iter().zip(&hash_r).map(|(a, b)| Expr::binary(BinaryOp::Eq, (*a).clone(), (*b).clone())).collect();
+            v.extend(eq_pairs.iter().map(|(li, ri)| Expr::binary(BinaryOp::Eq, Expr::Column(column_path(&l.cols[*li])), Expr::Column(column_path(&r.cols[*ri])))));
+            v
+        } else {
+            Vec::new()
+        };
+        let residual: Vec<&Expr> = residual.iter().copied().chain(hash_exprs_as_residual.iter()).collect();
+        let hashed = !coercing && (!eq_pairs.is_empty() || !hash_l.is_empty());
         let mut index: HashMap<String, Vec<usize>> = HashMap::new();
         if hashed {
             for (i, row) in r.rows.iter().enumerate() {
@@ -1706,8 +1785,14 @@ impl Exec<'_> {
         if column_refs(e).is_empty() {
             return self.eval_const(e).ok();
         }
-        // Correlated with an enclosing query: constant for this scan.
+        // Correlated with an enclosing query: constant for this scan, unless a name it uses is
+        // one of this query's own columns, which hide the enclosing query's.
         let env = outer?;
+        let scope = self.scope.borrow();
+        let own = scope.last()?.as_ref()?;
+        if column_refs(e).iter().any(|p| resolves(own, p)) {
+            return None;
+        }
         self.eval(e, env).ok()
     }
 
@@ -1830,7 +1915,48 @@ impl Exec<'_> {
         Ok(rel)
     }
 
+    /// The columns `from` brings into scope; `None` if that cannot be told without running it.
+    fn scope_of(&self, from: &[TableRef]) -> Option<Vec<ColMeta>> {
+        fn add(ex: &Exec<'_>, t: &TableRef, out: &mut Vec<ColMeta>) -> Option<()> {
+            match t {
+                TableRef::Named { schema: None, name, alias } if ex.cte(name).is_none() && !name.starts_with('@') && !system::is_system(None, name) => {
+                    let table = ex.s.engine.find_table(name).ok()??;
+                    out.extend(Rel { cols: table_cols(&table), rows: Vec::new() }.requalify(alias, Some(&table.name)).ok()?.cols);
+                    Some(())
+                }
+                TableRef::Join { left, right, .. } => {
+                    add(ex, left, out)?;
+                    add(ex, right, out)
+                }
+                _ => None,
+            }
+        }
+        let mut out = Vec::new();
+        for t in from {
+            add(self, t, &mut out)?;
+        }
+        Some(out)
+    }
+
     fn select_inner(
+        &self,
+        sel: &Select,
+        outer: Option<&Env<'_>>,
+        order_by: &[OrderBy],
+        limit: Option<usize>,
+        offset: usize,
+    ) -> SqlResult<Rel> {
+        // Only a correlated select can mistake its own columns for the enclosing query's.
+        if outer.is_none() {
+            return self.select_scoped(sel, outer, order_by, limit, offset);
+        }
+        self.scope.borrow_mut().push(self.scope_of(&sel.from));
+        let out = self.select_scoped(sel, outer, order_by, limit, offset);
+        self.scope.borrow_mut().pop();
+        out
+    }
+
+    fn select_scoped(
         &self,
         sel: &Select,
         outer: Option<&Env<'_>>,
@@ -2718,7 +2844,7 @@ fn unify_types(types: impl Iterator<Item = DataType>) -> Option<DataType> {
 /// Upper bound on a join's intermediate rows.
 const MAX_JOIN_ROWS: usize = 20_000_000;
 
-fn resolves(cols: &[ColMeta], p: &[String]) -> bool {
+pub(crate) fn resolves(cols: &[ColMeta], p: &[String]) -> bool {
     let q = if p.len() > 1 {
         Some(p[p.len() - 2].as_str())
     } else {

@@ -14,6 +14,8 @@ pub mod activity;
 pub(crate) mod advisory;
 pub mod control;
 pub mod explain;
+pub(crate) mod optimizer;
+pub mod stats;
 pub(crate) mod ddl;
 pub(crate) mod dml;
 mod eval;
@@ -81,6 +83,9 @@ pub struct Engine {
     pub(crate) acl_cache: std::sync::RwLock<Option<(std::time::Instant, Arc<acl::Acl>)>>,
     /// The gateway's sessions.
     pub registry: Arc<control::Registry>,
+    /// Table statistics, as last read.
+    #[allow(clippy::type_complexity)]
+    pub(crate) stats_cache: std::sync::RwLock<Option<(std::time::Instant, Arc<HashMap<String, stats::TableStats>>)>>,
 }
 
 /// The databases of a gateway: the default one (`EngineConfig::database`) and those made by
@@ -134,6 +139,7 @@ impl Engine {
             next_session: Arc::new(AtomicU64::new(1)),
             acl_cache: std::sync::RwLock::new(None),
             registry: Arc::default(),
+            stats_cache: std::sync::RwLock::new(None),
         })
     }
 
@@ -196,6 +202,7 @@ impl Engine {
             databases: Arc::clone(&self.databases),
             acl_cache: std::sync::RwLock::new(None),
             registry: Arc::clone(&self.registry),
+            stats_cache: std::sync::RwLock::new(None),
         });
         open.insert(key, Arc::downgrade(&e));
         Ok(e)
@@ -1237,6 +1244,10 @@ impl Session {
             Statement::Delete(d) => {
                 let out = dml::delete(self, d, params);
                 self.count_changes(out)
+            }
+            Statement::Analyze(tables) => {
+                stats::analyze(self, tables)?;
+                Ok(Outcome::command("ANALYZE"))
             }
             Statement::Kill { id, query_only } => {
                 if !self.signal_session(*id, !*query_only)? {

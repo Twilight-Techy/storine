@@ -176,7 +176,10 @@ impl Exec<'_> {
         let limit_known = q.limit.is_some();
         let vector = self.vector_hint_for(sel, order_by, if limit_known { Some(10) } else { None }, 0).ok().flatten();
         let mut from: Option<Node> = None;
-        for item in &sel.from {
+        if let Some((flat, order)) = self.plan_join_order(&sel.from, &pushable)? {
+            from = Some(self.plan_planned_join(&flat, &order, &pushable)?);
+        }
+        for item in if from.is_some() { &[][..] } else { &sel.from[..] } {
             let right = self.plan_from(item, &pushable, vector.is_some())?;
             from = Some(match from {
                 None => right,
@@ -345,8 +348,58 @@ impl Exec<'_> {
 
 impl Exec<'_> {
     /// Estimated rows and cost of a scan (`None` without statistics).
-    fn estimate_scan(&self, _table: &crate::catalog::Table, _conjs: &[&Expr], _node: &Node) -> (Option<f64>, Option<f64>) {
-        (None, None)
+    fn estimate_scan(&self, table: &crate::catalog::Table, conjs: &[&Expr], _node: &Node) -> (Option<f64>, Option<f64>) {
+        let Ok(all) = self.s.engine.stats() else { return (None, None) };
+        let Some(stats) = all.get(&table.name.to_ascii_lowercase()) else { return (None, None) };
+        let cols = crate::exec::select::table_cols(table);
+        let mut rows = stats.rows;
+        for c in conjs {
+            let refs = crate::exec::select::column_refs(c);
+            if !refs.is_empty() && !has_subquery(c) && refs.iter().all(|p| crate::exec::select::resolves(&cols, p)) {
+                rows *= crate::exec::optimizer::selectivity(self, c, stats, &cols);
+            }
+        }
+        (Some(rows.max(1.0)), Some(stats.rows))
+    }
+
+    /// A planned join as a plan: left-deep, in the optimizer's order.
+    fn plan_planned_join(&self, flat: &crate::exec::optimizer::Flat<'_>, order: &[usize], pushable: &[&Expr]) -> SqlResult<Node> {
+        let mut top: Option<Node> = None;
+        let mut seen: Vec<crate::exec::select::ColMeta> = Vec::new();
+        for &i in order {
+            let item = flat.items[i];
+            let cols = self.leaf_cols(item)?;
+            let scan = self.plan_from(item, pushable, false)?;
+            top = Some(match top {
+                None => scan,
+                Some(l) => {
+                    let mut both = seen.clone();
+                    both.extend(cols.iter().cloned());
+                    let linked: Vec<String> = flat
+                        .on
+                        .iter()
+                        .chain(pushable)
+                        .filter(|c| {
+                            let refs = crate::exec::select::column_refs(c);
+                            !refs.is_empty() && refs.iter().all(|p| crate::exec::select::resolves(&both, p)) && refs.iter().any(|p| crate::exec::select::resolves(&cols, p)) && refs.iter().any(|p| crate::exec::select::resolves(&seen, p))
+                        })
+                        .map(ToString::to_string)
+                        .collect();
+                    let mut n = if linked.is_empty() { Node::new("Nested Loop").with("Join Type", "Cross") } else { Node::new("Hash Join").with("Join Type", "Inner").with("Join Cond", linked.join(" AND ")) };
+                    n.rows = match (l.rows, scan.rows) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        _ => None,
+                    };
+                    n.children.push(l);
+                    n.children.push(scan);
+                    n
+                }
+            });
+            seen.extend(cols);
+        }
+        let mut n = top.unwrap_or_else(|| Node::new("Result"));
+        n = n.with("Join Order", "chosen by the optimizer from statistics");
+        Ok(n)
     }
 }
 
