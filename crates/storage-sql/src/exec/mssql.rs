@@ -268,6 +268,9 @@ const SYS_VIEWS: &[&str] = &[
     "databases",
     "database_principals",
     "dm_exec_sessions",
+    "dm_exec_requests",
+    "dm_exec_connections",
+    "dm_exec_query_stats",
     "sequences",
     "extended_properties",
     "system_views",
@@ -1071,9 +1074,18 @@ pub fn sys_catalog(ex: &Exec<'_>, n: &str, tables: &[Arc<Table>]) -> SqlResult<R
             let mut bd = Builder::new(&[
                 ("session_id", I4),
                 ("login_name", T),
+                ("nt_user_name", T),
+                ("original_login_name", T),
+                ("status", T),
+                ("host_name", T),
+                ("program_name", T),
+                ("login_time", DataType::Timestamp),
+                ("last_request_start_time", DataType::Timestamp),
+                ("last_request_end_time", DataType::Timestamp),
                 ("transaction_isolation_level", I4),
                 ("is_user_process", B),
                 ("database_id", I4),
+                ("open_transaction_count", I4),
             ]);
             let level = match ex
                 .s
@@ -1087,13 +1099,65 @@ pub fn sys_catalog(ex: &Exec<'_>, n: &str, tables: &[Arc<Table>]) -> SqlResult<R
                 Some(v) if v.contains("snapshot") => 5,
                 _ => 2,
             };
-            bd.row(vec![
-                i(ex.s.id as i64),
-                t(&ex.s.user),
-                i(level),
-                b(true),
-                i(5),
+            for v in visible_sessions(ex)? {
+                let id = &v.identity;
+                let status = if id.running { "running" } else { "sleeping" };
+                bd.row(vec![i(v.id as i64), t(&id.user), t(""), t(&id.user), t(status), t(id.client.as_str()), t(id.application.as_str()), super::activity::timestamp(id.backend_start_ns), super::activity::timestamp(id.query_start_ns), super::activity::timestamp(id.state_change_ns), i(level), b(true), i(5), i(i64::from(id.in_transaction))]);
+            }
+            bd.done()
+        }
+        "dm_exec_requests" => {
+            let mut bd = Builder::new(&[
+                ("session_id", I4),
+                ("request_id", I4),
+                ("start_time", DataType::Timestamp),
+                ("status", T),
+                ("command", T),
+                ("sql_handle", T),
+                ("database_id", I4),
+                ("blocking_session_id", I4),
+                ("wait_type", T),
+                ("wait_time", I4),
+                ("total_elapsed_time", I4),
+                ("cpu_time", I4),
+                ("reads", I8),
+                ("writes", I8),
+                ("logical_reads", I8),
+                ("row_count", I8),
+                ("percent_complete", DataType::Double),
             ]);
+            for v in visible_sessions(ex)? {
+                let id = &v.identity;
+                if !id.running {
+                    continue;
+                }
+                let elapsed = (crate::exec::now_ns().saturating_sub(id.query_start_ns) / 1_000_000).max(0);
+                let verb = id.query.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+                bd.row(vec![i(v.id as i64), i(0), super::activity::timestamp(id.query_start_ns), t(if id.wait.is_some() { "suspended" } else { "running" }), t(verb), t(handle_of(&id.query)), i(5), i(0), id.wait.as_deref().map_or(N, |_| t("LCK_M_X")), i(0), i(elapsed), i(elapsed), i(0), i(0), i(0), i(0), Datum::Float(0.0)]);
+            }
+            bd.done()
+        }
+        "dm_exec_connections" => {
+            let mut bd = Builder::new(&[("session_id", I4), ("connect_time", DataType::Timestamp), ("net_transport", T), ("protocol_type", T), ("auth_scheme", T), ("client_net_address", T), ("most_recent_sql_handle", T)]);
+            for v in visible_sessions(ex)? {
+                let id = &v.identity;
+                bd.row(vec![i(v.id as i64), super::activity::timestamp(id.backend_start_ns), t("TCP"), t(if id.dialect == "mssql" { "TSQL" } else { id.dialect }), t("SQL"), t(id.client.as_str()), t(handle_of(&id.query))]);
+            }
+            bd.done()
+        }
+        "dm_exec_query_stats" => {
+            let mut bd = Builder::new(&[("sql_handle", T), ("plan_handle", T), ("execution_count", I8), ("total_worker_time", I8), ("total_elapsed_time", I8), ("min_elapsed_time", I8), ("max_elapsed_time", I8), ("total_rows", I8), ("last_rows", I8)]);
+            let acl = ex.s.engine.acl()?;
+            let all = acl.is_superuser(ex.s.current_role());
+            for st in ex.s.engine.registry.statements.all() {
+                if !all && crate::exec::acl::role_key(&st.user) != crate::exec::acl::role_key(ex.s.current_role()) {
+                    continue;
+                }
+                // Times are in microseconds.
+                let us = |ns: u64| i((ns / 1000).min(i64::MAX as u64) as i64);
+                let h = handle_of(&st.text);
+                bd.row(vec![t(h.clone()), t(h), i(st.calls as i64), us(st.total_ns), us(st.total_ns), us(st.min_ns), us(st.max_ns), i(st.rows as i64), i(0)]);
+            }
             bd.done()
         }
         "sequences" => {
@@ -1969,6 +2033,30 @@ pub fn return_type(name: &str) -> Option<DataType> {
 
 // ── system stored procedures ──
 
+/// Sessions a role may see: all with `VIEW SERVER STATE` (a superuser here), its own otherwise.
+fn visible_sessions(ex: &Exec<'_>) -> SqlResult<Vec<super::activity::SessionView>> {
+    let acl = ex.s.engine.acl()?;
+    let all = acl.is_superuser(ex.s.current_role());
+    Ok(super::activity::sessions(ex)?.into_iter().filter(|v| all || v.full).collect())
+}
+
+/// A handle naming a statement's text (`sys.dm_exec_sql_text`).
+fn handle_of(text: &str) -> String {
+    format!("0x{}", crate::hash::hex(&crate::hash::sha256(text.as_bytes())[..20]))
+}
+
+/// The text behind a handle, as this role may read it.
+pub(crate) fn sql_for_handle(ex: &Exec<'_>, handle: &str) -> SqlResult<Option<String>> {
+    for v in visible_sessions(ex)? {
+        if handle_of(&v.identity.query) == handle {
+            return Ok(Some(v.identity.query));
+        }
+    }
+    let acl = ex.s.engine.acl()?;
+    let all = acl.is_superuser(ex.s.current_role());
+    Ok(ex.s.engine.registry.statements.all().into_iter().find(|st| handle_of(&st.text) == handle && (all || crate::exec::acl::role_key(&st.user) == crate::exec::acl::role_key(ex.s.current_role()))).map(|st| st.text))
+}
+
 fn rows(cols: &[(&str, DataType)], rows: Vec<Vec<Datum>>) -> super::Outcome {
     super::Outcome::Rows(super::ResultSet {
         columns: cols
@@ -2054,6 +2142,16 @@ pub fn exec_proc(
                 }
             }
             run_sql(s, &sql, vars)
+        }
+        "sp_who" | "sp_who2" => {
+            let ex = Exec::new(s, &[]);
+            let mut out = Vec::new();
+            for v in visible_sessions(&ex)? {
+                let id = &v.identity;
+                let text = |x: &str| Datum::Text(x.to_owned());
+                out.push(vec![Datum::Int(v.id as i64), text(if id.running { "runnable" } else { "sleeping" }), text(&id.user), text(&id.client), text("."), text(&id.database), text(if id.running { "SELECT" } else { "AWAITING COMMAND" })]);
+            }
+            Ok(rows(&[("spid", DataType::Int), ("status", DataType::Text), ("loginame", DataType::Text), ("hostname", DataType::Text), ("blk", DataType::Text), ("dbname", DataType::Text), ("cmd", DataType::Text)], out))
         }
         "sp_helpindex" => {
             let tb = {

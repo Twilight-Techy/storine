@@ -10,8 +10,10 @@
 //! keys and foreign-key parents are verified by preconditions in the same batch.
 
 pub mod acl;
+pub mod activity;
 pub(crate) mod advisory;
 pub mod control;
+pub mod explain;
 pub(crate) mod ddl;
 pub(crate) mod dml;
 mod eval;
@@ -326,6 +328,8 @@ impl Engine {
         Session {
             control: self.registry.register(id),
             depth: 0,
+            sql_text: None,
+            trace: None,
             engine,
             dialect,
             user: user.to_owned(),
@@ -691,6 +695,10 @@ pub struct Session {
     pub control: Arc<control::Control>,
     /// Nesting of `execute` (a statement's limits are set by the outermost).
     pub(crate) depth: u32,
+    /// The text of what is running, as the wire protocol received it (`exec/activity.rs`).
+    pub(crate) sql_text: Option<Arc<str>>,
+    /// `EXPLAIN ANALYZE` is running.
+    pub(crate) trace: Option<explain::Trace>,
     pub database: String,
     pub vars: HashMap<String, String>,
     /// Session defaults (`RESET ALL` / `DISCARD ALL` return to them): the dialect's defaults
@@ -721,6 +729,20 @@ pub fn now_ns() -> i64 {
 }
 
 impl Session {
+    /// T-SQL `SET SHOWPLAN_TEXT | SHOWPLAN_ALL ON`: statements are planned, not run.
+    fn showplan(&self) -> Option<crate::ast::ExplainOptions> {
+        if self.dialect != Dialect::MsSql {
+            return None;
+        }
+        let on = |n: &str| self.vars.get(n).is_some_and(|v| v.eq_ignore_ascii_case("on"));
+        (on("showplan_text") || on("showplan_all")).then_some(crate::ast::ExplainOptions { analyze: false, format: crate::ast::ExplainFormat::ShowPlan, summary: false })
+    }
+
+    /// Runs a statement for `EXPLAIN ANALYZE`, in its own transaction if none is open.
+    pub(crate) fn run_traced(&mut self, stmt: &Statement, params: &[Datum]) -> SqlResult<Outcome> {
+        self.execute_one(stmt, params)
+    }
+
     fn statement_timeout(&self) -> Option<Duration> {
         let (name, unit) = if self.dialect == Dialect::MySql { ("max_execution_time", 1.0) } else { ("statement_timeout", 1.0) };
         control::parse_duration(self.vars.get(name)?, unit)
@@ -905,18 +927,20 @@ impl Session {
 
     /// Runs one statement with bound parameters.
     pub fn execute(&mut self, stmt: &Statement, params: &[Datum]) -> SqlResult<Outcome> {
+        let started = now_ns();
         if self.depth == 0 {
             self.control.begin_statement(self.statement_timeout());
-            let mut id = self.control.identity.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if id.user != self.user {
-                id.user.clone_from(&self.user);
-            }
+            self.activity_start();
         }
         self.depth += 1;
-        let out = self.control.check().and_then(|()| self.execute_one(stmt, params));
+        let out = self.control.check().and_then(|()| match self.showplan() {
+            Some(opts) if !matches!(stmt, Statement::Set { .. } | Statement::Explain(..)) => self.explain(stmt, &opts, params),
+            _ => self.execute_one(stmt, params),
+        });
         self.depth -= 1;
         if self.depth == 0 {
             self.control.end_statement(self.in_transaction(), self.idle_transaction_timeout());
+            self.activity_end(&out, started);
         }
         // Transaction-scoped advisory locks end with the transaction (an autocommit statement
         // is a transaction of its own).
@@ -1346,28 +1370,7 @@ impl Session {
                 self.use_database(db)?;
                 Ok(Outcome::command("USE"))
             }
-            Statement::Explain(inner) => {
-                // A pushed-down aggregation says so (`TASK-130`).
-                let pushed = match &**inner {
-                    Statement::Query(q) if q.ctes.is_empty() => match &q.body {
-                        crate::ast::SetExpr::Select(sel) => {
-                            let ex = eval::Exec::new(self, params);
-                            ex.plan_pushdown(sel, &q.order_by, None)?.map(|p| eval::Exec::explain_pushdown(&p))
-                        }
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                let text = format!("Storine SQL plan: {}", pushed.unwrap_or_else(|| explain_text(inner)));
-                Ok(Outcome::Rows(ResultSet {
-                    columns: vec![OutCol {
-                        name: "QUERY PLAN".into(),
-                        ty: DataType::Text,
-                        table: None,
-                    }],
-                    rows: vec![vec![Datum::Text(text)]],
-                }))
-            }
+            Statement::Explain(inner, opts) => self.explain(inner, opts, params),
             Statement::CreateSchema {
                 database: false, ..
             } => Ok(Outcome::command("CREATE SCHEMA")),
@@ -1645,17 +1648,6 @@ fn is_retry_safe(stmt: &Statement) -> bool {
         stmt,
         Statement::CreateTable(_) | Statement::DropTable { .. } | Statement::AlterTable { .. }
     )
-}
-
-fn explain_text(stmt: &Statement) -> String {
-    match stmt {
-        Statement::Query(_) => "scan with filter push-down, in-memory joins and sorting".into(),
-        Statement::Insert(_) => "insert with primary-key and unique preconditions".into(),
-        Statement::Update(_) | Statement::Delete(_) => {
-            "read matching rows, write with version preconditions".into()
-        }
-        _ => "utility statement".into(),
-    }
 }
 
 /// Result columns of `RETURNING items` on `table` (for protocol-level Describe).

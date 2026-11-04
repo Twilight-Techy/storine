@@ -494,8 +494,26 @@ fn chaos(ranges: bool) {
         Ok(()) => {}
         Err((k, CheckError::Inconclusive)) => panic!("linearizability check inconclusive for key {k}"),
         Err((k, e)) => {
-            let ops: Vec<_> = history.iter().filter(|(kk, _)| *kk == k).map(|(_, e)| e.clone()).collect();
-            panic!("key {k} not linearizable: {e:?}\n{ops:#?}");
+            // In the checker's own order: `partial` indexes these.
+            let ops: Vec<_> = history.iter().filter(|(kk, e)| *kk == k && !(matches!(e.op, RegisterOp::Read(_)) && e.ret.is_none())).map(|(_, e)| e.clone()).collect();
+            let done = match &e {
+                CheckError::NotLinearizable { partial } => partial.len(),
+                CheckError::Inconclusive => 0,
+            };
+            eprintln!("key {k}: {} operations, {done} linearized", ops.len());
+            // A history has tens of thousands of operations: show where it stops.
+            let linearized: std::collections::BTreeSet<usize> = match &e {
+                CheckError::NotLinearizable { partial } => partial.iter().copied().collect(),
+                CheckError::Inconclusive => Default::default(),
+            };
+            let stuck = ops.iter().enumerate().filter(|(i, _)| !linearized.contains(i)).map(|(_, o)| o.call).min().unwrap_or(0);
+            let mut near: Vec<_> = ops.iter().filter(|o| o.call + 1_000_000 >= stuck && o.call <= stuck + 500_000).collect();
+            near.sort_by_key(|o| o.call);
+            for o in near {
+                eprintln!("  call {:>10} ret {:>10} {:?}", o.call, o.ret.map_or("none".to_owned(), |r| r.to_string()), o.op);
+            }
+            eprintln!("first operation left out began at {stuck}");
+            panic!("key {k} not linearizable after {done} of {} operations", ops.len());
         }
     }
     drop(cluster);

@@ -728,6 +728,7 @@ struct Prepared {
     stmts: Vec<Statement>,
     /// Parameter names in declaration order (`@p1`, `@name`, ...).
     names: Vec<String>,
+    sql: Arc<str>,
 }
 
 impl Conn {
@@ -1067,6 +1068,7 @@ impl Conn {
         if crate::log_enabled() {
             eprintln!("[tds {}] {sql}", self.session.id);
         }
+        self.session.note_sql(&sql);
         let stmts = match parse(&sql, Dialect::MsSql) {
             Ok((s, _)) => s,
             Err(e) => {
@@ -1254,6 +1256,7 @@ impl Conn {
                 let declared = declared_names(&text_param(&call, 1));
                 let sql = text_param(&call, 2);
                 let stmts = parse(&sql, Dialect::MsSql)?.0;
+                self.session.note_sql(&sql);
                 let handle = self.next_handle;
                 self.next_handle += 1;
                 self.prepared.insert(
@@ -1261,6 +1264,7 @@ impl Conn {
                     Prepared {
                         stmts: stmts.clone(),
                         names: declared.clone(),
+                        sql: Arc::from(sql.as_str()),
                     },
                 );
                 if call.proc == "sp_prepexec" {
@@ -1298,6 +1302,7 @@ impl Conn {
                     ));
                 };
                 let stmts = p.stmts.clone();
+                self.session.sql_text = Some(Arc::clone(&p.sql));
                 let bound: Vec<(String, Datum)> = p
                     .names
                     .iter()
@@ -1326,6 +1331,7 @@ impl Conn {
 
     /// `sp_executesql`: every statement of `sql` with `params` bound as variables.
     fn run_with_params(&mut self, sql: &str, params: &[(String, Datum)], t: &mut Tokens) {
+        self.session.note_sql(sql);
         if crate::log_enabled() {
             eprintln!("[tds {}] {sql}", self.session.id);
         }

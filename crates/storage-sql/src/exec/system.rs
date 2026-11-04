@@ -302,7 +302,8 @@ pub fn table(ex: &Exec<'_>, schema: Option<&str>, name: &str) -> SqlResult<Optio
             information_schema(ex, &n, &tables, &schema_name, mysql)?
         }
         (Some("sys"), _) if mssql => super::mssql::sys_catalog(ex, &n, &tables)?,
-        (Some("mysql" | "performance_schema" | "sys"), _) => Rel::default(),
+        (Some("performance_schema"), _) => performance_schema(ex, &n)?,
+        (Some("mysql" | "sys"), _) => Rel::default(),
         _ => pg_catalog(ex, &n, &tables)?,
     };
     Ok(Some(rel))
@@ -1188,37 +1189,144 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 ("datid", I8),
                 ("datname", T),
                 ("pid", I8),
+                ("leader_pid", I8),
+                ("usesysid", I8),
                 ("usename", T),
                 ("application_name", T),
+                ("client_addr", T),
+                ("client_hostname", T),
+                ("client_port", I4),
+                ("backend_start", DataType::TimestampTz),
+                ("xact_start", DataType::TimestampTz),
+                ("query_start", DataType::TimestampTz),
+                ("state_change", DataType::TimestampTz),
+                ("wait_event_type", T),
+                ("wait_event", T),
                 ("state", T),
+                ("backend_xid", T),
+                ("backend_xmin", T),
+                ("query_id", I8),
                 ("query", T),
+                ("backend_type", T),
             ]);
-            bd.row(vec![
-                i(16_384),
-                t(&ex.s.database),
-                i(ex.s.id as i64),
-                t(&user),
-                t(ex.s
-                    .vars
-                    .get("application_name")
-                    .cloned()
-                    .unwrap_or_default()),
-                t("active"),
-                t(""),
+            for v in super::activity::sessions(ex)? {
+                let id = &v.identity;
+                let shown = |d: Datum| if v.full { d } else { N };
+                let (state, query) = if v.full { (t(super::activity::state_name(id)), t(id.query.clone())) } else { (N, t(super::activity::INSUFFICIENT)) };
+                let (wait_type, wait) = match (&id.wait, v.full) {
+                    (Some(w), true) => (t("Lock"), t(w.clone())),
+                    _ => (N, N),
+                };
+                bd.row(vec![
+                    i(16_384),
+                    t(id.database.clone()),
+                    i(v.id as i64),
+                    N,
+                    i(10),
+                    t(id.user.clone()),
+                    t(id.application.clone()),
+                    shown(t(id.client.clone())),
+                    N,
+                    N,
+                    super::activity::timestamp(id.backend_start_ns),
+                    shown(super::activity::timestamp(id.transaction_start_ns)),
+                    shown(super::activity::timestamp(id.query_start_ns)),
+                    shown(super::activity::timestamp(id.state_change_ns)),
+                    wait_type,
+                    wait,
+                    state,
+                    N,
+                    N,
+                    N,
+                    query,
+                    t("client backend"),
+                ]);
+            }
+            bd.done()
+        }
+        "pg_stat_statements" => {
+            let mut bd = Builder::new(&[
+                ("userid", I8),
+                ("username", T),
+                ("dbid", I8),
+                ("datname", T),
+                ("toplevel", B),
+                ("queryid", I8),
+                ("query", T),
+                ("calls", I8),
+                ("total_exec_time", DataType::Double),
+                ("min_exec_time", DataType::Double),
+                ("max_exec_time", DataType::Double),
+                ("mean_exec_time", DataType::Double),
+                ("rows", I8),
             ]);
+            let acl = ex.s.engine.acl()?;
+            let me = ex.s.current_role().to_owned();
+            let all = acl.is_superuser(&me);
+            for st in ex.s.engine.registry.statements.all() {
+                let mine = crate::exec::acl::role_key(&st.user) == crate::exec::acl::role_key(&me);
+                let ms = |ns: u64| Datum::Float(ns as f64 / 1e6);
+                bd.row(vec![
+                    i(10),
+                    t(st.user.clone()),
+                    i(16_384),
+                    t(st.database.clone()),
+                    b(true),
+                    i(st.id),
+                    if all || mine { t(st.text.clone()) } else { t(super::activity::INSUFFICIENT) },
+                    i(st.calls as i64),
+                    ms(st.total_ns),
+                    ms(st.min_ns),
+                    ms(st.max_ns),
+                    ms(st.total_ns / st.calls.max(1)),
+                    i(st.rows as i64),
+                ]);
+            }
+            bd.done()
+        }
+        "pg_locks" => {
+            let mut bd = Builder::new(&[
+                ("locktype", T),
+                ("database", I8),
+                ("relation", I8),
+                ("page", I4),
+                ("tuple", I4),
+                ("virtualxid", T),
+                ("transactionid", T),
+                ("classid", I8),
+                ("objid", T),
+                ("objsubid", I4),
+                ("virtualtransaction", T),
+                ("pid", I8),
+                ("mode", T),
+                ("granted", B),
+                ("fastpath", B),
+                ("waitstart", DataType::TimestampTz),
+            ]);
+            let mut lock_row = |kind: &str, relation: Datum, object: Datum, pid: i64, mode: &str, granted: bool| {
+                bd.row(vec![t(kind), i(16_384), relation, N, N, N, N, N, object, N, N, i(pid), t(mode), b(granted), b(false), N]);
+            };
+            let session_of = |owner: &str| owner.rsplit('#').next().and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
+            for d in ex.s.engine.store.scan(crate::catalog::LOCKS, None)? {
+                let owner = d.fields.get("owner").and_then(storine::Value::as_str).unwrap_or_default();
+                let collection = d.key.split('/').next().unwrap_or_default();
+                let relation = tables.iter().find(|x| x.collection == collection).map_or(N, |x| i(table_oid(&x.name)));
+                lock_row("tuple", relation, t(d.key.clone()), session_of(owner), "RowExclusiveLock", true);
+            }
+            for (key, holders) in super::advisory::all_holders(&ex.s.engine.store)? {
+                for (owner, exclusive) in holders {
+                    lock_row("advisory", N, t(key.clone()), session_of(&owner), if exclusive { "ExclusiveLock" } else { "ShareLock" }, true);
+                }
+            }
+            for v in super::activity::sessions(ex)? {
+                if let (Some(w), true) = (&v.identity.wait, v.full) {
+                    lock_row("tuple", N, t(w.clone()), v.id as i64, "RowExclusiveLock", false);
+                }
+            }
             bd.done()
         }
         // Catalogs of features this gateway does not have: empty, with their real columns
         // so introspection queries that name them still run.
-        "pg_locks" => Builder::new(&[
-            ("locktype", T),
-            ("database", I8),
-            ("relation", I8),
-            ("pid", I8),
-            ("mode", T),
-            ("granted", B),
-        ])
-        .done(),
         "pg_stat_user_tables" => Builder::new(&[
             ("relid", I8),
             ("schemaname", T),
@@ -1472,6 +1580,53 @@ fn pg_data_type(ty: &DataType) -> String {
             s.split('(').next().unwrap_or(&s).to_owned()
         }
     }
+}
+
+/// MySQL `performance_schema`: the tables monitoring tools read first.
+fn performance_schema(ex: &Exec<'_>, n: &str) -> SqlResult<Rel> {
+    Ok(match n {
+        "threads" | "processlist" => {
+            let mut bd = Builder::new(&[("THREAD_ID", I8), ("NAME", T), ("TYPE", T), ("PROCESSLIST_ID", I8), ("ID", I8), ("PROCESSLIST_USER", T), ("USER", T), ("PROCESSLIST_HOST", T), ("HOST", T), ("PROCESSLIST_DB", T), ("DB", T), ("PROCESSLIST_COMMAND", T), ("COMMAND", T), ("PROCESSLIST_TIME", I8), ("TIME", I8), ("PROCESSLIST_STATE", T), ("STATE", T), ("PROCESSLIST_INFO", T), ("INFO", T)]);
+            for r in process_rows(ex)? {
+                let (id, user, host, db, cmd, time, state, info) = r;
+                bd.row(vec![i(id), t("thread/sql/one_connection"), t("FOREGROUND"), i(id), i(id), t(user.clone()), t(user), t(host.clone()), t(host), t(db.clone()), t(db), t(cmd.clone()), t(cmd), i(time), i(time), t(state.clone()), t(state), info.clone(), info]);
+            }
+            bd.done()
+        }
+        "events_statements_summary_by_digest" => {
+            let mut bd = Builder::new(&[("SCHEMA_NAME", T), ("DIGEST", T), ("DIGEST_TEXT", T), ("COUNT_STAR", I8), ("SUM_TIMER_WAIT", I8), ("MIN_TIMER_WAIT", I8), ("AVG_TIMER_WAIT", I8), ("MAX_TIMER_WAIT", I8), ("SUM_ROWS_SENT", I8)]);
+            let acl = ex.s.engine.acl()?;
+            let all = acl.is_superuser(ex.s.current_role());
+            for st in ex.s.engine.registry.statements.all() {
+                if !all && crate::exec::acl::role_key(&st.user) != crate::exec::acl::role_key(ex.s.current_role()) {
+                    continue;
+                }
+                // Timers are in picoseconds.
+                let ps = |ns: u64| i(ns.saturating_mul(1000).min(i64::MAX as u64) as i64);
+                bd.row(vec![t(st.database.clone()), t(format!("{:016x}", st.id)), t(st.text.clone()), i(st.calls as i64), ps(st.total_ns), ps(st.min_ns), ps(st.total_ns / st.calls.max(1)), ps(st.max_ns), i(st.rows as i64)]);
+            }
+            bd.done()
+        }
+        _ => Rel::default(),
+    })
+}
+
+type ProcessRow = (i64, String, String, String, String, i64, String, Datum);
+
+/// The process list a MySQL client may see: every session with `PROCESS` (a superuser here), its
+/// own otherwise.
+fn process_rows(ex: &Exec<'_>) -> SqlResult<Vec<ProcessRow>> {
+    let acl = ex.s.engine.acl()?;
+    let all = acl.is_superuser(ex.s.current_role());
+    let mut rows = Vec::new();
+    for v in super::activity::sessions(ex)?.into_iter().filter(|v| all || v.full) {
+        let id = v.identity;
+        let elapsed = (crate::exec::now_ns().saturating_sub(id.state_change_ns) / 1_000_000_000).max(0);
+        let host = if id.client.is_empty() { "localhost".to_owned() } else { id.client.clone() };
+        let info = if id.running { Datum::Text(id.query.clone()) } else { N };
+        rows.push((v.id as i64, id.user, host, id.database, if id.running { "Query".to_owned() } else { "Sleep".to_owned() }, elapsed, id.wait.unwrap_or_default(), info));
+    }
+    Ok(rows)
 }
 
 fn information_schema(
@@ -2222,8 +2377,15 @@ fn information_schema(
             }
             bd.done()
         }
+        "processlist" => {
+            let mut bd = mk(&[("ID", I8), ("USER", T), ("HOST", T), ("DB", T), ("COMMAND", T), ("TIME", I8), ("STATE", T), ("INFO", T)]);
+            for (id, user, host, db, cmd, time, state, info) in process_rows(ex)? {
+                bd.row(vec![i(id), t(user), t(host), t(db), t(cmd), i(time), t(state), info]);
+            }
+            bd.done()
+        }
         "routines" | "triggers" | "parameters" | "events" | "partitions" | "table_privileges"
-        | "column_privileges" | "user_privileges" | "schema_privileges" | "processlist"
+        | "column_privileges" | "user_privileges" | "schema_privileges"
         | "innodb_trx" | "role_table_grants" | "domains" | "element_types" | "attributes"
         | "user_defined_types" | "column_statistics" | "plugins" => {
             mk(&[("table_schema", T), ("table_name", T)]).done()
@@ -2778,21 +2940,11 @@ pub fn show(s: &mut Session, what: &Show) -> SqlResult<Outcome> {
             let rows = crate::exec::acl::show_grants(s, &who)?.into_iter().map(|g| vec![Datum::Text(g)]).collect();
             text_rs(&["Grants"], rows)
         }
-        Show::ProcessList => text_rs(
-            &[
-                "Id", "User", "Host", "db", "Command", "Time", "State", "Info",
-            ],
-            vec![vec![
-                i(s.id as i64),
-                t(&s.user),
-                t("localhost"),
-                t(&db),
-                t("Query"),
-                i(0),
-                t(""),
-                t("SHOW PROCESSLIST"),
-            ]],
-        ),
+        Show::ProcessList => {
+            let ex = Exec::new(s, &[]);
+            let rows: Vec<Vec<Datum>> = process_rows(&ex)?.into_iter().map(|(id, user, host, db, cmd, time, state, info)| vec![i(id), t(user), t(host), t(db), t(cmd), i(time), t(state), info]).collect();
+            text_rs(&["Id", "User", "Host", "db", "Command", "Time", "State", "Info"], rows)
+        }
         Show::TableStatus { like } => {
             let rows = tables
                 .iter()

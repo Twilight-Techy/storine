@@ -85,6 +85,9 @@ impl Control {
 
     /// Gives the control the connection's socket, so a terminate reaches an idle connection.
     pub fn attach_socket(&self, stream: &TcpStream) {
+        if let Ok(peer) = stream.peer_addr() {
+            self.identity.lock().unwrap_or_else(std::sync::PoisonError::into_inner).client = peer.ip().to_string();
+        }
         if let Ok(c) = stream.try_clone() {
             *self.socket.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(c);
         }
@@ -142,6 +145,17 @@ impl Control {
         }
     }
 
+    /// Whether a client is connected (internal sessions, such as a database switch's, are not
+    /// shown), or it has run something.
+    pub fn is_serving(&self) -> bool {
+        self.socket.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() || !self.identity.lock().unwrap_or_else(std::sync::PoisonError::into_inner).user.is_empty()
+    }
+
+    /// What this session is waiting for now.
+    pub fn set_wait(&self, wait: Option<String>) {
+        self.identity.lock().unwrap_or_else(std::sync::PoisonError::into_inner).wait = wait;
+    }
+
     /// Who owns this session, for permission checks.
     pub fn user(&self) -> String {
         self.identity.lock().unwrap_or_else(std::sync::PoisonError::into_inner).user.clone()
@@ -153,6 +167,8 @@ impl Control {
 pub struct Registry {
     sessions: Mutex<HashMap<u64, Weak<Control>>>,
     janitor: AtomicBool,
+    /// Statistics of statements run (`exec/activity.rs`).
+    pub statements: crate::exec::activity::Statements,
 }
 
 impl Registry {

@@ -143,9 +143,13 @@ impl Exec<'_> {
     pub fn query(&self, q: &Query, outer: Option<&Env<'_>>) -> SqlResult<Rel> {
         // What a query read on the way is gone when it returns; its result stays.
         let held = self.memory.get();
+        let started = self.s.trace.as_ref().map(|_| std::time::Instant::now());
         let rel = self.query_inner(q, outer)?;
         self.memory.set(held);
         self.charge(rel_size(&rel))?;
+        if let (Some(trace), Some(at)) = (&self.s.trace, started) {
+            crate::exec::explain::note(trace, q as *const Query as usize, rel.rows.len() as u64, at);
+        }
         Ok(rel)
     }
 
@@ -512,9 +516,7 @@ impl Exec<'_> {
             // `FROM a, LATERAL (SELECT ... a.x ...)`: evaluated once per row of what precedes it.
             if let (
                 TableRef::Derived {
-                    query,
-                    alias,
-                    lateral: true,
+                    lateral: true, ..
                 },
                 Some(l),
             ) = (item, acc.as_ref())
@@ -525,8 +527,7 @@ impl Exec<'_> {
                 };
                 acc = Some(self.lateral_join(
                     l,
-                    query,
-                    alias,
+                    item,
                     JoinKind::Cross,
                     &JoinConstraint::None,
                     outer,
@@ -581,6 +582,22 @@ impl Exec<'_> {
     }
 
     fn eval_from_entry(
+        &self,
+        item: &TableRef,
+        pushable: &[&Expr],
+        outer: Option<&Env<'_>>,
+        lateral_left: Option<&Rel>,
+    ) -> SqlResult<Rel> {
+        let Some(trace) = self.s.trace.clone() else {
+            return self.eval_from_entry_inner(item, pushable, outer, lateral_left);
+        };
+        let started = std::time::Instant::now();
+        let rel = self.eval_from_entry_inner(item, pushable, outer, lateral_left)?;
+        crate::exec::explain::note(&trace, item as *const TableRef as usize, rel.rows.len() as u64, started);
+        Ok(rel)
+    }
+
+    fn eval_from_entry_inner(
         &self,
         item: &TableRef,
         pushable: &[&Expr],
@@ -697,13 +714,14 @@ impl Exec<'_> {
                         &[]
                     };
                 let l = self.eval_from_entry(left, lp, outer, lateral_left)?;
-                if let TableRef::Derived {
-                    query,
-                    alias,
-                    lateral: true,
-                } = &**right
-                {
-                    return self.lateral_join(l, query, alias, *kind, constraint, outer);
+                // A LATERAL subquery, or a function reading the tables before it.
+                let lateral = match &**right {
+                    TableRef::Derived { lateral, .. } => *lateral,
+                    TableRef::Function { args, .. } => args.iter().any(|a| !column_refs(a).is_empty()),
+                    _ => false,
+                };
+                if lateral {
+                    return self.lateral_join(l, right, *kind, constraint, outer);
                 }
                 // Lookup join: fetch only the right rows whose join key appears on the left.
                 let r = match (&**right, constraint) {
@@ -723,7 +741,11 @@ impl Exec<'_> {
                         let table = self.s.engine.table(name)?;
                         let qual = alias.as_ref().map_or(name.as_str(), |a| a.name.as_str());
                         let extra = self.lookup_filters(&table, qual, on, &l, outer)?;
+                        let started = std::time::Instant::now();
                         let rows = self.scan_rows(&table, Some(qual), rp, extra, outer)?;
+                        if let Some(trace) = &self.s.trace {
+                            crate::exec::explain::note(trace, &**right as *const TableRef as usize, rows.len() as u64, started);
+                        }
                         Rel {
                             cols: table_cols(&table),
                             rows: rows.into_iter().map(|r| r.row).collect(),
@@ -801,8 +823,7 @@ impl Exec<'_> {
     fn lateral_join(
         &self,
         left: Rel,
-        query: &Query,
-        alias: &Option<TableAlias>,
+        right: &TableRef,
         kind: JoinKind,
         constraint: &JoinConstraint,
         outer: Option<&Env<'_>>,
@@ -826,7 +847,7 @@ impl Exec<'_> {
                 outer,
                 aggs: None,
             };
-            let sub = self.query(query, Some(&env))?.requalify(alias, None)?;
+            let sub = self.eval_from_entry(right, &[], Some(&env), None)?;
             let one = Rel {
                 cols: left.cols.clone(),
                 rows: if left.rows.is_empty() {
@@ -1144,7 +1165,7 @@ impl Exec<'_> {
 
     /// The vector hint for `sel` when it is a plain single-table query ordered by
     /// `vector_column <=> constant` with a LIMIT, and the column has an hnsw / ivfflat index.
-    fn vector_hint_for(
+    pub(crate) fn vector_hint_for(
         &self,
         sel: &Select,
         order_by: &[OrderBy],
@@ -1564,7 +1585,7 @@ impl Exec<'_> {
     }
 
     /// Keys when the conjuncts pin the whole primary key to constants (`id = 5`, `id IN (1, 2)`).
-    fn pk_lookup(
+    pub(crate) fn pk_lookup(
         &self,
         table: &Table,
         qual: Option<&str>,
@@ -1691,7 +1712,7 @@ impl Exec<'_> {
     }
 
     /// A storage filter equivalent to (or wider than) conjunct `c` for this table.
-    fn to_filter(
+    pub(crate) fn to_filter(
         &self,
         table: &Table,
         qual: Option<&str>,
@@ -1793,6 +1814,23 @@ impl Exec<'_> {
     // ── SELECT ──
 
     pub fn select(
+        &self,
+        sel: &Select,
+        outer: Option<&Env<'_>>,
+        order_by: &[OrderBy],
+        limit: Option<usize>,
+        offset: usize,
+    ) -> SqlResult<Rel> {
+        let Some(trace) = self.s.trace.clone() else {
+            return self.select_inner(sel, outer, order_by, limit, offset);
+        };
+        let started = std::time::Instant::now();
+        let rel = self.select_inner(sel, outer, order_by, limit, offset)?;
+        crate::exec::explain::note(&trace, sel as *const Select as usize, rel.rows.len() as u64, started);
+        Ok(rel)
+    }
+
+    fn select_inner(
         &self,
         sel: &Select,
         outer: Option<&Env<'_>>,

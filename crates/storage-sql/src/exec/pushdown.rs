@@ -39,7 +39,7 @@ enum Out {
 /// A pushed-down aggregation.
 #[derive(Debug)]
 pub(crate) struct Plan {
-    table: std::sync::Arc<Table>,
+    pub(crate) table: std::sync::Arc<Table>,
     cols: Vec<ColMeta>,
     query: storine::AggregateQuery,
     /// Table columns of the group keys, in key order.

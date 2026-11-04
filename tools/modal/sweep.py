@@ -16,6 +16,7 @@ Usage (from the repository root):
     modal run tools/modal/sweep.py --tests txn_simulation --only bank_transfers_with_meta --seeds 1000
     modal run tools/modal/sweep.py --suite-args "-p storage-core -p storage-index"   # a whole `cargo test`
     modal run tools/modal/sweep.py --suite-args "-p storage-server --test process_chaos -- --nocapture" --env STORINE_CHAOS_SECS=90
+    modal run tools/modal/sweep.py --suite-args "-p storage-server --test process_chaos" --repeat 12  # hunt a rare failure
     modal run tools/modal/sweep.py --sdks all            # all 8 SDK suites against range clusters
     modal run tools/modal/sweep.py --sdks python --plain # against a plain server
 
@@ -159,13 +160,22 @@ def run_shard(binary: bytes, name: str, test: str, lo: int, hi: int) -> list[dic
 
 
 @app.function(image=image, cpu=16, memory=32768, timeout=7200, volumes={"/target": target_vol})
-def suite(src: bytes, cargo_args: str, env: dict[str, str]) -> tuple[int, str]:
-    """Runs `cargo test --release <cargo_args>` with `env`; returns (exit code, summary)."""
+def suite(src: bytes, cargo_args: str, env: dict[str, str], repeat: int = 1) -> tuple[int, str]:
+    """Runs `cargo test --release <cargo_args>` with `env` up to `repeat` times, stopping at the
+    first failure; returns (exit code, summary, with the end of the output on a failure)."""
     unpack(src)
-    proc = subprocess.run(f"cargo test --release --no-fail-fast {cargo_args} 2>&1", shell=True, cwd="/src", capture_output=True, text=True, env={**os.environ, **env})
-    target_vol.commit()
-    lines = [l for l in proc.stdout.splitlines() if l.startswith("test result") or "FAILED" in l or "panicked" in l or l.startswith("error") or "process chaos" in l or "range cluster" in l]
-    return proc.returncode, "\n".join(lines[-200:])
+    summary = []
+    for attempt in range(1, repeat + 1):
+        proc = subprocess.run(f"cargo test --release --no-fail-fast {cargo_args} 2>&1", shell=True, cwd="/src", capture_output=True, text=True, env={**os.environ, **env})
+        target_vol.commit()
+        lines = [l for l in proc.stdout.splitlines() if l.startswith("test result") or "FAILED" in l or "panicked" in l or l.startswith("error") or "process chaos" in l or "range cluster" in l]
+        summary.append(f"--- run {attempt}/{repeat}: exit {proc.returncode}")
+        summary.extend(lines[-200:])
+        if proc.returncode != 0:
+            if repeat > 1:
+                summary.append(proc.stdout[-60000:])
+            return proc.returncode, "\n".join(summary)
+    return 0, "\n".join(summary)
 
 
 @app.function(image=image, cpu=16, memory=32768, timeout=3600, volumes={"/target": target_vol})
@@ -216,7 +226,7 @@ def seeded_tests(root: str, name: str) -> tuple[list[str], list[str]]:
 
 
 @app.local_entrypoint()
-def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300, only: str = "", shard: int = 10, suite_args: str = "", env: str = "", sdks: str = "", plain: bool = False):
+def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300, only: str = "", shard: int = 10, suite_args: str = "", env: str = "", sdks: str = "", plain: bool = False, repeat: int = 1):
     root = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True).stdout.strip()
     if sdks:
         # SDK end-to-end suites, against range clusters unless --plain.
@@ -237,7 +247,7 @@ def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300,
     print(f"source: {len(src) / 1e6:.1f} MB")
     if suite_args:
         extra = dict(kv.split("=", 1) for kv in env.split(",") if "=" in kv)
-        code, summary = suite.remote(src, suite_args, extra)
+        code, summary = suite.remote(src, suite_args, extra, repeat)
         print(summary)
         print(f"cargo test exit code {code}")
         if code:

@@ -718,3 +718,9 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Bug found by testing**: a join with no residual filter never evaluated an expression, so it could not notice a cancel, and its output was only counted after it finished. Join candidates now tick and charge.
 - **Test note**: the first python-tds run appeared to hang because the driver is not thread-safe, not because of the server. Driven from one thread, attention is acknowledged in 0.43 s.
 
+### Stage 31: activity, statistics and `EXPLAIN` (`TASK-147`) — 2026-11-04
+
+- **What exists now**: operators can see what is running and what has run, in each dialect's own catalogs, and `EXPLAIN` reports the plan the executor actually follows. Before this, `pg_stat_activity` listed only the asking session, and `EXPLAIN` printed one fixed sentence per statement kind.
+- **Decision**: `EXPLAIN` calls the same decision functions as the executor rather than modelling them separately, so the two cannot drift apart for those choices. Join algorithm is the one place it mirrors a rule; `ANALYZE` shows the rows actually read.
+- **Test note**: `EXPLAIN ANALYZE` exposed that lookup joins bypass the common scan entry point, so they first read as "never executed". They now record their own rows.
+

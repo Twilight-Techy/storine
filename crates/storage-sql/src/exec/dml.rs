@@ -707,6 +707,7 @@ pub fn lock_rows(s: &mut Session, table: &Table, keys: &[String], nowait: bool) 
             };
             match s.engine.store.commit(std::slice::from_ref(&w)) {
                 Ok(_) => {
+                    s.control.set_wait(None);
                     s.txn_mut().locks.push(lock_key.clone());
                     break;
                 }
@@ -731,6 +732,9 @@ pub fn lock_rows(s: &mut Session, table: &Table, keys: &[String], nowait: bool) 
                         }
                     } else {
                         continue;
+                    }
+                    if !nowait {
+                        s.control.set_wait(Some(lock_key.clone()));
                     }
                     if nowait || deadline.is_some_and(|d| Instant::now() >= d) {
                         return Err(SqlError::lock_timeout(&format!(

@@ -882,6 +882,13 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             ex.s.current_role().to_owned()
         }),
         "current_catalog" => Datum::Text(ex.s.database.clone()),
+        "pg_stat_statements_reset" => {
+            if !ex.s.engine.acl()?.is_superuser(ex.s.current_role()) {
+                return Err(SqlError::new("42501", "permission denied for function pg_stat_statements_reset"));
+            }
+            ex.s.engine.registry.statements.reset();
+            Datum::Null
+        }
         "pg_backend_pid" | "connection_id" => Datum::Int(ex.s.id as i64),
         "pg_cancel_backend" | "pg_terminate_backend" => {
             let terminate = name == "pg_terminate_backend";
@@ -1729,6 +1736,15 @@ pub const RESERVED_WORDS: &[&str] = &[
 
 pub fn table_function(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Rel> {
     match name {
+        // T-SQL: the text behind a handle of `sys.dm_exec_requests` / `dm_exec_query_stats`.
+        "dm_exec_sql_text" => {
+            let handle = args.first().map(|d| d.as_text()).unwrap_or_default();
+            let text = crate::exec::mssql::sql_for_handle(ex, &handle)?;
+            Ok(Rel {
+                cols: vec![ColMeta::new("dbid", Some(DataType::Int)), ColMeta::new("objectid", Some(DataType::Int)), ColMeta::new("number", Some(DataType::Int)), ColMeta::new("encrypted", Some(DataType::Bool)), ColMeta::new("text", Some(DataType::Text))],
+                rows: text.into_iter().map(|t| vec![Datum::Int(5), Datum::Null, Datum::Null, Datum::Bool(false), Datum::Text(t)]).collect(),
+            })
+        }
         // T-SQL: extended properties (column comments) are not stored.
         "fn_listextendedproperty" => Ok(Rel {
             cols: ["objtype", "objname", "name", "value"]

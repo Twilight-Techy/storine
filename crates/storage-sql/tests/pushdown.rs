@@ -62,7 +62,7 @@ fn same(s: &mut Session, sql: &str) {
 }
 
 fn plan(s: &mut Session, sql: &str) -> String {
-    rows(s, &format!("EXPLAIN {sql}")).rows[0][0].as_text()
+    rows(s, &format!("EXPLAIN {sql}")).rows.iter().map(|r| r.iter().map(|d| d.as_text()).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join("\n")
 }
 
 fn load(s: &mut Session, table: &str, from: i64, to: i64) {

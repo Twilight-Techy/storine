@@ -107,6 +107,22 @@ fn count(m: &Doc, field: &str) -> i64 {
 }
 
 /// Holders of a lock document: owner -> (exclusive, shared, lease expiry).
+/// An advisory lock's key and its holders: (owner, exclusive).
+pub type HeldLock = (String, Vec<(String, bool)>);
+
+/// Every advisory lock held.
+pub fn all_holders(store: &Store) -> SqlResult<Vec<HeldLock>> {
+    let now = now_ns();
+    let mut out = Vec::new();
+    for d in store.scan(ADVISORY, None)? {
+        let held: Vec<(String, bool)> = holders(Some(&d.fields)).into_iter().filter(|(_, (x, s, exp))| *exp >= now && (*x > 0 || *s > 0)).map(|(o, (x, _, _))| (o, x > 0)).collect();
+        if !held.is_empty() {
+            out.push((d.key, held));
+        }
+    }
+    Ok(out)
+}
+
 fn holders(doc: Option<&Doc>) -> BTreeMap<String, (i64, i64, i64)> {
     let mut out = BTreeMap::new();
     if let Some(Value::Map(h)) = doc.and_then(|d| d.get("h")) {

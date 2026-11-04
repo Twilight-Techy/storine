@@ -108,6 +108,7 @@ const NATIVE: &str = "mysql_native_password";
 
 struct Prepared {
     stmt: Statement,
+    sql: Arc<str>,
     nparams: usize,
     columns: Vec<OutCol>,
     /// Parameter types sent with the last execution (reused when a client omits them).
@@ -599,6 +600,7 @@ impl Conn {
         if crate::log_enabled() {
             eprintln!("[mysql {}] {sql}", self.session.id);
         }
+        self.session.note_sql(&sql);
         let stmts = match parse(&sql, Dialect::MySql) {
             Ok((s, _)) => s,
             Err(e) => return self.err(&e),
@@ -716,6 +718,7 @@ impl Conn {
             id,
             Prepared {
                 stmt,
+                sql: Arc::from(sql.as_str()),
                 nparams,
                 columns,
                 types: Vec::new(),
@@ -767,6 +770,7 @@ impl Conn {
         }
         let stmt = st.stmt.clone();
         let described = st.columns.clone();
+        self.session.sql_text = Some(Arc::clone(&st.sql));
         match self.session.execute(&stmt, &params) {
             Ok(Outcome::Rows(rs)) => {
                 // Column types come from the actual result (they may refine the prepared ones).

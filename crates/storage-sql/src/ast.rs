@@ -106,7 +106,7 @@ pub enum Statement {
     },
     /// `USE db`: switches the session to another database.
     Use(String),
-    Explain(Box<Statement>),
+    Explain(Box<Statement>, ExplainOptions),
     /// `CREATE SCHEMA` (accepted, there is one schema per database) or, with `database`,
     /// `CREATE DATABASE` (MySQL's `CREATE SCHEMA` is a database too).
     /// `CREATE [OR REPLACE] VIEW name [(columns)] AS query`; `sql` is the query's text.
@@ -191,6 +191,13 @@ pub struct Query {
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,
     pub lock: Option<LockMode>,
+}
+
+impl Query {
+    /// A query with nothing around its body (planning a part of a set operation).
+    pub(crate) fn empty() -> Query {
+        Query { recursive: false, ctes: Vec::new(), body: SetExpr::Values(Vec::new()), order_by: Vec::new(), limit: None, offset: None, lock: None }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -517,6 +524,24 @@ pub enum AlterOp {
     ForceRowSecurity(bool),
     /// `OWNER TO role`.
     OwnerTo(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExplainFormat {
+    Text,
+    Json,
+    /// MySQL's table of one row per table read.
+    Traditional,
+    /// SQL Server's `SET SHOWPLAN_TEXT ON`.
+    ShowPlan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExplainOptions {
+    pub analyze: bool,
+    pub format: ExplainFormat,
+    /// Planning and execution times below the plan.
+    pub summary: bool,
 }
 
 /// A statement about roles.

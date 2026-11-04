@@ -50,11 +50,13 @@ const MAX_MESSAGE: usize = 1 << 30;
 
 struct Prepared {
     stmt: Statement,
+    sql: Arc<str>,
     param_types: Vec<u32>,
 }
 
 struct Portal {
     stmt: Statement,
+    sql: Arc<str>,
     params: Vec<Datum>,
     result_formats: Vec<i16>,
     /// Result computed at Describe time (or on the first Execute), with the rows already sent.
@@ -435,6 +437,7 @@ impl Conn {
         if crate::log_enabled() {
             eprintln!("[pg {}] {sql}", self.session.id);
         }
+        self.session.note_sql(sql);
         let stmts = match parse(sql, Dialect::Postgres) {
             Ok((s, _)) => s,
             Err(e) => {
@@ -937,6 +940,7 @@ impl Conn {
             name,
             Prepared {
                 stmt,
+                sql: Arc::from(sql.as_str()),
                 param_types: inferred,
             },
         );
@@ -985,9 +989,11 @@ impl Conn {
             result_formats.push(b.i16().map_err(io_sql)?);
         }
         let stmt = prep.stmt.clone();
+        let sql = Arc::clone(&prep.sql);
         self.portals.insert(
             portal,
             Portal {
+                sql,
                 stmt,
                 params,
                 result_formats,
@@ -1028,6 +1034,7 @@ impl Conn {
         // Describing a portal runs it (its parameters are bound); Execute then streams the rows.
         if portal.result.is_none() {
             let (stmt, params) = (portal.stmt.clone(), portal.params.clone());
+            self.session.sql_text = Some(Arc::clone(&portal.sql));
             let o = self.session.execute(&stmt, &params)?;
             self.after_discard(&o, Some(&name));
             if let Some(p) = self.portals.get_mut(&name) {
@@ -1066,6 +1073,7 @@ impl Conn {
             .ok_or_else(|| SqlError::new("34000", format!("portal \"{name}\" does not exist")))?;
         if portal.result.is_none() {
             let (stmt, params) = (portal.stmt.clone(), portal.params.clone());
+            self.session.sql_text = Some(Arc::clone(&portal.sql));
             let o = self.session.execute(&stmt, &params)?;
             self.after_discard(&o, Some(&name));
             if let Some(p) = self.portals.get_mut(&name) {

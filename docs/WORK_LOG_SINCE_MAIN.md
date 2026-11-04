@@ -108,7 +108,8 @@ The latest instruction from the user is to do everything that remains, **except*
 ### Stage 30
 - **TASK-144**: done. `dist/backup.rs`, `dist/feed.rs`, `OP_ADMIN_RESTORE`, `OP_CHANGEFEED`, `storage-cli changefeed`. Stage 30 is complete; Stage 31 (`TASK-145` onward) is next.
 - **TASK-145**: done. `exec/acl.rs`, `parser/acl.rs`, `tests/access_control.rs`.
-- **TASK-146**: done. `exec/control.rs`, `tests/control.rs`. Next: `TASK-147`.
+- **TASK-146**: done. `exec/control.rs`, `tests/control.rs`.
+- **TASK-147**: done. `exec/activity.rs`, `exec/explain.rs`, `tests/activity.rs`. Next: `TASK-148`.
 
 ### Stage 31 — Enterprise SQL (TASK-145 – 152)
 - Enforced `GRANT` / `REVOKE` and row-level security.

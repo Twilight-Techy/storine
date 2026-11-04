@@ -767,9 +767,60 @@ impl Parser {
                     let table = self.table_name()?;
                     return Ok(Statement::Show(Show::Columns { table, full: false }));
                 }
-                let _ = self.eat_kw("analyze");
-                let _ = self.eat_kw("verbose");
-                Ok(Statement::Explain(Box::new(self.statement()?)))
+                let mut analyze = false;
+                let mut format = if self.dialect == Dialect::MySql { ExplainFormat::Traditional } else { ExplainFormat::Text };
+                let mut summary = None;
+                if self.dialect == Dialect::Postgres && self.is_op("(") {
+                    // EXPLAIN (ANALYZE [bool], FORMAT x, ...).
+                    self.pos += 1;
+                    loop {
+                        let opt = self.ident()?.to_ascii_lowercase();
+                        let value = match self.peek().and_then(Token::keyword) {
+                            Some(k) if k != "," => {
+                                self.pos += 1;
+                                Some(k)
+                            }
+                            _ => None,
+                        };
+                        let on = !matches!(value.as_deref(), Some("off" | "false" | "0"));
+                        match opt.as_str() {
+                            "analyze" | "analyse" => analyze = on,
+                            "summary" => summary = Some(on),
+                            "format" => {
+                                format = match value.as_deref() {
+                                    Some("text") => ExplainFormat::Text,
+                                    Some("json") => ExplainFormat::Json,
+                                    other => return Err(SqlError::unsupported(format!("EXPLAIN FORMAT {}", other.unwrap_or("")))),
+                                };
+                            }
+                            "verbose" | "costs" | "buffers" | "timing" | "settings" | "wal" | "generic_plan" | "serialize" | "memory" => {}
+                            other => return Err(SqlError::syntax(format!("unrecognized EXPLAIN option \"{other}\""))),
+                        }
+                        if !self.eat_op(",") {
+                            break;
+                        }
+                    }
+                    self.expect_op(")")?;
+                } else {
+                    if self.eat_kw("format") {
+                        // MySQL: FORMAT = JSON | TREE | TRADITIONAL.
+                        self.eat_op("=");
+                        format = match self.peek().and_then(Token::keyword).as_deref() {
+                            Some("json") => ExplainFormat::Json,
+                            Some("tree") => ExplainFormat::Text,
+                            Some("traditional") => ExplainFormat::Traditional,
+                            _ => return Err(self.unexpected("JSON, TREE or TRADITIONAL")),
+                        };
+                        self.pos += 1;
+                    }
+                    analyze = self.eat_kw("analyze") || self.eat_kw("analyse");
+                    let _ = self.eat_kw("verbose");
+                    if analyze && self.dialect == Dialect::MySql {
+                        format = ExplainFormat::Text;
+                    }
+                }
+                let summary = summary.unwrap_or(analyze);
+                Ok(Statement::Explain(Box::new(self.statement()?), ExplainOptions { analyze, format, summary }))
             }
             "prepare" => {
                 self.pos += 1;
@@ -3200,6 +3251,17 @@ impl Parser {
     fn table_ref(&mut self) -> SqlResult<TableRef> {
         let mut left = self.table_factor()?;
         loop {
+            // T-SQL `CROSS APPLY` / `OUTER APPLY`: a lateral join with no condition.
+            if self.dialect == Dialect::MsSql && (self.is_kw("cross") || self.is_kw("outer")) && self.is_kw_at(1, "apply") {
+                let kind = if self.is_kw("cross") { JoinKind::Inner } else { JoinKind::Left };
+                self.pos += 2;
+                let mut right = self.table_factor()?;
+                if let TableRef::Derived { lateral, .. } = &mut right {
+                    *lateral = true;
+                }
+                left = TableRef::Join { left: Box::new(left), right: Box::new(right), kind, constraint: JoinConstraint::None };
+                continue;
+            }
             let natural = self.eat_kw("natural");
             let kind = if self.eat_kw("cross") {
                 self.expect_kw("join")?;
