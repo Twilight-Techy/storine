@@ -8,10 +8,8 @@
 //! `STORINE_FUZZ_ITERS` scales every iteration count (e.g. `0.1` or `100`); `STORINE_FUZZ_SEED`
 //! varies the generators.
 
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -25,43 +23,15 @@ use storage_types::testing::SweepRng;
 
 // ── harness ──
 
-/// The system allocator, recording the largest single request (`LARGEST`).
-struct Tracking;
-
-static LARGEST: AtomicUsize = AtomicUsize::new(0);
-
-// SAFETY: every call is forwarded unchanged to `System`; the bookkeeping is one atomic.
-unsafe impl GlobalAlloc for Tracking {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        LARGEST.fetch_max(layout.size(), Ordering::Relaxed);
-        // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract.
-        unsafe { System.alloc(layout) }
-    }
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        LARGEST.fetch_max(layout.size(), Ordering::Relaxed);
-        // SAFETY: the caller upholds `GlobalAlloc::alloc_zeroed`'s contract.
-        unsafe { System.alloc_zeroed(layout) }
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: `ptr` came from `System` with this layout.
-        unsafe { System.dealloc(ptr, layout) }
-    }
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        LARGEST.fetch_max(new_size, Ordering::Relaxed);
-        // SAFETY: the caller upholds `GlobalAlloc::realloc`'s contract.
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-}
-
 #[global_allocator]
-static ALLOCATOR: Tracking = Tracking;
+static ALLOCATOR: storage_codec::peak_alloc::ProcessPeakAlloc = storage_codec::peak_alloc::ProcessPeakAlloc;
 
 /// No single allocation in this binary may exceed this: every input here is at most a few
 /// MiB, so anything larger was sized by a hostile length field.
 const ALLOC_LIMIT: usize = 64 << 20;
 
 fn check_allocations() {
-    let largest = LARGEST.load(Ordering::Relaxed);
+    let largest = storage_codec::peak_alloc::process_largest();
     assert!(
         largest <= ALLOC_LIMIT,
         "an allocation of {largest} bytes: a length field was trusted"

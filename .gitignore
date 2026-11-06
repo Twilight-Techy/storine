@@ -4,3 +4,4 @@
 *.pdb
 *.tmp
 /.claude/worktrees/
+node_modules/

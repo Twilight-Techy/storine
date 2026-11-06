@@ -4,12 +4,14 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
+pub mod aes_ni;
 pub mod archive;
 pub mod checksum;
 pub mod relations;
 pub mod compress;
 pub mod crypto;
 pub mod curve25519;
+pub mod peak_alloc;
 pub mod rand;
 pub mod sha512;
 pub mod field_ops;

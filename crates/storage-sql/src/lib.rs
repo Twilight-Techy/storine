@@ -53,51 +53,10 @@ pub fn log_enabled() -> bool {
 /// Shared pieces of the in-crate fuzz sweeps (`TASK-135`) over the private decoders.
 #[cfg(test)]
 pub(crate) mod fuzz_support {
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::cell::Cell;
-
     pub(crate) use storage_types::testing::SweepRng;
 
-    /// The system allocator, noting the largest request made while a thread measures.
-    struct Tracking;
-
-    thread_local! {
-        static MEASURING: Cell<bool> = const { Cell::new(false) };
-        static LARGEST: Cell<usize> = const { Cell::new(0) };
-    }
-
-    fn note(size: usize) {
-        if MEASURING.try_with(Cell::get).unwrap_or(false) {
-            let _ = LARGEST.try_with(|l| l.set(l.get().max(size)));
-        }
-    }
-
-    // SAFETY: every call is forwarded unchanged to `System`; `note` only reads and writes
-    // const-initialized thread-locals, which never allocate.
-    unsafe impl GlobalAlloc for Tracking {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            note(layout.size());
-            // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract.
-            unsafe { System.alloc(layout) }
-        }
-        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            note(layout.size());
-            // SAFETY: the caller upholds `GlobalAlloc::alloc_zeroed`'s contract.
-            unsafe { System.alloc_zeroed(layout) }
-        }
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            // SAFETY: `ptr` came from `System` with this layout (every allocation does).
-            unsafe { System.dealloc(ptr, layout) }
-        }
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            note(new_size);
-            // SAFETY: the caller upholds `GlobalAlloc::realloc`'s contract.
-            unsafe { System.realloc(ptr, layout, new_size) }
-        }
-    }
-
     #[global_allocator]
-    static ALLOCATOR: Tracking = Tracking;
+    static ALLOCATOR: storage_codec::peak_alloc::PeakAlloc = storage_codec::peak_alloc::PeakAlloc;
 
     /// Largest single allocation a decoder may make for hostile input of a few KiB.
     pub(crate) const ALLOC_LIMIT: usize = 16 << 20;
@@ -105,11 +64,7 @@ pub(crate) mod fuzz_support {
     /// Runs `f`, failing if it allocated more than `ALLOC_LIMIT` bytes at once (a length
     /// field trusted before the bytes arrived).
     pub(crate) fn bounded<T>(what: &dyn std::fmt::Debug, f: impl FnOnce() -> T) -> T {
-        LARGEST.with(|l| l.set(0));
-        MEASURING.with(|m| m.set(true));
-        let out = f();
-        MEASURING.with(|m| m.set(false));
-        let largest = LARGEST.with(Cell::get);
+        let (out, largest) = storage_codec::peak_alloc::measure(f);
         assert!(
             largest <= ALLOC_LIMIT,
             "allocated {largest} bytes at once for {what:?}"

@@ -132,9 +132,9 @@ impl Aes {
     pub fn encrypt_block(&self, b: &mut [u8; 16]) {
         #[cfg(target_arch = "x86_64")]
         if self.ni {
-            // SAFETY: AES-NI and SSE2 were detected at run time.
-            unsafe { ni::encrypt(&self.enc, b) };
-            return;
+            if storage_codec::aes_ni::encrypt(&self.enc, b) {
+                return;
+            }
         }
         let k = &self.enc;
         xor16(b, &k[0]);
@@ -153,9 +153,9 @@ impl Aes {
     pub fn decrypt_block(&self, b: &mut [u8; 16]) {
         #[cfg(target_arch = "x86_64")]
         if self.ni {
-            // SAFETY: AES-NI and SSE2 were detected at run time.
-            unsafe { ni::decrypt(&self.enc, b) };
-            return;
+            if storage_codec::aes_ni::decrypt(&self.enc, b) {
+                return;
+            }
         }
         let k = &self.enc;
         xor16(b, &k[self.rounds]);
@@ -300,44 +300,6 @@ fn inv_mix_columns(s: &mut [u8; 16]) {
                 ^ gmul(a[(i + 1) % 4], 11)
                 ^ gmul(a[(i + 2) % 4], 13)
                 ^ gmul(a[(i + 3) % 4], 9);
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-mod ni {
-    use std::arch::x86_64::*;
-
-    #[target_feature(enable = "aes,sse2")]
-    #[allow(unused_unsafe)]
-    pub unsafe fn encrypt(keys: &[[u8; 16]], b: &mut [u8; 16]) {
-        let rounds = keys.len() - 1;
-        // SAFETY: every pointer is to a 16-byte array (unaligned `loadu` / `storeu` are allowed);
-        // the caller detected AES-NI and SSE2, which this function enables.
-        unsafe {
-            let load = |k: &[u8; 16]| _mm_loadu_si128(k.as_ptr().cast());
-            let mut s = _mm_xor_si128(_mm_loadu_si128(b.as_ptr().cast()), load(&keys[0]));
-            for k in &keys[1..rounds] {
-                s = _mm_aesenc_si128(s, load(k));
-            }
-            s = _mm_aesenclast_si128(s, load(&keys[rounds]));
-            _mm_storeu_si128(b.as_mut_ptr().cast(), s);
-        }
-    }
-
-    #[target_feature(enable = "aes,sse2")]
-    #[allow(unused_unsafe)]
-    pub unsafe fn decrypt(keys: &[[u8; 16]], b: &mut [u8; 16]) {
-        let rounds = keys.len() - 1;
-        // SAFETY: as in `encrypt`.
-        unsafe {
-            let load = |k: &[u8; 16]| _mm_loadu_si128(k.as_ptr().cast());
-            let mut s = _mm_xor_si128(_mm_loadu_si128(b.as_ptr().cast()), load(&keys[rounds]));
-            for k in keys[1..rounds].iter().rev() {
-                s = _mm_aesdec_si128(s, _mm_aesimc_si128(load(k)));
-            }
-            s = _mm_aesdeclast_si128(s, load(&keys[0]));
-            _mm_storeu_si128(b.as_mut_ptr().cast(), s);
         }
     }
 }

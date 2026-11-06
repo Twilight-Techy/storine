@@ -820,20 +820,18 @@ fn soak(ranges: bool) {
     // Money is conserved, whatever was in flight.
     let deadline = Instant::now() + Duration::from_secs(60);
     let total = loop {
-        let read = (|| -> Option<i64> {
-            // Only the leader answers in a single group, and any node may be it.
-            addrs.iter().find_map(|a| {
-                let mut c = StorageClient::connect_timeout(*a, client_timeout(ranges)).ok()?;
-                let mut t = 0;
-                for i in 0..ACCOUNTS {
-                    let d = c.doc_get("bank", &format!("a{i}")).ok()??;
-                    if let Some(PropertyValue::Int64(v)) = d.fields.get("bal") {
-                        t += v;
-                    }
+        // Only the leader answers in a single group, and any node may be it.
+        let read = addrs.iter().find_map(|a| {
+            let mut c = StorageClient::connect_timeout(*a, client_timeout(ranges)).ok()?;
+            let mut t = 0;
+            for i in 0..ACCOUNTS {
+                let d = c.doc_get("bank", &format!("a{i}")).ok()??;
+                if let Some(PropertyValue::Int64(v)) = d.fields.get("bal") {
+                    t += v;
                 }
-                Some(t)
-            })
-        })();
+            }
+            Some(t)
+        });
         match read {
             Some(t) => break t,
             None if Instant::now() < deadline => thread::sleep(Duration::from_millis(500)),
