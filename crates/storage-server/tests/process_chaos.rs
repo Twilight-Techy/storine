@@ -295,6 +295,25 @@ fn one_fault(cluster: &Mutex<Cluster>, rng: &mut SweepRng, faults: &mut BTreeMap
     }
 }
 
+/// Prints where a key's history stops being linearizable: histories run to tens of thousands of
+/// operations.
+fn report_unlinearized(history: &History, k: usize, e: &CheckError) {
+    // In the checker's own order: `partial` indexes these.
+    let ops: Vec<_> = history.iter().filter(|(kk, e)| *kk == k && !(matches!(e.op, RegisterOp::Read(_)) && e.ret.is_none())).map(|(_, e)| e.clone()).collect();
+    let linearized: std::collections::BTreeSet<usize> = match e {
+        CheckError::NotLinearizable { partial } => partial.iter().copied().collect(),
+        CheckError::Inconclusive => Default::default(),
+    };
+    eprintln!("key {k}: {} operations, {} linearized", ops.len(), linearized.len());
+    let stuck = ops.iter().enumerate().filter(|(i, _)| !linearized.contains(i)).map(|(_, o)| o.call).min().unwrap_or(0);
+    let mut near: Vec<_> = ops.iter().filter(|o| o.call + 1_000_000 >= stuck && o.call <= stuck + 500_000).collect();
+    near.sort_by_key(|o| o.call);
+    for o in near {
+        eprintln!("  call {:>10} ret {:>10} {:?}", o.call, o.ret.map_or("none".to_owned(), |r| r.to_string()), o.op);
+    }
+    eprintln!("first operation left out began at {stuck}");
+}
+
 fn chaos(ranges: bool) {
     let secs: u64 = std::env::var("STORINE_CHAOS_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
     let dir = std::env::temp_dir().join(format!("storine_process_chaos_{}_{ranges}", std::process::id()));
@@ -499,26 +518,8 @@ fn chaos(ranges: bool) {
         Ok(()) => {}
         Err((k, CheckError::Inconclusive)) => panic!("linearizability check inconclusive for key {k}"),
         Err((k, e)) => {
-            // In the checker's own order: `partial` indexes these.
-            let ops: Vec<_> = history.iter().filter(|(kk, e)| *kk == k && !(matches!(e.op, RegisterOp::Read(_)) && e.ret.is_none())).map(|(_, e)| e.clone()).collect();
-            let done = match &e {
-                CheckError::NotLinearizable { partial } => partial.len(),
-                CheckError::Inconclusive => 0,
-            };
-            eprintln!("key {k}: {} operations, {done} linearized", ops.len());
-            // A history has tens of thousands of operations: show where it stops.
-            let linearized: std::collections::BTreeSet<usize> = match &e {
-                CheckError::NotLinearizable { partial } => partial.iter().copied().collect(),
-                CheckError::Inconclusive => Default::default(),
-            };
-            let stuck = ops.iter().enumerate().filter(|(i, _)| !linearized.contains(i)).map(|(_, o)| o.call).min().unwrap_or(0);
-            let mut near: Vec<_> = ops.iter().filter(|o| o.call + 1_000_000 >= stuck && o.call <= stuck + 500_000).collect();
-            near.sort_by_key(|o| o.call);
-            for o in near {
-                eprintln!("  call {:>10} ret {:>10} {:?}", o.call, o.ret.map_or("none".to_owned(), |r| r.to_string()), o.op);
-            }
-            eprintln!("first operation left out began at {stuck}");
-            panic!("key {k} not linearizable after {done} of {} operations", ops.len());
+            report_unlinearized(&history, k, &e);
+            panic!("key {k} not linearizable");
         }
     }
     drop(cluster);
@@ -579,6 +580,8 @@ fn soak(ranges: bool) {
     let next_value = Arc::new(AtomicU64::new(1));
     // writes, reads, transfers, event writes, aggregates, scans, failures of any kind
     let counts = Arc::new(Mutex::new([0u64; 7]));
+    // The window each register worker's current operation belongs to.
+    let in_window: Arc<[AtomicU64; 3]> = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
     let mut workers = Vec::new();
     let client_of = move |addrs: &[SocketAddr], target: &mut usize| loop {
         match StorageClient::connect_timeout(addrs[*target % addrs.len()], client_timeout(ranges)) {
@@ -591,14 +594,16 @@ fn soak(ranges: bool) {
     };
     // Registers: the same check as the chaos test, on keys of this window.
     for w in 0..3u64 {
-        let (addrs, stop, window, history, next_value, counts) = (addrs.clone(), Arc::clone(&stop), Arc::clone(&window), Arc::clone(&history), Arc::clone(&next_value), Arc::clone(&counts));
+        let (addrs, stop, window, history, next_value, counts, in_window) = (addrs.clone(), Arc::clone(&stop), Arc::clone(&window), Arc::clone(&history), Arc::clone(&next_value), Arc::clone(&counts), Arc::clone(&in_window));
         workers.push(thread::spawn(move || {
             let mut rng = SweepRng::new(w + 500);
             let mut target = w as usize;
             let mut c = None;
             while !stop.load(Ordering::Relaxed) {
                 let client = c.get_or_insert_with(|| client_of(&addrs, &mut target));
-                let key = window.load(Ordering::Relaxed) as usize * 3 + rng.below(3);
+                let current = window.load(Ordering::Relaxed);
+                in_window[w as usize].store(current, Ordering::Relaxed);
+                let key = current as usize * 3 + rng.below(3);
                 let name = format!("k{key}");
                 let call = now();
                 if rng.below(2) == 0 {
@@ -784,15 +789,23 @@ fn soak(ranges: bool) {
         }
         n += 1;
         window.store(n, Ordering::Relaxed);
-        // Writers move to fresh keys; what they had in flight lands within a moment.
-        thread::sleep(Duration::from_secs(2));
+        // Workers move to fresh keys. A key is checked once no operation on it can still return:
+        // one that came back after the check would be judged alone, against no writes.
+        let settled = Instant::now() + Duration::from_secs(300);
+        while in_window.iter().any(|w| w.load(Ordering::Relaxed) < n) {
+            assert!(Instant::now() < settled, "soak: a register worker is stuck in an operation of window {}", n - 1);
+            thread::sleep(Duration::from_millis(50));
+        }
         let done: History = std::mem::take(&mut *history.lock().unwrap());
         let closed: History = done.iter().filter(|(k, _)| *k < n as usize * 3).cloned().collect();
         history.lock().unwrap().extend(done.into_iter().filter(|(k, _)| *k >= n as usize * 3));
         match check_keyed(&closed, 50_000_000) {
             Ok(()) => {}
             Err((_, CheckError::Inconclusive)) => eprintln!("soak window {n}: a key was too concurrent to decide"),
-            Err((k, e)) => panic!("window {n}: key {k} not linearizable: {:?}", matches!(e, CheckError::NotLinearizable { .. })),
+            Err((k, e)) => {
+                report_unlinearized(&closed, k, &e);
+                panic!("soak window {n}: key {k} not linearizable");
+            }
         }
         let counted = *counts.lock().unwrap();
         eprintln!("soak: window {n} at {}s: rss max {} MiB, fds max {fds_max}; writes {} reads {} transfers {} event batches {} aggregates {} scans {} failures {}", t0.elapsed().as_secs(), rss_max / 1024, counted[0], counted[1], counted[2], counted[3], counted[4], counted[5], counted[6]);
@@ -808,23 +821,27 @@ fn soak(ranges: bool) {
     let deadline = Instant::now() + Duration::from_secs(60);
     let total = loop {
         let read = (|| -> Option<i64> {
-            let mut c = StorageClient::connect_timeout(addrs[0], client_timeout(ranges)).ok()?;
-            let mut t = 0;
-            for i in 0..ACCOUNTS {
-                let d = c.doc_get("bank", &format!("a{i}")).ok()??;
-                if let Some(PropertyValue::Int64(v)) = d.fields.get("bal") {
-                    t += v;
+            // Only the leader answers in a single group, and any node may be it.
+            addrs.iter().find_map(|a| {
+                let mut c = StorageClient::connect_timeout(*a, client_timeout(ranges)).ok()?;
+                let mut t = 0;
+                for i in 0..ACCOUNTS {
+                    let d = c.doc_get("bank", &format!("a{i}")).ok()??;
+                    if let Some(PropertyValue::Int64(v)) = d.fields.get("bal") {
+                        t += v;
+                    }
                 }
-            }
-            Some(t)
+                Some(t)
+            })
         })();
         match read {
             Some(t) => break t,
             None if Instant::now() < deadline => thread::sleep(Duration::from_millis(500)),
-            None => panic!("accounts unreadable after the soak"),
+            None => panic!("soak: accounts unreadable 60 s after healing"),
         }
     };
     assert_eq!(total, 100 * ACCOUNTS as i64, "money created or destroyed");
+    eprintln!("soak: finished (ranges: {ranges}), balances conserved at {total}");
     // Nothing climbs without end: the last windows hold about what the first full ones did.
     if windows.len() >= 6 {
         let early = windows[1..3].iter().map(|w| w.0).max().unwrap_or(0);

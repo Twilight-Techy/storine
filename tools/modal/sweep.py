@@ -169,7 +169,10 @@ def suite(src: bytes, cargo_args: str, env: dict[str, str], repeat: int = 1) -> 
     for attempt in range(1, repeat + 1):
         proc = subprocess.run(f"cargo test --release --no-fail-fast {cargo_args} 2>&1", shell=True, cwd="/src", capture_output=True, text=True, env={**os.environ, **env})
         target_vol.commit()
-        lines = [l for l in proc.stdout.splitlines() if l.startswith("test result") or "FAILED" in l or "panicked" in l or l.startswith("error") or "process chaos" in l or "range cluster" in l or l.startswith("bench:") or l.startswith("soak")]
+        all_lines = proc.stdout.splitlines()
+        # A panic's message is the line after its header.
+        after_panic = [all_lines[k + 1] for k, l in enumerate(all_lines[:-1]) if "panicked" in l]
+        lines = [l for l in all_lines if l in after_panic or l.startswith("  call ") or l.startswith("key ") or l.startswith("first operation left out") or l.startswith("test result") or "FAILED" in l or "panicked" in l or l.startswith("error") or "process chaos" in l or "range cluster" in l or l.startswith("bench:") or l.startswith("soak")]
         summary.append(f"--- run {attempt}/{repeat}: exit {proc.returncode}")
         summary.extend(lines[-200:])
         if proc.returncode != 0:
