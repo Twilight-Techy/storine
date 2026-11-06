@@ -134,3 +134,12 @@ Yes:
 - **Document API**: atomic conditional batches with idempotent request ids; `transaction()` in every SDK.
 - **SQL**: `BEGIN` / `COMMIT` / `ROLLBACK`, savepoints, REPEATABLE READ and SERIALIZABLE.
 - **Across ranges** (Stage 30): distributed serializable transactions. Exposing them through SQL and the SDKs is TASK-143.
+
+### Stage 31: tool suites (`TASK-150`) — 2026-11-04
+
+- **Result**: real Metabase and Grafana, and the real drivers behind DBeaver, Superset, Tableau, Power BI and pgAdmin, all pass (0 JDBC failures, 177 tool checks with 0 failures). Which are real programs and which are stand-ins is in a table under `TASK-150`.
+- **Why it found bugs other tests had not**: the first run had 48 failures, mostly catalog gaps, a few in my own tests.
+- **Older correctness bug**: `HAVING` without `GROUP BY` or an aggregate was silently ignored. Any such query returned too many rows.
+- **Protocol bug**: cursor rows carried the tag `SELECT n` instead of `FETCH n`, which broke psqlODBC's `UseDeclareFetch` without any server error. Found by reading the driver's source after the gateway log showed nothing.
+- **Decision**: a test that expected one exported key on MySQL was wrong. The driver's own query returns two for a table with two unique keys. The test now says so, with the reason.
+- **Next**: `TASK-151` (2-hour soak running on Modal), `TASK-152`.

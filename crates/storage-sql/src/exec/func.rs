@@ -868,6 +868,35 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
                 name == "date_format",
             )?)
         }
+        "time_format" => {
+            if null_if_any(args) {
+                return Ok(Datum::Null);
+            }
+            let ns = match &a0 {
+                Datum::Time(ns) => *ns,
+                other => match cast(other, &DataType::Time)? {
+                    Datum::Time(ns) => ns,
+                    _ => 0,
+                },
+            };
+            let body = format_datetime(&Datum::Timestamp(ns.abs()), &text(arg(args, 1)), true)?;
+            Datum::Text(if ns < 0 { format!("-{body}") } else { body })
+        }
+        "timediff" => {
+            if null_if_any(args) {
+                return Ok(Datum::Null);
+            }
+            let moment = |d: &Datum| -> SqlResult<i64> {
+                Ok(match d {
+                    Datum::Time(ns) | Datum::Timestamp(ns) => *ns,
+                    other => match cast(other, &DataType::Timestamp)? {
+                        Datum::Timestamp(ns) => ns,
+                        _ => 0,
+                    },
+                })
+            };
+            Datum::Time(moment(&a0)? - moment(arg(args, 1))?)
+        }
         "make_date" => {
             if null_if_any(args) {
                 return Ok(Datum::Null);
@@ -997,9 +1026,25 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
         "inet_server_port" => Datum::Int(5432),
         "pg_encoding_to_char" => Datum::Text("UTF8".into()),
         "pg_get_userbyid" => Datum::Text(ex.s.user.clone()),
-        "has_table_privilege" | "has_column_privilege" | "has_schema_privilege" | "has_database_privilege" | "has_sequence_privilege" | "has_function_privilege" | "pg_has_role" => crate::exec::system::has_privilege(ex, name, args)?,
-        "obj_description" | "col_description" | "shobj_description" | "pg_get_viewdef"
-        | "pg_get_triggerdef" => Datum::Null,
+        "has_table_privilege" | "has_column_privilege" | "has_any_column_privilege" | "has_schema_privilege" | "has_database_privilege" | "has_sequence_privilege" | "has_function_privilege" | "pg_has_role" => crate::exec::system::has_privilege(ex, name, args)?,
+        "obj_description" | "col_description" | "shobj_description" | "pg_get_triggerdef" => {
+            Datum::Null
+        }
+        "pg_get_viewdef" => crate::exec::system::view_def(ex, &a0)?,
+        FIELD_SELECT => match &a0 {
+            Datum::Null => Datum::Null,
+            Datum::Json(j) => {
+                let field = arg(args, 1);
+                match json_get(j, field, false)? {
+                    Datum::Json(raw) => match raw.parse::<i64>() {
+                        Ok(n) => Datum::Int(n),
+                        Err(_) => json_get(j, field, true)?,
+                    },
+                    other => other,
+                }
+            }
+            _ => return Err(SqlError::new("42809", "field selection needs a composite value")),
+        },
         n if n.starts_with("pg_") && n.ends_with("_is_visible") => Datum::Bool(true),
         "format_type" => crate::exec::system::format_type(&a0, args.get(1)),
         "pg_get_expr" => crate::exec::system::pg_get_expr(ex, &a0, args.get(1))?,
@@ -1034,6 +1079,9 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
                     .to_owned();
                 match ex.s.engine.find_table(&bare)? {
                     Some(t) => Datum::Int(crate::exec::system::table_oid(&t.name)),
+                    None if ex.s.engine.view(&bare)?.is_some() => {
+                        Datum::Int(crate::exec::system::table_oid(&bare))
+                    }
                     None if name == "to_regclass"
                         || crate::exec::system::is_system(None, &bare) =>
                     {
@@ -1791,6 +1839,19 @@ pub const RESERVED_WORDS: &[&str] = &[
     "WITH",
 ];
 
+/// The function `(composite).field` parses to.
+pub const FIELD_SELECT: &str = "__field_select";
+
+/// A row as one value, for `(value).field`: composites are JSON objects keyed by field.
+pub fn composite(names: &[&str], row: &[Datum]) -> Datum {
+    let fields: Vec<String> = names
+        .iter()
+        .zip(row)
+        .map(|(n, d)| format!("{}:{}", datum::json_of(&Datum::Text((*n).to_owned())), datum::json_of(d)))
+        .collect();
+    Datum::Json(format!("{{{}}}", fields.join(",")))
+}
+
 pub fn table_function(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Rel> {
     match name {
         // T-SQL: the text behind a handle of `sys.dm_exec_requests` / `dm_exec_query_stats`.
@@ -1868,6 +1929,26 @@ pub fn table_function(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Re
             Ok(Rel {
                 cols: vec![ColMeta::new("generate_series", Some(DataType::BigInt))],
                 rows,
+            })
+        }
+        // `information_schema._pg_expandarray`: each element with its one-based position.
+        "_pg_expandarray" => {
+            let elements = match args.first() {
+                Some(Datum::Array(a)) => a.clone(),
+                Some(Datum::Text(s)) if s.trim_start().starts_with('{') => datum::parse_array(s)?,
+                Some(Datum::Text(s)) => s
+                    .split_whitespace()
+                    .map(|x| x.parse().map_or_else(|_| Datum::Text(x.to_owned()), Datum::Int))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            Ok(Rel {
+                cols: vec![ColMeta::new("x", Some(DataType::Int)), ColMeta::new("n", Some(DataType::Int))],
+                rows: elements
+                    .into_iter()
+                    .enumerate()
+                    .map(|(k, x)| vec![x, Datum::Int(k as i64 + 1)])
+                    .collect(),
             })
         }
         "generate_subscripts" => {
@@ -2360,6 +2441,7 @@ pub fn return_type(
         | "md5"
         | "to_char"
         | "date_format"
+        | "time_format"
         | "string_agg"
         | "group_concat"
         | "version"
@@ -2417,7 +2499,7 @@ pub fn return_type(
         "localtimestamp" | "utc_timestamp" | "sysdate" | "getdate" | "date_trunc"
         | "from_unixtime" | "date_add" | "date_sub" | "convert_tz" => DataType::Timestamp,
         "current_date" | "curdate" | "date" | "to_date" | "make_date" => DataType::Date,
-        "current_time" | "curtime" => DataType::Time,
+        "current_time" | "curtime" | "timediff" => DataType::Time,
         "gen_random_uuid" | "uuid_generate_v4" | "newid" => DataType::Uuid,
         "uuid" if mysql => DataType::Varchar(Some(36)),
         "random" | "rand" | "sqrt" | "power" | "pow" | "exp" | "ln" | "log" | "log10" | "pi" => {
@@ -2432,6 +2514,8 @@ pub fn return_type(
         | "every"
         | "pg_table_is_visible"
         | "has_table_privilege"
+        | "has_any_column_privilege"
+        | "has_column_privilege"
         | "starts_with"
         | "pg_is_in_recovery" => DataType::Bool,
         "abs" | "round" | "ceil" | "ceiling" | "floor" | "trunc" | "mod" => return arg_ty(0),

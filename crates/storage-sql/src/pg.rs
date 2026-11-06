@@ -120,6 +120,8 @@ struct Conn {
     session: Session,
     prepared: HashMap<String, Prepared>,
     portals: HashMap<String, Portal>,
+    /// The command tag of the rows being sent: drivers tell a cursor's FETCH by it.
+    rows_tag: &'static str,
     /// After an error in the extended protocol, messages are skipped until Sync.
     skipping: bool,
 }
@@ -388,6 +390,7 @@ impl Conn {
             session,
             prepared: HashMap::new(),
             portals: HashMap::new(),
+            rows_tag: "SELECT",
             skipping: false,
         };
         c.ready()?;
@@ -518,6 +521,7 @@ impl Conn {
                 }
                 continue;
             }
+            self.rows_tag = rows_tag(st);
             let outcome = match self.session.execute(st, &[]) {
                 Ok(o) => o,
                 Err(e) => {
@@ -1081,6 +1085,13 @@ impl Conn {
             }
             return Ok(());
         }
+        // A cursor declared in SQL is a portal too (psycopg's named cursors describe it).
+        if !self.portals.contains_key(&name) {
+            if let Some(c) = self.session.cursors.get(&name.to_ascii_lowercase()) {
+                let msg = row_description(&c.columns, &[]);
+                return self.send(msg).map_err(io_err);
+            }
+        }
         let portal = self
             .portals
             .get_mut(&name)
@@ -1125,6 +1136,7 @@ impl Conn {
             .portals
             .get_mut(&name)
             .ok_or_else(|| SqlError::new("34000", format!("portal \"{name}\" does not exist")))?;
+        self.rows_tag = rows_tag(&portal.stmt);
         if portal.result.is_none() {
             let (stmt, params) = (portal.stmt.clone(), portal.params.clone());
             self.session.sql_text = Some(Arc::clone(&portal.sql));
@@ -1158,7 +1170,7 @@ impl Conn {
                 }
                 return Ok(());
             }
-            self.send(Msg::new(b'C').cstr(&format!("SELECT {}", rs.rows.len())))
+            self.send(Msg::new(b'C').cstr(&format!("{} {}", self.rows_tag, rs.rows.len())))
                 .map_err(io_err)?;
         } else {
             self.send_outcome(&outcome, &formats, false, 0)
@@ -1179,8 +1191,9 @@ impl Conn {
         let name = b.cstr().map_err(io_sql)?;
         if kind == b'S' {
             self.prepared.remove(&name);
-        } else {
-            self.portals.remove(&name);
+        } else if self.portals.remove(&name).is_none() {
+            // Closing a name that is nothing is not an error, as in PostgreSQL.
+            let _ = self.session.close_cursor(Some(&name));
         }
         self.send(Msg::new(b'3')).map_err(io_err)
     }
@@ -1202,7 +1215,7 @@ impl Conn {
                     let m = data_row(&rs.columns, row, formats);
                     send_raw(&mut self.w, m)?;
                 }
-                self.send(Msg::new(b'C').cstr(&format!("SELECT {}", rs.rows.len())))
+                self.send(Msg::new(b'C').cstr(&format!("{} {}", self.rows_tag, rs.rows.len())))
             }
             Outcome::Command { tag, .. } if tag.is_empty() => self.send(Msg::new(b'I')),
             Outcome::Command { tag, .. } => self.send(Msg::new(b'C').cstr(tag)),
@@ -1360,6 +1373,14 @@ fn format_for(formats: &[i16], i: usize) -> i16 {
         0 => 0,
         1 => formats[0],
         _ => formats.get(i).copied().unwrap_or(0),
+    }
+}
+
+fn rows_tag(st: &Statement) -> &'static str {
+    if matches!(st, Statement::Fetch { .. }) {
+        "FETCH"
+    } else {
+        "SELECT"
     }
 }
 

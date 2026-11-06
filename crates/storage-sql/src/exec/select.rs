@@ -2153,7 +2153,7 @@ impl Exec<'_> {
                         outer,
                         aggs: Some(&aggs),
                     };
-                    if !self.eval_bool(h, &env)? {
+                    if !self.having_holds(h, &items, &env)? {
                         continue;
                     }
                 }
@@ -2249,14 +2249,28 @@ impl Exec<'_> {
                     aggs: Some(&aggs),
                 };
                 if let Some(h) = &sel.having {
-                    if !self.eval_bool(h, &env)? {
+                    if !self.having_holds(h, &items, &env)? {
                         continue;
                     }
                 }
                 work.push((rep.clone(), aggs));
             }
         } else {
-            work = rows.into_iter().map(|r| (r, Vec::new())).collect();
+            for r in rows {
+                // HAVING with neither GROUP BY nor an aggregate filters rows.
+                if let Some(h) = &sel.having {
+                    let env = Env {
+                        cols: &cols,
+                        row: &r,
+                        outer,
+                        aggs: None,
+                    };
+                    if !self.having_holds(h, &items, &env)? {
+                        continue;
+                    }
+                }
+                work.push((r, Vec::new()));
+            }
         }
         // Window functions over the rows (or groups) that survived WHERE / HAVING.
         let mut wins: Vec<Expr> = Vec::new();
@@ -2276,20 +2290,7 @@ impl Exec<'_> {
         }
         // Set-returning functions in the select list (`SELECT unnest(a), generate_subscripts(a, 1)`)
         // expand each row; several run in lockstep, the shorter padded with NULLs.
-        let srf: Vec<Option<(&str, &[Expr])>> = items
-            .iter()
-            .map(|(e, _, _)| match e {
-                Expr::Function {
-                    name,
-                    args,
-                    over: None,
-                    ..
-                } if SELECT_LIST_SRFS.contains(&name.as_str()) => {
-                    Some((name.as_str(), args.as_slice()))
-                }
-                _ => None,
-            })
-            .collect();
+        let srf: Vec<_> = items.iter().map(|(e, _, _)| select_list_srf(e)).collect();
         for (row, aggs) in &work {
             let env = Env {
                 cols: &cols,
@@ -2309,21 +2310,27 @@ impl Exec<'_> {
             let mut series: Vec<Option<Vec<Datum>>> = Vec::with_capacity(items.len());
             for f in &srf {
                 series.push(match f {
-                    Some((name, args)) => {
+                    Some((name, args, field)) => {
                         let vals = args
                             .iter()
                             .map(|a| self.eval(a, &env))
                             .collect::<SqlResult<Vec<_>>>()?;
                         let rel = func::table_function(self, name, &vals)?;
+                        let at = field
+                            .map(|f| {
+                                rel.cols.iter().position(|c| c.name == f).ok_or_else(|| {
+                                    SqlError::new("42703", format!("column \"{f}\" not found in data type record"))
+                                })
+                            })
+                            .transpose()?;
+                        let names: Vec<&str> = rel.cols.iter().map(|c| c.name.as_str()).collect();
                         Some(
                             rel.rows
-                                .into_iter()
-                                .map(|mut r| {
-                                    if r.is_empty() {
-                                        Datum::Null
-                                    } else {
-                                        r.swap_remove(0)
-                                    }
+                                .iter()
+                                .map(|r| match at {
+                                    Some(k) => r[k].clone(),
+                                    None if r.len() > 1 => func::composite(&names, r),
+                                    None => r.first().cloned().unwrap_or(Datum::Null),
                                 })
                                 .collect(),
                         )
@@ -2815,7 +2822,67 @@ const SELECT_LIST_SRFS: &[&str] = &[
     "jsonb_array_elements",
     "json_array_elements_text",
     "jsonb_array_elements_text",
+    "_pg_expandarray",
 ];
+
+impl Exec<'_> {
+    /// Whether a group or row passes HAVING. In MySQL it may name a select-list alias, which comes
+    /// before a column of the same name.
+    fn having_holds<T>(&self, h: &Expr, items: &[(Expr, String, T)], env: &Env<'_>) -> SqlResult<bool> {
+        if self.dialect() != Dialect::MySql {
+            return self.eval_bool(h, env);
+        }
+        let mut names: Vec<String> = Vec::new();
+        walk(h, &mut |x| {
+            if let Expr::Column(p) = x {
+                if let [name] = p.as_slice() {
+                    names.push(name.clone());
+                }
+            }
+        });
+        let aliased: Vec<&(Expr, String, T)> = items
+            .iter()
+            .filter(|(e, name, _)| {
+                names.iter().any(|n| n.eq_ignore_ascii_case(name))
+                    && !matches!(e, Expr::Column(p) if p.last().is_some_and(|c| c.eq_ignore_ascii_case(name)))
+            })
+            .collect();
+        if aliased.is_empty() {
+            return self.eval_bool(h, env);
+        }
+        let cols: Vec<ColMeta> = aliased.iter().map(|(_, name, _)| ColMeta::new(name, None)).collect();
+        let row = aliased.iter().map(|(e, _, _)| self.eval(e, env)).collect::<SqlResult<Vec<_>>>()?;
+        let inner = Env {
+            cols: &cols,
+            row: &row,
+            outer: Some(env),
+            aggs: env.aggs,
+        };
+        self.eval_bool(h, &inner)
+    }
+}
+
+/// A set-returning call in a select list: its name, arguments and, for `(f(..)).field`, the field.
+fn select_list_srf(e: &Expr) -> Option<(&str, &[Expr], Option<&str>)> {
+    let Expr::Function {
+        name,
+        args,
+        over: None,
+        ..
+    } = e
+    else {
+        return None;
+    };
+    if SELECT_LIST_SRFS.contains(&name.as_str()) {
+        return Some((name.as_str(), args.as_slice(), None));
+    }
+    match args.as_slice() {
+        [inner, Expr::Str(field)] if name == func::FIELD_SELECT => {
+            select_list_srf(inner).map(|(n, a, _)| (n, a, Some(field.as_str())))
+        }
+        _ => None,
+    }
+}
 
 /// One type for a column whose values have these types: the widest numeric type, or the
 /// common type (`None` when they disagree).

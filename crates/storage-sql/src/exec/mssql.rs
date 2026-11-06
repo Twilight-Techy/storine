@@ -2213,9 +2213,84 @@ pub fn exec_proc(
             run_sql(s, &sql, Vec::new())
         }
         "sp_tables" | "sp_columns" | "sp_columns_100" | "sp_pkeys" | "sp_fkeys"
-        | "sp_statistics" | "sp_statistics_100" => {
+        | "sp_statistics" | "sp_statistics_100" | "sp_datatype_info" | "sp_datatype_info_100"
+        | "sp_table_privileges" | "sp_column_privileges" | "sp_stored_procedures"
+        | "sp_special_columns" | "sp_special_columns_100" => {
             let ex = Exec::new(s, params);
             metadata(&ex, name, &|n: &str, pos: usize| arg(n, pos))
+        }
+        // Parameter types for mssql-jdbc's `getParameterMetaData`. Nothing here infers them from
+        // the statement: nvarchar is what every value coerces from where the statement runs.
+        "sp_describe_undeclared_parameters" => {
+            let declared = crate::tds::declared_names(&text(&arg("params", 1)));
+            let (tokens, _) = crate::lexer::tokenize(&text(&arg("tsql", 0)), crate::lexer::Dialect::MsSql)?;
+            let mut names: Vec<String> = Vec::new();
+            for tok in tokens {
+                if let crate::lexer::Token::Variable { name, system: false } = tok {
+                    let bare = name.trim_start_matches('@');
+                    let known = declared.iter().any(|d| d.trim_start_matches('@').eq_ignore_ascii_case(bare));
+                    if !known && !names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                        names.push(name);
+                    }
+                }
+            }
+            const I: DataType = DataType::Int;
+            const B: DataType = DataType::Bool;
+            let out = names
+                .iter()
+                .enumerate()
+                .map(|(k, name)| {
+                    let (id, len) = (Datum::Int(231), Datum::Int(8000));
+                    let (no, yes) = (Datum::Bool(false), Datum::Bool(true));
+                    vec![
+                        Datum::Int(k as i64 + 1),
+                        Datum::Text(format!("@{}", name.trim_start_matches('@'))),
+                        id.clone(),
+                        Datum::Text("nvarchar(4000)".to_owned()),
+                        len.clone(),
+                        Datum::Int(0),
+                        Datum::Int(0),
+                        N, N, N, N, N, N, N, N, N,
+                        no.clone(),
+                        no.clone(),
+                        no.clone(),
+                        yes,
+                        no,
+                        N,
+                        id,
+                        len,
+                    ]
+                })
+                .collect();
+            Ok(rows(
+                &[
+                    ("parameter_ordinal", I),
+                    ("name", T),
+                    ("suggested_system_type_id", I),
+                    ("suggested_system_type_name", T),
+                    ("suggested_max_length", I),
+                    ("suggested_precision", I),
+                    ("suggested_scale", I),
+                    ("suggested_user_type_id", I),
+                    ("suggested_user_type_database", T),
+                    ("suggested_user_type_schema", T),
+                    ("suggested_user_type_name", T),
+                    ("suggested_assembly_qualified_type_name", T),
+                    ("suggested_xml_collection_id", I),
+                    ("suggested_xml_collection_database", T),
+                    ("suggested_xml_collection_schema", T),
+                    ("suggested_xml_collection_name", T),
+                    ("suggested_is_xml_document", B),
+                    ("suggested_is_case_sensitive", B),
+                    ("suggested_is_fixed_length", B),
+                    ("suggested_is_input", B),
+                    ("suggested_is_output", B),
+                    ("formal_parameter_name", T),
+                    ("suggested_tds_type_id", I),
+                    ("suggested_tds_length", I),
+                ],
+                out,
+            ))
         }
         "sp_reset_connection" => {
             s.role = None; // a pooled connection's next user is not who the last one impersonated
@@ -2317,6 +2392,60 @@ pub fn exec_proc(
 // ── JDBC / ODBC catalog procedures ──
 
 /// ODBC 3 type codes, as `sp_columns` reports them.
+/// A column's ODBC `PRECISION` and `LENGTH`, from `column_type`.
+fn column_size(ty: &str, len: i64, p: i64) -> (i64, i64) {
+    const MAXLEN: i64 = 2_147_483_647;
+    let wide = matches!(ty, "nchar" | "nvarchar" | "ntext");
+    let length = if len < 0 { MAXLEN } else { len };
+    let precision = if wide || matches!(ty, "char" | "varchar" | "text") {
+        if len < 0 {
+            MAXLEN / if wide { 2 } else { 1 }
+        } else if wide {
+            len / 2
+        } else {
+            len
+        }
+    } else if matches!(ty, "binary" | "varbinary" | "image") {
+        length
+    } else {
+        p
+    };
+    (precision, length)
+}
+
+/// `sp_datatype_info`: name, precision, literal prefix and suffix, create params, whether it is
+/// case sensitive, searchable (3 = everywhere, 0 = no, 1 = LIKE only), unsigned, money, autoincrement-capable, scale range.
+#[allow(clippy::type_complexity)]
+const DATA_TYPES: &[(&str, i64, Option<&str>, Option<&str>, Option<&str>, i64, i64, Option<bool>, bool, bool, Option<(i64, i64)>)] = &[
+    ("bit", 1, None, None, None, 0, 2, None, false, false, None),
+    ("tinyint", 3, None, None, None, 0, 2, Some(true), false, true, None),
+    ("smallint", 5, None, None, None, 0, 2, Some(false), false, true, None),
+    ("int", 10, None, None, None, 0, 2, Some(false), false, true, None),
+    ("bigint", 19, None, None, None, 0, 2, Some(false), false, true, None),
+    ("decimal", 38, None, None, Some("precision,scale"), 0, 2, Some(false), false, true, Some((0, 38))),
+    ("numeric", 38, None, None, Some("precision,scale"), 0, 2, Some(false), false, true, Some((0, 38))),
+    ("money", 19, Some("$"), None, None, 0, 2, Some(false), true, false, Some((4, 4))),
+    ("smallmoney", 10, Some("$"), None, None, 0, 2, Some(false), true, false, Some((4, 4))),
+    ("float", 53, None, None, None, 0, 2, Some(false), false, false, None),
+    ("real", 24, None, None, None, 0, 2, Some(false), false, false, None),
+    ("date", 10, Some("'"), Some("'"), None, 0, 3, None, false, false, None),
+    ("time", 16, Some("'"), Some("'"), Some("scale"), 0, 3, None, false, false, Some((0, 7))),
+    ("datetime", 23, Some("'"), Some("'"), None, 0, 3, None, false, false, Some((3, 3))),
+    ("smalldatetime", 16, Some("'"), Some("'"), None, 0, 3, None, false, false, Some((0, 0))),
+    ("datetime2", 27, Some("'"), Some("'"), Some("scale"), 0, 3, None, false, false, Some((0, 7))),
+    ("datetimeoffset", 34, Some("'"), Some("'"), Some("scale"), 0, 3, None, false, false, Some((0, 7))),
+    ("char", 8000, Some("'"), Some("'"), Some("length"), 0, 3, None, false, false, None),
+    ("varchar", 8000, Some("'"), Some("'"), Some("max length"), 0, 3, None, false, false, None),
+    ("text", 2_147_483_647, Some("'"), Some("'"), None, 0, 1, None, false, false, None),
+    ("nchar", 4000, Some("N'"), Some("'"), Some("length"), 0, 3, None, false, false, None),
+    ("nvarchar", 4000, Some("N'"), Some("'"), Some("max length"), 0, 3, None, false, false, None),
+    ("ntext", 1_073_741_823, Some("N'"), Some("'"), None, 0, 1, None, false, false, None),
+    ("binary", 8000, Some("0x"), None, Some("length"), 0, 2, None, false, false, None),
+    ("varbinary", 8000, Some("0x"), None, Some("max length"), 0, 2, None, false, false, None),
+    ("image", 2_147_483_647, Some("0x"), None, None, 0, 0, None, false, false, None),
+    ("uniqueidentifier", 36, Some("'"), Some("'"), None, 0, 2, None, false, false, None),
+];
+
 fn odbc_type(name: &str) -> i64 {
     match name {
         "bit" => -7,
@@ -2384,8 +2513,156 @@ fn metadata(
             .collect()
     };
     const I2: DataType = DataType::SmallInt;
-    const MAXLEN: i64 = 2_147_483_647;
     Ok(match proc_name {
+        "sp_datatype_info" | "sp_datatype_info_100" => {
+            let only = arg("data_type", 0);
+            let only = if only.is_null() { 0 } else { only.as_i64()? };
+            let mut out = Vec::new();
+            for (name, precision, prefix, suffix, params, case, search, unsigned, money, auto, scale) in DATA_TYPES {
+                let code = odbc_type(name);
+                if only != 0 && only != code {
+                    continue;
+                }
+                let (sql_type, sub) = match code {
+                    91 => (9, Some(1)),
+                    93 => (9, Some(3)),
+                    other => (other, None),
+                };
+                let opt = |s: &Option<&str>| s.map_or(N, t);
+                let flag = |f: bool| i(i64::from(f));
+                let numeric = unsigned.is_some() || *name == "bit";
+                out.push(vec![
+                    t(*name),
+                    i(code),
+                    i(*precision),
+                    opt(prefix),
+                    opt(suffix),
+                    opt(params),
+                    i(1),
+                    i(*case),
+                    i(*search),
+                    unsigned.map_or(N, flag),
+                    flag(*money),
+                    if *auto { i(0) } else { N },
+                    t(*name),
+                    scale.map_or(N, |s| i(s.0)),
+                    scale.map_or(N, |s| i(s.1)),
+                    i(sql_type),
+                    sub.map_or(N, i),
+                    if numeric { i(10) } else { N },
+                    N,
+                    i(0),
+                ]);
+            }
+            rows(
+                &[
+                    ("TYPE_NAME", T),
+                    ("DATA_TYPE", I2),
+                    ("PRECISION", DataType::Int),
+                    ("LITERAL_PREFIX", T),
+                    ("LITERAL_SUFFIX", T),
+                    ("CREATE_PARAMS", T),
+                    ("NULLABLE", I2),
+                    ("CASE_SENSITIVE", I2),
+                    ("SEARCHABLE", I2),
+                    ("UNSIGNED_ATTRIBUTE", I2),
+                    ("MONEY", I2),
+                    ("AUTO_INCREMENT", I2),
+                    ("LOCAL_TYPE_NAME", T),
+                    ("MINIMUM_SCALE", I2),
+                    ("MAXIMUM_SCALE", I2),
+                    ("SQL_DATA_TYPE", I2),
+                    ("SQL_DATETIME_SUB", I2),
+                    ("NUM_PREC_RADIX", DataType::Int),
+                    ("INTERVAL_PRECISION", I2),
+                    ("USERTYPE", I2),
+                ],
+                out,
+            )
+        }
+        "sp_table_privileges" | "sp_column_privileges" => {
+            let by_column = proc_name == "sp_column_privileges";
+            let col_pat = arg("column_name", 3);
+            let acl = ex.s.engine.acl()?;
+            let mut out = Vec::new();
+            for tb in named(&arg("table_name", 0)) {
+                let object = format!("table:{}", tb.name);
+                for g in acl.grants().iter().filter(|g| g.object == object && !g.deny) {
+                    let grantable = t(if g.grant_option { "YES" } else { "NO" });
+                    if !by_column {
+                        if g.column.is_empty() {
+                            out.push(vec![t(&db), t("dbo"), t(&tb.name), t(&g.grantor), t(&g.grantee), t(&g.privilege), grantable]);
+                        }
+                        continue;
+                    }
+                    for c in tb.columns.iter().filter(|c| (g.column.is_empty() || g.column == c.name) && pattern_match(&col_pat, &c.name)) {
+                        out.push(vec![t(&db), t("dbo"), t(&tb.name), t(&c.name), t(&g.grantor), t(&g.grantee), t(&g.privilege), grantable.clone()]);
+                    }
+                }
+            }
+            let mut cols = vec![("TABLE_QUALIFIER", T), ("TABLE_OWNER", T), ("TABLE_NAME", T)];
+            if by_column {
+                cols.push(("COLUMN_NAME", T));
+            }
+            cols.extend([("GRANTOR", T), ("GRANTEE", T), ("PRIVILEGE", T), ("IS_GRANTABLE", T)]);
+            rows(&cols, out)
+        }
+        "sp_stored_procedures" => {
+            let pat = arg("sp_name", 0);
+            let mut out = Vec::new();
+            for d in ex.s.engine.store.scan(super::routine::FUNCTIONS, None)? {
+                if pattern_match(&pat, &d.key) {
+                    out.push(vec![t(&db), t("dbo"), t(format!("{};1", d.key)), i(-1), i(-1), i(-1), N, i(2)]);
+                }
+            }
+            rows(
+                &[
+                    ("PROCEDURE_QUALIFIER", T),
+                    ("PROCEDURE_OWNER", T),
+                    ("PROCEDURE_NAME", T),
+                    ("NUM_INPUT_PARAMS", DataType::Int),
+                    ("NUM_OUTPUT_PARAMS", DataType::Int),
+                    ("NUM_RESULT_SETS", DataType::Int),
+                    ("REMARKS", T),
+                    ("PROCEDURE_TYPE", I2),
+                ],
+                out,
+            )
+        }
+        "sp_special_columns" | "sp_special_columns_100" => {
+            // 'R' the best row identifier: the primary key, else the first unique key. There are no
+            // columns a write changes on its own, so 'V' (version columns) has none.
+            let best = !text(&arg("col_type", 3)).eq_ignore_ascii_case("V");
+            let mut out = Vec::new();
+            if best {
+                for tb in named(&arg("table_name", 0)) {
+                    let key: Vec<usize> = if tb.primary_key.is_empty() {
+                        super::system::index_list(&tb).into_iter().find(|(n, _)| tb.uniques.iter().any(|u| &u.name == n)).map_or(Vec::new(), |(_, c)| c)
+                    } else {
+                        tb.primary_key.clone()
+                    };
+                    for k in key {
+                        let c = &tb.columns[k];
+                        let (ty, _, len, p, sc) = column_type(c);
+                        let (precision, length) = column_size(&ty, len, p);
+                        out.push(vec![i(1), t(&c.name), i(odbc_type(&ty)), t(&ty), i(precision), i(length), i(sc), i(1)]);
+                    }
+                }
+            }
+            rows(
+                &[
+                    ("SCOPE", I2),
+                    ("COLUMN_NAME", T),
+                    ("DATA_TYPE", I2),
+                    ("TYPE_NAME", T),
+                    ("PRECISION", DataType::Int),
+                    ("LENGTH", DataType::Int),
+                    ("SCALE", I2),
+                    ("PSEUDO_COLUMN", I2),
+                ],
+                out,
+            )
+        }
         "sp_tables" => {
             let types = text(&arg("table_type", 3)).to_ascii_uppercase();
             let want = |kind: &str| types.is_empty() || types.contains(kind);
@@ -2426,20 +2703,7 @@ fn metadata(
                     let wide = matches!(ty.as_str(), "nchar" | "nvarchar" | "ntext");
                     let chars_ty = wide || matches!(ty.as_str(), "char" | "varchar" | "text");
                     let bytes_ty = matches!(ty.as_str(), "binary" | "varbinary" | "image");
-                    let length = if len < 0 { MAXLEN } else { len };
-                    let precision = if chars_ty {
-                        if len < 0 {
-                            MAXLEN / if wide { 2 } else { 1 }
-                        } else if wide {
-                            len / 2
-                        } else {
-                            len
-                        }
-                    } else if bytes_ty {
-                        length
-                    } else {
-                        p
-                    };
+                    let (precision, length) = column_size(&ty, len, p);
                     let numeric = !(chars_ty
                         || bytes_ty
                         || matches!(ty.as_str(), "uniqueidentifier" | "xml"));

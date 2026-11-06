@@ -654,6 +654,18 @@ impl<'a> Exec<'a> {
                         .and_then(|k| a.get(k).cloned())
                         .unwrap_or(Datum::Null),
                     (Datum::Json(j), i) => func::json_get(&j, &i, false)?,
+                    // A catalog int2vector ("1 2") is zero-based.
+                    (Datum::Text(s), Datum::Int(n)) if !s.trim_start().starts_with('{') => {
+                        usize::try_from(n)
+                            .ok()
+                            .and_then(|k| s.split_whitespace().nth(k))
+                            .and_then(|x| x.parse().ok())
+                            .map_or(Datum::Null, Datum::Int)
+                    }
+                    (Datum::Text(s), Datum::Int(n)) => usize::try_from(n - 1)
+                        .ok()
+                        .and_then(|k| datum::parse_array(&s).ok()?.get(k).cloned())
+                        .unwrap_or(Datum::Null),
                     _ => Datum::Null,
                 }
             }

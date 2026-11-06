@@ -513,6 +513,39 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                 ("attmissingval", T),
             ]);
             for tb in tables {
+                // An index has attributes too: drivers join them to number its key columns.
+                for (name, cols) in index_list(tb) {
+                    for (k, c) in cols.iter().enumerate() {
+                        let c = &tb.columns[*c];
+                        bd.row(vec![
+                            i(object_oid("i", &tb.name, &name)),
+                            t(&c.name),
+                            i(i64::from(type_oid(&c.ty))),
+                            i(-1),
+                            i(-1),
+                            i(k as i64 + 1),
+                            i(0),
+                            i(-1),
+                            i(i64::from(c.type_mod())),
+                            b(false),
+                            t("p"),
+                            t("i"),
+                            b(false),
+                            b(false),
+                            b(false),
+                            t(""),
+                            t(""),
+                            b(false),
+                            b(true),
+                            i(0),
+                            i(0),
+                            N,
+                            N,
+                            N,
+                            N,
+                        ]);
+                    }
+                }
                 let oid = table_oid(&tb.name);
                 for (k, c) in tb.columns.iter().enumerate() {
                     let len = match c.ty {
@@ -726,9 +759,9 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                         b(true),
                         b(false),
                         int2vector(&cols),
-                        t("0"),
-                        t("0"),
-                        t("0"),
+                        t(vec!["0"; cols.len()].join(" ")),
+                        t(vec!["0"; cols.len()].join(" ")),
+                        t(vec!["0"; cols.len()].join(" ")),
                         N,
                         N,
                     ]);
@@ -833,6 +866,20 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                             .collect(),
                         None => Vec::new(),
                     };
+                    // The unique index the key references.
+                    let ref_index = tables
+                        .iter()
+                        .find(|p| p.name == f.ref_table)
+                        .and_then(|p| {
+                            let same = |c: &Vec<usize>| {
+                                c.len() == fcols.len() && fcols.iter().all(|k| c.contains(k))
+                            };
+                            index_list(p)
+                                .into_iter()
+                                .find(|(_, c)| same(c))
+                                .map(|(name, _)| object_oid("i", &p.name, &name))
+                        })
+                        .unwrap_or(0);
                     bd.row(vec![
                         i(object_oid("c", &tb.name, &f.name)),
                         t(&f.name),
@@ -843,7 +890,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
                         b(true),
                         i(toid),
                         i(0),
-                        i(0),
+                        i(ref_index),
                         i(0),
                         i(table_oid(&f.ref_table)),
                         act(f.on_update),
@@ -1535,7 +1582,7 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
 }
 
 /// Index names with their columns: the primary key first, then unique keys, then indexes.
-fn index_list(tb: &Table) -> Vec<(String, Vec<usize>)> {
+pub(crate) fn index_list(tb: &Table) -> Vec<(String, Vec<usize>)> {
     let mut out = Vec::new();
     if !tb.primary_key.is_empty() {
         out.push((format!("{}_pkey", tb.name), tb.primary_key.clone()));
@@ -2426,8 +2473,65 @@ fn information_schema(
             }
             bd.done()
         }
-        "routines" | "triggers" | "parameters" | "events" | "partitions" | "table_privileges"
-        | "column_privileges" | "user_privileges" | "schema_privileges"
+        "table_privileges" | "column_privileges" => {
+            let by_column = n == "column_privileges";
+            let mut spec = vec![("grantor", T), ("grantee", T), ("table_catalog", T), ("table_schema", T), ("table_name", T)];
+            if by_column {
+                spec.push(("column_name", T));
+            }
+            spec.extend([("privilege_type", T), ("is_grantable", T)]);
+            let mut bd = mk(&spec);
+            let acl = ex.s.engine.acl()?;
+            for tb in tables {
+                let object = format!("table:{}", tb.name);
+                for g in acl.grants().iter().filter(|g| g.object == object && !g.deny) {
+                    let grantable = t(if g.grant_option { "YES" } else { "NO" });
+                    let head = vec![t(&g.grantor), t(&g.grantee), t(if mysql { "def" } else { &db }), t(schema), t(&tb.name)];
+                    if by_column {
+                        for c in tb.columns.iter().filter(|c| g.column.is_empty() || g.column == c.name) {
+                            let mut row = head.clone();
+                            row.extend([t(&c.name), t(&g.privilege), grantable.clone()]);
+                            bd.row(row);
+                        }
+                    } else if g.column.is_empty() {
+                        let mut row = head;
+                        row.extend([t(&g.privilege), grantable]);
+                        bd.row(row);
+                    }
+                }
+            }
+            bd.done()
+        }
+        "routines" => {
+            let mut bd = mk(&[
+                ("specific_name", T),
+                ("routine_catalog", T),
+                ("routine_schema", T),
+                ("routine_name", T),
+                ("routine_type", T),
+                ("data_type", T),
+                ("routine_body", T),
+                ("routine_definition", T),
+                ("external_language", T),
+            ]);
+            for d in ex.s.engine.store.scan(super::routine::FUNCTIONS, None)? {
+                let text = |k: &str| d.fields.get(k).and_then(storine::Value::as_str).unwrap_or_default().to_owned();
+                let procedure = matches!(d.fields.get("procedure"), Some(storine::Value::Bool(true)));
+                bd.row(vec![
+                    t(&d.key),
+                    t(if mysql { "def" } else { &db }),
+                    t(schema),
+                    t(&d.key),
+                    t(if procedure { "PROCEDURE" } else { "FUNCTION" }),
+                    if procedure { N } else { t(text("returns")) },
+                    t("EXTERNAL"),
+                    t(text("body")),
+                    t(text("language")),
+                ]);
+            }
+            bd.done()
+        }
+        "triggers" | "parameters" | "events" | "partitions" | "user_privileges" | "schema_privileges"
         | "innodb_trx" | "role_table_grants" | "domains" | "element_types" | "attributes"
         | "user_defined_types" | "column_statistics" | "plugins" => {
             mk(&[("table_schema", T), ("table_name", T)]).done()
@@ -2578,6 +2682,22 @@ pub fn constraint_def(ex: &Exec<'_>, oid: &Datum) -> SqlResult<Datum> {
 }
 
 /// `pg_get_indexdef(oid)`, or with `column` > 0 the name of that index column.
+/// `pg_get_viewdef(oid | name)`.
+pub fn view_def(ex: &Exec<'_>, view: &Datum) -> SqlResult<Datum> {
+    let name = view.as_text();
+    let bare = name.rsplit('.').next().unwrap_or(&name).trim_matches('"');
+    for v in ex.s.engine.view_names()? {
+        let found = match view {
+            Datum::Int(oid) => table_oid(&v) == *oid,
+            _ => v == bare,
+        };
+        if found {
+            return Ok(ex.s.engine.view(&v)?.map_or(Datum::Null, |d| Datum::Text(d.0)));
+        }
+    }
+    Ok(Datum::Null)
+}
+
 pub fn index_def(ex: &Exec<'_>, oid: &Datum, column: i64) -> SqlResult<Datum> {
     let Ok(o) = oid.as_i64() else {
         return Ok(Datum::Null);
@@ -3073,12 +3193,24 @@ pub fn has_privilege(ex: &crate::exec::eval::Exec<'_>, name: &str, args: &[Datum
     let one = |p: &str| -> SqlResult<bool> {
         Ok(match name {
             "pg_has_role" => acl.is_superuser(&user) || acl.closure(&user).contains(&crate::exec::acl::role_key(&bare)),
-            "has_table_privilege" | "has_column_privilege" => {
-                let Some(t) = ex.s.engine.find_table(&bare)? else { return Ok(false) };
+            "has_table_privilege" | "has_column_privilege" | "has_any_column_privilege" => {
+                let Some(t) = ex.s.engine.find_table(&bare)? else {
+                    // A view has no columns of its own to grant here: its grants are on its name.
+                    if ex.s.engine.view(&bare)?.is_none() {
+                        return Ok(false);
+                    }
+                    let object = format!("table:{bare}");
+                    let roles = acl.closure(&user);
+                    return Ok(acl.is_superuser(&user)
+                        || acl.grants().iter().any(|g| {
+                            g.object == object && g.privilege == p && !g.deny && roles.contains(&g.grantee)
+                        }));
+                };
                 match (acl.table_access(&user, &t, p), name) {
                     (Access::All, _) => true,
                     (Access::None, _) => false,
                     (Access::Columns(_), "has_table_privilege") => false,
+                    (Access::Columns(c), "has_any_column_privilege") => !c.is_empty(),
                     (Access::Columns(c), _) => c.contains(&text(&rest[1]).to_ascii_lowercase()),
                 }
             }

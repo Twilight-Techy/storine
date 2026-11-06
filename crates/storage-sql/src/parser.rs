@@ -379,6 +379,38 @@ impl Parser {
     // ── nesting limits ──
 
     /// Runs `f` one recursion level deeper ("statement nested too deeply" past `MAX_DEPTH`).
+    /// `name [@p =] value [OUTPUT], ...` of a T-SQL procedure call.
+    fn proc_call(&mut self, status: Option<String>) -> SqlResult<Statement> {
+        let (_, name) = self.object_name()?;
+        let mut args = Vec::new();
+        while !self.statement_end() {
+            let named = match (self.peek(), self.peek_at(1)) {
+                (Some(Token::Variable { name, .. }), Some(Token::Op("="))) => {
+                    Some(name.clone())
+                }
+                _ => None,
+            };
+            if named.is_some() {
+                self.pos += 2;
+            }
+            let e = if self.eat_kw("default") {
+                Expr::Null
+            } else {
+                self.expr()?
+            };
+            let _ = self.eat_kw("output") || self.eat_kw("out");
+            args.push((named, e));
+            if !self.eat_op(",") {
+                break;
+            }
+        }
+        Ok(Statement::ExecProc {
+            name: name.to_ascii_lowercase(),
+            args,
+            status,
+        })
+    }
+
     fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> SqlResult<T>) -> SqlResult<T> {
         if self.depth >= MAX_DEPTH {
             return Err(too_deep());
@@ -923,34 +955,11 @@ impl Parser {
                         self.pos += 2;
                     }
                 }
-                let (_, name) = self.object_name()?;
-                let mut args = Vec::new();
-                while !self.statement_end() {
-                    let named = match (self.peek(), self.peek_at(1)) {
-                        (Some(Token::Variable { name, .. }), Some(Token::Op("="))) => {
-                            Some(name.clone())
-                        }
-                        _ => None,
-                    };
-                    if named.is_some() {
-                        self.pos += 2;
-                    }
-                    let e = if self.eat_kw("default") {
-                        Expr::Null
-                    } else {
-                        self.expr()?
-                    };
-                    let _ = self.eat_kw("output") || self.eat_kw("out");
-                    args.push((named, e));
-                    if !self.eat_op(",") {
-                        break;
-                    }
-                }
-                Ok(Statement::ExecProc {
-                    name: name.to_ascii_lowercase(),
-                    args,
-                    status,
-                })
+                self.proc_call(status)
+            }
+            k if self.dialect == Dialect::MsSql && (k.starts_with("sp_") || k.starts_with("xp_")) => {
+                // A batch may name a system procedure without EXEC.
+                self.proc_call(None)
             }
             "execute" | "exec" => {
                 self.pos += 1;
@@ -3525,16 +3534,23 @@ impl Parser {
     fn table_factor(&mut self) -> SqlResult<TableRef> {
         let lateral = self.eat_kw("lateral");
         if self.eat_op("(") {
-            if self.is_kw("select") || self.is_kw("with") || self.is_kw("values") || self.is_op("(")
-            {
-                let query = self.query()?;
-                self.expect_op(")")?;
-                let alias = self.table_alias()?;
-                return Ok(TableRef::Derived {
-                    query: Box::new(query),
-                    alias,
-                    lateral,
-                });
+            let start = self.pos;
+            // `((SELECT ..) UNION ..)` opens like a parenthesized join, `((a JOIN b ON ..) JOIN c ..)`.
+            let may_be_join = self.is_op("(");
+            if may_be_join || self.is_kw("select") || self.is_kw("with") || self.is_kw("values") {
+                let parsed = self.query().and_then(|q| self.expect_op(")").map(|_| q));
+                match parsed {
+                    Ok(query) => {
+                        let alias = self.table_alias()?;
+                        return Ok(TableRef::Derived {
+                            query: Box::new(query),
+                            alias,
+                            lateral,
+                        });
+                    }
+                    Err(_) if may_be_join => self.pos = start,
+                    Err(e) => return Err(e),
+                }
             }
             let inner = self.nested(Self::table_ref)?;
             self.expect_op(")")?;
@@ -4133,6 +4149,17 @@ impl Parser {
                     return Ok(Expr::Tuple(items));
                 }
                 self.expect_op(")")?;
+                // `(composite).field`.
+                if self.dialect == Dialect::Postgres && self.eat_op(".") {
+                    let field = self.ident()?;
+                    return Ok(Expr::Function {
+                        name: crate::exec::func::FIELD_SELECT.into(),
+                        args: vec![first, Expr::Str(field)],
+                        star: false,
+                        distinct: false,
+                        over: None,
+                    });
+                }
                 Ok(first)
             }
             Token::Op("{") if self.dialect == Dialect::MySql => {

@@ -431,6 +431,7 @@ fn default_vars(dialect: Dialect) -> HashMap<String, String> {
         ("application_name", ""),
         ("extra_float_digits", "1"),
         ("max_identifier_length", "63"),
+        ("max_index_keys", "32"),
     ] {
         v.insert(k.to_owned(), val.to_owned());
     }

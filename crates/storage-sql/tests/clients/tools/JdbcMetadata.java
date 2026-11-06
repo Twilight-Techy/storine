@@ -45,7 +45,10 @@ public class JdbcMetadata {
             expect("columns of customers", check("getColumns", () -> d.getColumns(catalog, schema, "customers", "%")) == 6);
             expect("primary key", check("getPrimaryKeys", () -> d.getPrimaryKeys(catalog, schema, "customers")) == 1);
             expect("imported key", check("getImportedKeys", () -> d.getImportedKeys(catalog, schema, "orders")) == 1);
-            expect("exported key", check("getExportedKeys", () -> d.getExportedKeys(catalog, schema, "customers")) == 1);
+            // Connector/J's query joins every unique key of the referenced table: customers has two,
+            // so MySQL itself answers two rows (`DatabaseMetaDataUsingInfoSchema.getExportedKeys`).
+            int exported = check("getExportedKeys", () -> d.getExportedKeys(catalog, schema, "customers"));
+            expect("exported key", exported == (url.startsWith("jdbc:mysql") ? 2 : 1));
             check("getCrossReference", () -> d.getCrossReference(catalog, schema, "customers", catalog, schema, "orders"));
             check("getIndexInfo", () -> d.getIndexInfo(catalog, schema, "orders", false, true));
             check("getTablePrivileges", () -> d.getTablePrivileges(catalog, schema, "customers"));

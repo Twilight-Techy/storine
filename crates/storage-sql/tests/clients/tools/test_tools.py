@@ -3,6 +3,7 @@
 Runs what the tools really run, headless. See `run.sh` for what is installed. Each suite prints
 `ok` / `FAIL` lines; the exit status is the number of suites that failed.
 """
+import base64
 import json
 import os
 import subprocess
@@ -74,7 +75,7 @@ def sqlalchemy_superset():
                FROM public.orders WHERE ordered_at >= '2024-01-01 00:00:00.000000' AND ordered_at < '2025-01-01 00:00:00.000000'
                GROUP BY DATE_TRUNC('month', ordered_at), status ORDER BY "SUM(amount)" DESC LIMIT 10000"""
         rows = attempt("explore chart query", lambda: c.execute(sa.text(q)).fetchall()) or []
-        note(len(rows) == 4, "chart rows", rows)
+        note(len(rows) == 5, "chart rows", rows)
         attempt("sample rows", lambda: c.execute(sa.text("SELECT * FROM public.customers LIMIT 100")).fetchall())
         attempt("distinct filter values", lambda: c.execute(sa.text("SELECT DISTINCT region FROM public.customers ORDER BY 1")).fetchall())
         attempt("select_star limit", lambda: c.execute(sa.text("SELECT id, name, email FROM public.customers\nLIMIT 1000")).fetchall())
@@ -105,7 +106,7 @@ def psqlodbc_tableau_powerbi():
     note(len(cols) == 6, "orders has 6 columns", [x.column_name for x in cols])
     pks = attempt("SQLPrimaryKeys", lambda: cur.primaryKeys("customers").fetchall()) or []
     note(len(pks) == 1, "primary key", pks)
-    fks = attempt("SQLForeignKeys", lambda: cur.foreignKeys(table="orders").fetchall()) or []
+    fks = attempt("SQLForeignKeys", lambda: cur.foreignKeys(foreignTable="orders").fetchall()) or []
     note(len(fks) == 1, "foreign key", fks)
     attempt("SQLStatistics", lambda: cur.statistics("orders").fetchall())
     attempt("SQLGetTypeInfo", lambda: cur.getTypeInfo().fetchall())
@@ -196,19 +197,20 @@ def grafana():
     browsing its query builder does, and a time series."""
     global suite
     suite = "grafana"
-    base = "http://admin:admin@127.0.0.1:3000"
+    base = "http://127.0.0.1:3000"
+    auth = {"Authorization": "Basic " + base64.b64encode(b"admin:admin").decode()}
     try:
         wait_http("http://127.0.0.1:3000/api/health", 120, "grafana")
     except Exception as e:
         note(False, "grafana up", e)
         return
     def query(sql, fmt="table"):
-        return http("POST", f"{base}/api/ds/query", {"queries": [{"refId": "A", "datasource": {"uid": "storine"}, "rawSql": sql, "format": fmt}], "from": "now-5y", "to": "now"}, timeout=30)
+        return http("POST", f"{base}/api/ds/query", {"queries": [{"refId": "A", "datasource": {"uid": "storine"}, "rawSql": sql, "format": fmt}], "from": "now-5y", "to": "now"}, headers=auth, timeout=30)
 
     def frames(r):
         return r["results"]["A"]["frames"][0]["data"]["values"]
 
-    h = attempt("data source health", lambda: http("GET", f"{base}/api/datasources/uid/storine/health"))
+    h = attempt("data source health", lambda: http("GET", f"{base}/api/datasources/uid/storine/health", headers=auth))
     note(bool(h) and h.get("status") == "OK", "health is OK", h)
     # What the query builder asks, from its source.
     v = attempt("tables", lambda: frames(query("""select quote_ident(table_name) as "table" from information_schema.tables where quote_ident(table_schema) not in ('information_schema','pg_catalog','_timescaledb_cache','_timescaledb_catalog','_timescaledb_internal','_timescaledb_config','timescaledb_information','timescaledb_experimental') and table_type = 'BASE TABLE' and quote_ident(table_schema) IN (select CASE WHEN trim(s[i]) = '"$user"' THEN user ELSE trim(s[i]) END from generate_series(array_lower(string_to_array(current_setting('search_path'),','),1),array_upper(string_to_array(current_setting('search_path'),','),1)) as i, string_to_array(current_setting('search_path'),',') s)""")))

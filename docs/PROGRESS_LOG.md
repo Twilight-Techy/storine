@@ -741,3 +741,7 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Older bug found**: wire messages were written as a header and a body in two calls, which a second writer could split. Messages are one write now.
 - **Stale-read fix confirmed**: 80 of 80 process-chaos runs pass on the fixed code, against 3 failures in about 53 unfixed runs (at that rate, a clean 80 by chance is about 1%).
 
+## 2026-11-04: TASK-150 BI & GUI tool suites
+
+- `modal run tools/modal/sweep.py --tools all`: pgjdbc, Connector/J and mssql-jdbc metadata with 0 failures; 177 tool checks with 0 failures (Metabase and Grafana themselves; SQLAlchemy, psqlODBC and psycopg as stand-ins for Superset, Tableau / Power BI and pgAdmin). `docs/TASKS.md` names what each one is.
+- Fixed: `HAVING` ignored without `GROUP BY` or an aggregate, cursor rows tagged `SELECT` instead of `FETCH`, portals for SQL cursors, composite field access, parenthesized joins, missing catalog data and T-SQL metadata procedures.

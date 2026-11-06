@@ -521,3 +521,164 @@ fn network_and_range_types() {
     let mut m = e.new_session(Dialect::MySql, "app", None);
     assert_eq!(code(&mut m, "CREATE TABLE x (a INET)"), "0A000");
 }
+
+/// What pgjdbc's `DatabaseMetaData` sends (`TASK-150`), verbatim from its 42.7 sources.
+#[test]
+fn pgjdbc_metadata_queries() {
+    let (e, _g) = engine("pgjdbc");
+    let mut s = e.new_session(Dialect::Postgres, "app", None);
+    ok(&mut s, "CREATE TABLE p (a INT, b INT, label TEXT, PRIMARY KEY (a, b))");
+    ok(&mut s, "CREATE TABLE c (id INT PRIMARY KEY, pa INT, pb INT, FOREIGN KEY (pa, pb) REFERENCES p (a, b))");
+    ok(&mut s, "CREATE INDEX c_pa ON c (pa, pb)");
+    ok(&mut s, "CREATE VIEW v AS SELECT a FROM p");
+
+    assert_eq!(col(&mut s, "SELECT setting FROM pg_catalog.pg_settings WHERE name='max_index_keys'"), ["32"]);
+
+    let pk = rows(&mut s, "SELECT result.TABLE_CAT, result.TABLE_SCHEM, result.TABLE_NAME, result.COLUMN_NAME, result.KEY_SEQ, result.PK_NAME FROM (SELECT NULL AS TABLE_CAT, n.nspname AS TABLE_SCHEM, ct.relname AS TABLE_NAME, a.attname AS COLUMN_NAME, (information_schema._pg_expandarray(i.indkey)).n AS KEY_SEQ, ci.relname AS PK_NAME, information_schema._pg_expandarray(i.indkey) AS KEYS, a.attnum AS A_ATTNUM, i.indnkeyatts AS KEY_COUNT FROM pg_catalog.pg_class ct JOIN pg_catalog.pg_attribute a ON (ct.oid = a.attrelid) JOIN pg_catalog.pg_namespace n ON (ct.relnamespace = n.oid) JOIN pg_catalog.pg_index i ON ( a.attrelid = i.indrelid) JOIN pg_catalog.pg_class ci ON (ci.oid = i.indexrelid) WHERE true AND ct.relname = E'p' AND i.indisprimary ) result where  result.A_ATTNUM = (result.KEYS).x  ORDER BY result.table_name, result.pk_name, result.key_seq");
+    let pk: Vec<(&str, &str)> = pk.iter().map(|r| (r[3].as_str(), r[4].as_str())).collect();
+    assert_eq!(pk, [("a", "1"), ("b", "2")]);
+
+    let idx = rows(&mut s, "SELECT tmp.TABLE_CAT, tmp.TABLE_SCHEM, tmp.TABLE_NAME, tmp.NON_UNIQUE, tmp.INDEX_QUALIFIER, tmp.INDEX_NAME, tmp.TYPE, tmp.ORDINAL_POSITION, trim(both '\"' from pg_catalog.pg_get_indexdef(tmp.CI_OID, tmp.ORDINAL_POSITION, false)) AS COLUMN_NAME, CASE tmp.AM_NAME WHEN 'btree' THEN CASE tmp.I_INDOPTION[tmp.ORDINAL_POSITION - 1] & 1::smallint WHEN 1 THEN 'D' ELSE 'A' END ELSE NULL END AS ASC_OR_DESC, tmp.CARDINALITY, tmp.PAGES, tmp.FILTER_CONDITION FROM (SELECT NULL AS TABLE_CAT, n.nspname AS TABLE_SCHEM, ct.relname AS TABLE_NAME, NOT i.indisunique AS NON_UNIQUE, NULL AS INDEX_QUALIFIER, ci.relname AS INDEX_NAME, CASE i.indisclustered WHEN true THEN 1 ELSE CASE am.amname WHEN 'hash' THEN 2 ELSE 3 END END AS TYPE, (information_schema._pg_expandarray(i.indkey)).n AS ORDINAL_POSITION, ci.reltuples AS CARDINALITY, ci.relpages AS PAGES, pg_catalog.pg_get_expr(i.indpred, i.indrelid) AS FILTER_CONDITION, ci.oid AS CI_OID, i.indoption AS I_INDOPTION, am.amname AS AM_NAME FROM pg_catalog.pg_class ct JOIN pg_catalog.pg_namespace n ON (ct.relnamespace = n.oid) JOIN pg_catalog.pg_index i ON (ct.oid = i.indrelid) JOIN pg_catalog.pg_class ci ON (ci.oid = i.indexrelid) JOIN pg_catalog.pg_am am ON (ci.relam = am.oid) WHERE true  AND n.nspname = E'public' AND ct.relname = E'c') AS tmp ORDER BY NON_UNIQUE, TYPE, INDEX_NAME, ORDINAL_POSITION");
+    let idx: Vec<(&str, &str, &str, &str)> = idx.iter().map(|r| (r[5].as_str(), r[7].as_str(), r[8].as_str(), r[9].as_str())).collect();
+    assert_eq!(idx, [("c_pkey", "1", "id", "A"), ("c_pa", "1", "pa", "A"), ("c_pa", "2", "pb", "A")]);
+
+    let fk = rows(&mut s, "SELECT NULL::text AS PKTABLE_CAT, pkn.nspname AS PKTABLE_SCHEM, pkc.relname AS PKTABLE_NAME, pka.attname AS PKCOLUMN_NAME, NULL::text AS FKTABLE_CAT, fkn.nspname AS FKTABLE_SCHEM, fkc.relname AS FKTABLE_NAME, fka.attname AS FKCOLUMN_NAME, pos.n AS KEY_SEQ, CASE con.confupdtype  WHEN 'c' THEN 0 WHEN 'n' THEN 2 WHEN 'd' THEN 4 WHEN 'r' THEN 1 WHEN 'p' THEN 1 WHEN 'a' THEN 3 ELSE NULL END AS UPDATE_RULE, CASE con.confdeltype  WHEN 'c' THEN 0 WHEN 'n' THEN 2 WHEN 'd' THEN 4 WHEN 'r' THEN 1 WHEN 'p' THEN 1 WHEN 'a' THEN 3 ELSE NULL END AS DELETE_RULE, con.conname AS FK_NAME, pkic.relname AS PK_NAME, CASE  WHEN con.condeferrable AND con.condeferred THEN 5 WHEN con.condeferrable THEN 6 ELSE 7 END AS DEFERRABILITY FROM  pg_catalog.pg_namespace pkn, pg_catalog.pg_class pkc, pg_catalog.pg_attribute pka,  pg_catalog.pg_namespace fkn, pg_catalog.pg_class fkc, pg_catalog.pg_attribute fka,  pg_catalog.pg_constraint con,  pg_catalog.generate_series(1, 32) pos(n),  pg_catalog.pg_class pkic WHERE pkn.oid = pkc.relnamespace AND pkc.oid = pka.attrelid AND pka.attnum = con.confkey[pos.n] AND con.confrelid = pkc.oid  AND fkn.oid = fkc.relnamespace AND fkc.oid = fka.attrelid AND fka.attnum = con.conkey[pos.n] AND con.conrelid = fkc.oid  AND con.contype = 'f' AND (pkic.relkind = 'i' OR pkic.relkind = 'I') AND pkic.oid = con.conindid  AND fkn.nspname = E'public' AND fkc.relname = E'c' ORDER BY pkn.nspname,pkc.relname, con.conname,pos.n");
+    let fk: Vec<(&str, &str, &str, &str)> = fk.iter().map(|r| (r[3].as_str(), r[7].as_str(), r[8].as_str(), r[12].as_str())).collect();
+    assert_eq!(fk, [("a", "pa", "1", "p_pkey"), ("b", "pb", "2", "p_pkey")]);
+
+    // pgAdmin and SQLAlchemy read view definitions; a view is a relation to `regclass`.
+    assert_eq!(col(&mut s, "SELECT pg_catalog.pg_get_viewdef('v'::regclass, true)").len(), 1);
+    assert!(col(&mut s, "SELECT pg_get_viewdef('v'::regclass, true)")[0].to_lowercase().contains("select"));
+    assert!(col(&mut s, "SELECT pg_get_viewdef(c.oid, true) FROM pg_class c WHERE c.relname = 'v'")[0].to_lowercase().contains("select"));
+    assert_eq!(col(&mut s, "SELECT pg_get_viewdef('missing')"), ["NULL"]);
+
+    // Composite fields; a value that is not one is refused, not read as NULL.
+    assert_eq!(col(&mut s, "SELECT (information_schema._pg_expandarray(ARRAY[7,8])).x"), ["7", "8"]);
+    assert_eq!(code(&mut s, "SELECT (1).x"), "42809");
+    assert_eq!(code(&mut s, "SELECT (information_schema._pg_expandarray(ARRAY[7])).nope"), "42703");
+    assert_eq!(col(&mut s, "SELECT indkey[1] FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'c_pa'"), ["3"]);
+}
+
+/// psqlODBC nests its joins in parentheses, around tables and around subqueries.
+#[test]
+fn parenthesized_joins() {
+    let (e, _g) = engine("parens");
+    let mut s = e.new_session(Dialect::Postgres, "app", None);
+    ok(&mut s, "CREATE TABLE a (id INT PRIMARY KEY)");
+    ok(&mut s, "CREATE TABLE b (id INT PRIMARY KEY, a INT)");
+    ok(&mut s, "CREATE TABLE c (id INT PRIMARY KEY, b INT)");
+    ok(&mut s, "INSERT INTO a VALUES (1), (2)");
+    ok(&mut s, "INSERT INTO b VALUES (10, 1), (20, 2)");
+    ok(&mut s, "INSERT INTO c VALUES (100, 10)");
+    assert_eq!(col(&mut s, "SELECT c.id FROM ((a INNER JOIN b ON b.a = a.id) INNER JOIN c ON c.b = b.id)"), ["100"]);
+    assert_eq!(col(&mut s, "SELECT count(*) FROM ((a INNER JOIN b ON b.a = a.id)) LEFT OUTER JOIN c ON c.b = b.id"), ["2"]);
+    assert_eq!(col(&mut s, "SELECT r.id FROM ((((SELECT id, a FROM b) r INNER JOIN a ON a.id = r.a)) INNER JOIN c ON c.b = r.id)"), ["10"]);
+    // Still a query where it is one, and a syntax error where it is neither.
+    assert_eq!(col(&mut s, "SELECT count(*) FROM ((SELECT id FROM a) UNION ALL (SELECT id FROM b)) u"), ["4"]);
+    assert_eq!(col(&mut s, "SELECT x.id FROM ((SELECT id FROM a WHERE id = 2)) x"), ["2"]);
+    assert_eq!(code(&mut s, "SELECT 1 FROM ((a JOIN b ON true)"), "42601");
+    assert_eq!(code(&mut s, "SELECT 1 FROM (SELEC 1) x"), "42601");
+}
+
+/// What mssql-jdbc's `DatabaseMetaData` calls (`TASK-150`).
+#[test]
+fn tsql_metadata_procedures() {
+    let (e, _g) = engine("tsqlmeta");
+    let mut s = e.new_session(Dialect::MsSql, "app", None);
+    ok(&mut s, "CREATE TABLE t1 (id INT PRIMARY KEY, name NVARCHAR(10))");
+    ok(&mut s, "CREATE TABLE t2 (a INT UNIQUE, b INT)");
+    let mut pg = e.new_session(Dialect::Postgres, "app", None);
+    ok(&mut pg, "CREATE PROCEDURE pr1() LANGUAGE plpgsql AS $$ BEGIN NULL; END $$");
+    // Named without EXEC, as the first statement of a batch.
+    assert!(col(&mut s, "sp_datatype_info_100 @ODBCVer=3").contains(&"nvarchar".to_owned()));
+    assert_eq!(col(&mut s, "EXEC sp_datatype_info @data_type = 4"), ["int"]);
+    assert_eq!(code(&mut s, "sp_no_such_proc"), "42883");
+    assert_eq!(rows(&mut s, "EXEC sp_special_columns_100 't1', NULL, NULL, 'R'")[0][1], "id");
+    assert_eq!(rows(&mut s, "EXEC sp_special_columns_100 't2'")[0][1], "a");
+    assert!(rows(&mut s, "EXEC sp_special_columns_100 't1', NULL, NULL, 'V'").is_empty());
+    assert_eq!(rows(&mut s, "EXEC sp_stored_procedures 'pr1'")[0][2], "pr1;1");
+    assert!(rows(&mut s, "EXEC sp_stored_procedures 'nope'").is_empty());
+    ok(&mut s, "CREATE ROLE reader");
+    ok(&mut s, "GRANT SELECT ON t1 TO reader");
+    let g = rows(&mut s, "EXEC sp_table_privileges 't1'");
+    assert_eq!((g[0][4].as_str(), g[0][5].as_str(), g[0][6].as_str()), ("reader", "SELECT", "NO"));
+    assert_eq!(rows(&mut s, "EXEC sp_column_privileges 't1'").len(), 2);
+    assert_eq!(rows(&mut s, "EXEC sp_column_privileges 't1', NULL, NULL, 'name'").len(), 1);
+    assert!(rows(&mut s, "EXEC sp_table_privileges 't2'").is_empty());
+    // Undeclared parameters, in order, once each; declared ones are not asked about.
+    let p = rows(&mut s, "EXEC sp_describe_undeclared_parameters N'SELECT * FROM t1 WHERE id = @P0 AND name = @P1 OR id = @P0'");
+    assert_eq!(p.iter().map(|r| r[1].as_str()).collect::<Vec<_>>(), ["@P0", "@P1"]);
+    assert_eq!(p[0][3], "nvarchar(4000)");
+    let p = rows(&mut s, "EXEC sp_describe_undeclared_parameters N'SELECT @a, @b', N'@a int'");
+    assert_eq!(p.iter().map(|r| r[1].as_str()).collect::<Vec<_>>(), ["@b"]);
+}
+
+/// `information_schema` shows real grants and routines, in every dialect's letter case.
+#[test]
+fn information_schema_grants_and_routines() {
+    let (e, _g) = engine("infoschema");
+    let mut s = e.new_session(Dialect::Postgres, "app", None);
+    ok(&mut s, "CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT)");
+    ok(&mut s, "CREATE ROLE reader");
+    ok(&mut s, "GRANT SELECT ON t1 TO reader");
+    ok(&mut s, "GRANT UPDATE (name) ON t1 TO reader");
+    ok(&mut s, "CREATE FUNCTION f1() RETURNS INT LANGUAGE plpgsql AS $$ BEGIN RETURN 1; END $$");
+    assert_eq!(
+        rows(&mut s, "SELECT grantee, table_name, privilege_type, is_grantable FROM information_schema.table_privileges"),
+        [["reader", "t1", "SELECT", "NO"]]
+    );
+    assert_eq!(
+        rows(&mut s, "SELECT column_name, privilege_type FROM information_schema.column_privileges ORDER BY 2, 1"),
+        [["id", "SELECT"], ["name", "SELECT"], ["name", "UPDATE"]]
+    );
+    assert_eq!(
+        rows(&mut s, "SELECT routine_name, routine_type, external_language FROM information_schema.routines"),
+        [["f1", "FUNCTION", "plpgsql"]]
+    );
+    let mut t = e.new_session(Dialect::MsSql, "app", None);
+    assert_eq!(col(&mut t, "SELECT ROUTINE_NAME FROM INFORMATION_SCHEMA.ROUTINES"), ["f1"]);
+    assert_eq!(col(&mut t, "SELECT GRANTEE FROM INFORMATION_SCHEMA.TABLE_PRIVILEGES"), ["reader"]);
+}
+
+/// HAVING without GROUP BY filters, and MySQL's may name aliases; Connector/J lists tables by one.
+#[test]
+fn having_filters_and_mysql_aliases() {
+    let (e, _g) = engine("having");
+    let mut s = e.new_session(Dialect::MySql, "app", None);
+    ok(&mut s, "CREATE TABLE t (a INT PRIMARY KEY, g INT)");
+    ok(&mut s, "CREATE TABLE u (a INT PRIMARY KEY)");
+    ok(&mut s, "CREATE VIEW v AS SELECT a FROM t");
+    ok(&mut s, "INSERT INTO t VALUES (1, 1), (2, 1), (3, 2)");
+    assert_eq!(col(&mut s, "SELECT a FROM t HAVING a > 1 ORDER BY a"), ["2", "3"]);
+    assert_eq!(col(&mut s, "SELECT a * 10 AS x FROM t HAVING x > 10 ORDER BY x"), ["20", "30"]);
+    assert_eq!(rows(&mut s, "SELECT g, count(*) AS c FROM t GROUP BY g HAVING c > 1"), [["1", "2"]]);
+    assert_eq!(col(&mut s, "SELECT g FROM t GROUP BY g HAVING sum(a) > 2 AND g < 2"), ["1"]);
+    // An alias over a column of the same name wins, as the driver relies on.
+    assert_eq!(col(&mut s, "SELECT g + 1 AS a FROM t HAVING a = 3"), ["3"]);
+    assert_eq!(col(&mut s, "SELECT t.a AS b FROM t HAVING t.a = 2"), ["2"]);
+    let list = |kind: &str| format!("SELECT TABLE_SCHEMA AS TABLE_CAT, TABLE_NAME, CASE WHEN TABLE_TYPE='BASE TABLE' THEN CASE WHEN TABLE_SCHEMA = 'mysql' OR TABLE_SCHEMA = 'performance_schema' THEN 'SYSTEM TABLE' ELSE 'TABLE' END WHEN TABLE_TYPE='TEMPORARY' THEN 'LOCAL_TEMPORARY' ELSE TABLE_TYPE END AS TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = 'storine' AND TABLE_NAME LIKE '%' HAVING TABLE_TYPE IN ('{kind}',null,null,null,null) ORDER BY TABLE_TYPE, TABLE_SCHEMA, TABLE_NAME");
+    assert_eq!(rows(&mut s, &list("TABLE")).iter().map(|r| r[1].clone()).collect::<Vec<_>>(), ["t", "u"]);
+    assert_eq!(rows(&mut s, &list("VIEW")).iter().map(|r| r[1].clone()).collect::<Vec<_>>(), ["v"]);
+    // Metabase's time zone probe.
+    assert_eq!(col(&mut s, "SELECT time_format(timediff(now(), convert_tz(now(), @@GLOBAL.time_zone, '+00:00')), '%H:%i') AS 'offset'"), ["00:00"]);
+    assert_eq!(col(&mut s, "SELECT time_format(timediff('2024-01-01 10:00:00', '2024-01-01 12:30:00'), '%H:%i')"), ["-02:30"]);
+}
+
+/// pg_attribute has index columns: psqlODBC's SQLPrimaryKeys joins them.
+#[test]
+fn psqlodbc_catalog_queries() {
+    let (e, _g) = engine("psqlodbc");
+    let mut s = e.new_session(Dialect::Postgres, "app", None);
+    ok(&mut s, "CREATE TABLE p (a INT, b INT, PRIMARY KEY (b, a))");
+    ok(&mut s, "CREATE TABLE c (id INT PRIMARY KEY, pa INT, pb INT, FOREIGN KEY (pb, pa) REFERENCES p (b, a))");
+    let pk = col(&mut s, "select ta.attname, ia.attnum, ic.relname, n.nspname, tc.relname from pg_catalog.pg_attribute ta, pg_catalog.pg_attribute ia, pg_catalog.pg_class tc, pg_catalog.pg_index i, pg_catalog.pg_namespace n, pg_catalog.pg_class ic where tc.relname = 'p' AND n.nspname = 'public' AND tc.oid = i.indrelid AND n.oid = tc.relnamespace AND i.indisprimary = 't' AND ia.attrelid = i.indexrelid AND ta.attrelid = i.indrelid AND ta.attnum = i.indkey[ia.attnum-1] AND (NOT ta.attisdropped) AND (NOT ia.attisdropped) AND ic.oid = i.indexrelid order by ia.attnum");
+    assert_eq!(pk, ["b", "a"]);
+    let fk = rows(&mut s, "select ref.oid, a1.attname, a2.attname, ref.i from ((((((( (select cn.oid, conrelid, conkey, confrelid, confkey, generate_series(array_lower(conkey, 1), array_upper(conkey, 1)) i, confupdtype, confdeltype, conname, condeferrable, condeferred from pg_catalog.pg_constraint cn, pg_catalog.pg_class c, pg_catalog.pg_namespace n where contype = 'f' and conrelid = c.oid and relname = 'c' and n.oid = c.relnamespace and n.nspname = 'public') ref inner join pg_catalog.pg_class c1 on c1.oid = ref.conrelid) inner join pg_catalog.pg_namespace n1 on n1.oid = c1.relnamespace) inner join pg_catalog.pg_attribute a1 on a1.attrelid = c1.oid and a1.attnum = conkey[i]) inner join pg_catalog.pg_class c2 on c2.oid = ref.confrelid) inner join pg_catalog.pg_namespace n2 on n2.oid = c2.relnamespace) inner join pg_catalog.pg_attribute a2 on a2.attrelid = c2.oid and a2.attnum = confkey[i]) left outer join pg_catalog.pg_constraint cn on cn.conrelid = ref.confrelid and cn.contype = 'p') order by ref.oid, ref.i");
+    let fk: Vec<(&str, &str)> = fk.iter().map(|r| (r[1].as_str(), r[2].as_str())).collect();
+    assert_eq!(fk, [("pb", "b"), ("pa", "a")]);
+    // Metabase's table listing reaches views too, and column-wise grants.
+    ok(&mut s, "CREATE VIEW w AS SELECT a FROM p");
+    assert_eq!(col(&mut s, "SELECT pg_catalog.has_any_column_privilege(current_user, '\"public\".\"p\"', 'update')"), ["t"]);
+    assert_eq!(col(&mut s, "SELECT has_table_privilege(current_user, '\"public\".\"w\"', 'select')"), ["t"]);
+    assert_eq!(col(&mut s, "SELECT has_table_privilege(current_user, 'nothing', 'select')"), ["f"]);
+}

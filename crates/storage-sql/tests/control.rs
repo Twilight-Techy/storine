@@ -370,3 +370,56 @@ fn over_the_postgres_wire() {
     let (t, b) = g.read();
     assert_eq!((t, sqlstate(&b).as_str()), (b'E', "57P01"));
 }
+
+/// What drivers read of a SQL cursor over the wire (`TASK-150`): psqlODBC finds its rows by the
+/// `FETCH` tag; psycopg describes and closes the cursor as a portal.
+#[test]
+fn cursors_over_the_postgres_wire() {
+    let (e, _g) = engine("wirecursor", EngineConfig::default());
+    let addr = serve(&e);
+    let mut c = Pg::connect(addr);
+    assert_eq!(c.run("CREATE TABLE t (a INT PRIMARY KEY, b TEXT)"), None);
+    assert_eq!(c.run("INSERT INTO t VALUES (1, 'x'), (2, 'y')"), None);
+    let messages = |c: &mut Pg| {
+        let mut out = Vec::new();
+        loop {
+            let (tag, body) = c.read();
+            if tag == b'Z' {
+                return out;
+            }
+            out.push((tag, body));
+        }
+    };
+    let text = |b: &[u8]| String::from_utf8_lossy(b).trim_end_matches('\0').to_owned();
+
+    // As psqlODBC sends it: three statements, the rows tagged by the last.
+    c.send("BEGIN;declare \"SQL_CUR\" cursor with hold for SELECT a FROM t ORDER BY a;fetch 100 in \"SQL_CUR\"");
+    let tags: Vec<String> = messages(&mut c).iter().filter(|m| m.0 == b'C').map(|m| text(&m.1)).collect();
+    assert_eq!(tags, ["BEGIN", "DECLARE CURSOR", "FETCH 2"]);
+
+    // Describe ('P') of the portal a DECLARE made: its columns, without moving it.
+    c.s.write_all(&msg(b'D', b"PSQL_CUR\0")).unwrap();
+    c.s.write_all(&msg(b'S', b"")).unwrap();
+    let got = messages(&mut c);
+    assert_eq!(got[0].0, b'T', "{got:?}");
+    assert!(String::from_utf8_lossy(&got[0].1).contains('a'));
+
+    // Close ('P') ends the cursor; closing what does not exist is no error.
+    for _ in 0..2 {
+        c.s.write_all(&msg(b'C', b"PSQL_CUR\0")).unwrap();
+        c.s.write_all(&msg(b'S', b"")).unwrap();
+        assert_eq!(messages(&mut c)[0].0, b'3');
+    }
+    assert_eq!(c.run("FETCH 1 IN \"SQL_CUR\"").as_deref(), Some("34000"));
+    assert_eq!(c.run("COMMIT"), None);
+
+    // A portal that is nothing is still an error.
+    c.s.write_all(&msg(b'D', b"Pnothing\0")).unwrap();
+    c.s.write_all(&msg(b'S', b"")).unwrap();
+    assert_eq!(messages(&mut c)[0].0, b'E');
+
+    // Plain queries keep their tag after a fetch.
+    c.send("SELECT 1");
+    let tags: Vec<String> = messages(&mut c).iter().filter(|m| m.0 == b'C').map(|m| text(&m.1)).collect();
+    assert_eq!(tags, ["SELECT 1"]);
+}
