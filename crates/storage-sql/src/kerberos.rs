@@ -675,9 +675,10 @@ impl Kerberos {
                 kvno.map_or("-".into(), |k| k.to_string())
             ));
         }
-        let enc_ticket = candidates
+        // The realm is the key's, not the ticket's: that field is outside the encryption.
+        let (service_realm, enc_ticket) = candidates
             .iter()
-            .find_map(|e| etype.decrypt(&e.key, 2, cipher))
+            .find_map(|e| etype.decrypt(&e.key, 2, cipher).map(|plain| (e.realm.clone(), plain)))
             .ok_or_else(|| {
                 format!("the ticket for {sname}@{realm} does not decrypt with the keytab's key (an old kvno?)")
             })?;
@@ -737,7 +738,7 @@ impl Kerberos {
             }
             seen.insert(key, ctime + 2 * SKEW);
         }
-        let user = if crealm == realm && !self.keep_realm {
+        let user = if crealm == service_realm && !self.keep_realm {
             cname
         } else {
             format!("{cname}@{crealm}")

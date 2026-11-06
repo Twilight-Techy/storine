@@ -196,6 +196,8 @@ struct ReplicaState {
     hb_seq: u64,
     acks: BTreeMap<NodeId, u64>,
     last_heartbeat: u64,
+    /// Leader: since when it has been talking to its peers (elected, or woken from quiescence).
+    active_since: u64,
     idle_beats: u32,
     /// Leader: members being removed and the time the removal was proposed. They are kept
     /// informed until they acknowledge the configuration that removed them (thesis §4.2.2), or
@@ -235,6 +237,8 @@ pub struct NodeStats {
     pub allocator_actions: u64,
     pub replicas_added: u64,
     pub replicas_removed: u64,
+    /// Leaders that stepped down for want of a quorum.
+    pub check_quorum_step_downs: u64,
 }
 
 /// The multi-Raft driver of one node (see the module docs).
@@ -445,6 +449,7 @@ impl NodeDriver {
                 hb_seq: 0,
                 acks: BTreeMap::new(),
                 last_heartbeat: 0,
+                active_since: 0,
                 idle_beats: 0,
                 removing: Vec::new(),
                 uninitialized_since: None,
@@ -919,7 +924,22 @@ impl NodeDriver {
         let raft = Arc::clone(&r.raft);
         if raft.is_leader() && r.lead_term == raft.current_term() {
             if r.leader_quiet {
+                r.active_since = now;
                 return Ok(());
+            }
+            // Check quorum: a leader cut off from most of its range keeps its term forever, and
+            // requests would wait on it for a quorum that never answers.
+            let window = self.cfg.election_max_us.saturating_mul(2);
+            if now.saturating_sub(r.active_since) > window {
+                let m = raft.membership();
+                let voters: Vec<NodeId> = m.members().iter().filter(|x| m.is_voter(x.id)).map(|x| x.id).collect();
+                let reachable = voters.iter().filter(|&&v| v == self.id || self.heard.get(&v).is_some_and(|&t| now.saturating_sub(t) < window)).count();
+                if !voters.is_empty() && reachable <= voters.len() / 2 {
+                    raft.relinquish_leadership();
+                    self.reset_election(range);
+                    self.stats.check_quorum_step_downs += 1;
+                    return Ok(());
+                }
             }
             if now.saturating_sub(r.last_heartbeat) >= hb {
                 r.last_heartbeat = now;
@@ -1042,6 +1062,7 @@ impl NodeDriver {
             .collect();
         r.acks.clear();
         r.closing = None;
+        r.active_since = self.now;
         r.leader_quiet = false;
         r.idle_beats = 0;
         r.quiescent = None;

@@ -573,6 +573,9 @@ fn parenthesized_joins() {
     assert_eq!(col(&mut s, "SELECT c.id FROM ((a INNER JOIN b ON b.a = a.id) INNER JOIN c ON c.b = b.id)"), ["100"]);
     assert_eq!(col(&mut s, "SELECT count(*) FROM ((a INNER JOIN b ON b.a = a.id)) LEFT OUTER JOIN c ON c.b = b.id"), ["2"]);
     assert_eq!(col(&mut s, "SELECT r.id FROM ((((SELECT id, a FROM b) r INNER JOIN a ON a.id = r.a)) INNER JOIN c ON c.b = r.id)"), ["10"]);
+    // What follows a query in its parentheses, and aliases that look like it.
+    assert_eq!(col(&mut s, "SELECT id FROM ((SELECT id FROM a ORDER BY id DESC) LIMIT 1) x"), ["2"]);
+    assert_eq!(col(&mut s, "SELECT minus.id FROM ((SELECT id FROM a) minus JOIN b ON b.a = minus.id) ORDER BY 1"), ["1", "2"]);
     // Still a query where it is one, and a syntax error where it is neither.
     assert_eq!(col(&mut s, "SELECT count(*) FROM ((SELECT id FROM a) UNION ALL (SELECT id FROM b)) u"), ["4"]);
     assert_eq!(col(&mut s, "SELECT x.id FROM ((SELECT id FROM a WHERE id = 2)) x"), ["2"]);
@@ -681,4 +684,97 @@ fn psqlodbc_catalog_queries() {
     assert_eq!(col(&mut s, "SELECT pg_catalog.has_any_column_privilege(current_user, '\"public\".\"p\"', 'update')"), ["t"]);
     assert_eq!(col(&mut s, "SELECT has_table_privilege(current_user, '\"public\".\"w\"', 'select')"), ["t"]);
     assert_eq!(col(&mut s, "SELECT has_table_privilege(current_user, 'nothing', 'select')"), ["f"]);
+}
+
+/// Audit findings over SQL (`TASK-152`): each of these was a way past a check or a wrong answer.
+#[test]
+fn audit_temp_tables_cannot_stand_in_for_real_ones() {
+    let (e, _g) = engine("audit_temp");
+    let mut admin = e.new_session(Dialect::Postgres, "app", None);
+    ok(&mut admin, "CREATE TABLE payroll (id INT PRIMARY KEY, pay INT)");
+    ok(&mut admin, "CREATE TABLE helper (id INT PRIMARY KEY)");
+    ok(&mut admin, "INSERT INTO helper VALUES (1)");
+    ok(&mut admin, "INSERT INTO payroll VALUES (1, 100), (2, 200)");
+    ok(&mut admin, "CREATE VIEW v AS SELECT id FROM helper");
+    // A grant kept by name must not outlive the temporary table it was made on.
+    ok(&mut admin, "CREATE TEMP TABLE payroll2 (x INT)");
+    assert_eq!(code(&mut admin, "GRANT ALL ON payroll2 TO PUBLIC"), "0A000");
+    // A view reads its own table, not a temporary one named like it.
+    ok(&mut admin, "CREATE TEMP TABLE helper (id INT PRIMARY KEY)");
+    ok(&mut admin, "INSERT INTO helper VALUES (7), (8)");
+    assert_eq!(col(&mut admin, "SELECT id FROM v"), ["1"]);
+    assert_eq!(col(&mut admin, "SELECT count(*) FROM helper"), ["2"]);
+}
+
+#[test]
+fn audit_optimizer_keeps_results() {
+    let (e, _g) = engine("audit_opt");
+    let mut s = e.new_session(Dialect::Postgres, "app", None);
+    ok(&mut s, "CREATE TABLE o (k INT PRIMARY KEY, w INT)");
+    ok(&mut s, "CREATE TABLE i (id INT PRIMARY KEY, k INT, v INT)");
+    ok(&mut s, "INSERT INTO o VALUES (1, 10), (2, 20)");
+    ok(&mut s, "INSERT INTO i VALUES (1, 1, 5)");
+    // An aggregate always gives a row, so EXISTS is true for every outer row.
+    assert_eq!(col(&mut s, "SELECT k FROM o WHERE EXISTS (SELECT count(*) FROM i WHERE i.k = o.k) ORDER BY k"), ["1", "2"]);
+    assert!(col(&mut s, "SELECT k FROM o WHERE NOT EXISTS (SELECT max(v) FROM i WHERE i.k = o.k)").is_empty());
+    // The aggregate's argument names the outer row.
+    assert_eq!(col(&mut s, "SELECT (SELECT sum(i.v + o.w) FROM i WHERE i.k = o.k) FROM o ORDER BY k"), ["15", "NULL"]);
+    // Cached subqueries of two arms of a statement are different queries.
+    assert_eq!(col(&mut s, "SELECT (SELECT max(k) FROM o) UNION ALL SELECT (SELECT min(k) FROM o)"), ["2", "1"]);
+    // Equal values join whatever their numeric type.
+    assert_eq!(col(&mut s, "SELECT count(*) FROM (SELECT 1.5::float8 AS a) x JOIN (SELECT 1.5::numeric AS b) y ON a = b"), ["1"]);
+    // An unqualified ON name stays on the table it resolved to.
+    ok(&mut s, "CREATE TABLE a (k INT, x INT)");
+    ok(&mut s, "CREATE TABLE b (k INT, j INT)");
+    ok(&mut s, "CREATE TABLE c (j INT, x INT)");
+    ok(&mut s, "INSERT INTO a SELECT g % 10, g % 2 FROM generate_series(1, 2000) g");
+    ok(&mut s, "INSERT INTO b SELECT g, g FROM generate_series(0, 9) g");
+    ok(&mut s, "INSERT INTO c SELECT g, 0 FROM generate_series(0, 9) g");
+    ok(&mut s, "ANALYZE");
+    assert_eq!(col(&mut s, "SELECT count(*) FROM a JOIN b ON a.k = b.k AND x = 1 JOIN c ON b.j = c.j"), ["1000"]);
+}
+
+#[test]
+fn audit_limits_hold() {
+    let (e, _g) = engine("audit_limits");
+    let mut s = e.new_session(Dialect::Postgres, "app", None);
+    // A setting past what a duration holds is refused; it used to abort the process later.
+    let _ = exec(&mut s, "SET statement_timeout = '100000000000000000000000000'");
+    assert_eq!(col(&mut s, "SELECT 1"), ["1"]);
+    // Function bodies nested in the parser.
+    let deep = format!("CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ {} $$", "BEGIN ".repeat(200_000));
+    assert_eq!(code(&mut s, &deep), "54001");
+    // `..` inside a string is the string's.
+    ok(&mut s, "CREATE FUNCTION dots() RETURNS text LANGUAGE plpgsql AS $$ BEGIN RETURN 'a..b'; END $$");
+    assert_eq!(col(&mut s, "SELECT dots()"), ["a..b"]);
+    ok(&mut s, "CREATE FUNCTION loops() RETURNS int LANGUAGE plpgsql AS $$ DECLARE t int := 0; BEGIN FOR i IN 1..10 LOOP t := t + i; END LOOP; RETURN t; END $$");
+    assert_eq!(col(&mut s, "SELECT loops()"), ["55"]);
+    // A routine's returned rows count against the statement's memory.
+    ok(&mut s, "SET max_query_memory = '1MB'");
+    ok(&mut s, "CREATE FUNCTION boom() RETURNS SETOF int LANGUAGE plpgsql AS $$ BEGIN LOOP RETURN NEXT 1; END LOOP; END $$");
+    assert_eq!(code(&mut s, "SELECT * FROM boom()"), "53200");
+    // More columns than a wire format can say.
+    let wide = format!("SELECT {}", vec!["1"; 5000].join(","));
+    assert_eq!(code(&mut s, &wide), "54011");
+    // Bad cursor arithmetic stops at the ends.
+    ok(&mut s, "BEGIN");
+    ok(&mut s, "DECLARE c SCROLL CURSOR FOR SELECT 1");
+    ok(&mut s, "FETCH 1 FROM c");
+    assert!(col(&mut s, "FETCH RELATIVE 9223372036854775807 FROM c").is_empty());
+    ok(&mut s, "COMMIT");
+    // Parentheses that open both readings cost no exponential time.
+    let t = std::time::Instant::now();
+    let nested = format!("SELECT * FROM {}", "((SELECT * FROM ".repeat(70));
+    assert_eq!(code(&mut s, &nested), "42601");
+    assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+}
+
+#[test]
+fn audit_expressions_that_could_not_be_kept_are_refused() {
+    let (e, _g) = engine("audit_ddl");
+    let mut s = e.new_session(Dialect::Postgres, "app", None);
+    assert_eq!(code(&mut s, "CREATE TABLE t (a INT DEFAULT (SELECT 1))"), "0A000");
+    assert_eq!(code(&mut s, "CREATE TABLE t (a INT, CHECK (a IN (SELECT 1)))"), "0A000");
+    ok(&mut s, "CREATE TABLE t (a INT)");
+    assert_eq!(code(&mut s, "ALTER TABLE t ALTER COLUMN a SET DEFAULT (SELECT 1)"), "0A000");
 }

@@ -1260,25 +1260,56 @@ fn route_ranges(conn: &mut NonBlockingConn, rc: &ranges::RangeContext, security:
             ConnStep::Progress
         }
     };
+    let pool = if op == OP_KV { &rc.kv_pool } else { &rc.pool };
     let job: cluster::Job = match op {
+        OP_AUTH => {
+            let Ok(token) = core::str::from_utf8(&body) else {
+                return reply(conn, (STATUS_UNAUTHORIZED, 0, b"invalid UTF-8 token".to_vec()));
+            };
+            return match security.authenticate_token(token) {
+                Some(role) => {
+                    conn.role = role;
+                    reply(conn, (STATUS_OK, role as u64, Vec::new()))
+                }
+                None => {
+                    conn.role = security.initial_role();
+                    reply(conn, (STATUS_UNAUTHORIZED, 0, b"invalid credentials".to_vec()))
+                }
+            };
+        }
         OP_RANGE_BATCH => {
             rc.node.deliver(body);
             return reply(conn, (STATUS_OK, 0, Vec::new()));
         }
+        // A pool of its own: a coordinator on one node blocks on these from another, and sharing
+        // workers would let every worker wait on a call queued behind them.
         OP_KV => {
             let node = Arc::clone(&rc.node);
             let timeout = rc.kv_timeout();
             Box::new(move || (STATUS_OK, 0, node.handle_encoded(&body, timeout)))
         }
-        OP_DOC_GET | OP_DOC_WRITE | OP_DOC_QUERY | OP_DOC_INFO | OP_DOC_ADMIN | OP_DOC_AGGREGATE | OP_DOC_SCAN_COLUMNS => {
+        OP_DOC_AGGREGATE | OP_DOC_SCAN_COLUMNS => {
+            // Whole-collection work in memory, as in the other modes.
+            let Some(permit) = rc.analytics_permit() else {
+                return reply(conn, (STATUS_OVERLOADED, 0, b"too many concurrent analytic queries".to_vec()));
+            };
+            let backend = rc.backend();
+            Box::new(move || {
+                let _permit = permit;
+                if op == OP_DOC_AGGREGATE {
+                    documents::doc_aggregate(&backend, &body)
+                } else {
+                    documents::doc_scan_columns(&backend, &body)
+                }
+            })
+        }
+        OP_DOC_GET | OP_DOC_WRITE | OP_DOC_QUERY | OP_DOC_INFO | OP_DOC_ADMIN => {
             let backend = rc.backend();
             Box::new(move || match op {
                 OP_DOC_GET => documents::doc_get(&backend, &body),
                 OP_DOC_WRITE => documents::doc_write(&backend, &body),
                 OP_DOC_QUERY => documents::doc_query(&backend, &body),
                 OP_DOC_INFO => documents::doc_admin(&backend, &body, false),
-                OP_DOC_AGGREGATE => documents::doc_aggregate(&backend, &body),
-                OP_DOC_SCAN_COLUMNS => documents::doc_scan_columns(&backend, &body),
                 _ => documents::doc_admin(&backend, &body, true),
             })
         }
@@ -1318,7 +1349,7 @@ fn route_ranges(conn: &mut NonBlockingConn, rc: &ranges::RangeContext, security:
         let sh = Arc::clone(shard);
         Arc::new(move || sh.wake())
     };
-    match rc.pool.submit(job, wake) {
+    match pool.submit(job, wake) {
         Ok(rx) => {
             conn.pending_job = Some(rx);
             ConnStep::Progress

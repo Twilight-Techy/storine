@@ -12,7 +12,6 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
 
 use storage_types::Decimal;
 
@@ -37,23 +36,14 @@ pub struct Auth {
 
 /// Accepts SQL Server clients on `listener` forever (one thread per connection).
 pub fn serve(engine: Arc<Engine>, listener: TcpListener, auth: Arc<Auth>) {
-    for conn in listener.incoming() {
-        let Ok(stream) = conn else { continue };
-        let engine = Arc::clone(&engine);
-        let auth = Arc::clone(&auth);
-        thread::spawn(move || {
-            let _ = stream.set_nodelay(true);
-            if let Err(e) = Conn::run(engine, stream, &auth) {
-                if !matches!(
-                    e.kind(),
-                    io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-                ) {
-                    eprintln!("storine-sql: tds connection ended: {e}");
-                }
-            }
-        });
-    }
+    crate::listener::serve("tds", listener, move |stream, login| {
+        Conn::run(Arc::clone(&engine), stream, &auth, &login)
+    });
 }
+
+// Packet status bits.
+const STATUS_RESET: u8 = 0x08;
+const STATUS_RESET_KEEP_TXN: u8 = 0x10;
 
 // Packet types.
 const PT_SQL_BATCH: u8 = 0x01;
@@ -93,11 +83,29 @@ const COLLATION: [u8; 5] = [0x09, 0x04, 0xd0, 0x00, 0x34];
 
 /// Largest TDS message accepted from a client.
 const MAX_MESSAGE: usize = 256 * 1024 * 1024;
+/// The same before login. A token in LOGIN7 is the largest thing that comes then.
+const MAX_LOGIN_MESSAGE: usize = 1 << 20;
 
 /// Days between 0001-01-01 and 1970-01-01.
 const DAYS_0001_TO_1970: i64 = 719_162;
 /// Days between 1900-01-01 and 1970-01-01.
 const DAYS_1900_TO_1970: i64 = 25_567;
+
+/// An error message can echo a client's value, and its token's length is two bytes: past that,
+/// the rest of the message would be read as tokens.
+fn bounded_message(m: String) -> String {
+    const MAX_UNITS: usize = 8000;
+    let mut units = 0;
+    let mut end = m.len();
+    for (at, c) in m.char_indices() {
+        units += c.len_utf16();
+        if units > MAX_UNITS {
+            end = at;
+            break;
+        }
+    }
+    m[..end].to_owned()
+}
 
 fn utf16(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(u16::to_le_bytes).collect()
@@ -466,8 +474,10 @@ impl Wire {
                     .bytes(&mag.to_le_bytes()[..usize::from(len - 1)]);
             }
             Wire::NVarChar(Some(_)) => {
+                // TDS before 7.2 has no way to say more than a two-byte length.
                 let u = utf16(&text_of(d));
-                t.u16(u.len() as u16).bytes(&u);
+                let n = u.len().min(65_534);
+                t.u16(n as u16).bytes(&u[..n]);
             }
             Wire::VarBinary(Some(_)) => {
                 let b = bytes_of(d);
@@ -711,6 +721,10 @@ impl Write for Output {
 
 struct Conn {
     attention: AttentionWatch,
+    /// Largest message accepted now: less before login.
+    max_message: usize,
+    /// The message just read asked for a connection reset; whether it keeps the transaction.
+    reset: Option<bool>,
     r: Input,
     w: Output,
     session: Session,
@@ -732,12 +746,19 @@ struct Prepared {
 }
 
 impl Conn {
-    fn run(engine: Arc<Engine>, stream: TcpStream, auth: &Auth) -> io::Result<()> {
+    fn run(
+        engine: Arc<Engine>,
+        stream: TcpStream,
+        auth: &Auth,
+        deadline: &crate::listener::Login,
+    ) -> io::Result<()> {
         let session = engine.new_session(Dialect::MsSql, "", None);
         session.control.attach_socket(&stream);
         let attention = AttentionWatch::start(stream.try_clone()?, Arc::clone(&session.control));
         let mut c = Conn {
             attention,
+            max_message: MAX_LOGIN_MESSAGE,
+            reset: None,
             r: Input::Plain(BufReader::new(stream.try_clone()?)),
             w: Output::Plain(BufWriter::new(stream)),
             session,
@@ -958,6 +979,8 @@ impl Conn {
         c.env_change(&mut t, 4, &ps, "4096");
         c.done(&mut t, TK_DONE, 0, 0, 0);
         c.send(PT_REPLY, &t.b)?;
+        deadline.done();
+        c.max_message = MAX_MESSAGE;
         c.requests()
     }
 
@@ -1023,6 +1046,14 @@ impl Conn {
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return Err(e),
             };
+            if let Some(keep_transaction) = self.reset.take() {
+                if keep_transaction {
+                    self.session.reset_session_state();
+                } else {
+                    self.session.reset_connection();
+                }
+                self.prepared.clear();
+            }
             self.attention.begin();
             let mut t = Tokens {
                 b: Vec::new(),
@@ -1482,7 +1513,7 @@ impl Conn {
         b.u32(error_number(e.code) as u32)
             .u8(1)
             .u8(16)
-            .us_varchar(&tsql_message(e, &self.session.database))
+            .us_varchar(&bounded_message(tsql_message(e, &self.session.database)))
             .b_varchar("storine")
             .b_varchar("");
         if self.version >= TDS72 {
@@ -1507,10 +1538,14 @@ impl Conn {
                     "bad TDS packet length",
                 ));
             }
+            // How pooled clients reset a connection: bits of the first packet's status.
+            if out.is_empty() && h[1] & (STATUS_RESET | STATUS_RESET_KEEP_TXN) != 0 {
+                self.reset = Some(h[1] & STATUS_RESET == 0);
+            }
             let start = out.len();
             out.resize(start + len - 8, 0);
             self.r.read_exact(&mut out[start..])?;
-            if out.len() > MAX_MESSAGE {
+            if out.len() > self.max_message {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "TDS message too large",

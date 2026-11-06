@@ -541,3 +541,85 @@ fn trust_mode_keeps_working() {
     let mut l = e.new_session(Dialect::Postgres, "limited", None);
     refused(&mut l, "SELECT * FROM t");
 }
+
+/// Audit findings (`TASK-152`): ways a role could become more than it was given.
+#[test]
+fn audit_no_way_up() {
+    let (e, _keep, dir) = engine("audit_up");
+    let mut a = e.new_session(Dialect::Postgres, "admin", None);
+    ok(&mut a, "CREATE ROLE member LOGIN IN ROLE sysadmin");
+    ok(&mut a, "CREATE ROLE boss CREATEROLE LOGIN");
+    ok(&mut a, "CREATE ROLE low LOGIN");
+    ok(&mut a, "CREATE TABLE t (a INT PRIMARY KEY, secret TEXT, owner_name TEXT)");
+    ok(&mut a, "INSERT INTO t VALUES (1, 's', 'low')");
+    // CREATEROLE does not reach a superuser role, directly or through membership.
+    let mut boss = e.new_session(Dialect::Postgres, "boss", None);
+    refused(&mut boss, "ALTER ROLE boss IN ROLE sysadmin");
+    refused(&mut boss, "CREATE ROLE evil LOGIN PASSWORD 'x' IN ROLE sysadmin");
+    refused(&mut boss, "ALTER ROLE member PASSWORD 'pwned'");
+    let mut my = e.new_session(Dialect::MySql, "boss", None);
+    refused(&mut my, "SET PASSWORD FOR member = 'pwned'");
+    // A grant option on a column gives that column.
+    ok(&mut a, "GRANT SELECT (a) ON t TO low WITH GRANT OPTION");
+    let mut low = e.new_session(Dialect::Postgres, "low", None);
+    refused(&mut low, "GRANT SELECT ON t TO low");
+    refused(&mut low, "GRANT SELECT (secret) ON t TO low");
+    ok(&mut low, "GRANT SELECT (a) ON t TO boss");
+    refused(&mut low, "SELECT secret FROM t");
+    // A temporary table's name is no way to a grant on the real one.
+    let mut low2 = e.new_session(Dialect::Postgres, "low", None);
+    ok(&mut low2, "CREATE TEMP TABLE t (x INT)");
+    assert_eq!(exec(&mut low2, "GRANT ALL ON t TO low").map(|_| ()).unwrap_err().code, "0A000");
+    ok(&mut low2, "DROP TABLE t");
+    refused(&mut low2, "SELECT secret FROM t");
+    // Nor is one read beside a view of the real one: their answers are not shared.
+    ok(&mut a, "CREATE ROLE maker LOGIN");
+    ok(&mut a, "GRANT CREATE ON DATABASE storine TO maker");
+    let mut m = e.new_session(Dialect::Postgres, "maker", None);
+    ok(&mut m, "CREATE VIEW v AS SELECT * FROM t");
+    ok(&mut m, "CREATE TEMP TABLE t (x INT)");
+    refused(&mut m, "SELECT * FROM t s LEFT JOIN v ON true");
+    // Membership in a superuser role makes a role off limits to a role manager, whichever way.
+    ok(&mut a, "CREATE ROLE deep LOGIN IN ROLE member");
+    refused(&mut boss, "GRANT member TO boss");
+    refused(&mut boss, "GRANT deep TO boss");
+    refused(&mut boss, "DROP ROLE member");
+    refused(&mut boss, "ALTER ROLE member RENAME TO other");
+    drop((a, boss, my, low, low2, m));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn audit_row_security_holds() {
+    let (e, _keep, dir) = engine("audit_rls");
+    let mut a = e.new_session(Dialect::Postgres, "admin", None);
+    ok(&mut a, "CREATE ROLE low LOGIN");
+    ok(&mut a, "CREATE TABLE memberships (usr TEXT PRIMARY KEY, tenant INT)");
+    ok(&mut a, "INSERT INTO memberships VALUES ('low', 1)");
+    ok(&mut a, "CREATE TABLE docs (id INT PRIMARY KEY, tenant INT, ssn TEXT)");
+    ok(&mut a, "INSERT INTO docs VALUES (1, 1, 'mine'), (2, 2, 'yours')");
+    ok(&mut a, "GRANT SELECT ON docs TO low");
+    ok(&mut a, "GRANT SELECT ON memberships TO low");
+    ok(&mut a, "ALTER TABLE docs ENABLE ROW LEVEL SECURITY");
+    ok(&mut a, "CREATE POLICY p ON docs USING (tenant IN (SELECT tenant FROM memberships WHERE usr = current_user))");
+    // The policy reads its own table, not the caller's temporary one.
+    let mut low = e.new_session(Dialect::Postgres, "low", None);
+    assert_eq!(rows(&mut low, "SELECT id FROM docs"), vec![vec!["1"]]);
+    ok(&mut low, "CREATE TEMP TABLE memberships (usr TEXT, tenant INT)");
+    ok(&mut low, "INSERT INTO memberships VALUES ('low', 2)");
+    assert_eq!(rows(&mut low, "SELECT id FROM docs"), vec![vec!["1"]]);
+    // Statistics are over every row: row security hides them.
+    ok(&mut a, "ANALYZE docs");
+    assert!(rows(&mut low, "SELECT attname FROM pg_stats WHERE tablename = 'docs'").is_empty());
+    assert!(!rows(&mut a, "SELECT attname FROM pg_stats WHERE tablename = 'docs'").is_empty());
+    // WITH CHECK sees what a BEFORE trigger made of the row.
+    ok(&mut a, "CREATE TABLE owned (id INT PRIMARY KEY, who TEXT)");
+    ok(&mut a, "GRANT SELECT, INSERT, UPDATE ON owned TO low");
+    ok(&mut a, "ALTER TABLE owned ENABLE ROW LEVEL SECURITY");
+    ok(&mut a, "CREATE POLICY mine ON owned USING (who = current_user) WITH CHECK (who = current_user)");
+    ok(&mut a, "CREATE FUNCTION steal() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.who := 'victim'; RETURN NEW; END $$");
+    ok(&mut a, "CREATE TRIGGER x BEFORE INSERT ON owned FOR EACH ROW EXECUTE FUNCTION steal()");
+    refused(&mut low, "INSERT INTO owned VALUES (1, 'low')");
+    drop((a, low));
+    let _ = std::fs::remove_dir_all(dir);
+}

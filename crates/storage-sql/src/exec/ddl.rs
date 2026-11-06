@@ -27,6 +27,7 @@ const MAX_STORAGE_INDEXES: usize = 16;
 
 fn column_from_def(ex: &Exec<'_>, d: &ColumnDef) -> SqlResult<Column> {
     if let Some(def) = &d.default {
+        no_subquery(def, "a DEFAULT")?;
         // Validate the default now (a bad default is a DDL error, not an INSERT surprise).
         if !contains_column(def) {
             let v = ex.eval_const(def)?;
@@ -129,6 +130,7 @@ fn add_constraint(t: &mut Table, c: &TableConstraint, s: &Session) -> SqlResult<
                     }
                 )
             });
+            no_subquery(expr, "a CHECK constraint")?;
             t.checks.push(CheckDef {
                 name,
                 expr: expr.clone(),
@@ -302,7 +304,7 @@ pub fn drop_policy(s: &mut Session, name: &str, table: &str, if_exists: bool) ->
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn alter_policy(s: &mut Session, name: &str, table: &str, rename: Option<&str>, roles: Option<&[String]>, using: Option<&Expr>, check: Option<&Expr>) -> SqlResult<Outcome> {
+pub fn alter_policy(s: &mut Session, name: &str, table: &str, rename: Option<&str>, roles: Option<&[String]>, using: Option<&(Expr, String)>, check: Option<&(Expr, String)>) -> SqlResult<Outcome> {
     let mut t = (*s.engine.table(table)?).clone();
     s.require_owner(&t, "ALTER")?;
     if let Some(rs) = roles {
@@ -327,6 +329,15 @@ pub fn alter_policy(s: &mut Session, name: &str, table: &str, rename: Option<&st
     }
     save_table(s, &t)?;
     Ok(Outcome::command("ALTER POLICY"))
+}
+
+/// What a table keeps as an expression prints back into its catalog: a subquery does not, and none
+/// of these could run one per row anyway.
+fn no_subquery(e: &Expr, what: &str) -> SqlResult<()> {
+    if super::select::has_subquery(e) {
+        return Err(SqlError::new("0A000", format!("a subquery in {what}")));
+    }
+    Ok(())
 }
 
 pub fn create_table(s: &mut Session, ct: &CreateTable, params: &[Datum]) -> SqlResult<Outcome> {
@@ -1062,7 +1073,10 @@ pub fn alter_table(s: &mut Session, table: &str, ops: &[AlterOp]) -> SqlResult<O
                 };
                 for change in &steps {
                     match change {
-                        AlterColumn::SetDefault(e) => t.columns[i].default = Some(e.clone()),
+                        AlterColumn::SetDefault(e) => {
+                            no_subquery(e, "a DEFAULT")?;
+                            t.columns[i].default = Some(e.clone());
+                        }
                         AlterColumn::SetNamedDefault(n, e) => {
                             t.columns[i].default = Some(e.clone());
                             t.columns[i].default_name = n.clone();

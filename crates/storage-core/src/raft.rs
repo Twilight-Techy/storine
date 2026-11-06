@@ -987,11 +987,20 @@ fn decode_log_entry(bytes: &[u8], cursor: usize) -> Result<(RaftLogEntry, usize)
 
 /// Compact the log once this many applied entries are retained in it.
 const RAFT_COMPACT_THRESHOLD: u64 = 8_192;
+/// The same in bytes: 8,192 entries of whole large documents would be tens of gigabytes in memory.
+const RAFT_COMPACT_BYTES: u64 = 64 << 20;
+/// What a compaction by bytes keeps for lagging followers.
+const RAFT_RETAIN_BYTES: u64 = 16 << 20;
 /// Applied entries kept after compaction so briefly lagging followers can catch up from the log.
 const RAFT_RETAIN_TAIL: u64 = 1_024;
 
 #[derive(Debug)]
 struct RaftState {
+    /// An append failed after the entries reached memory: the disk is behind. The next write
+    /// rewrites the whole log, and nothing is acknowledged until one succeeds.
+    log_dirty: bool,
+    /// Bytes logged since the last compaction, about.
+    log_bytes: u64,
     role: RaftRole,
     current_term: u64,
     voted_for: Option<NodeId>,
@@ -1018,9 +1027,20 @@ struct RaftState {
     durable_applied: Option<u64>,
 }
 
+/// About what an entry holds in memory.
+fn entry_bytes(entry: &RaftLogEntry) -> u64 {
+    match &entry.command {
+        RaftCommand::Upsert { frame, .. } => frame.len() as u64 + 64,
+        RaftCommand::Ops(b) => b.len() as u64 + 64,
+        _ => 256,
+    }
+}
+
 impl RaftState {
     fn new() -> Self {
         Self {
+            log_dirty: false,
+            log_bytes: 0,
             role: RaftRole::Follower,
             current_term: 0,
             voted_for: None,
@@ -1043,6 +1063,7 @@ impl RaftState {
         if let RaftCommand::Config(m) = &entry.command {
             self.configs.push((entry.index, m.clone()));
         }
+        self.log_bytes = self.log_bytes.saturating_add(entry_bytes(&entry));
         self.log.push(entry);
     }
 
@@ -1134,6 +1155,8 @@ impl RaftState {
 ///   append; only a conflicting-suffix truncation rewrites the file.
 #[derive(Debug)]
 struct RaftStorage {
+    #[cfg(test)]
+    fail_next_append: std::sync::atomic::AtomicBool,
     meta_path: PathBuf,
     log_path: PathBuf,
     /// This node's snapshot (generated as leader, or the last one installed as follower).
@@ -1158,6 +1181,8 @@ impl RaftStorage {
         };
         Self {
             meta_path: dir.join(format!("{stem}_raft.meta")),
+            #[cfg(test)]
+            fail_next_append: std::sync::atomic::AtomicBool::new(false),
             log_path: dir.join(format!("{stem}_raft.log")),
             snapshot_path: dir.join(format!("{stem}_raft.snapshot")),
             recv_path: dir.join(format!("{stem}_raft.snapshot.recv")),
@@ -1302,6 +1327,10 @@ impl RaftStorage {
     }
 
     fn append_log(&self, entries: &[RaftLogEntry]) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_next_append.swap(false, core::sync::atomic::Ordering::Relaxed) {
+            return Err(StorageError::io("raft log append", std::io::Error::other("injected")));
+        }
         if entries.is_empty() {
             return Ok(());
         }
@@ -1411,7 +1440,11 @@ impl RaftStorage {
 
         // Durable entries can never be fewer than the committed prefix we claim, and only applied
         // entries are ever compacted.
+        // (An interrupted snapshot install emptied the log first: recovery redoes it, right after.)
         let len = st.last_log_index();
+        if self.installing_path.exists() {
+            return Ok(Some(st));
+        }
         if st.commit_index > len
             || st.last_applied > st.commit_index
             || st.snapshot_index > st.last_applied
@@ -1849,7 +1882,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             // read-index a committed entry of the current term (§8).
             let (prev, _) = st.last_log_index_and_term();
             let entry = RaftLogEntry { term: st.current_term, index: prev + 1, command: RaftCommand::Noop };
-            if self.storage.append_log(core::slice::from_ref(&entry)).is_err() {
+            if self.append_durably(&mut st, core::slice::from_ref(&entry)).is_err() {
                 st.role = RaftRole::Follower;
                 st.leader_id = None;
                 return false;
@@ -1883,7 +1916,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         }
         let (prev, _) = st.last_log_index_and_term();
         let entry = RaftLogEntry { term: st.current_term, index: prev + 1, command };
-        self.storage.append_log(core::slice::from_ref(&entry))?;
+        self.append_durably(&mut st, core::slice::from_ref(&entry))?;
         let term = entry.term;
         st.push_entry(entry);
         self.outcomes
@@ -2019,6 +2052,29 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         Ok(false)
     }
 
+    /// Appends `entries`, not yet in memory, to the disk. A failure can leave part of them there, so
+    /// the next write replaces the file with what memory holds rather than appending after them.
+    fn append_durably(&self, st: &mut RaftState, entries: &[RaftLogEntry]) -> Result<()> {
+        if st.log_dirty {
+            self.storage.rewrite_log(&st.log)?;
+            st.log_dirty = false;
+        }
+        st.log_dirty = true;
+        self.storage.append_log(entries)?;
+        st.log_dirty = false;
+        Ok(())
+    }
+
+    /// Steps down without a new term: this leader can no longer reach a quorum, so whatever it
+    /// was waiting for from one will not come, and clients should look elsewhere.
+    pub fn relinquish_leadership(&self) {
+        let mut st = self.lock_state();
+        if st.role == RaftRole::Leader {
+            st.role = RaftRole::Follower;
+            st.leader_id = None;
+        }
+    }
+
     /// Appends a blind upsert (`Some`) or deletion (`None`) of `id` to the leader's durable log
     /// (prior to replication).
     pub fn append_leader_entry(
@@ -2036,7 +2092,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             RecordCodec::encode_aligned(rec, Version(next_idx), 0, RecordFlags::NONE, 0)
         });
         let entry = RaftLogEntry::record(st.current_term, next_idx, id, frame);
-        self.storage.append_log(core::slice::from_ref(&entry))?;
+        self.append_durably(&mut st, core::slice::from_ref(&entry))?;
         st.push_entry(entry.clone());
         self.outcomes.lock().unwrap_or_else(|p| p.into_inner()).awaited.insert(next_idx, entry.term);
         Ok((entry, prev_idx, prev_term))
@@ -2296,10 +2352,16 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 new_from.get_or_insert(st.log.len());
                 st.push_entry(entry);
             }
-            if truncated {
+            // Memory first means a failure here leaves entries only there: a retry would find them
+            // and acknowledge what no disk holds, so the next write rewrites instead.
+            if truncated || st.log_dirty {
+                st.log_dirty = true;
                 self.storage.rewrite_log(&st.log)?;
+                st.log_dirty = false;
             } else if let Some(from) = new_from {
+                st.log_dirty = true;
                 self.storage.append_log(&st.log[from..])?;
+                st.log_dirty = false;
             }
 
             let match_index = last_new.min(st.last_log_index());
@@ -2394,12 +2456,39 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         }
         // Bound log memory and disk (anti-bloat): compact once enough applied entries pile up,
         // keeping a tail for lagging followers.
-        let (applied, snapshot) = {
-            let st = self.lock_state();
-            (st.last_applied, st.snapshot_index)
+        let (applied, snapshot, by_bytes) = {
+            let mut st = self.lock_state();
+            let (applied, snapshot) = (st.last_applied, st.snapshot_index);
+            let mut by_bytes = None;
+            if st.log_bytes > RAFT_COMPACT_BYTES {
+                // Keep a tail by size, then count what stays.
+                let mut kept = 0u64;
+                let mut retained = 0u32;
+                let mut through = snapshot;
+                let mut stays = 0u64;
+                for e in st.log.iter().rev() {
+                    stays = stays.saturating_add(entry_bytes(e));
+                    if e.index <= applied && through == snapshot {
+                        kept = kept.saturating_add(entry_bytes(e));
+                        retained += 1;
+                        // Some entries however large: a follower one behind should not need a snapshot.
+                        if kept > RAFT_RETAIN_BYTES && retained > 8 {
+                            through = e.index;
+                            stays = stays.saturating_sub(entry_bytes(e));
+                        }
+                    } else if through != snapshot {
+                        stays = stays.saturating_sub(entry_bytes(e));
+                    }
+                }
+                st.log_bytes = stays;
+                by_bytes = (through > snapshot).then_some(through);
+            }
+            (applied, snapshot, by_bytes)
         };
         if applied.saturating_sub(snapshot) > RAFT_COMPACT_THRESHOLD {
             self.compact_locked(applied - RAFT_RETAIN_TAIL)?;
+        } else if let Some(through) = by_bytes {
+            self.compact_locked(through)?;
         }
         Ok(())
     }
@@ -2732,7 +2821,12 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 Some(pos) if st.log.get(pos).is_some_and(|e| e.term == last_term) => {
                     st.drain_log(pos + 1);
                 }
-                _ => st.clear_log(),
+                _ => {
+                    st.clear_log();
+                    // Before the hard state claims the snapshot: a crash between the two would
+                    // leave an old branch above it, which recovery has no way to tell from a tail.
+                    self.storage.rewrite_log(&st.log)?;
+                }
             }
             if config.is_some() {
                 st.base_config = config;
@@ -3193,6 +3287,47 @@ mod tests {
     use super::*;
     use crate::engine::EngineConfig;
     use crate::model::AgentObjectRecord;
+
+    /// A crash between emptying the log and saving the hard state of a snapshot install: the node
+    /// must still open, and recovery decides from the install's marker.
+    #[test]
+    fn test_crash_inside_snapshot_install_still_opens() {
+        let dir = std::env::temp_dir().join(format!("stge_raft_install_crash_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Arc::new(StorageEngine::<AgentObjectRecord>::open(&dir, EngineConfig::default()).unwrap());
+        let f = RaftNode::new(9, Arc::clone(&engine)).unwrap();
+        let e = |index| RaftLogEntry { term: 1, index, command: RaftCommand::Noop };
+        let req = AppendEntriesReq { term: 1, leader_id: 1, prev_log_index: 0, prev_log_term: 0, entries: vec![e(1), e(2), e(3)], leader_commit: 3 };
+        assert!(f.handle_append_entries(req).unwrap().success);
+        f.storage.rewrite_log(&[]).unwrap();
+        std::fs::write(&f.storage.installing_path, 50u64.to_le_bytes()).unwrap();
+        let installing = f.storage.installing_path.clone();
+        drop(f);
+        // No received snapshot to redo it from: the replica starts over, for the leader to rebuild.
+        let again = RaftNode::new(9, engine).unwrap();
+        assert_eq!(again.last_log_index(), 0);
+        assert!(!installing.exists());
+    }
+
+    /// An append that failed must not be acknowledged by its retry, which finds the entries in
+    /// memory, and they must reach the disk in the end.
+    #[test]
+    fn test_failed_follower_append_is_not_acknowledged_later() {
+        let dir = std::env::temp_dir().join(format!("stge_raft_failed_append_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Arc::new(StorageEngine::<AgentObjectRecord>::open(&dir, EngineConfig::default()).unwrap());
+        let f = RaftNode::new(9, Arc::clone(&engine)).unwrap();
+        let e = |index| RaftLogEntry { term: 1, index, command: RaftCommand::Noop };
+        let ae = |prev_log_index, entries| AppendEntriesReq { term: 1, leader_id: 1, prev_log_index, prev_log_term: u64::from(prev_log_index > 0), entries, leader_commit: 0 };
+        f.storage.fail_next_append.store(true, core::sync::atomic::Ordering::Relaxed);
+        assert!(f.handle_append_entries(ae(0, vec![e(1), e(2)])).is_err());
+        // The retry writes them; so does what follows it.
+        assert!(f.handle_append_entries(ae(0, vec![e(1), e(2)])).unwrap().success);
+        assert!(f.handle_append_entries(ae(2, vec![e(3)])).unwrap().success);
+        drop(f);
+        let again = RaftNode::new(9, engine).unwrap();
+        assert_eq!(again.last_log_index(), 3);
+    }
 
     /// A follower may hold stale entries past the end of what an AppendEntries verified (a
     /// delayed or duplicated request). It must commit only up to the last entry the request

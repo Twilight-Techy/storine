@@ -367,16 +367,31 @@ impl Acl {
     }
 
     /// Whether `user` may grant `privilege` on `object` with `owner`.
-    fn may_grant(&self, user: &str, object: &str, owner: Option<&str>, privilege: &str) -> bool {
+    fn may_grant(&self, user: &str, object: &str, owner: Option<&str>, privilege: &str, columns: &[String]) -> bool {
         if self.is_superuser(user) || self.owns(user, owner) {
             return true;
         }
         let roles = self.closure(user);
-        self.grants.iter().any(|g| !g.deny && g.grant_option && g.privilege == privilege && (g.object == object || g.object == "db") && roles.contains(&g.grantee))
+        // A grant option on some columns gives no more than those columns.
+        let holds = |column: &str| {
+            self.grants.iter().any(|g| {
+                !g.deny
+                    && g.grant_option
+                    && g.privilege == privilege
+                    && (g.object == object || g.object == "db")
+                    && (g.column.is_empty() || g.column == column)
+                    && roles.contains(&g.grantee)
+            })
+        };
+        if columns.is_empty() {
+            holds("")
+        } else {
+            columns.iter().all(|c| holds(&c.to_ascii_lowercase()))
+        }
     }
 
     /// The policies that apply to `user` for `command`, or `None` when row security does not.
-    fn policies(&self, user: &str, table: &Table, command: &str) -> Option<Vec<Policy>> {
+    pub(crate) fn policies(&self, user: &str, table: &Table, command: &str) -> Option<Vec<Policy>> {
         if !table.row_security || self.is_superuser(user) || self.roles.get(&role_key(user)).is_some_and(|r| r.bypassrls) {
             return None;
         }
@@ -615,7 +630,8 @@ pub fn role_statement(s: &mut Session, st: &RoleStmt) -> SqlResult<Outcome> {
             if !own_password_only && !s.may_manage_roles(&acl) {
                 return Err(no_createrole());
             }
-            if old.superuser && !acl.is_superuser(&me) {
+            // A member of a superuser role is one too: `is_superuser` follows memberships.
+            if acl.is_superuser(name) && !acl.is_superuser(&me) && !own_password_only {
                 return Err(SqlError::new("42501", "only a superuser may alter a superuser"));
             }
             let mut r = old;
@@ -631,6 +647,9 @@ pub fn role_statement(s: &mut Session, st: &RoleStmt) -> SqlResult<Outcome> {
             let Some(mut r) = acl.role(&target).cloned() else {
                 return Err(SqlError::new("42704", format!("role \"{target}\" does not exist")));
             };
+            if role_key(&target) != role_key(&me) && acl.is_superuser(&target) && !acl.is_superuser(&me) {
+                return Err(SqlError::new("42501", "only a superuser may change a superuser's password"));
+            }
             r.set_password(Some(password));
             put_role(s, &r)?;
             Ok(Outcome::command("SET"))
@@ -645,7 +664,7 @@ pub fn role_statement(s: &mut Session, st: &RoleStmt) -> SqlResult<Outcome> {
             if acl.role(to).is_some() {
                 return Err(SqlError::new("42710", format!("role \"{to}\" already exists")));
             }
-            if r.superuser && !acl.is_superuser(&me) {
+            if acl.is_superuser(from) && !acl.is_superuser(&me) {
                 return Err(SqlError::new("42501", "only a superuser may rename a superuser"));
             }
             r.name = to.clone();
@@ -678,7 +697,7 @@ pub fn role_statement(s: &mut Session, st: &RoleStmt) -> SqlResult<Outcome> {
                     }
                     return Err(SqlError::new("42704", format!("role \"{n}\" does not exist")));
                 };
-                if r.superuser && !acl.is_superuser(&me) {
+                if acl.is_superuser(n) && !acl.is_superuser(&me) {
                     return Err(SqlError::new("42501", "only a superuser may drop a superuser"));
                 }
                 if role_key(n) == role_key(&me) {
@@ -826,6 +845,9 @@ fn apply_role_options(s: &Session, acl: &Acl, r: &mut Role, opts: &[RoleOpt], cr
                 }
                 for x in rs {
                     s.check_role_known(x)?;
+                    if acl.is_superuser(x) && !acl.is_superuser(s.current_role()) {
+                        return Err(SqlError::new("42501", format!("only a superuser may join role \"{x}\", which is one")));
+                    }
                     if !r.member_of.iter().any(|(m, _)| role_key(m) == role_key(x)) {
                         r.member_of.push((x.clone(), false));
                     }
@@ -855,7 +877,7 @@ fn change_members(s: &Session, acl: &Acl, roles: &[String], members: &[String], 
     for role in roles {
         s.check_role_known(role)?;
         // A fixed role's power is not the role manager's to hand out.
-        let powerful = role_key(role) == "sysadmin" || acl.role(role).is_some_and(|r| r.superuser);
+        let powerful = role_key(role) == "sysadmin" || acl.is_superuser(role);
         let allowed = acl.is_superuser(me) || (!powerful && !is_fixed_role(&role_key(role)) && s.may_manage_roles(acl)) || (role_key(role) != "sysadmin" && acl.role(me).is_some_and(|r| r.member_of.iter().any(|(m, adm)| *adm && role_key(m) == role_key(role))));
         if !allowed {
             return Err(SqlError::new("42501", format!("permission denied to change members of role \"{role}\"")));
@@ -1012,6 +1034,11 @@ pub fn grant_statement(s: &mut Session, g: &GrantStmt) -> SqlResult<Outcome> {
     match &g.object {
         GrantObject::Tables(names) => {
             for n in names {
+                // Grants are kept by name: one on a temporary table would land on the real table
+                // of that name once the temporary one is gone.
+                if crate::exec::temp::lookup(n).is_some() {
+                    return Err(SqlError::new("0A000", format!("privileges on temporary table \"{n}\": it belongs to its session alone")));
+                }
                 match s.engine.find_table(n)? {
                     Some(t) => objects.push((format!("table:{}", t.name), t.owner.clone())),
                     None => match view_owner(n)? {
@@ -1051,7 +1078,12 @@ pub fn grant_statement(s: &mut Session, g: &GrantStmt) -> SqlResult<Outcome> {
                 objects.push((format!("func:{}", r.name), r.owner.clone()));
             }
         }
-        GrantObject::AllFunctions => objects.push(("db".into(), None)),
+        GrantObject::AllFunctions => {
+            for d in s.engine.store.scan(crate::exec::routine::FUNCTIONS, None)? {
+                let owner = d.fields.get("owner").and_then(storine::Value::as_str).map(str::to_owned);
+                objects.push((format!("func:{}", d.key), owner));
+            }
+        }
         GrantObject::Database(name) => {
             if let Some(n) = name {
                 if !n.eq_ignore_ascii_case(&s.database) && !s.engine.is_same_database(n) {
@@ -1074,7 +1106,7 @@ pub fn grant_statement(s: &mut Session, g: &GrantStmt) -> SqlResult<Outcome> {
     let mut writes = Vec::new();
     for (object, owner) in &objects {
         for (p, cols) in &privileges {
-            if !acl.may_grant(&me, object, owner.as_deref(), p) {
+            if !acl.may_grant(&me, object, owner.as_deref(), p, cols) {
                 let what = object.split(':').next_back().unwrap_or(object);
                 return Err(SqlError::new("42501", format!("permission denied to grant {p} on {what}")));
             }
@@ -1211,7 +1243,10 @@ impl Exec<'_> {
     /// `None`: unrestricted. The flag says no access at all for this privilege.
     fn restriction(&self, table: &Table, command: &str) -> SqlResult<Option<(Rc<Restriction>, bool)>> {
         let user = self.effective_user();
-        let key = (user.clone(), table.name.clone(), command.to_owned());
+        // A temporary table and the real table of its name can both be read in one statement (the
+        // real one from a view's body): an answer for one says nothing about the other.
+        let scope = if table.temp.is_some() { format!("{command}\u{0}temporary") } else { command.to_owned() };
+        let key = (user.clone(), table.name.clone(), scope);
         if let Some(r) = self.restrictions.borrow().get(&key) {
             return Ok(r.clone());
         }
@@ -1232,7 +1267,7 @@ impl Exec<'_> {
                 for p in ps {
                     // Reads and `USING` commands filter by `USING`; a policy for all commands
                     // with only `WITH CHECK` does not limit reads.
-                    let e = p.using.clone().unwrap_or(Expr::Bool(true));
+                    let e = p.using.clone().map_or(Expr::Bool(true), |(e, _)| e);
                     if p.permissive {
                         r.permissive.push(e);
                     } else {
@@ -1273,7 +1308,7 @@ impl Exec<'_> {
             return Err(SqlError::new("42P17", "infinite recursion detected in row-level security policy"));
         }
         self.rls_depth.set(d + 1);
-        let out = f();
+        let out = crate::exec::temp::hidden(f);
         self.rls_depth.set(d);
         out
     }
@@ -1298,7 +1333,7 @@ impl Exec<'_> {
         let verdict = self.guarded(|| {
             let mut any = false;
             for p in &ps {
-                let Some(e) = p.check.as_ref().or(p.using.as_ref()) else {
+                let Some((e, _)) = p.check.as_ref().or(p.using.as_ref()) else {
                     any |= p.permissive;
                     continue;
                 };

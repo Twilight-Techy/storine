@@ -300,6 +300,15 @@ impl Exec<'_> {
                 return Ok(None);
             }
         }
+        // An unqualified ON name means the table it resolved to where it was written: moved, it
+        // could find another leaf's column of that name and still "resolve".
+        for c in &flat.on {
+            for p in column_refs(c) {
+                if p.len() == 1 && leaves.iter().filter(|l| resolves(&l.cols, std::slice::from_ref(&p[0]))).count() > 1 {
+                    return Ok(None);
+                }
+            }
+        }
         let mut edges = Vec::new();
         for c in flat.on.iter().chain(pushable) {
             let refs = column_refs(c);
@@ -449,12 +458,12 @@ impl Exec<'_> {
             return Ok(None);
         }
         let key = q as *const Query as usize;
-        let cached = self.semi_joins.borrow().get(&key).cloned();
+        let cached = self.semi_joins.borrow().get(&key).filter(|(same, _)| same == q).map(|(_, e)| e.clone());
         let entry = match cached {
             Some(e) => e,
             None => {
                 let e = self.build_semi_join(q)?.map(Rc::new);
-                self.semi_joins.borrow_mut().insert(key, e.clone());
+                self.semi_joins.borrow_mut().insert(key, (q.clone(), e.clone()));
                 e
             }
         };
@@ -475,17 +484,35 @@ impl Exec<'_> {
         Ok(Some(semi.keys.contains(&k)))
     }
 
+    /// Runs a decorrelated subquery; `None` if it still names the outer row (`sum(i.v + o.w)`).
+    fn without_outer(&self, inner: &Select) -> SqlResult<Option<Rel>> {
+        match self.select(inner, None, &[], None, 0) {
+            Ok(rel) => Ok(Some(rel)),
+            Err(e) if e.code == "42703" || e.code == "42P01" => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     fn build_semi_join(&self, q: &Query) -> SqlResult<Option<SemiJoin>> {
         if !q.ctes.is_empty() || q.limit.is_some() || q.offset.is_some() || q.lock.is_some() {
             return Ok(None);
         }
         let SetExpr::Select(sel) = &q.body else { return Ok(None) };
+        // What rows the subquery has is what EXISTS asks. An aggregate gives a row with no input,
+        // grouping and HAVING change how many, and a set-returning call can give none.
+        let shapes_rows = sel.items.iter().any(|i| match i {
+            SelectItem::Expr { expr, .. } => has_aggregate(expr) || makes_rows(expr),
+            _ => false,
+        });
+        if shapes_rows || !sel.group_by.is_empty() || sel.having.is_some() {
+            return Ok(None);
+        }
         let Some(c) = self.correlation(sel)? else { return Ok(None) };
         let mut inner = (**sel).clone();
         inner.distinct = false;
         inner.items = c.keys.iter().map(|(i, _)| SelectItem::Expr { expr: (*i).clone(), alias: None }).collect();
         inner.where_ = c.rest.iter().map(|e| (*e).clone()).reduce(|a, b| Expr::binary(BinaryOp::And, a, b));
-        let rel = self.select(&inner, None, &[], None, 0)?;
+        let Some(rel) = self.without_outer(&inner)? else { return Ok(None) };
         let mut keys = HashSet::with_capacity(rel.rows.len());
         let Some(classes) = classes_of(&rel.rows, c.keys.len()) else { return Ok(None) };
         'row: for row in &rel.rows {
@@ -509,12 +536,12 @@ impl Exec<'_> {
             return Ok(None);
         }
         let key = q as *const Query as usize;
-        let cached = self.group_maps.borrow().get(&key).cloned();
+        let cached = self.group_maps.borrow().get(&key).filter(|(same, _)| same == q).map(|(_, e)| e.clone());
         let entry = match cached {
             Some(e) => e,
             None => {
                 let e = self.build_group_map(q)?.map(Rc::new);
-                self.group_maps.borrow_mut().insert(key, e.clone());
+                self.group_maps.borrow_mut().insert(key, (q.clone(), e.clone()));
                 e
             }
         };
@@ -539,7 +566,7 @@ impl Exec<'_> {
             return Ok(None);
         }
         let SetExpr::Select(sel) = &q.body else { return Ok(None) };
-        if sel.distinct {
+        if sel.distinct || !sel.group_by.is_empty() || sel.having.is_some() {
             return Ok(None);
         }
         // One aggregate call, nothing around it: what no rows give is then known.
@@ -560,7 +587,7 @@ impl Exec<'_> {
         inner.items.push(SelectItem::Expr { expr: agg.clone(), alias: None });
         inner.where_ = c.rest.iter().map(|e| (*e).clone()).reduce(|a, b| Expr::binary(BinaryOp::And, a, b));
         inner.group_by = inner_keys;
-        let rel = self.select(&inner, None, &[], None, 0)?;
+        let Some(rel) = self.without_outer(&inner)? else { return Ok(None) };
         let width = c.keys.len();
         let Some(classes) = classes_of(&rel.rows, width) else { return Ok(None) };
         let mut values = HashMap::with_capacity(rel.rows.len());
@@ -577,6 +604,17 @@ impl Exec<'_> {
         }
         Ok(Some(GroupMap { values, classes, outer_keys: c.keys.iter().map(|(_, o)| (*o).clone()).collect(), empty }))
     }
+}
+
+/// Whether `e` calls a set-returning function in a select list.
+fn makes_rows(e: &Expr) -> bool {
+    let mut found = false;
+    crate::exec::eval::walk(e, &mut |x| {
+        if let Expr::Function { name, .. } = x {
+            found |= crate::exec::select::SELECT_LIST_SRFS.contains(&name.as_str());
+        }
+    });
+    found
 }
 
 /// The class of each of the first `width` columns; `None` if a column mixes classes. Empty when

@@ -2293,7 +2293,7 @@ pub fn exec_proc(
             ))
         }
         "sp_reset_connection" => {
-            s.role = None; // a pooled connection's next user is not who the last one impersonated
+            s.reset_connection();
             ok()
         }
         "sp_set_session_context"

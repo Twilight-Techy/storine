@@ -33,6 +33,45 @@ use crate::store::{Op, Pre, Tag, Write};
 pub const FUNCTIONS: &str = "_sql_functions";
 /// Routine calls nested deeper than this are stopped (a runaway recursion or trigger cascade).
 const MAX_DEPTH: usize = 32;
+/// Views and routines nested in each other. Each has its own limit, which a cycle through both
+/// (a view calling a function reading the view) would multiply into a stack overflow.
+const MAX_NESTING: u32 = 64;
+
+thread_local! {
+    static NESTING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Rows a routine has returned so far on this thread, in bytes.
+    static RETURNED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) struct Nesting;
+
+impl Drop for Nesting {
+    fn drop(&mut self) {
+        NESTING.with(|n| n.set(n.get() - 1));
+    }
+}
+
+pub(crate) fn enter_nesting() -> SqlResult<Nesting> {
+    let depth = NESTING.with(std::cell::Cell::get);
+    if depth >= MAX_NESTING {
+        return Err(SqlError::new("54001", "views and routines are nested too deeply"));
+    }
+    NESTING.with(|n| n.set(depth + 1));
+    Ok(Nesting)
+}
+
+/// Counts a row a routine returns against the statement's memory limit.
+fn charge_returned(host: &dyn Host, row: &[Datum]) -> SqlResult<()> {
+    let bytes: u64 = row.iter().map(crate::exec::select::datum_size).sum::<u64>() + 32;
+    let used = RETURNED.with(|r| {
+        r.set(r.get().saturating_add(bytes));
+        r.get()
+    });
+    if used > host.session().memory_limit() {
+        return Err(SqlError::new("53200", "a routine returned more rows than the statement's memory limit holds"));
+    }
+    Ok(())
+}
 /// Marks the error raised when a body writes over a shared session.
 const NEEDS_SESSION: &str = "a function called inside a query cannot write";
 
@@ -451,6 +490,7 @@ fn run_routine(host: &mut dyn Host, r: &Routine, args: Vec<Datum>, frame: Option
             vars.insert(name.clone(), v);
         }
     }
+    let _nesting = enter_nesting()?;
     {
         let mut frames = host.session().frames.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if frames.len() >= MAX_DEPTH {
@@ -458,7 +498,9 @@ fn run_routine(host: &mut dyn Host, r: &Routine, args: Vec<Datum>, frame: Option
         }
         frames.push(vars);
     }
+    let returned = RETURNED.with(|c| c.replace(0));
     let out = run_body(host, r);
+    RETURNED.with(|c| c.set(returned));
     host.session().frames.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop();
     out
 }
@@ -702,14 +744,18 @@ fn run_stmt(host: &mut dyn Host, st: &PlStmt, rows: &mut Vec<Vec<Datum>>, trigge
         }
         PlStmt::ReturnNext(e) => {
             let Some(e) = e else { return Err(SqlError::unsupported("RETURN NEXT without an expression")) };
-            let v = eval(host, e)?;
-            rows.push(vec![v]);
+            let row = vec![eval(host, e)?];
+            charge_returned(host, &row)?;
+            rows.push(row);
         }
         PlStmt::ReturnQuery(q) => {
             let params = host.session().frame_params();
             let ex = Exec::new(host.session(), &params);
             let rel = ex.query(q, None)?;
-            rows.extend(rel.rows);
+            for row in rel.rows {
+                charge_returned(host, &row)?;
+                rows.push(row);
+            }
         }
         PlStmt::Perform(q) => {
             // A routine called here may write when this routine may.

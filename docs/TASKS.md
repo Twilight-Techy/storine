@@ -1245,4 +1245,58 @@ This document defines the strict chronological execution order for building the 
   - **Test bugs fixed, not the database's**: Grafana's URL credentials, a wrong row count, `pyodbc.foreignKeys(table=)` asking for the wrong direction, and Connector/J's `getExportedKeys`. That last query joins every unique key of the referenced table, so `customers`, with a primary key and a unique email, gives two rows on MySQL too (read from the driver's source; not run against a MySQL server).
   - **Known limits**: `sp_describe_undeclared_parameters` suggests `nvarchar(4000)` for every parameter instead of inferring from the statement (values coerce where they are used, but a driver showing parameter types shows that one). `sp_sproc_columns` is refused. A view's privileges are listed by its name; only explicit grants appear in `information_schema` and `sp_*_privileges`, not an owner's implicit rights. `(j).field` also reads a JSON column's key, where PostgreSQL would refuse. HAVING over a plain column without `GROUP BY` is accepted in PostgreSQL and T-SQL too, where they would refuse it. The MySQL gateway under `--no-tls` refuses an SSL attempt: Metabase's MariaDB driver logs one failed try, then connects.
 - [ ] **TASK-151: Soak Under Faults (`F-ENT-07`)** — hours of mixed OLTP + analytics with fault injection; memory and descriptor ceilings checked throughout.
-- [ ] **TASK-152: Final Audit (Stages 28–31)** — full-project review for gaps, bugs and vulnerabilities; docs brought in line with the code.
+- [x] **TASK-152: Final Audit (Stages 28–31)** — full-project review for gaps, bugs and vulnerabilities; docs brought in line with the code.
+  - **How**: three independent read-only reviews (the distributed core; SQL access control and execution; wire protocols and parsers), each finding read against the code before it was fixed, with a regression test where one can be written. A review can miss things: `dist/alloc.rs`, `dist/zone.rs`, the simulators and part of `dist/node.rs` were not read in full, and the fixes for the wire limits, optimizer and Raft were tested, not re-reviewed.
+  - **Rules**: `unsafe` moved out of `storage-sql` into `storage-codec` behind safe APIs (`aes_ni`, `peak_alloc`, `RULE-SAFE-01`). Left as is: `benches/` (a measuring tool, never linked into the server). 4,446 vendored Prisma files left the git index (still in history, so the repository does not shrink).
+  - **Could take down the server** (release builds abort on panic):
+    - PL/pgSQL nesting overflowed the stack before any check. Now under the parser's depth limit, and bodies nested in bodies are limited too.
+    - Expressions the parser allowed overflowed the evaluator's 2 MiB stack. Connection threads have 16 MiB. An embedded caller's own thread still has what it has.
+    - `SET statement_timeout` with an absurd value panicked at the next statement. It is refused.
+    - A cycle through views and routines multiplied two depth limits. They now share one (64).
+    - `thread::spawn` panicked when threads ran out, and a full descriptor table spun the accept loop. Both are refused with a logged line (`listener.rs`).
+    - Exponential backtracking in `FROM ((((..` (a 1 KiB statement could never finish). Now one linear look-ahead.
+  - **Before login**: a client that says nothing is closed after 30 s, on all three protocols; connections are capped (`--max-connections`, default 1024); MySQL no longer commits 16 MiB for a 4-byte header; messages before login are capped at 1 MiB (MySQL, TDS).
+  - **Authentication**:
+    - A range cluster could not authenticate at all: `OP_AUTH` was refused, so any cluster with tokens failed closed. It works, with a test.
+    - Kerberos read the realm from the unencrypted part of the ticket: a cross-realm user could become a local one of the same name. It now uses the realm of the key that decrypted the ticket.
+    - `--oidc-*` or `--kerberos-keytab` without `--user` left every client trusted. It now refuses to start.
+    - SCRAM told real names from unknown ones by whether the salt changed, and did a key derivation per `--user` connection. Salts are now fixed per name and verifiers derived once. Salts, nonces and secrets come from the OS generator instead of SipHash.
+    - TDS still does one key derivation for a password check on a catalog role.
+  - **Privilege escalation**:
+    - `GRANT` on a temporary table wrote a by-name grant that applied to the real table of that name once the temporary one was gone: any role could reach any table. Refused.
+    - `CREATEROLE` could join `sysadmin`, or reset the password of a role that is a superuser through membership. Refused.
+    - A grant option on one column could be widened to the whole table. Now limited to its columns.
+  - **Row security**:
+    - A temporary table could stand in for a table a policy or a view reads, returning every row. Policies, views and materialized view refreshes see no temporary tables now.
+    - `pg_stats` showed values hidden by row security. Now hidden for a role under a policy.
+    - `WITH CHECK` ran before `BEFORE` triggers, so a trigger could store a row the policy forbids. It now runs after them.
+    - `REFRESH MATERIALIZED VIEW` ran with the refresher's rights. It now runs as the owner.
+    - A policy with a subquery stored as the text "(subquery)" and failed when read back, so such policies never worked. The source text is stored now. A subquery in `DEFAULT` or `CHECK` is refused for the same reason.
+    - Pooled connections kept temporary tables, variables and cursors after `sp_reset_connection` and `COM_RESET_CONNECTION`, and `DISCARD TEMP` did nothing. All now share one reset.
+    - `REVOKE EXECUTE ON ALL FUNCTIONS` did nothing. It now covers every function.
+  - **Wrong answers**:
+    - `EXISTS (SELECT count(*) ..)` was false where it must be true: an aggregate always gives a row.
+    - A correlated aggregate argument failed under the optimizer.
+    - Reordering joins could rebind an unqualified `ON` column to another table.
+    - Subquery caches keyed by a freed node's address could answer with another query's result.
+    - Equal float and numeric values hashed apart, so hash joins lost matches.
+    - `COMMIT` of a failed transaction delivered its `NOTIFY`, and `ROLLBACK TO` kept them.
+    - `..` inside a PL/pgSQL string was rewritten.
+  - **Limits**: rows a routine returns count against `max_query_memory`. Too many parameters or more than 4,096 result columns are refused instead of wrapping a wire count. A TDS error message is bounded so it cannot overflow its token's length and be read as forged tokens. COPY stops buffering after a failure and takes records in linear time. MySQL refuses `1; DROP TABLE t` from a client that did not ask for `CLIENT_MULTI_STATEMENTS`.
+  - **Distributed correctness**:
+    - A partitioned leader answered writes that propose nothing (a delete of a key it thought absent, a failed check) from stale state. They now confirm by read index first.
+    - Range leaders never stepped down. They do now, once they cannot hear a quorum for twice the election timeout, so requests get an answer instead of waiting.
+    - A read restarted above its uncertainty limit passed intents below it and could see half a transaction.
+    - A failed follower log append stayed in memory and its retry acknowledged it; a restart then failed. The next write now rewrites the log.
+    - A crash during a snapshot install could keep an old log branch above the snapshot.
+    - Read errors during scans silently dropped rows, including from backups, which still reported success. They are errors now.
+    - A latch stayed held forever if its replica was destroyed or its leader deposed.
+    - Collecting a tombstone raised the history bound past it, so re-creating a dropped collection broke all-collection feeds.
+  - **Distributed resources**:
+    - Coordinators and `OP_KV` shared a worker pool, which collapsed under load. They are separate now.
+    - The Raft log in memory was limited by entries only (tens of gigabytes with large documents). It also compacts by bytes now (64 MiB, keeping 16 MiB).
+    - Peer batches and pending requests were unbounded. Batches are now capped at 1 GiB per node (Raft resends what is dropped), and callers that have gone are forgotten after a minute.
+    - Scans could starve under steady writes. Writes arriving after a waiting scan now wait behind it. That is a real cost: a write can wait for a scan on its span.
+    - Range mode now has the limit on concurrent analytics that the other modes had.
+  - **A review of these fixes found more, all fixed**: reading a temporary table and the real table of its name in one statement shared a cached access decision (introduced by the fix above), so a view could read a table its owner has no rights on. `GRANT`, `DROP ROLE` and `RENAME` missed superusers by membership. A crash between emptying the log and saving the hard state stopped a node from opening. Failed leader appends left the log file ahead of memory. Valid `FROM` forms were refused. Stepping down did not answer writes already proposed. The review also found that TDS's reset bit in a packet's status, which pooled clients use, was ignored: it now resets as `sp_reset_connection` does.
+  - **Known limits**: a view, or a function called from a view or policy, cannot read a temporary table: it fails with `42P01`, or reads a real table of that name. An embedded `Session` on a small thread stack can still overflow on the tallest expressions the parser allows. Non-superuser `CREATEROLE` holders can still manage ordinary roles' passwords (by design). Check quorum uses any message from a peer as contact, not per-range acknowledgement, so a node reachable for other ranges does not step down for this one until its peers' replies stop.

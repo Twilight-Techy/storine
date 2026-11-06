@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -159,6 +159,9 @@ impl Transport for TcpRangeTransport {
 pub struct RangeContext {
     pub(crate) node: Arc<RangeNode>,
     pub(crate) pool: Arc<WorkerPool>,
+    /// `OP_KV` from other nodes' coordinators.
+    pub(crate) kv_pool: Arc<WorkerPool>,
+    analytics: Arc<AtomicUsize>,
     transport: Arc<TcpRangeTransport>,
     gateway: GatewayConfig,
     hlc: Arc<Hlc>,
@@ -197,9 +200,26 @@ impl core::fmt::Debug for RangeOptions {
     }
 }
 
+/// A running analytic query's place; gives it back when dropped.
+pub(crate) struct AnalyticsPermit(Arc<AtomicUsize>);
+
+impl Drop for AnalyticsPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl RangeContext {
+    pub(crate) fn analytics_permit(&self) -> Option<AnalyticsPermit> {
+        if self.analytics.fetch_add(1, Ordering::AcqRel) >= crate::MAX_CONCURRENT_ANALYTICS {
+            self.analytics.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(AnalyticsPermit(Arc::clone(&self.analytics)))
+    }
+
     pub(crate) fn new(o: RangeOptions, workers: usize) -> Self {
-        Self { node: o.node, pool: WorkerPool::new(workers, 16_384), transport: o.transport, gateway: o.gateway, hlc: o.hlc, cache: Arc::new(RwLock::new(RangeIndex::new())), plain: Arc::default(), backup_running: Arc::default() }
+        Self { node: o.node, pool: WorkerPool::new(workers, 16_384), kv_pool: WorkerPool::new(workers, 16_384), analytics: Arc::default(), transport: o.transport, gateway: o.gateway, hlc: o.hlc, cache: Arc::new(RwLock::new(RangeIndex::new())), plain: Arc::default(), backup_running: Arc::default() }
     }
 
     /// The node's backup slot, unless a backup or restore holds it (each occupies a worker for as

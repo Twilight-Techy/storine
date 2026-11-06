@@ -127,6 +127,8 @@ pub struct Reader {
     fmt: Format,
     buf: Vec<u8>,
     header_pending: bool,
+    /// How much of `buf` is consumed: taking records from its front must not move the rest.
+    at: usize,
     /// The `\.` end-of-data marker was seen.
     pub done: bool,
 }
@@ -140,12 +142,15 @@ impl Reader {
             header_pending: fmt.header,
             fmt,
             buf: Vec::new(),
+            at: 0,
             done: false,
         }
     }
 
     pub fn feed(&mut self, data: &[u8]) {
         if !self.done {
+            self.buf.drain(..self.at);
+            self.at = 0;
             self.buf.extend_from_slice(data);
         }
     }
@@ -159,13 +164,15 @@ impl Reader {
             let end = if self.fmt.csv {
                 self.csv_record_end()
             } else {
-                self.buf.iter().position(|b| *b == b'\n')
+                self.buf[self.at..].iter().position(|b| *b == b'\n')
             };
             let (line_end, consumed) = match end {
                 Some(i) => (i, i + 1),
-                None if eof && !self.buf.is_empty() => (self.buf.len(), self.buf.len()),
+                None if eof && self.at < self.buf.len() => {
+                    (self.buf.len() - self.at, self.buf.len() - self.at)
+                }
                 None => {
-                    if self.buf.len() > MAX_RECORD {
+                    if self.buf.len() - self.at > MAX_RECORD {
                         return Err(SqlError::new(
                             "22P04",
                             "COPY record is too long (unterminated quote?)",
@@ -174,7 +181,8 @@ impl Reader {
                     return Ok(None);
                 }
             };
-            let mut line: Vec<u8> = self.buf.drain(..consumed).take(line_end).collect();
+            let mut line: Vec<u8> = self.buf[self.at..self.at + line_end].to_vec();
+            self.at += consumed;
             if line.last() == Some(&b'\r') {
                 line.pop();
             }
@@ -183,6 +191,7 @@ impl Reader {
             if line == "\\." {
                 self.done = true;
                 self.buf.clear();
+                self.at = 0;
                 return Ok(None);
             }
             if self.header_pending {
@@ -201,7 +210,7 @@ impl Reader {
     fn csv_record_end(&self) -> Option<usize> {
         let (q, e) = (self.fmt.quote, self.fmt.escape);
         let mut quoted = false;
-        let mut i = 0;
+        let mut i = self.at;
         while i < self.buf.len() {
             let b = self.buf[i];
             if quoted {
@@ -219,7 +228,7 @@ impl Reader {
             } else if b == q {
                 quoted = true;
             } else if b == b'\n' {
-                return Some(i);
+                return Some(i - self.at);
             }
             i += 1;
         }

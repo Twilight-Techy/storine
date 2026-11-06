@@ -537,6 +537,8 @@ pub struct Txn {
     checks: Vec<Write>,
     journal: Vec<Undo>,
     savepoints: Vec<(String, usize)>,
+    /// How many notifications were pending at each of `savepoints`.
+    savepoint_notifies: Vec<usize>,
     /// Row locks held (lock-document keys), released at commit / rollback.
     pub(crate) locks: Vec<String>,
     /// REPEATABLE READ / SERIALIZABLE: every row read is validated at commit.
@@ -799,7 +801,8 @@ impl Session {
     fn replace_rows(&mut self, name: &str, rows: Vec<Vec<Datum>>, params: &[Datum]) -> SqlResult<u64> {
         use crate::ast::{Delete, Insert, InsertSource};
         let n = rows.len() as u64;
-        let own_txn = !self.in_explicit_transaction();
+        // Inside a routine's statement there is a transaction already, implicit or not.
+        let own_txn = !self.in_transaction();
         if own_txn {
             self.txn = Some(Txn { explicit: true, ..Txn::default() });
         }
@@ -838,9 +841,12 @@ impl Session {
             return Err(SqlError::internal("a materialized view's query did not parse"));
         };
         let rows = if with_data {
+            // As its owner, like a view, whoever refreshes it: its rows are served to all.
             let ex = eval::Exec::new(self, params);
-            let rel = ex.query(&q, None)?;
-            ex.result_set(rel)?.rows
+            let outer_actor = ex.acting_as.replace(t.owner.clone().or_else(|| Some(ex.effective_user())));
+            let rel = temp::hidden(|| ex.query(&q, None));
+            ex.acting_as.replace(outer_actor);
+            ex.result_set(rel?)?.rows
         } else {
             Vec::new()
         };
@@ -870,6 +876,28 @@ impl Session {
         }
         self.control.check()?;
         self.run(stmt, params)
+    }
+
+    /// A pooled connection handed to its next user: nothing of the last one stays, whatever the
+    /// protocol's way of asking (`DISCARD ALL`, `COM_RESET_CONNECTION`, `sp_reset_connection`).
+    pub(crate) fn reset_connection(&mut self) {
+        self.rollback();
+        self.reset_session_state();
+    }
+
+    /// `reset_connection` for a client that keeps its transaction (TDS's "skip transaction" reset).
+    pub(crate) fn reset_session_state(&mut self) {
+        self.prepared.clear();
+        advisory::release_all(self, None, "");
+        self.vars = self.base_vars.clone();
+        self.role = None;
+        self.cursors.clear();
+        self.drop_temp_tables();
+        self.listening.clear();
+        self.engine.registry.unlisten_all(self.id);
+        self.user_vars.clear();
+        self.table_vars.clear();
+        self.pending_notifies.clear();
     }
 
     /// Inside `BEGIN ... COMMIT` (not the implicit transaction of one statement).
@@ -1096,7 +1124,9 @@ impl Session {
             }
             // Notifications go out when their transaction commits; a failure drops them.
             if !self.in_transaction() {
-                let ok = out.is_ok() && !matches!(stmt, Statement::Rollback);
+                // COMMIT of a failed transaction rolls it back, and says so.
+                let rolled_back = matches!(&out, Ok(Outcome::Command { tag, .. }) if tag == "ROLLBACK");
+                let ok = out.is_ok() && !rolled_back && !matches!(stmt, Statement::Rollback);
                 self.flush_notifies(ok);
             }
             self.control.end_statement(self.in_transaction(), self.idle_transaction_timeout());
@@ -1170,13 +1200,17 @@ impl Session {
                 }
                 let mark = txn.mark();
                 txn.savepoints.push((name.to_ascii_lowercase(), mark));
+                txn.savepoint_notifies.push(self.pending_notifies.len());
                 return Ok(Outcome::command("SAVEPOINT"));
             }
             Statement::ReleaseSavepoint(name) => {
                 if let Some(txn) = self.txn.as_mut() {
                     let n = name.to_ascii_lowercase();
                     match txn.savepoints.iter().rposition(|(s, _)| *s == n) {
-                        Some(p) => txn.savepoints.truncate(p),
+                        Some(p) => {
+                            txn.savepoints.truncate(p);
+                            txn.savepoint_notifies.truncate(p);
+                        }
                         None => {
                             return Err(SqlError::new(
                                 "3B001",
@@ -1203,6 +1237,9 @@ impl Session {
                 };
                 let mark = txn.savepoints[p].1;
                 txn.savepoints.truncate(p + 1);
+                txn.savepoint_notifies.truncate(p + 1);
+                let notifies = txn.savepoint_notifies[p];
+                self.pending_notifies.truncate(notifies);
                 txn.rollback_to(mark);
                 txn.failed = false;
                 return Ok(Outcome::command("ROLLBACK"));
@@ -1737,16 +1774,9 @@ impl Session {
                             "DISCARD ALL cannot run inside a transaction block",
                         ));
                     }
-                    self.prepared.clear();
-                    advisory::release_all(self, None, "");
-                    self.vars = self.base_vars.clone();
-                    self.role = None;
-                    self.cursors.clear();
+                    self.reset_connection();
+                } else if kind == "temp" || kind == "temporary" {
                     self.drop_temp_tables();
-                    self.listening.clear();
-                    self.engine.registry.unlisten_all(self.id);
-                    self.user_vars.clear();
-                    self.table_vars.clear();
                 }
                 Ok(Outcome::command(format!("DISCARD {}", kind.to_ascii_uppercase())))
             }

@@ -9,11 +9,13 @@ use std::time::Duration;
 use storage_codec::field_ops::FieldOp;
 use storage_codec::PropertyValue;
 use storage_core::dist::docs;
-use storage_core::dist::hlc::{Hlc, SystemClock};
+use storage_core::dist::hlc::{Hlc, SystemClock, Timestamp};
+use storage_core::dist::mvcc::TxnId;
 use storage_core::dist::meta::RangeIndex;
 use storage_core::dist::node::{NodeConfig, NodeDriver};
 use storage_core::dist::runtime::{Gateway, GatewayConfig, LocalTransport, RangeNode, RuntimeConfig};
-use storage_core::dist::server::NodeServer;
+use storage_core::dist::server::{KvRequest, KvResponse, NodeServer};
+use storage_core::dist::txn::KvSender;
 use storage_core::engine::Precondition;
 use storage_core::raft::KeySpan;
 use storage_core::{DocOp, DocQuery, DocWrite, Direction, DocumentRecord, EngineConfig, Filter, StorageEngine};
@@ -346,4 +348,63 @@ fn changefeeds_get_every_version_or_fail_loudly() {
         other => panic!("expected lost history, got {other:?}"),
     }
     drop(c);
+}
+
+/// Asks one node and takes no redirect.
+struct Only(Arc<RangeNode>);
+
+impl KvSender for Only {
+    fn send(&mut self, reqs: Vec<KvRequest>) -> Vec<Result<KvResponse, String>> {
+        reqs.into_iter().map(|r| self.0.request(r, Duration::from_secs(3)).map_err(|e| e.to_string())).collect()
+    }
+    fn now(&mut self) -> Timestamp {
+        hlc().now()
+    }
+    fn max_offset_ns(&self) -> u64 {
+        500_000_000
+    }
+    fn sleep(&mut self, us: u64) {
+        std::thread::sleep(Duration::from_micros(us));
+    }
+    fn new_id(&mut self) -> TxnId {
+        static NEXT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+        [NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed); 16]
+    }
+}
+
+/// A leader cut off from its range (`TASK-152`): it must stop answering from its own state, also for
+/// writes that would propose nothing, and step down instead of waiting for a quorum forever.
+#[test]
+fn a_cut_off_leader_answers_nothing_stale_and_steps_down() {
+    let cluster = start("cutoff");
+    let mut g = cluster.gateway();
+    docs::write(&mut g, vec![put("t", "seed", BTreeMap::new(), Precondition::None)], None).unwrap();
+    // Whoever answers a read of the key itself, without a redirect, leads its range.
+    let position = (0..MEMBERS.len()).find(|&i| docs::get(&mut Only(Arc::clone(&cluster.nodes[i])), "t", "seed").is_ok());
+    let position = position.expect("a leader");
+    let old = MEMBERS[position];
+    let mut stale = Only(Arc::clone(&cluster.nodes[position]));
+    for &id in &MEMBERS {
+        if id != old {
+            cluster.transport.partition(old, id);
+        }
+    }
+    // The others elect, and create a document the old leader has never seen.
+    let others: Vec<u16> = MEMBERS.iter().copied().filter(|&m| m != old).collect();
+    let cfg = GatewayConfig { nodes: others, request_timeout: Duration::from_secs(20), call_timeout: Duration::from_secs(2) };
+    let mut rest = Gateway::new(cluster.transport.clone(), cfg, hlc(), Arc::new(RwLock::new(RangeIndex::new())));
+    docs::write(&mut rest, vec![put("t", "new", BTreeMap::new(), Precondition::None)], None).unwrap();
+    // A delete there would propose nothing, on a key that exists: it must not report success.
+    let delete = DocWrite { collection: "t".into(), key: "new".into(), op: DocOp::Delete, precondition: Precondition::None };
+    assert!(docs::write(&mut stale, vec![delete], None).is_err());
+    assert!(docs::get(&mut rest, "t", "new").unwrap().is_some());
+    // The cut-off node stops claiming the range soon after, and says so at once.
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    while docs::get(&mut stale, "t", "seed").is_ok() {
+        assert!(std::time::Instant::now() < until, "a cut-off node kept serving reads");
+    }
+    let at = std::time::Instant::now();
+    assert!(docs::get(&mut stale, "t", "seed").is_err());
+    assert!(at.elapsed() < Duration::from_secs(2), "it should answer, not wait: {:?}", at.elapsed());
+    cluster.transport.heal();
 }

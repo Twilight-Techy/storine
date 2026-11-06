@@ -971,7 +971,10 @@ fn build_row(
     }
     compute_generated(ex, table, &mut row)?;
     check_row(ex, table, &row)?;
-    ex.check_new_row(table, &row, "insert")?;
+    // A BEFORE trigger can change the row: with one, this comes after it.
+    if !table.triggers.iter().any(|t| t.for_each_row) {
+        ex.check_new_row(table, &row, "insert")?;
+    }
     Ok(row)
 }
 
@@ -1125,6 +1128,7 @@ fn insert_rows(s: &mut Session, ins: &Insert, params: &[Datum]) -> SqlResult<Out
             let ex = Exec::new(s, params);
             compute_generated(&ex, &table, &mut changed)?;
             check_row(&ex, &table, &changed)?;
+            ex.check_new_row(&table, &changed, "insert")?;
             changed
         } else {
             row
@@ -1677,7 +1681,9 @@ fn update_rows(s: &mut Session, upd: &Update, params: &[Datum]) -> SqlResult<Out
             }
             compute_generated(&ex, &table, &mut new)?;
             check_row(&ex, &table, &new)?;
-            ex.check_new_row(&table, &new, "update")?;
+            if !table.triggers.iter().any(|t| t.for_each_row) {
+                ex.check_new_row(&table, &new, "update")?;
+            }
             changes.push((t, new));
         }
         (changes, matched)
@@ -1691,6 +1697,7 @@ fn update_rows(s: &mut Session, upd: &Update, params: &[Datum]) -> SqlResult<Out
             let ex = Exec::new(s, params);
             compute_generated(&ex, &table, &mut after)?;
             check_row(&ex, &table, &after)?;
+            ex.check_new_row(&table, &after, "update")?;
             after
         } else {
             new

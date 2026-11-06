@@ -13,6 +13,7 @@ pub mod fmt;
 pub mod hash;
 pub mod kerberos;
 pub mod lexer;
+pub mod listener;
 pub mod mysql;
 pub mod nettypes;
 pub mod oidc;

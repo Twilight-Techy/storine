@@ -844,8 +844,9 @@ impl Exec<'_> {
             ));
         }
         self.view_depth.set(depth + 1);
+        let _nesting = crate::exec::routine::enter_nesting()?;
         let outer_actor = self.acting_as.replace(Some(owner.unwrap_or_else(|| self.effective_user())));
-        let rel = self.query(&def.0, None);
+        let rel = crate::exec::temp::hidden(|| self.query(&def.0, None));
         self.acting_as.replace(outer_actor);
         self.view_depth.set(depth);
         let mut rel = rel?;
@@ -2076,6 +2077,10 @@ impl Exec<'_> {
                 }
             }
         }
+        // The protocols count columns in 16 bits at most, some in less.
+        if items.len() > MAX_RESULT_COLUMNS {
+            return Err(SqlError::new("54011", format!("a result can have at most {MAX_RESULT_COLUMNS} columns")));
+        }
         let aggregated = !sel.group_by.is_empty()
             || items.iter().any(|(e, _, _)| has_aggregate(e))
             || sel.having.as_ref().is_some_and(has_aggregate)
@@ -2813,8 +2818,11 @@ fn refers_to(e: &SetExpr, name: &str) -> bool {
 /// Rows a validating (REPEATABLE READ / SERIALIZABLE) transaction may read.
 const MAX_VALIDATED_READS: usize = 200_000;
 
+/// As SQL Server and MySQL allow.
+const MAX_RESULT_COLUMNS: usize = 4096;
+
 /// Set-returning functions allowed directly in a select list.
-const SELECT_LIST_SRFS: &[&str] = &[
+pub(crate) const SELECT_LIST_SRFS: &[&str] = &[
     "unnest",
     "generate_series",
     "generate_subscripts",

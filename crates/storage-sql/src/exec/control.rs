@@ -249,7 +249,8 @@ pub fn parse_duration(text: &str, unit_ms: f64) -> Option<Duration> {
         "us" => n / 1e3,
         _ => return None,
     };
-    (ms > 0.0 && ms.is_finite()).then(|| Duration::from_secs_f64(ms / 1e3))
+    // Past what a `Duration` holds it is refused, like any other value that makes no sense.
+    (ms > 0.0 && ms.is_finite()).then(|| Duration::try_from_secs_f64(ms / 1e3).ok()).flatten()
 }
 
 /// A byte-size setting: bytes, or with a unit (`64kB`, `512MB`, `2GB`).

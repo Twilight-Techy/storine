@@ -25,7 +25,9 @@ pub struct Exec<'a> {
     /// Common table expressions in scope (innermost last).
     pub ctes: RefCell<Vec<HashMap<String, Rc<Rel>>>>,
     /// Results of uncorrelated subqueries, by node address.
-    subquery_cache: RefCell<HashMap<usize, Rc<Rel>>>,
+    /// With a copy of the query: nodes can be clones freed mid-statement, so that an address alone
+    /// could come back as another query.
+    subquery_cache: RefCell<HashMap<usize, (Query, Rc<Rel>)>>,
     /// Subqueries known to be correlated (re-run per row).
     correlated: RefCell<std::collections::HashSet<usize>>,
     /// Parsed view definitions used by this statement (kept alive: the subquery cache is keyed
@@ -50,9 +52,9 @@ pub struct Exec<'a> {
     pub(crate) scope: RefCell<Vec<Option<Vec<ColMeta>>>>,
     /// Decorrelated subqueries of this statement, by address (`None`: runs per row).
     #[allow(clippy::type_complexity)]
-    pub(crate) semi_joins: RefCell<HashMap<usize, Option<Rc<crate::exec::optimizer::SemiJoin>>>>,
+    pub(crate) semi_joins: RefCell<HashMap<usize, (Query, Option<Rc<crate::exec::optimizer::SemiJoin>>)>>,
     #[allow(clippy::type_complexity)]
-    pub(crate) group_maps: RefCell<HashMap<usize, Option<Rc<crate::exec::optimizer::GroupMap>>>>,
+    pub(crate) group_maps: RefCell<HashMap<usize, (Query, Option<Rc<crate::exec::optimizer::GroupMap>>)>>,
     /// Evaluations since the last look at the session's control (`exec/control.rs`).
     ticks: std::cell::Cell<u32>,
     /// Bytes of rows this statement holds, and the most it may.
@@ -988,8 +990,10 @@ impl<'a> Exec<'a> {
     /// Runs a subquery with `env` as its enclosing row. Uncorrelated subqueries run once.
     pub fn subquery(&self, q: &Query, env: &Env<'_>) -> SqlResult<Rc<Rel>> {
         let key = q as *const Query as usize;
-        if let Some(r) = self.subquery_cache.borrow().get(&key) {
-            return Ok(Rc::clone(r));
+        if let Some((same, r)) = self.subquery_cache.borrow().get(&key) {
+            if same == q {
+                return Ok(Rc::clone(r));
+            }
         }
         if !self.correlated.borrow().contains(&key) {
             match self.query(q, None) {
@@ -997,7 +1001,7 @@ impl<'a> Exec<'a> {
                     let rel = Rc::new(rel);
                     self.subquery_cache
                         .borrow_mut()
-                        .insert(key, Rc::clone(&rel));
+                        .insert(key, (q.clone(), Rc::clone(&rel)));
                     return Ok(rel);
                 }
                 Err(e) if e.code == "42703" || e.code == "42P01" => {

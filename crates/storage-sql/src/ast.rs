@@ -86,8 +86,8 @@ pub enum Statement {
         table: String,
         rename: Option<String>,
         roles: Option<Vec<String>>,
-        using: Option<Expr>,
-        check: Option<Expr>,
+        using: PolicyExpr,
+        check: PolicyExpr,
     },
     Query(Box<Query>),
     Insert(Box<Insert>),
@@ -748,6 +748,9 @@ pub struct GrantStmt {
     pub default_for: Option<String>,
 }
 
+/// A policy's predicate and its source text, if it has the clause.
+pub type PolicyExpr = Option<(Expr, String)>;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreatePolicy {
     pub name: String,
@@ -757,8 +760,8 @@ pub struct CreatePolicy {
     pub command: String,
     /// Empty: everyone.
     pub roles: Vec<String>,
-    pub using: Option<Expr>,
-    pub check: Option<Expr>,
+    pub using: PolicyExpr,
+    pub check: PolicyExpr,
 }
 
 #[derive(Debug, Clone, PartialEq)]

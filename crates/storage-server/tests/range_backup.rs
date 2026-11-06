@@ -252,3 +252,48 @@ fn backup_restore_and_changefeed() {
     drop((a, b, d));
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A range cluster with authentication on (`TASK-152`): its nodes and its clients log in.
+#[test]
+fn a_range_cluster_authenticates() {
+    use storage_server::RbacRole;
+    let root: PathBuf = std::env::temp_dir().join(format!("storine_range_auth_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let addrs: Vec<SocketAddr> = (0..3).map(|_| free_addr()).collect();
+    let peers: HashMap<u16, SocketAddr> = addrs.iter().enumerate().map(|(i, a)| ((i + 1) as u16, *a)).collect();
+    let _servers: Vec<_> = (0..3)
+        .map(|i| {
+            start_range_server(RangeServerConfig {
+                data_dir: root.join(format!("n{}", i + 1)),
+                bind_addr: addrs[i].to_string(),
+                node_id: (i + 1) as u16,
+                peers: peers.clone(),
+                token: Some("secret-token-for-the-cluster".to_owned()),
+                security: SecurityConfig::new(true).with_token("secret-token-for-the-cluster", RbacRole::Admin),
+                max_connections: 256,
+                max_offset: Duration::from_millis(100),
+            })
+            .unwrap()
+        })
+        .collect();
+    // Without a token, nothing.
+    let mut anon = StorageClient::connect(addrs[0]).unwrap();
+    assert!(anon.doc_write(&[put("t", "x".to_owned(), 1)], None).is_err());
+    let mut bad = StorageClient::connect(addrs[0]).unwrap();
+    assert!(bad.authenticate("wrong").is_err());
+    // With one, the nodes have talked to each other and a write commits.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let wrote = (|| -> Result<(), StorageError> {
+            let mut c = StorageClient::connect_timeout(addrs[0], Duration::from_secs(5))?;
+            c.authenticate("secret-token-for-the-cluster")?;
+            c.doc_write(&[put("t", "x".to_owned(), 1)], None).map(|_| ())
+        })();
+        match wrote {
+            Ok(()) => break,
+            Err(e) if std::time::Instant::now() > deadline => panic!("no write committed: {e}"),
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

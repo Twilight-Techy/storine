@@ -32,6 +32,17 @@ const LEASE_NS: i64 = 3_600_000_000_000;
 thread_local! {
     /// The temporary tables of the session running on this thread.
     static CURRENT: RefCell<Option<TempTables>> = const { RefCell::new(None) };
+    /// Inside `hidden`: code an owner wrote is not to read what the caller named like its tables.
+    static HIDDEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `f` (a view's body, a row policy) seeing no temporary tables: a caller's `CREATE TEMP TABLE
+/// memberships` must not stand in for the table a policy reads.
+pub(crate) fn hidden<R>(f: impl FnOnce() -> R) -> R {
+    HIDDEN.with(|h| h.set(h.get() + 1));
+    let out = f();
+    HIDDEN.with(|h| h.set(h.get() - 1));
+    out
 }
 
 /// What this thread's name lookups see from now on.
@@ -41,6 +52,9 @@ pub(crate) fn enter(tables: &TempTables) {
 
 /// The temporary table of that name, for the session on this thread.
 pub(crate) fn lookup(name: &str) -> Option<Arc<Table>> {
+    if HIDDEN.with(std::cell::Cell::get) > 0 {
+        return None;
+    }
     CURRENT.with(|c| {
         let c = c.borrow();
         let tables = c.as_ref()?.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

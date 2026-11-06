@@ -270,8 +270,13 @@ pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// `len` bytes from the OS-seeded SipHash keys plus a counter and the clock (nonces, salts).
+/// `len` bytes from the operating system's generator (nonces, salts, keys, cancel secrets). Only if
+/// that fails: OS-seeded SipHash keys over a counter and the clock.
 pub fn random_bytes(len: usize) -> Vec<u8> {
+    let mut from_os = vec![0u8; len];
+    if storage_codec::rand::os_random(&mut from_os).is_ok() {
+        return from_os;
+    }
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     use std::sync::atomic::{AtomicU64, Ordering};

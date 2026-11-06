@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::thread;
 
 use crate::ast::{DataType, Statement};
 use crate::datum::{self, Datum};
@@ -28,22 +27,14 @@ pub struct Auth {
 
 /// Accepts MySQL clients on `listener` forever (one thread per connection).
 pub fn serve(engine: Arc<Engine>, listener: TcpListener, auth: Arc<Auth>) {
-    for conn in listener.incoming() {
-        let Ok(stream) = conn else { continue };
-        let engine = Arc::clone(&engine);
-        let auth = Arc::clone(&auth);
-        thread::spawn(move || {
-            let _ = stream.set_nodelay(true);
-            if let Err(e) = Conn::run(engine, stream, &auth) {
-                if e.kind() != io::ErrorKind::UnexpectedEof
-                    && e.kind() != io::ErrorKind::ConnectionReset
-                {
-                    eprintln!("storine-sql: mysql connection ended: {e}");
-                }
-            }
-        });
-    }
+    crate::listener::serve("mysql", listener, move |stream, login| {
+        Conn::run(Arc::clone(&engine), stream, &auth, &login)
+    });
 }
+
+/// Largest packet after login, and before it: nothing a login sends comes near a mebibyte.
+const MAX_PACKET: usize = 1 << 30;
+const MAX_LOGIN_PACKET: usize = 1 << 20;
 
 // Capability flags.
 const CLIENT_LONG_PASSWORD: u32 = 1;
@@ -158,6 +149,11 @@ impl Write for Output {
 }
 
 struct Conn {
+    /// Largest packet accepted now: less before login.
+    max_packet: usize,
+    /// `CLIENT_MULTI_STATEMENTS`, or `COM_SET_OPTION`: a client that did not ask gets one
+    /// statement per query, which is what stops `1; DROP TABLE t` in an injected value.
+    multi_statements: bool,
     r: Input,
     w: Output,
     seq: u8,
@@ -286,11 +282,14 @@ impl Conn {
                 usize::from(hdr[0]) | (usize::from(hdr[1]) << 8) | (usize::from(hdr[2]) << 16);
             self.seq = hdr[3].wrapping_add(1);
             let start = out.len();
-            if start + len > (1 << 30) {
+            if start + len > self.max_packet {
                 return Err(bad("packet too large"));
             }
-            out.resize(start + len, 0);
-            self.r.read_exact(&mut out[start..])?;
+            // Grows as bytes arrive: a header alone is no reason to commit 16 MiB.
+            let got = (&mut self.r).take(len as u64).read_to_end(&mut out)?;
+            if got < len {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
             if len < 0xff_ffff {
                 return Ok(out);
             }
@@ -375,7 +374,12 @@ impl Conn {
         self.write_packet(&p)
     }
 
-    fn run(engine: Arc<Engine>, stream: TcpStream, auth: &Auth) -> io::Result<()> {
+    fn run(
+        engine: Arc<Engine>,
+        stream: TcpStream,
+        auth: &Auth,
+        login: &crate::listener::Login,
+    ) -> io::Result<()> {
         let socket = stream.try_clone()?;
         let r = Input::Plain(BufReader::new(stream.try_clone()?));
         let w = Output::Plain(BufWriter::new(stream));
@@ -389,6 +393,8 @@ impl Conn {
             session,
             stmts: HashMap::new(),
             next_stmt: 1,
+            max_packet: MAX_LOGIN_PACKET,
+            multi_statements: false,
         };
         // Handshake.
         let nonce: Vec<u8> = hash::random_bytes(20)
@@ -450,6 +456,7 @@ impl Conn {
             return Ok(());
         }
         c.caps = caps & SERVER_CAPS;
+        c.multi_statements = caps & CLIENT_MULTI_STATEMENTS != 0;
         let _max_packet = rd.u32()?;
         let _charset = rd.u8()?;
         rd.take(23)?;
@@ -509,6 +516,8 @@ impl Conn {
         }
         c.ok(0, 0, false, "")?;
         c.w.flush()?;
+        login.done();
+        c.max_packet = MAX_PACKET;
         c.commands()
     }
 
@@ -577,10 +586,13 @@ impl Conn {
                     }
                     self.ok(0, 0, false, "")
                 }
-                0x1b => self.eof(false),
+                0x1b => {
+                    // COM_SET_OPTION: 0 turns multiple statements on, 1 off.
+                    self.multi_statements = body.first() == Some(&0);
+                    self.eof(false)
+                }
                 0x1f => {
-                    self.session.rollback();
-                    self.session.role = None;
+                    self.session.reset_connection();
                     self.stmts.clear();
                     self.ok(0, 0, false, "")
                 }
@@ -607,6 +619,11 @@ impl Conn {
         };
         if stmts.is_empty() {
             return self.ok(0, 0, false, "");
+        }
+        if stmts.len() > 1 && !self.multi_statements {
+            return self.err(&SqlError::syntax(
+                "more than one statement in a query, and the client did not ask for CLIENT_MULTI_STATEMENTS".to_owned(),
+            ));
         }
         let n = stmts.len();
         for (k, st) in stmts.iter().enumerate() {
@@ -683,6 +700,9 @@ impl Conn {
             Ok(x) => x,
             Err(e) => return self.err(&e),
         };
+        if nparams > usize::from(u16::MAX) {
+            return self.err(&SqlError::new("54000", "a statement can have at most 65535 parameters"));
+        }
         let columns = match describe(&mut self.session, &stmt, nparams) {
             Ok(c) => c,
             Err(e) => return self.err(&e),

@@ -1042,6 +1042,7 @@ fn servers() -> &'static Servers {
                 users,
                 tls: tls.clone(),
                 require_tls: false,
+                verifiers: Default::default(),
             });
             spawn_server(move |l| storage_sql::pg::serve(engine, l, auth))
         };
@@ -1593,6 +1594,25 @@ fn tds_batch(sql: &str) -> Vec<u8> {
     p.extend_from_slice(&1u32.to_le_bytes());
     p.extend_from_slice(&utf16(sql));
     p
+}
+
+/// The status bit pooled clients use to reset a connection (`TASK-152`).
+#[test]
+fn tds_reset_bit_clears_the_session() {
+    let engine = Arc::clone(engine());
+    let addr = spawn_server(move |l| {
+        let auth = storage_sql::tds::Auth { users: Default::default(), oidc: None, kerberos: None, tls: None, require_tls: false };
+        storage_sql::tds::serve(engine, l, Arc::new(auth));
+    });
+    let mut s = tds_session(addr).unwrap();
+    s.write_all(&tds_packet(0x01, &tds_batch("CREATE TABLE #t (a INT)"))).unwrap();
+    assert!(!tds_read(&mut s).unwrap().contains(&0xaa));
+    s.write_all(&tds_packet(0x01, &tds_batch("SELECT * FROM #t"))).unwrap();
+    assert!(!tds_read(&mut s).unwrap().contains(&0xaa));
+    let mut reset = tds_packet(0x01, &tds_batch("SELECT * FROM #t"));
+    reset[1] |= 0x08;
+    s.write_all(&reset).unwrap();
+    assert!(tds_read(&mut s).unwrap().contains(&0xaa), "the temporary table outlived the reset");
 }
 
 fn tds_healthy(addr: SocketAddr) {

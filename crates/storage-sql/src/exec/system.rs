@@ -1316,8 +1316,9 @@ fn pg_catalog(ex: &Exec<'_>, n: &str, tables: &[std::sync::Arc<Table>]) -> SqlRe
             names.sort();
             for table in names {
                 let st = &stats[table];
-                // As in PostgreSQL: only what the role may read.
-                let readable = tables.iter().find(|x| x.name.eq_ignore_ascii_case(table)).is_some_and(|x| ex.s.engine.acl().is_ok_and(|a| a.table_access(ex.s.current_role(), x, "SELECT") == crate::exec::acl::Access::All));
+                // As in PostgreSQL: only what the role may read in full. Statistics are taken over every
+                // row, so row security hides them too.
+                let readable = tables.iter().find(|x| x.name.eq_ignore_ascii_case(table)).is_some_and(|x| ex.s.engine.acl().is_ok_and(|a| a.table_access(ex.s.current_role(), x, "SELECT") == crate::exec::acl::Access::All && a.policies(ex.s.current_role(), x, "select").is_none()));
                 if !readable {
                     continue;
                 }

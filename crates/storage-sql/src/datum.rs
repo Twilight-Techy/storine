@@ -397,10 +397,14 @@ pub fn hash_key(d: &Datum) -> String {
             .map(|x| format!("n{}", x.normalize()))
             .unwrap_or_default(),
         Datum::Float(f) => {
-            if f.fract() == 0.0 && f.abs() < 1e15 {
-                format!("n{}", *f as i64)
+            // As an equal number hashes: `1.5::float = 1.5::numeric`.
+            if *f == 0.0 {
+                "n0".into()
             } else {
-                format!("f{f}")
+                match parse_dec(&format!("{f}")) {
+                    Ok(x) => format!("n{}", x.normalize()),
+                    Err(()) => format!("f{f}"),
+                }
             }
         }
         Datum::Bool(b) => format!("b{b}"),

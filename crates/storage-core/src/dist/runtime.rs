@@ -14,7 +14,7 @@
 //!   `NotLeader` redirects and refreshes on `WrongRange`, within a deadline. Clients therefore
 //!   connect to any node (SDKs need no range awareness, `TASK-143`'s decision).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
@@ -64,7 +64,9 @@ enum Input {
 pub struct RangeNode {
     id: NodeId,
     tx: Sender<Input>,
+    /// Requests waiting for an answer, and bytes of batches not yet stepped.
     queued: Arc<AtomicU64>,
+    batch_bytes: Arc<AtomicU64>,
     max_queued: usize,
     thread: Mutex<Option<JoinHandle<()>>>,
     stopped: AtomicBool,
@@ -81,6 +83,9 @@ fn now_us() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64)
 }
 
+/// Most bytes of peers' batches queued at a node.
+const MAX_QUEUED_BATCH_BYTES: u64 = 1 << 30;
+
 impl RangeNode {
     /// Starts `server`'s event loop. Batches it produces go out through `transport`.
     pub fn start(server: NodeServer, transport: Arc<dyn Transport>, cfg: RuntimeConfig) -> Arc<Self> {
@@ -88,12 +93,14 @@ impl RangeNode {
         let (tx, rx) = mpsc::channel();
         let queued = Arc::new(AtomicU64::new(0));
         let q = Arc::clone(&queued);
+        let batch_bytes = Arc::new(AtomicU64::new(0));
+        let b = Arc::clone(&batch_bytes);
         let tick = cfg.tick;
         let thread = std::thread::Builder::new()
             .name(format!("range-node-{id}"))
-            .spawn(move || event_loop(server, rx, transport, tick, q))
+            .spawn(move || event_loop(server, rx, transport, tick, q, b))
             .ok();
-        Arc::new(Self { id, tx, queued, max_queued: cfg.max_queued, thread: Mutex::new(thread), stopped: AtomicBool::new(false) })
+        Arc::new(Self { id, tx, queued, batch_bytes, max_queued: cfg.max_queued, thread: Mutex::new(thread), stopped: AtomicBool::new(false) })
     }
 
     pub fn id(&self) -> NodeId {
@@ -102,6 +109,12 @@ impl RangeNode {
 
     /// Hands an encoded batch from another node to the event loop.
     pub fn deliver(&self, batch: Vec<u8>) {
+        // Past this the node is behind: Raft sends again what is dropped, which memory could not.
+        let len = batch.len() as u64;
+        if self.batch_bytes.load(Ordering::Relaxed).saturating_add(len) > MAX_QUEUED_BATCH_BYTES {
+            return;
+        }
+        self.batch_bytes.fetch_add(len, Ordering::Relaxed);
         let _ = self.tx.send(Input::Batch(batch));
     }
 
@@ -148,7 +161,7 @@ impl Drop for RangeNode {
     }
 }
 
-fn event_loop(mut srv: NodeServer, rx: Receiver<Input>, transport: Arc<dyn Transport>, tick: Duration, queued: Arc<AtomicU64>) {
+fn event_loop(mut srv: NodeServer, rx: Receiver<Input>, transport: Arc<dyn Transport>, tick: Duration, queued: Arc<AtomicU64>, batch_bytes: Arc<AtomicU64>) {
     // Request ids are this loop's own: replies go back through their channels.
     let trace = std::env::var_os("STORINE_NODE_TRACE").is_some();
     if trace {
@@ -157,6 +170,7 @@ fn event_loop(mut srv: NodeServer, rx: Receiver<Input>, transport: Arc<dyn Trans
     let mut waiting: BTreeMap<u64, (Instant, SyncSender<KvResponse>)> = BTreeMap::new();
     let mut next_id = 0u64;
     let mut last_tick = Instant::now();
+    let mut last_sweep = Instant::now();
     loop {
         let wait = tick.saturating_sub(last_tick.elapsed());
         let first = match rx.recv_timeout(wait) {
@@ -176,6 +190,7 @@ fn event_loop(mut srv: NodeServer, rx: Receiver<Input>, transport: Arc<dyn Trans
                 Input::Stop => return,
                 Input::Batch(bytes) => {
                     kinds.0 += 1;
+                    batch_bytes.fetch_sub(bytes.len() as u64, Ordering::Relaxed);
                     let Ok(batch) = wire::decode_batch(&bytes) else { continue };
                     // A batch from a node whose clock is beyond the offset bound is refused.
                     if srv.hlc().update(batch.ts).is_err() {
@@ -185,7 +200,6 @@ fn event_loop(mut srv: NodeServer, rx: Receiver<Input>, transport: Arc<dyn Trans
                 }
                 Input::Request(req, reply) => {
                     kinds.1 += 1;
-                    queued.fetch_sub(1, Ordering::Relaxed);
                     next_id += 1;
                     waiting.insert(next_id, (Instant::now(), reply));
                     srv.submit(next_id, 0, req);
@@ -211,6 +225,7 @@ fn event_loop(mut srv: NodeServer, rx: Receiver<Input>, transport: Arc<dyn Trans
         }
         for r in srv.take_replies() {
             if let Some((_, tx)) = waiting.remove(&r.id) {
+                queued.fetch_sub(1, Ordering::Relaxed);
                 let _ = tx.try_send(r.resp);
             }
         }
@@ -222,10 +237,16 @@ fn event_loop(mut srv: NodeServer, rx: Receiver<Input>, transport: Arc<dyn Trans
         for (to, batch) in out {
             transport.send_batch(to, wire::encode_batch(&batch));
         }
-        // Bounded memory: a request that never applies (its proposal was lost with a leader
-        // change) is forgotten after a minute; its caller has long timed out.
-        if waiting.len() > 1024 {
-            waiting.retain(|_, (since, _)| since.elapsed() < Duration::from_secs(60));
+        // Bounded memory: a request that never answered (its proposal was lost with a leader
+        // change, say) is forgotten after a minute; its caller has long timed out.
+        if last_sweep.elapsed() >= Duration::from_secs(1) {
+            last_sweep = Instant::now();
+            let expired: HashSet<u64> = waiting.iter().filter(|(_, (since, _))| since.elapsed() >= Duration::from_secs(60)).map(|(id, _)| *id).collect();
+            if !expired.is_empty() {
+                waiting.retain(|id, _| !expired.contains(id));
+                queued.fetch_sub(expired.len() as u64, Ordering::Relaxed);
+                srv.forget(&expired);
+            }
         }
     }
 }

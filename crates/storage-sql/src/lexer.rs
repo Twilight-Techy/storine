@@ -59,6 +59,8 @@ const OPS: &[&str] = &[
 pub struct Params {
     pub count: usize,
     pub names: Vec<String>,
+    /// Position of each of `names`: a statement can have very many.
+    positions: std::collections::HashMap<String, usize>,
 }
 
 pub fn tokenize(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Token>, Params)> {
@@ -248,7 +250,10 @@ pub fn tokenize(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Token>, Params)> 
             continue;
         }
         // Numbers: 12, 1.5, .5, 1e10, 0x1F.
-        if c.is_ascii_digit() || (c == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit)) {
+        // Not after a `.`: the `10` of `1..10` is not `.10`.
+        if c.is_ascii_digit()
+            || (c == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit) && (i == 0 || b[i - 1] != b'.'))
+        {
             if c == b'0'
                 && matches!(b.get(i + 1), Some(b'x' | b'X'))
                 && b.get(i + 2).is_some_and(u8::is_ascii_hexdigit)
@@ -325,9 +330,10 @@ pub fn tokenize(sql: &str, dialect: Dialect) -> SqlResult<(Vec<Token>, Params)> 
 
 fn named(params: &mut Params, name: &str) -> usize {
     let lower = name.to_ascii_lowercase();
-    if let Some(p) = params.names.iter().position(|n| *n == lower) {
-        return p;
+    if let Some(p) = params.positions.get(&lower) {
+        return *p;
     }
+    params.positions.insert(lower.clone(), params.names.len());
     params.names.push(lower);
     params.count = params.count.max(params.names.len());
     params.names.len() - 1

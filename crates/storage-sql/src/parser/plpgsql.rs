@@ -5,7 +5,7 @@
 //! `... RETURNING ... INTO`, `EXCEPTION WHEN`, and any other SQL statement. Anything else is refused
 //! when the function is created.
 
-use super::Parser;
+use super::{too_deep, Parser};
 use crate::ast::*;
 use crate::error::{SqlError, SqlResult};
 use crate::lexer::{tokenize, Dialect, Token};
@@ -41,10 +41,26 @@ pub struct PlBlock {
 }
 
 /// Parses a PL/pgSQL body.
+/// How deep function bodies may nest in function bodies. Each is parsed by a new parser, so the
+/// parser's own depth limit does not see them.
+const MAX_BODY_NESTING: usize = 4;
+
+fn nested_body<T>(parse: impl FnOnce() -> SqlResult<T>) -> SqlResult<T> {
+    thread_local! {
+        static NESTING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    let depth = NESTING.with(std::cell::Cell::get);
+    if depth >= MAX_BODY_NESTING {
+        return Err(too_deep());
+    }
+    NESTING.with(|n| n.set(depth + 1));
+    let out = parse();
+    NESTING.with(|n| n.set(depth));
+    out
+}
+
 pub fn parse_body(body: &str) -> SqlResult<PlBlock> {
-    // `1..10` must not read as the number `1.` and `.10`.
-    let text = body.replace("..", " .. ");
-    let (tokens, _) = tokenize(&text, Dialect::Postgres)?;
+    let (tokens, _) = tokenize(body, Dialect::Postgres)?;
     let mut p = Parser::new(tokens, Dialect::Postgres);
     let block = p.pl_block()?;
     let _ = p.eat_op(";");
@@ -184,6 +200,10 @@ impl Parser {
     }
 
     fn pl_statement(&mut self) -> SqlResult<PlStmt> {
+        self.nested(Self::pl_statement_body)
+    }
+
+    fn pl_statement_body(&mut self) -> SqlResult<PlStmt> {
         let kw = self.peek().and_then(Token::keyword).unwrap_or_default();
         match kw.as_str() {
             "null" => {
@@ -454,11 +474,13 @@ impl Parser {
         }
         let body = body.ok_or_else(|| SqlError::new("42P13", "no function body specified"))?;
         // Refused now rather than at the first call.
-        if language == "plpgsql" {
-            parse_body(&body)?;
-        } else {
-            super::parse(&body, Dialect::Postgres)?;
-        }
+        nested_body(|| {
+            if language == "plpgsql" {
+                parse_body(&body).map(|_| ())
+            } else {
+                super::parse(&body, Dialect::Postgres).map(|_| ())
+            }
+        })?;
         Ok(Statement::CreateFunction(Box::new(CreateFunction { name, or_replace, args, returns, language, body, is_procedure })))
     }
 

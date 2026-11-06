@@ -591,18 +591,24 @@ impl Parser {
         list(self).map(GrantObject::Tables)
     }
 
-    fn policy_predicates(&mut self) -> SqlResult<(Option<Expr>, Option<Expr>)> {
+    /// `USING (..)` and `WITH CHECK (..)`, each with its text: that is what the catalog keeps, since
+    /// an expression holding a subquery does not print back as one.
+    fn policy_predicates(&mut self) -> SqlResult<(PolicyExpr, PolicyExpr)> {
         let mut using = None;
         let mut check = None;
+        let predicate = |p: &mut Self| -> SqlResult<PolicyExpr> {
+            p.expect_op("(")?;
+            let from = p.pos;
+            let e = p.expr()?;
+            let sql = super::tokens_sql(&p.tokens[from..p.pos], Dialect::Postgres)?;
+            p.expect_op(")")?;
+            Ok(Some((e, sql)))
+        };
         if self.eat_kw("using") {
-            self.expect_op("(")?;
-            using = Some(self.expr()?);
-            self.expect_op(")")?;
+            using = predicate(self)?;
         }
         if self.eat_kws(&["with", "check"]) {
-            self.expect_op("(")?;
-            check = Some(self.expr()?);
-            self.expect_op(")")?;
+            check = predicate(self)?;
         }
         Ok((using, check))
     }

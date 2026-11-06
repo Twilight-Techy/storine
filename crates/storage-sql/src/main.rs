@@ -26,7 +26,7 @@ use std::time::Duration;
 use storage_sql::exec::{Engine, EngineConfig};
 use storage_sql::store::Store;
 
-const USAGE: &str = "usage: storine-sql (--data DIR | --storine URL) [--pg ADDR] [--mysql ADDR] [--mssql ADDR] [--no-pg] [--no-mysql] [--no-mssql] [--user NAME:PASSWORD]... [--database NAME] [--tls-cert FILE --tls-key FILE | --no-tls] [--require-tls] [--oidc-issuer URL --oidc-audience AUD --oidc-jwks FILE [--oidc-user-claim CLAIM]] [--kerberos-keytab FILE [--kerberos-keep-realm]]";
+const USAGE: &str = "usage: storine-sql (--data DIR | --storine URL) [--pg ADDR] [--mysql ADDR] [--mssql ADDR] [--no-pg] [--no-mysql] [--no-mssql] [--user NAME:PASSWORD]... [--database NAME] [--tls-cert FILE --tls-key FILE | --no-tls] [--require-tls] [--oidc-issuer URL --oidc-audience AUD --oidc-jwks FILE [--oidc-user-claim CLAIM]] [--kerberos-keytab FILE [--kerberos-keep-realm]] [--max-connections N]";
 
 fn main() -> ExitCode {
     match run() {
@@ -70,6 +70,10 @@ fn run() -> Result<(), String> {
             "--tls-cert" => tls_cert = Some(PathBuf::from(value("--tls-cert")?)),
             "--tls-key" => tls_key = Some(PathBuf::from(value("--tls-key")?)),
             "--no-tls" => no_tls = true,
+            "--max-connections" => {
+                let n: usize = value("--max-connections")?.parse().map_err(|_| "--max-connections takes a number")?;
+                storage_sql::listener::set_max_connections(n);
+            }
             "--require-tls" => require_tls = true,
             "--oidc-issuer" => oidc_issuer = Some(value("--oidc-issuer")?),
             "--oidc-audience" => oidc_audiences.push(value("--oidc-audience")?),
@@ -151,6 +155,10 @@ fn run() -> Result<(), String> {
         None if keep_realm => return Err("--kerberos-keep-realm needs --kerberos-keytab".into()),
         None => None,
     };
+    if users.is_empty() && (oidc.is_some() || kerberos.is_some()) {
+        // No accounts means every client is trusted: a token would then guard nothing.
+        return Err("--oidc-* and --kerberos-keytab need at least one --user: without one every client is trusted".into());
+    }
     if !users.is_empty() {
         // Authentication on: the configured accounts are the superusers (`exec/acl.rs`).
         config.bootstrap_users = Some(users.keys().cloned().collect());
@@ -179,6 +187,7 @@ fn run() -> Result<(), String> {
                 users: users.clone(),
                 tls: tls.clone(),
                 require_tls,
+                verifiers: Default::default(),
             }),
         );
         threads.push(std::thread::spawn(move || {

@@ -423,3 +423,14 @@ fn cursors_over_the_postgres_wire() {
     let tags: Vec<String> = messages(&mut c).iter().filter(|m| m.0 == b'C').map(|m| text(&m.1)).collect();
     assert_eq!(tags, ["SELECT 1"]);
 }
+
+/// Audit findings over the wire (`TASK-152`): what the parser accepts, the connection's stack holds.
+#[test]
+fn deep_expressions_run_over_the_wire() {
+    let (e, _g) = engine("wiredeep", EngineConfig::default());
+    let addr = serve(&e);
+    let mut c = Pg::connect(addr);
+    let sql = format!("SELECT 1{}", " + 1".repeat(990));
+    assert_eq!(c.run(&sql), None);
+    assert_eq!(c.run("SELECT 1"), None);
+}

@@ -21,7 +21,7 @@
 //! Requests and responses are plain values. The host passes them in and out, so the same code
 //! runs over TCP and in the simulator.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -156,6 +156,8 @@ struct Pending {
     state: PendingState,
     /// A one-phase commit waiting for another transaction's intent: since when.
     waiting_since: Option<u64>,
+    /// A read index confirmed this leader since the request started.
+    read_confirmed: bool,
 }
 
 #[derive(Debug)]
@@ -242,6 +244,8 @@ pub struct NodeServer {
     pending: Vec<Pending>,
     /// Key -> the (client, request id) writing it.
     latches: BTreeMap<Vec<u8>, (u64, u64)>,
+    /// Spans of the scans seen so far in this pass over the pending requests.
+    scan_fences: Vec<(Vec<u8>, Option<Vec<u8>>)>,
     tscache: BTreeMap<RangeId, TsCache>,
     replies: VecDeque<Reply>,
     /// Evaluation log for debugging (`enable_trace`).
@@ -377,7 +381,7 @@ impl NodeServer {
     pub fn new(driver: NodeDriver, hlc: Arc<Hlc>) -> Self {
         // Scans walk ids in key order.
         driver.engine().enable_ordered_ids();
-        Self { driver, hlc, pending: Vec::new(), latches: BTreeMap::new(), tscache: BTreeMap::new(), replies: VecDeque::new(), trace: None, meta: None, published: BTreeMap::new(), meta_waiting: BTreeMap::new(), next_internal: 0, follower_reads: 0, protections: BTreeMap::new() }
+        Self { driver, hlc, pending: Vec::new(), latches: BTreeMap::new(), scan_fences: Vec::new(), tscache: BTreeMap::new(), replies: VecDeque::new(), trace: None, meta: None, published: BTreeMap::new(), meta_waiting: BTreeMap::new(), next_internal: 0, follower_reads: 0, protections: BTreeMap::new() }
     }
 
     /// Records every evaluation (tests and debugging).
@@ -475,7 +479,7 @@ impl NodeServer {
             self.replies.push_back(Reply { id, client, resp: KvResponse::NotLeader { leader } });
             return;
         }
-        self.pending.push(Pending { id, client, range, req, state: PendingState::New, waiting_since: None });
+        self.pending.push(Pending { id, client, range, req, state: PendingState::New, waiting_since: None, read_confirmed: false });
     }
 
     /// Replies ready to send.
@@ -638,6 +642,7 @@ impl NodeServer {
     pub fn poll_progress(&mut self, now_ns: u64) -> bool {
         self.publish(now_ns);
         let ready_reads = self.driver.take_ready_reads();
+        self.scan_fences.clear();
         let pending = std::mem::take(&mut self.pending);
         let mut keep = Vec::new();
         let mut moved = !ready_reads.is_empty();
@@ -657,6 +662,24 @@ impl NodeServer {
         }
         self.pending = keep;
         moved
+    }
+
+    /// Whether a scan that came first waits on a span holding `id`.
+    fn fenced(&self, id: &[u8]) -> bool {
+        self.scan_fences.iter().any(|(lo, hi)| lo.as_slice() <= id && hi.as_deref().is_none_or(|h| id < h))
+    }
+
+    /// Forgets requests whose callers have long gone, keeping any whose entry is proposed (it
+    /// answers, or is dropped, when the log says).
+    pub fn forget(&mut self, ids: &HashSet<u64>) {
+        let pending = std::mem::take(&mut self.pending);
+        for p in pending {
+            if ids.contains(&p.id) && !matches!(p.state, PendingState::Proposed { .. }) {
+                self.release(&p);
+            } else {
+                self.pending.push(p);
+            }
+        }
     }
 
     fn release(&mut self, p: &Pending) {
@@ -682,8 +705,15 @@ impl NodeServer {
     fn advance(&mut self, p: &mut Pending, ready: &[ReadToken], now_ns: u64) -> Option<KvResponse> {
         // Proposed: wait for the apply.
         if let PendingState::Proposed { index, term, resp } = &p.state {
-            let rep = self.driver.replica(p.range)?;
+            // Gone with the range, or deposed before the entry applied: it may never apply, and the
+            // log can be truncated below it. Whichever it was, the latch must not stay behind.
+            let Some(rep) = self.driver.replica(p.range) else {
+                return Some(KvResponse::NotLeader { leader: None });
+            };
             if rep.last_applied() < *index {
+                if rep.current_term() != *term || !self.driver.is_leader(p.range) {
+                    return Some(KvResponse::NotLeader { leader: self.driver.leader_of(p.range) });
+                }
                 return None; // the client times out if it never applies
             }
             return match rep.wait_applied(*index, *term, Duration::ZERO) {
@@ -704,6 +734,7 @@ impl NodeServer {
         if let PendingState::AwaitRead { token, term: t } = &p.state {
             if ready.contains(token) {
                 p.state = PendingState::Confirmed;
+                p.read_confirmed = true;
             } else if *t != term {
                 p.state = PendingState::New; // the read was dropped with the old term
             }
@@ -715,6 +746,9 @@ impl NodeServer {
         if let Some(span) = p.req.span() {
             // A scan waits for every in-flight write in its span (it must see their intents).
             let (lo, hi) = clip(span, &self.driver.replica(p.range).map(|r| r.span()).unwrap_or_else(KeySpan::all));
+            // Writes that arrive after a waiting scan wait behind it: otherwise a steady stream of
+            // them, each with its own key, keeps the span busy and the scan never runs.
+            self.scan_fences.push((lo.clone(), hi.clone()));
             let busy = match &hi {
                 Some(h) => self.latches.range::<[u8], _>((std::ops::Bound::Included(lo.as_slice()), std::ops::Bound::Excluded(h.as_slice()))).next().is_some(),
                 None => self.latches.range::<[u8], _>((std::ops::Bound::Included(lo.as_slice()), std::ops::Bound::Unbounded)).next().is_some(),
@@ -724,6 +758,10 @@ impl NodeServer {
             }
         } else if let KvRequest::Atomic { ids, .. } = &p.req {
             // All of its keys at once, or wait in line (requests are advanced in arrival order).
+            let me = (p.client, p.id);
+            if ids.iter().any(|id| self.latches.get(id.as_slice()) != Some(&me) && self.fenced(id)) {
+                return None;
+            }
             if ids.iter().any(|id| self.latches.get(id.as_slice()).is_some_and(|&holder| holder != (p.client, p.id))) {
                 return None;
             }
@@ -732,6 +770,9 @@ impl NodeServer {
             }
         } else {
             // Latch: one in-flight write per key; reads wait for it.
+            if p.req.is_write() && self.latches.get(anchor.as_slice()) != Some(&(p.client, p.id)) && self.fenced(&anchor) {
+                return None;
+            }
             if self.latches.get(anchor.as_slice()).is_some_and(|&holder| holder != (p.client, p.id)) {
                 return None;
             }
@@ -781,6 +822,17 @@ impl NodeServer {
             }
         }
         match result {
+            // A write that proposes nothing proves nothing about this leader: its answer came from
+            // state a deposed leader could still hold.
+            Ok(Eval::Done(_)) if matches!(p.req, KvRequest::Atomic { .. }) && !p.read_confirmed => {
+                match self.driver.read_index(p.range) {
+                    Ok(token) => {
+                        p.state = PendingState::AwaitRead { token, term };
+                        None
+                    }
+                    Err(_) => Some(KvResponse::NotLeader { leader: self.driver.leader_of(p.range) }),
+                }
+            }
             Ok(Eval::Done(resp)) => Some(resp),
             Ok(Eval::Wait) => {
                 let since = *p.waiting_since.get_or_insert(now_ns);
@@ -1081,7 +1133,12 @@ impl NodeServer {
                 resume = Some(id.as_bytes().to_vec());
                 break;
             }
-            let Ok((_, rec)) = self.driver.engine().get_owned(*id) else { continue };
+            let rec = match self.driver.engine().get_owned(*id) {
+                Ok((_, rec)) => rec,
+                Err(StorageError::RecordNotFound { .. }) => continue,
+                // Skipping it would make a scan, a backup or a feed silently wrong.
+                Err(e) => return Err(e),
+            };
             let k = MvccKey::from_record(Some(&rec))?;
             match eval_read(&k, ts, limit, txn) {
                 ReadOutcome::Value(Some(v), vts) => {
@@ -1122,7 +1179,12 @@ impl NodeServer {
                 resume = Some(id.as_bytes().to_vec());
                 break;
             }
-            let Ok((_, rec)) = self.driver.engine().get_owned(*id) else { continue };
+            let rec = match self.driver.engine().get_owned(*id) {
+                Ok((_, rec)) => rec,
+                Err(StorageError::RecordNotFound { .. }) => continue,
+                // Skipping it would make a scan, a backup or a feed silently wrong.
+                Err(e) => return Err(e),
+            };
             let k = MvccKey::from_record(Some(&rec))?;
             let key = || (rec.collection.clone(), rec.key.clone());
             if from < k.trimmed_below {
@@ -1159,7 +1221,11 @@ impl NodeServer {
             return Ok(KvResponse::WrongRange);
         }
         for id in self.driver.engine().ids_in_span(&span.start, span.end.as_deref(), usize::MAX) {
-            let Ok((_, rec)) = self.driver.engine().get_owned(id) else { continue };
+            let rec = match self.driver.engine().get_owned(id) {
+                Ok((_, rec)) => rec,
+                Err(StorageError::RecordNotFound { .. }) => continue,
+                Err(e) => return Err(e),
+            };
             if !eval_refresh(&MvccKey::from_record(Some(&rec))?, from, to, txn) {
                 return Ok(KvResponse::Refreshed(false));
             }

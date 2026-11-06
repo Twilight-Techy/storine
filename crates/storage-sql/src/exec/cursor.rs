@@ -135,7 +135,7 @@ impl Session {
             FetchDirection::Last => jump(c, n as i64, &mut out, &mut moved),
             FetchDirection::Absolute(k) => jump(c, *k, &mut out, &mut moved),
             FetchDirection::Relative(k) => {
-                let to = c.at as i64 + *k;
+                let to = (c.at as i64).saturating_add(*k);
                 if *k == 0 && (1..=n).contains(&c.at) {
                     moved = 1;
                     if !move_only {

@@ -3531,26 +3531,71 @@ impl Parser {
         Ok(Some(TableAlias { name, columns }))
     }
 
+    /// Just after `(` in FROM: whether a query follows rather than a table or join. Parentheses
+    /// around the innermost `SELECT` are a query's when each closes before `)`, a set operation or
+    /// an `ORDER BY`-style tail; otherwise (`((SELECT ..) x JOIN ..`) a join has begun.
+    fn parens_hold_query(&self) -> bool {
+        let mut inner = 0;
+        while self.is_op_at(inner, "(") {
+            inner += 1;
+        }
+        if !["select", "with", "values", "table"].iter().any(|k| self.is_kw_at(inner, k)) {
+            return false;
+        }
+        // One pass: each level's `)` is found from where the level inside it ended.
+        let mut at = inner;
+        for _ in 0..inner {
+            let Some(close) = self.closing_paren(at) else {
+                return true; // unbalanced: the query's parser says where
+            };
+            at = close + 1;
+            let tail = ["union", "intersect", "except", "minus", "order", "limit", "offset", "fetch", "for", "lock"];
+            // `minus` and `lock` can be aliases: `(SELECT 1) minus JOIN y`.
+            let joins = ["join", "inner", "left", "right", "full", "cross", "natural", "on", "using"];
+            let is_tail = tail.iter().any(|k| self.is_kw_at(at, k))
+                && !joins.iter().any(|k| self.is_kw_at(at + 1, k))
+                && !self.is_op_at(at + 1, ")")
+                && !self.is_op_at(at + 1, ",");
+            if !(self.is_op_at(at, ")") || is_tail) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The offset from here of the `)` that closes the parenthesis open at offset `from`.
+    fn closing_paren(&self, from: usize) -> Option<usize> {
+        let mut depth = 1usize;
+        let mut at = from;
+        loop {
+            match self.peek_at(at)? {
+                Token::Op("(") => depth += 1,
+                Token::Op(")") => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(at);
+                    }
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+    }
+
     fn table_factor(&mut self) -> SqlResult<TableRef> {
         let lateral = self.eat_kw("lateral");
         if self.eat_op("(") {
-            let start = self.pos;
-            // `((SELECT ..) UNION ..)` opens like a parenthesized join, `((a JOIN b ON ..) JOIN c ..)`.
-            let may_be_join = self.is_op("(");
-            if may_be_join || self.is_kw("select") || self.is_kw("with") || self.is_kw("values") {
-                let parsed = self.query().and_then(|q| self.expect_op(")").map(|_| q));
-                match parsed {
-                    Ok(query) => {
-                        let alias = self.table_alias()?;
-                        return Ok(TableRef::Derived {
-                            query: Box::new(query),
-                            alias,
-                            lateral,
-                        });
-                    }
-                    Err(_) if may_be_join => self.pos = start,
-                    Err(e) => return Err(e),
-                }
+            // Decided by looking ahead: trying one reading and then the other would double the
+            // work at each level of `((((`.
+            if self.parens_hold_query() {
+                let query = self.query()?;
+                self.expect_op(")")?;
+                let alias = self.table_alias()?;
+                return Ok(TableRef::Derived {
+                    query: Box::new(query),
+                    alias,
+                    lateral,
+                });
             }
             let inner = self.nested(Self::table_ref)?;
             self.expect_op(")")?;

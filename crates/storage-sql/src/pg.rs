@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
-use std::thread;
 
 use storage_types::Decimal;
 
@@ -25,25 +24,31 @@ pub struct Auth {
     pub tls: Option<Arc<crate::tls::TlsConfig>>,
     /// Refuse clients that do not switch to TLS.
     pub require_tls: bool,
+    /// SCRAM verifiers of `users`, as they are first asked for.
+    pub verifiers: Arc<std::sync::Mutex<HashMap<String, crate::exec::acl::Scram>>>,
+}
+
+impl Auth {
+    /// The verifier of a `--user` account: derived once, so that a client cannot make the server
+    /// spend a key derivation per connection, and with one salt, as a stored role has.
+    fn verifier(&self, user: &str, password: &str) -> crate::exec::acl::Scram {
+        let mut known = self.verifiers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        known.entry(user.to_owned()).or_insert_with(|| crate::exec::acl::Scram::from_password(password)).clone()
+    }
+}
+
+/// The salt offered for a name with no account: random per process, fixed per name.
+fn decoy_salt(user: &str) -> Vec<u8> {
+    static KEY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| hash::random_bytes(32));
+    hash::hmac_sha256(key, user.as_bytes())[..16].to_vec()
 }
 
 /// Accepts PostgreSQL clients on `listener` forever (one thread per connection).
 pub fn serve(engine: Arc<Engine>, listener: TcpListener, auth: Arc<Auth>) {
-    for conn in listener.incoming() {
-        let Ok(stream) = conn else { continue };
-        let engine = Arc::clone(&engine);
-        let auth = Arc::clone(&auth);
-        thread::spawn(move || {
-            let _ = stream.set_nodelay(true);
-            if let Err(e) = Conn::run(engine, stream, &auth) {
-                if e.kind() != io::ErrorKind::UnexpectedEof
-                    && e.kind() != io::ErrorKind::ConnectionReset
-                {
-                    eprintln!("storine-sql: postgres connection ended: {e}");
-                }
-            }
-        });
-    }
+    crate::listener::serve("postgres", listener, move |stream, login| {
+        Conn::run(Arc::clone(&engine), stream, &auth, &login)
+    });
 }
 
 const MAX_MESSAGE: usize = 1 << 30;
@@ -227,7 +232,12 @@ impl Msg {
 }
 
 impl Conn {
-    fn run(engine: Arc<Engine>, stream: TcpStream, auth: &Auth) -> io::Result<()> {
+    fn run(
+        engine: Arc<Engine>,
+        stream: TcpStream,
+        auth: &Auth,
+        login: &crate::listener::Login,
+    ) -> io::Result<()> {
         let socket = stream.try_clone()?;
         // Encryption negotiation: SSLRequest -> 'S' and a TLS handshake when TLS is configured,
         // 'N' otherwise (and always for GSSENCRequest); the startup packet follows.
@@ -331,10 +341,10 @@ impl Conn {
         let database = params.get("database").cloned();
         if !auth.users.is_empty() {
             let creds = match auth.users.get(&user) {
-                Some(p) => Some(crate::exec::acl::Scram::from_password(p)),
+                Some(p) => Some(auth.verifier(&user, p)),
                 None => engine.login_role(&user).and_then(|r| r.scram),
             };
-            match scram(&mut r, &mut w, creds.as_ref()) {
+            match scram(&mut r, &mut w, &user, creds.as_ref()) {
                 Ok(true) => {}
                 Ok(false) => {
                     let e = SqlError::auth(format!(
@@ -348,6 +358,7 @@ impl Conn {
             }
         }
         send_raw(&mut w, Msg::new(b'R').i32(0))?;
+        login.done();
         let mut session = engine.new_session(Dialect::Postgres, &user, database.as_deref());
         if let Err(e) = session.may_connect() {
             send_raw(&mut w, error_msg(&e, "FATAL"))?;
@@ -881,7 +892,10 @@ impl Conn {
             let body = read_body(&mut self.r, len - 4).map_err(io_err)?;
             let eof = match tag[0] {
                 b'd' => {
-                    reader.feed(&body);
+                    // After a failure the rest is only drained, not kept.
+                    if failure.is_none() {
+                        reader.feed(&body);
+                    }
                     false
                 }
                 b'c' => true,
@@ -979,6 +993,9 @@ impl Conn {
             eprintln!("[pg {} parse] {sql}", self.session.id);
         }
         let (stmts, count) = parse(&sql, Dialect::Postgres)?;
+        if count > 65_535 {
+            return Err(SqlError::new("54000", "a statement can have at most 65535 parameters"));
+        }
         let stmt = match stmts.len() {
             0 => Statement::Empty,
             1 => stmts.into_iter().next().unwrap_or(Statement::Empty),
@@ -1265,7 +1282,7 @@ fn error_msg(e: &SqlError, severity: &str) -> Msg {
 }
 
 /// SCRAM-SHA-256 (RFC 5802 / 7677) exchange; `Ok(false)`: wrong password or unknown user.
-fn scram(r: &mut impl Read, w: &mut impl Write, creds: Option<&crate::exec::acl::Scram>) -> io::Result<bool> {
+fn scram(r: &mut impl Read, w: &mut impl Write, user: &str, creds: Option<&crate::exec::acl::Scram>) -> io::Result<bool> {
     send_raw(w, Msg::new(b'R').i32(10).cstr("SCRAM-SHA-256").u8(0))?;
     w.flush()?;
     let read_msg = |r: &mut dyn Read| -> io::Result<Vec<u8>> {
@@ -1297,8 +1314,8 @@ fn scram(r: &mut impl Read, w: &mut impl Write, creds: Option<&crate::exec::acl:
         .find_map(|kv| kv.strip_prefix("r="))
         .unwrap_or("")
         .to_owned();
-    // Unknown users get a random salt like any other: nothing tells them apart.
-    let salt = creds.map_or_else(|| hash::random_bytes(16), |c| c.salt.clone());
+    // An unknown user's salt is as stable as a real one's: nothing tells them apart.
+    let salt = creds.map_or_else(|| decoy_salt(user), |c| c.salt.clone());
     let snonce = hash::base64_encode(&hash::random_bytes(18));
     let nonce = format!("{cnonce}{snonce}");
     let iterations = creds.map_or(4096, |c| c.iterations);
@@ -2155,7 +2172,7 @@ mod fuzz_tests {
             let password = (rng.below(2) == 0).then_some(&creds);
             fz::bounded(&input, || {
                 let mut out = Vec::new();
-                let _ = scram(&mut &input[..], &mut out, password);
+                let _ = scram(&mut &input[..], &mut out, "fuzz", password);
             });
         }
     }

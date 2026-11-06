@@ -56,8 +56,8 @@ pub struct Policy {
     pub command: String,
     /// Empty: everyone.
     pub roles: Vec<String>,
-    pub using: Option<Expr>,
-    pub check: Option<Expr>,
+    pub using: crate::ast::PolicyExpr,
+    pub check: crate::ast::PolicyExpr,
 }
 
 /// Collections the gateway keeps for itself (hidden from table listings).
@@ -456,11 +456,11 @@ impl Table {
                         m.insert("permissive".into(), Value::Bool(p.permissive));
                         m.insert("command".into(), Value::Text(p.command.clone()));
                         m.insert("roles".into(), Value::List(p.roles.iter().map(|r| Value::Text(r.clone())).collect()));
-                        if let Some(e) = &p.using {
-                            m.insert("using".into(), Value::Text(e.to_string()));
+                        if let Some((_, sql)) = &p.using {
+                            m.insert("using".into(), Value::Text(sql.clone()));
                         }
-                        if let Some(e) = &p.check {
-                            m.insert("check".into(), Value::Text(e.to_string()));
+                        if let Some((_, sql)) = &p.check {
+                            m.insert("check".into(), Value::Text(sql.clone()));
                         }
                         Value::Map(m)
                     })
@@ -619,9 +619,9 @@ impl Table {
         }
         for p in list(doc, "policies") {
             let m = p.as_map().ok_or_else(bad)?;
-            let expr = |k: &str| -> SqlResult<Option<Expr>> {
+            let expr = |k: &str| -> SqlResult<crate::ast::PolicyExpr> {
                 match m.get(k).and_then(Value::as_str) {
-                    Some(sql) => parse_expr(sql, Dialect::Postgres).map(Some),
+                    Some(sql) => Ok(Some((parse_expr(sql, Dialect::Postgres)?, sql.to_owned()))),
                     None => Ok(None),
                 }
             };

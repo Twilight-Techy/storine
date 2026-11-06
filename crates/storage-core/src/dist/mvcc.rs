@@ -213,7 +213,9 @@ impl MvccKey {
     pub fn trim(&mut self, now: Timestamp, protect: Option<Timestamp>) {
         let before = self.versions.len();
         let retained = Timestamp { wall: now.wall.saturating_sub(HISTORY_RETENTION_NS), logical: 0 };
-        self.gc(protect.map_or(retained, |p| p.min(retained)));
+        let tombstone_gone = self.gc(protect.map_or(retained, |p| p.min(retained)));
+        // A tombstone's going already set the bound: above it, reads lost nothing.
+        let after_gc = self.versions.len();
         self.versions.truncate(if protect.is_some() { HISTORY_PROTECTED_MAX_VERSIONS } else { HISTORY_MAX_VERSIONS });
         let mut bytes = 0usize;
         let over = self.versions.iter().enumerate().skip(1).find_map(|(i, (_, v))| {
@@ -229,7 +231,8 @@ impl MvccKey {
                 m.remove("r");
             }
         }
-        if self.versions.len() != before {
+        let shrunk = self.versions.len() != after_gc || (!tombstone_gone && after_gc != before);
+        if shrunk {
             if let Some((t, _)) = self.versions.last() {
                 self.trimmed_below = self.trimmed_below.max(*t);
             }
@@ -237,7 +240,8 @@ impl MvccKey {
     }
 
     /// Drops versions no read at or above `threshold` can see (keeps the newest at or below).
-    pub fn gc(&mut self, threshold: Timestamp) {
+    /// Whether that took a tombstone with it.
+    pub fn gc(&mut self, threshold: Timestamp) -> bool {
         if let Some(pos) = self.versions.iter().position(|(t, _)| *t <= threshold) {
             self.versions.truncate(pos + 1);
             // A tombstone that is the oldest remaining version is invisible at every timestamp
@@ -246,9 +250,11 @@ impl MvccKey {
                 if *t <= threshold {
                     self.trimmed_below = self.trimmed_below.max(*t);
                     self.versions.pop();
+                    return true;
                 }
             }
         }
+        false
     }
 }
 
@@ -289,7 +295,9 @@ pub fn eval_read(k: &MvccKey, ts: Timestamp, limit: Timestamp, txn: Option<&TxnI
         if Some(&i.txn.id) == txn {
             return ReadOutcome::Value(i.value.clone(), Some(i.ts));
         }
-        if i.ts <= limit {
+        // A restarted read can be above its uncertainty limit: an intent below the read is still
+        // one the read must not pass.
+        if i.ts <= limit.max(ts) {
             return ReadOutcome::Conflict(i.clone());
         }
     }
@@ -489,6 +497,24 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("x".to_string(), PropertyValue::Int64(x));
         Some(m)
+    }
+
+    /// A read restarted above its uncertainty limit still stops at an intent below it.
+    #[test]
+    fn an_intent_below_a_restarted_read_is_a_conflict() {
+        let k = MvccKey { intent: Some(Intent { txn: meta(1), ts: t(20), value: val(9) }), ..MvccKey::default() };
+        assert!(matches!(eval_read(&k, t(30), t(10), None), ReadOutcome::Conflict(_)));
+        assert!(matches!(eval_read(&k, t(15), t(10), None), ReadOutcome::Value(None, None)));
+    }
+
+    /// A dropped key made anew: the tombstone's collection takes no history a reader above it had.
+    #[test]
+    fn collecting_a_tombstone_keeps_reads_above_it() {
+        let far = Timestamp::new(HISTORY_RETENTION_NS * 10, 0);
+        let mut k = MvccKey { versions: vec![(Timestamp::new(HISTORY_RETENTION_NS * 10 - 1, 0), val(1)), (t(100), None)], ..MvccKey::default() };
+        k.trim(far, None);
+        assert_eq!(k.trimmed_below, t(100));
+        assert_eq!(k.versions.len(), 1);
     }
     fn meta(n: u8) -> TxnMeta {
         let id = [n; 16];
