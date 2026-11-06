@@ -691,7 +691,7 @@ pub fn role_statement(s: &mut Session, st: &RoleStmt) -> SqlResult<Outcome> {
                 return Err(no_createrole());
             }
             for n in names {
-                let Some(r) = acl.role(n) else {
+                let Some(_) = acl.role(n) else {
                     if *if_exists {
                         continue;
                     }
