@@ -745,3 +745,42 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 
 - `modal run tools/modal/sweep.py --tools all`: pgjdbc, Connector/J and mssql-jdbc metadata with 0 failures; 177 tool checks with 0 failures (Metabase and Grafana themselves; SQLAlchemy, psqlODBC and psycopg as stand-ins for Superset, Tableau / Power BI and pgAdmin). `docs/TASKS.md` names what each one is.
 - Fixed: `HAVING` ignored without `GROUP BY` or an aggregate, cursor rows tagged `SELECT` instead of `FETCH`, portals for SQL cursors, composite field access, parenthesized joins, missing catalog data and T-SQL metadata procedures.
+
+## 2026-11-05: TASK-152 final audit (Stages 28–31)
+
+- Three independent reviews (distributed core; SQL access control and execution; wire protocols and parsers), each finding checked against the code, then a second review of the fixes. The full list is under `TASK-152` in `docs/TASKS.md`.
+- Fixed:
+  - crashes from input: stack depth, `statement_timeout`, thread exhaustion, exponential `FROM` parsing
+  - a 30 s login deadline and `--max-connections` on all three protocols
+  - range-cluster authentication
+  - the Kerberos realm
+  - `--oidc-*` / `--kerberos-keytab` without `--user`
+  - SCRAM name probing
+  - privilege escalation through temporary tables and `CREATEROLE`
+  - row-security bypasses
+  - seven wrong-answer bugs
+  - stale writes from a partitioned leader
+  - range leaders that never stepped down
+  - unbounded Raft memory and peer batches
+- `unsafe` moved out of `storage-sql` into `storage-codec`. Vendored Prisma files left the index.
+
+## 2026-11-07: TASK-151 soak under faults
+
+- `modal run tools/modal/sweep.py --steady --suite-args "-p storage-server --test process_chaos soak -- --ignored --nocapture" --env STORINE_SOAK_SECS=7200,STORINE_SOAK_WINDOW_SECS=600` on `24b7414`: `2 passed` in 7,220 s, balances conserved at 600 in both modes.
+  - Range mode: RSS at most 4.5 GiB, descriptors at most 123.
+  - Single group: RSS at most 2.7 GiB, descriptors at most 194, with no climb.
+- Fixed:
+  - the reactor now releases a connection whose client hung up while its job was pending
+  - single-group check quorum, so a leader steps down after 2× the maximum election timeout without a quorum
+  - lease reads require a recent quorum acknowledgement
+  - reactors route with `try_read_state` and never wait on the Raft lock held across `fsync`
+- New test `abandoned_requests_do_not_hold_descriptors`: the half-open peak fell from 3,965 descriptors to 125.
+- Harness:
+  - unique chaos ports below gVisor's 16,000 ephemeral range
+  - node stderr kept, and a node that exits at start is reported
+  - 40 of 40 `process_chaos` runs pass
+- Modal:
+  - target volume removed (stale artifacts)
+  - `--steady` for long runs
+  - smaller CPU and memory requests
+- Known limits: 17–120 single-group sockets in `CLOSE_WAIT` at each sample (bounded, cause not proven); other TCP test files still pick ports the old way.

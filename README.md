@@ -228,7 +228,7 @@ target/release/storine-sql --data ./sql_data --user app:secret
 # Or in front of a running Storine server / cluster
 target/release/storine-sql --storine storine://h1:7878,h2:7878,h3:7878 --user app:secret
 ```
-Then use `postgresql://app:secret@127.0.0.1:5432/shop`, `mysql://app:secret@127.0.0.1:3306/shop` or `Server=tcp:127.0.0.1,1433;Database=shop;User ID=app;Password=secret;TrustServerCertificate=true` in the application. Details, supported SQL and limitations: [`crates/storage-sql/README.md`](crates/storage-sql/README.md).
+Then use `postgresql://app:secret@127.0.0.1:5432/shop`, `mysql://app:secret@127.0.0.1:3306/shop` or `Server=tcp:127.0.0.1,1433;Database=shop;User ID=app;Password=secret;TrustServerCertificate=true` in the application. A client that has not logged in after 30 s is closed, and `--max-connections N` (default 1024) caps open connections. `--oidc-*` and `--kerberos-keytab` need at least one `--user`. Details, supported SQL and limitations: [`crates/storage-sql/README.md`](crates/storage-sql/README.md).
 
 ---
 

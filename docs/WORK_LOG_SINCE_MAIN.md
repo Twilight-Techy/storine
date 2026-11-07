@@ -111,7 +111,11 @@ The latest instruction from the user is to do everything that remains, **except*
 - **TASK-146**: done. `exec/control.rs`, `tests/control.rs`.
 - **TASK-147**: done. `exec/activity.rs`, `exec/explain.rs`, `tests/activity.rs`.
 - **TASK-148**: done. `exec/stats.rs`, `exec/optimizer.rs`, `tests/optimizer.rs`. Fixed a Raft §8 stale read in single-group mode.
-- **TASK-149**: done. `exec/temp.rs`, `exec/cursor.rs`, `exec/routine.rs`, `exec/notify.rs`, `parser/plpgsql.rs`, `nettypes.rs`, `tests/sql_surface.rs`. Next: `TASK-150`.
+- **TASK-149**: done. `exec/temp.rs`, `exec/cursor.rs`, `exec/routine.rs`, `exec/notify.rs`, `parser/plpgsql.rs`, `nettypes.rs`, `tests/sql_surface.rs`.
+- **TASK-150**: done. `tools/modal/sweep.py --tools all`; 0 JDBC failures and 177 tool checks with 0 failures.
+- **TASK-151**: done. A 2-hour soak under faults passes in both modes (`process_chaos::soak_*`). Fixed along the way: connections held after clients hung up, leaders that never stepped down without a quorum, and reactors waiting on the Raft lock.
+- **TASK-152**: done. The final audit; findings and fixes are in `TASKS.md`.
+- **Stage 31 is complete.** Nothing planned is left apart from the two items below.
 
 ### Stage 31 — Enterprise SQL (TASK-145 – 152)
 - Enforced `GRANT` / `REVOKE` and row-level security.
@@ -142,4 +146,29 @@ Yes:
 - **Older correctness bug**: `HAVING` without `GROUP BY` or an aggregate was silently ignored. Any such query returned too many rows.
 - **Protocol bug**: cursor rows carried the tag `SELECT n` instead of `FETCH n`, which broke psqlODBC's `UseDeclareFetch` without any server error. Found by reading the driver's source after the gateway log showed nothing.
 - **Decision**: a test that expected one exported key on MySQL was wrong. The driver's own query returns two for a table with two unique keys. The test now says so, with the reason.
-- **Next**: `TASK-151` (2-hour soak running on Modal), `TASK-152`.
+- **Next**: `TASK-151`, `TASK-152`.
+
+### Stage 31: final audit (`TASK-152`) — 2026-11-05
+
+- **How**: three independent read-only reviews (distributed core; SQL access control and execution; wire protocols and parsers). Each finding was read against the code before it was fixed. The fixes were then reviewed again, which found more.
+- **Most serious findings**:
+  - `GRANT` on a temporary table reached the real table of that name.
+  - Kerberos took the realm from the unencrypted part of the ticket.
+  - Range clusters could not authenticate at all.
+  - Several inputs could abort the server: stack depth, an absurd timeout, thread exhaustion, and exponential parsing.
+  - A partitioned leader answered some writes from stale state.
+- **Rules**: `unsafe` is now only in `storage-codec` and `storage-mmap`.
+- **Full list and known limits**: `TASK-152` in `TASKS.md`.
+
+### Stage 31: soak under faults (`TASK-151`) — 2026-11-07
+
+- **Result**: 2 hours per mode, with five kinds of fault, on Modal. Both modes pass with balances conserved. Range mode stays at most 123 descriptors with none in `CLOSE_WAIT`; single group stays at most 194 with no climb. Numbers are in `TASKS.md`.
+- **Three server bugs the soak found**:
+  - Connections were held after clients hung up: 913 descriptors in 2 hours.
+  - Leaders cut off from a quorum never stepped down.
+  - Reactors waited on a Raft lock that is held across `fsync`.
+  
+  A probe test now covers all three.
+- **Harness bugs**: parallel chaos clusters could share ports and read each other's data, which looked like a linearizability failure until the reads showed the other cluster's values. Ports are now unique and kept below gVisor's ephemeral range.
+- **Cost**: preemption restarted two runs from zero before `--steady` existed. The final run cost about $3; the month's Modal total for storine is about $27.
+- **Not fully explained**: in single-group mode, 17–120 sockets sit in `CLOSE_WAIT` at each sample, bounded but not zero.
