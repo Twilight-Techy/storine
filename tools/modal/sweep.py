@@ -17,6 +17,7 @@ Usage (from the repository root):
     modal run tools/modal/sweep.py --suite-args "-p storage-core -p storage-index"   # a whole `cargo test`
     modal run tools/modal/sweep.py --suite-args "-p storage-server --test process_chaos -- --nocapture" --env STORINE_CHAOS_SECS=90
     modal run tools/modal/sweep.py --suite-args "-p storage-server --test process_chaos" --repeat 12  # hunt a rare failure
+    modal run tools/modal/sweep.py --suite-args "-p storage-server --test process_chaos soak -- --ignored --nocapture" --env STORINE_SOAK_SECS=7200 --steady  # hours: no preemption
     modal run tools/modal/sweep.py --tools all           # BI and GUI tools against the SQL gateway
     modal run tools/modal/sweep.py --sdks all            # all 8 SDK suites against range clusters
     modal run tools/modal/sweep.py --sdks python --plain # against a plain server
@@ -162,14 +163,32 @@ def run_shard(binary: bytes, name: str, test: str, lo: int, hi: int) -> list[dic
 
 @app.function(image=image, cpu=16, memory=32768, timeout=14400, volumes={"/target": target_vol})
 def suite(src: bytes, cargo_args: str, env: dict[str, str], repeat: int = 1) -> tuple[int, str]:
+    return run_suite(src, cargo_args, env, repeat)
+
+
+# A preempted container restarts its input from zero, so a run of hours may never finish on
+# preemptible capacity. This costs more: use it (`--steady`) only for long runs.
+@app.function(image=image, cpu=16, memory=32768, timeout=14400, volumes={"/target": target_vol}, nonpreemptible=True)
+def suite_steady(src: bytes, cargo_args: str, env: dict[str, str], repeat: int = 1) -> tuple[int, str]:
+    return run_suite(src, cargo_args, env, repeat)
+
+
+def run_suite(src: bytes, cargo_args: str, env: dict[str, str], repeat: int) -> tuple[int, str]:
     """Runs `cargo test --release <cargo_args>` with `env` up to `repeat` times, stopping at the
     first failure; returns (exit code, summary, with the end of the output on a failure)."""
     unpack(src)
     summary = []
     for attempt in range(1, repeat + 1):
-        proc = subprocess.run(f"cargo test --release --no-fail-fast {cargo_args} 2>&1", shell=True, cwd="/src", capture_output=True, text=True, env={**os.environ, **env})
+        proc = subprocess.Popen(f"cargo test --release --no-fail-fast {cargo_args} 2>&1", shell=True, cwd="/src", stdout=subprocess.PIPE, text=True, env={**os.environ, **env})
+        all_lines = []
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            all_lines.append(line)
+            # Readable meanwhile with `modal app logs`; the summary only comes back at the end.
+            if line.startswith("soak"):
+                print(line, flush=True)
+        proc.wait()
         target_vol.commit()
-        all_lines = proc.stdout.splitlines()
         # A panic's message is the line after its header.
         after_panic = [all_lines[k + 1] for k, l in enumerate(all_lines[:-1]) if "panicked" in l]
         lines = [l for l in all_lines if l in after_panic or l.startswith("  call ") or l.startswith("key ") or l.startswith("first operation left out") or l.startswith("test result") or "FAILED" in l or "panicked" in l or l.startswith("error") or "process chaos" in l or "range cluster" in l or l.startswith("bench:") or l.startswith("soak")]
@@ -177,7 +196,7 @@ def suite(src: bytes, cargo_args: str, env: dict[str, str], repeat: int = 1) -> 
         summary.extend(lines[-200:])
         if proc.returncode != 0:
             if repeat > 1:
-                summary.append(proc.stdout[-60000:])
+                summary.append("\n".join(all_lines)[-60000:])
             return proc.returncode, "\n".join(summary)
     return 0, "\n".join(summary)
 
@@ -260,7 +279,7 @@ def seeded_tests(root: str, name: str) -> tuple[list[str], list[str]]:
 
 
 @app.local_entrypoint()
-def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300, only: str = "", shard: int = 10, suite_args: str = "", env: str = "", sdks: str = "", plain: bool = False, repeat: int = 1, tools: str = ""):
+def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300, only: str = "", shard: int = 10, suite_args: str = "", env: str = "", sdks: str = "", plain: bool = False, repeat: int = 1, tools: str = "", steady: bool = False):
     root = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True).stdout.strip()
     if tools:
         # BI and GUI tools against the gateway; `all`, or suite functions of test_tools.py.
@@ -290,7 +309,7 @@ def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300,
     print(f"source: {len(src) / 1e6:.1f} MB")
     if suite_args:
         extra = dict(kv.split("=", 1) for kv in env.split(",") if "=" in kv)
-        code, summary = suite.remote(src, suite_args, extra, repeat)
+        code, summary = (suite_steady if steady else suite).remote(src, suite_args, extra, repeat)
         print(summary)
         print(f"cargo test exit code {code}")
         if code:

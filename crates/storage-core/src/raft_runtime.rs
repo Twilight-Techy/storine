@@ -369,34 +369,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
     /// have been elected (lease = 90% of the minimum election timeout, `RULE-SAFE-09`).
     pub fn lease_valid(&self) -> bool {
         let s = &self.shared;
-        if !s.node.is_leader() || !s.node.applied_own_term() {
-            return false;
-        }
-        let members = s.node.membership();
-        let self_votes = members.is_voter(s.node.node_id());
-        let peers: Vec<NodeId> = members.voters().filter(|&v| v != s.node.node_id()).collect();
-        if peers.is_empty() {
-            return self_votes;
-        }
-        let lease = s.config.election_timeout_min.mul_f64(0.9);
-        let term = s.node.current_term();
-        let now = Instant::now();
-        // Lock order: node state is never taken while `progress` is held.
-        let progress = s.progress.lock().unwrap_or_else(|p| p.into_inner());
-        if s.progress_term.load(Ordering::Acquire) != term {
-            return false;
-        }
-        let mut fresh = usize::from(self_votes);
-        for p in &peers {
-            if progress
-                .get(p)
-                .and_then(|pp| pp.acked_sent_at)
-                .is_some_and(|t| now.saturating_duration_since(t) < lease)
-            {
-                fresh += 1;
-            }
-        }
-        fresh >= quorum(&members)
+        s.node.is_leader() && s.node.applied_own_term() && quorum_acked_within(s, s.config.election_timeout_min.mul_f64(0.9))
     }
 
     /// Stops all runtime threads (the node keeps its durable state).
@@ -492,13 +465,57 @@ fn election_timeout<T: ZeroCopyRecord + Indexable>(s: &Shared<T>) -> Duration {
     Duration::from_micros(min + next_random(s) % span)
 }
 
+/// `true` if a quorum of voters acknowledged this leader's current term within `window`.
+fn quorum_acked_within<T: ZeroCopyRecord + Indexable>(s: &Shared<T>, window: Duration) -> bool {
+    let members = s.node.membership();
+    let self_votes = members.is_voter(s.node.node_id());
+    let peers: Vec<NodeId> = members.voters().filter(|&v| v != s.node.node_id()).collect();
+    if peers.is_empty() {
+        return self_votes;
+    }
+    let term = s.node.current_term();
+    let now = Instant::now();
+    // Lock order: node state is never taken while `progress` is held.
+    let progress = s.progress.lock().unwrap_or_else(|p| p.into_inner());
+    if s.progress_term.load(Ordering::Acquire) != term {
+        return false;
+    }
+    let mut fresh = usize::from(self_votes);
+    for p in &peers {
+        if progress
+            .get(p)
+            .and_then(|pp| pp.acked_sent_at)
+            .is_some_and(|t| now.saturating_duration_since(t) < window)
+        {
+            fresh += 1;
+        }
+    }
+    fresh >= quorum(&members)
+}
+
 /// Election timer and leader housekeeping. Sleeps until the next deadline (no busy loop).
 fn timer_loop<T: ZeroCopyRecord + Indexable + 'static>(s: &Arc<Shared<T>>) {
     let mut timeout = election_timeout(s);
     let mut last_sweep = Instant::now();
+    // When this leader last held a quorum (`None`: not leading).
+    let mut quorum_seen: Option<Instant> = None;
     while !s.shutdown.load(Ordering::Acquire) {
         reconcile_members(s);
         if s.node.is_leader() {
+            // Check quorum: a leader cut off from most of its group keeps its term forever, and
+            // every write would wait out `commit_timeout` on it instead of being told to look
+            // elsewhere. Two maximum election timeouts, so a slow round does not depose it.
+            let window = s.config.election_timeout_max * 2;
+            let seen = quorum_seen.get_or_insert_with(Instant::now);
+            if quorum_acked_within(s, window) {
+                *seen = Instant::now();
+            } else if seen.elapsed() > window {
+                s.node.relinquish_leadership();
+                s.node.touch_contact();
+                quorum_seen = None;
+                timeout = election_timeout(s);
+                continue;
+            }
             if s.node.engine().has_ttl_records() && last_sweep.elapsed() >= s.config.sweep_interval {
                 last_sweep = Instant::now();
                 let now_ns = std::time::SystemTime::now()
@@ -512,6 +529,7 @@ fn timer_loop<T: ZeroCopyRecord + Indexable + 'static>(s: &Arc<Shared<T>>) {
             sleep_interruptibly(s, s.config.heartbeat_interval);
             continue;
         }
+        quorum_seen = None;
         let since = s.node.since_contact();
         if since >= timeout && !s.node.membership().is_voter(s.node.node_id()) {
             // Learners, removed nodes and nodes still waiting to join never campaign.
@@ -1068,6 +1086,32 @@ mod tests {
             assert_eq!(c.state(i), c.state(new), "replica {i}");
         }
         assert_eq!(store2.get("acct", "a").unwrap().unwrap().fields["bal"], PropertyValue::Int64(101));
+    }
+
+    #[test]
+    fn test_leader_cut_off_from_a_quorum_steps_down() {
+        let c = Cluster::new("check_quorum", 3);
+        let l = c.leader(Duration::from_secs(5));
+        // Healthy and idle: heartbeats keep it in place for longer than the step-down window.
+        thread::sleep(fast().election_timeout_max * 4);
+        let l = (0..3).find(|&i| c.nodes[i].is_leader()).unwrap_or(l);
+        assert!(c.nodes[l].is_leader(), "a healthy leader stays");
+        let old = c.nodes[l].node_id();
+        c.net.set_isolated(old, true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while c.nodes[l].is_leader() {
+            assert!(Instant::now() < deadline, "a leader without a quorum must step down");
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Clients now hear so at once instead of waiting out the commit timeout.
+        let started = Instant::now();
+        let store = DocumentStore::from_engine(Arc::clone(&c.engines[l])).unwrap();
+        store.set_commit_sink(Arc::clone(&c.runtimes[l]) as Arc<dyn crate::document::CommitSink>);
+        let mut f = BTreeMap::new();
+        f.insert("v".to_string(), PropertyValue::Int64(1));
+        let err = store.put("kv", "a", f).unwrap_err();
+        assert!(matches!(err, StorageError::NotLeader { .. }), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

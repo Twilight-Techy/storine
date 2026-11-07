@@ -234,6 +234,76 @@ fn range_cluster_under_kills_pauses_and_partitions() {
     chaos(true);
 }
 
+/// A client that gives up on a request hangs up; the server must not keep that connection until the
+/// request answers. Clients that time out and reconnect while nothing can commit would otherwise
+/// pile up descriptors at the rate they retry (found by `TASK-151`).
+#[test]
+fn abandoned_requests_do_not_hold_descriptors() {
+    for (name, mode) in [("delay", Some(DELAY)), ("half-open", Some(BLACKHOLE)), ("paused followers", None)] {
+        abandoned_requests(name, mode);
+    }
+}
+
+fn abandoned_requests(name: &str, mode: Option<u8>) {
+    const CLIENTS: u64 = 64;
+    let dir = std::env::temp_dir().join(format!("storine_abandoned_{}_{}", std::process::id(), mode.unwrap_or(0)));
+    let cluster = Cluster::start(&dir, false);
+    let leader = (0..600)
+        .find_map(|_| {
+            let found = cluster.addrs.iter().position(|a| {
+                StorageClient::connect_timeout(*a, Duration::from_secs(2)).and_then(|mut c| c.doc_write(&[put("warmup", 0)], None)).is_ok()
+            });
+            if found.is_none() {
+                thread::sleep(Duration::from_millis(100));
+            }
+            found
+        })
+        .expect("no leader");
+    let (pid, port, addr) = (cluster.procs[leader].as_ref().unwrap().id(), cluster.addrs[leader].port(), cluster.addrs[leader]);
+    let baseline = process_usage(pid).unwrap().1;
+    match mode {
+        Some(mode) => cluster.isolate(leader, mode),
+        None => (0..cluster.addrs.len()).filter(|i| *i != leader).for_each(|i| cluster.signal(i, "-STOP")),
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let abandoned = Arc::new(AtomicU64::new(0));
+    let clients: Vec<_> = (0..CLIENTS)
+        .map(|c| {
+            let (stop, abandoned) = (Arc::clone(&stop), Arc::clone(&abandoned));
+            thread::spawn(move || {
+                let mut n = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(mut client) = StorageClient::connect_timeout(addr, Duration::from_millis(300)) {
+                        n += 1;
+                        if client.doc_write(&[put(&format!("c{c}"), n)], None).is_err() {
+                            abandoned.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            })
+        })
+        .collect();
+    let (mut peak, mut detail) = (0, String::new());
+    let end = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < end {
+        thread::sleep(Duration::from_millis(250));
+        let fds = process_usage(pid).unwrap().1;
+        if fds > peak {
+            peak = fds;
+            detail = describe_fds(pid, port);
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    for c in clients {
+        c.join().unwrap();
+    }
+    eprintln!("soak probe {name}: baseline {baseline}, peak {peak} ({detail}), abandoned {}", abandoned.load(Ordering::Relaxed));
+    drop(cluster);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(peak <= baseline + 2 * CLIENTS, "{name}: {peak} descriptors for {CLIENTS} clients, from {baseline}: {detail}");
+}
+
 const ACCOUNTS: usize = 6;
 
 /// Connect and request timeout. A range-cluster write is a distributed transaction (several
@@ -540,6 +610,35 @@ fn process_usage(pid: u32) -> Option<(u64, u64)> {
     Some((rss, fds))
 }
 
+/// What a node's descriptors are: sockets by TCP state on its client port, and files by extension.
+/// A number alone cannot tell a leak from a burst, so the soak prints this at each window's peak.
+fn describe_fds(pid: u32, port: u16) -> String {
+    let (mut sockets, mut files) = (0u64, std::collections::BTreeMap::<String, u64>::new());
+    for link in std::fs::read_dir(format!("/proc/{pid}/fd")).into_iter().flatten().flatten().filter_map(|e| std::fs::read_link(e.path()).ok()) {
+        if link.to_string_lossy().starts_with("socket:") {
+            sockets += 1;
+        } else {
+            let kind = link.extension().map_or_else(|| "other".to_string(), |e| e.to_string_lossy().into_owned());
+            *files.entry(kind).or_default() += 1;
+        }
+    }
+    let mut states = std::collections::BTreeMap::<&str, u64>::new();
+    let tcp = std::fs::read_to_string(format!("/proc/{pid}/net/tcp")).unwrap_or_default();
+    for fields in tcp.lines().skip(1).map(|l| l.split_whitespace().collect::<Vec<_>>()) {
+        let local = fields.get(1).and_then(|a| a.rsplit(':').next()).and_then(|p| u16::from_str_radix(p, 16).ok());
+        if local == Some(port) {
+            let state = match fields.get(3).copied() {
+                Some("01") => "established",
+                Some("08") => "close-wait",
+                Some("0A") => "listen",
+                _ => "other",
+            };
+            *states.entry(state).or_default() += 1;
+        }
+    }
+    format!("sockets {sockets} {states:?}, files {files:?}")
+}
+
 /// Hours of mixed OLTP and analytics under faults (`TASK-151`): linearizable registers (fresh keys
 /// each window, checked at its end), atomic transfers (conserved), inserts and overwrites read by
 /// aggregates and scans, while memory and descriptors stay under their ceilings and do not climb.
@@ -775,17 +874,28 @@ fn soak(ranges: bool) {
     while Instant::now() < end {
         let window_end = Instant::now() + Duration::from_secs(window_secs);
         let (mut rss_max, mut fds_max) = (0u64, 0u64);
+        // The lowest the busiest node fell to: a burst drains, a leak does not.
+        let (mut fds_floor, mut peak) = (u64::MAX, String::new());
         while Instant::now() < window_end && Instant::now() < end {
             thread::sleep(Duration::from_secs(5));
-            let pids: Vec<u32> = cluster.lock().unwrap().procs.iter().flatten().map(Child::id).collect();
-            for pid in pids {
+            let pids: Vec<(u32, u16)> = {
+                let c = cluster.lock().unwrap();
+                c.procs.iter().zip(&c.addrs).filter_map(|(p, a)| Some((p.as_ref()?.id(), a.port()))).collect()
+            };
+            let mut busiest = 0;
+            for (pid, port) in pids {
                 if let Some((rss, fds)) = process_usage(pid) {
                     rss_max = rss_max.max(rss);
-                    fds_max = fds_max.max(fds);
+                    busiest = busiest.max(fds);
+                    if fds > fds_max {
+                        fds_max = fds;
+                        peak = describe_fds(pid, port);
+                    }
                     assert!(rss <= SOAK_RSS_CEILING_KB, "a node holds {rss} kB, beyond the ceiling");
                     assert!(fds <= SOAK_FD_CEILING, "a node has {fds} descriptors open, beyond the ceiling");
                 }
             }
+            fds_floor = fds_floor.min(busiest);
         }
         n += 1;
         window.store(n, Ordering::Relaxed);
@@ -808,7 +918,7 @@ fn soak(ranges: bool) {
             }
         }
         let counted = *counts.lock().unwrap();
-        eprintln!("soak: window {n} at {}s: rss max {} MiB, fds max {fds_max}; writes {} reads {} transfers {} event batches {} aggregates {} scans {} failures {}", t0.elapsed().as_secs(), rss_max / 1024, counted[0], counted[1], counted[2], counted[3], counted[4], counted[5], counted[6]);
+        eprintln!("soak: window {n} at {}s: rss max {} MiB, fds max {fds_max} floor {fds_floor} ({peak}); writes {} reads {} transfers {} event batches {} aggregates {} scans {} failures {}", t0.elapsed().as_secs(), rss_max / 1024, counted[0], counted[1], counted[2], counted[3], counted[4], counted[5], counted[6]);
         windows.push((rss_max, fds_max));
     }
     stop.store(true, Ordering::Relaxed);

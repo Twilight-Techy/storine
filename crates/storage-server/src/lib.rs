@@ -1051,7 +1051,18 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
                     Err(_) => ConnStep::Closed,
                 };
             }
-            Err(TryRecvError::Empty) => return ConnStep::WouldBlock,
+            Err(TryRecvError::Empty) => {
+                // A client that gave up has hung up. Nobody is left to answer, so release the
+                // descriptor now: clients retrying on timeout would otherwise hold one per
+                // request for as long as commits stall. The job still runs; its outcome was
+                // already unknown to the client. `peek` leaves pipelined requests in place.
+                let mut probe = [0u8; 1];
+                return match conn.stream.peek(&mut probe) {
+                    Ok(0) => ConnStep::Closed,
+                    Err(e) if !matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => ConnStep::Closed,
+                    _ => ConnStep::WouldBlock,
+                };
+            }
             Err(TryRecvError::Disconnected) => {
                 conn.pending_job = None;
                 return match conn.send_or_queue_response(STATUS_ERROR, 0, b"admin job failed") {
