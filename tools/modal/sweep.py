@@ -38,12 +38,17 @@ import modal
 
 RUST = "1.99.1"
 app = modal.App("storine-sweeps")
-target_vol = modal.Volume.from_name("storine-target", create_if_missing=True)
+# Resources are (request, limit): Modal bills the higher of the request and actual use, so builds can
+# burst to the limit while the waiting parts of a run cost only what they use.
+#
+# Every run builds from scratch in its container. Do not share a target directory on a volume: Cargo
+# judges freshness by mtime, so a preempted run that rebuilt older source left artifacts that looked
+# newer than today's files, and later runs silently linked old code.
 image = (
     modal.Image.debian_slim()
     .apt_install("build-essential", "curl", "ca-certificates", "git")
     .run_commands(f"curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain {RUST}")
-    .env({"PATH": "/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "CARGO_TARGET_DIR": "/target/t", "CARGO_INCREMENTAL": "0",
+    .env({"PATH": "/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "CARGO_TARGET_DIR": "/tmp/t", "CARGO_INCREMENTAL": "0",
           # Builders and runners are different CPUs: never `target-cpu=native` (the repo's
           # default) here. x86-64-v3 keeps the AVX2 / BMI2 / SSE4.2 paths under test.
           "RUSTFLAGS": "-C target-cpu=x86-64-v3"})
@@ -98,7 +103,7 @@ def unpack(src: bytes) -> None:
         tar.extractall("/src", filter="data")
 
 
-@app.function(image=image, cpu=16, memory=32768, timeout=3600, volumes={"/target": target_vol})
+@app.function(image=image, cpu=(4, 16), memory=(4096, 32768), timeout=3600)
 def build(src: bytes, tests: list[str]) -> dict[str, bytes]:
     """Builds the named integration-test binaries of storage-core; returns name -> executable."""
     unpack(src)
@@ -107,7 +112,6 @@ def build(src: bytes, tests: list[str]) -> dict[str, bytes]:
         args += ["--test", t]
     t0 = time.time()
     proc = subprocess.run(args, cwd="/src", capture_output=True, text=True)
-    target_vol.commit()
     if proc.returncode != 0:
         raise RuntimeError("build failed:\n" + proc.stderr[-6000:])
     bins = {}
@@ -161,14 +165,14 @@ def run_shard(binary: bytes, name: str, test: str, lo: int, hi: int) -> list[dic
         lo = seed + 1
 
 
-@app.function(image=image, cpu=16, memory=32768, timeout=14400, volumes={"/target": target_vol})
+@app.function(image=image, cpu=(4, 16), memory=(4096, 32768), timeout=14400)
 def suite(src: bytes, cargo_args: str, env: dict[str, str], repeat: int = 1) -> tuple[int, str]:
     return run_suite(src, cargo_args, env, repeat)
 
 
 # A preempted container restarts its input from zero, so a run of hours may never finish on
 # preemptible capacity. This costs more: use it (`--steady`) only for long runs.
-@app.function(image=image, cpu=16, memory=32768, timeout=14400, volumes={"/target": target_vol}, nonpreemptible=True)
+@app.function(image=image, cpu=(8, 16), memory=(16384, 32768), timeout=14400, nonpreemptible=True)
 def suite_steady(src: bytes, cargo_args: str, env: dict[str, str], repeat: int = 1) -> tuple[int, str]:
     return run_suite(src, cargo_args, env, repeat)
 
@@ -188,7 +192,6 @@ def run_suite(src: bytes, cargo_args: str, env: dict[str, str], repeat: int) -> 
             if line.startswith("soak"):
                 print(line, flush=True)
         proc.wait()
-        target_vol.commit()
         # A panic's message is the line after its header.
         after_panic = [all_lines[k + 1] for k, l in enumerate(all_lines[:-1]) if "panicked" in l]
         lines = [l for l in all_lines if l in after_panic or l.startswith("  call ") or l.startswith("key ") or l.startswith("first operation left out") or l.startswith("test result") or "FAILED" in l or "panicked" in l or l.startswith("error") or "process chaos" in l or "range cluster" in l or l.startswith("bench:") or l.startswith("soak")]
@@ -201,15 +204,14 @@ def run_suite(src: bytes, cargo_args: str, env: dict[str, str], repeat: int) -> 
     return 0, "\n".join(summary)
 
 
-@app.function(image=image, cpu=16, memory=32768, timeout=3600, volumes={"/target": target_vol})
+@app.function(image=image, cpu=(4, 16), memory=(4096, 32768), timeout=3600)
 def build_server(src: bytes) -> bytes:
     """Builds `storage-server` (release); returns the executable."""
     unpack(src)
     proc = subprocess.run("cargo build --release -p storage-server 2>&1", shell=True, cwd="/src", capture_output=True, text=True)
-    target_vol.commit()
     if proc.returncode != 0:
         raise RuntimeError("build failed:\n" + proc.stdout[-6000:])
-    with open("/target/t/release/storage-server", "rb") as f:
+    with open("/tmp/t/release/storage-server", "rb") as f:
         return f.read()
 
 
@@ -219,15 +221,14 @@ tools_image = image.apt_install("postgresql-client", "default-jdk-headless", "un
 )
 
 
-@app.function(image=image, cpu=16, memory=32768, timeout=3600, volumes={"/target": target_vol})
+@app.function(image=image, cpu=(4, 16), memory=(4096, 32768), timeout=3600)
 def build_sql(src: bytes) -> bytes:
     """Builds `storine-sql` (release); returns the executable."""
     unpack(src)
     proc = subprocess.run("cargo build --release -p storage-sql 2>&1", shell=True, cwd="/src", capture_output=True, text=True)
-    target_vol.commit()
     if proc.returncode != 0:
         raise RuntimeError("build failed:\n" + proc.stdout[-6000:])
-    with open("/target/t/release/storine-sql", "rb") as f:
+    with open("/tmp/t/release/storine-sql", "rb") as f:
         return f.read()
 
 

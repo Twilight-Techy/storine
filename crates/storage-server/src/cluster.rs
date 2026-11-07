@@ -250,8 +250,7 @@ impl<T: ZeroCopyRecord + Indexable> ClusterContext<T> {
     }
 
     /// `NotLeader` reply: version = leader node id (`0` unknown), body = leader client address.
-    pub(crate) fn not_leader(&self) -> JobResponse {
-        let leader = self.runtime.node().leader_id();
+    pub(crate) fn not_leader(&self, leader: Option<NodeId>) -> JobResponse {
         let addr = leader.map(|l| self.addr_of(l)).unwrap_or_default();
         (crate::STATUS_NOT_LEADER, leader.map_or(0, u64::from), addr.into_bytes())
     }

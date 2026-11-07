@@ -1391,7 +1391,9 @@ fn route_cluster<T: ZeroCopyRecord + Indexable>(
             ConnStep::Progress
         }
     };
-    let is_leader = cl.runtime.node().is_leader();
+    // This thread serves every connection on its shard, and the node state is held across `fsync`:
+    // never wait for it here. When it is busy, a worker finds out (and refuses if not the leader).
+    let (is_leader, leader) = cl.runtime.node().try_read_state(|leader, id, _, _| (leader, id)).unwrap_or((true, None));
     let wake: Arc<dyn Fn() + Send + Sync> = {
         let sh = Arc::clone(shard);
         Arc::new(move || sh.wake())
@@ -1399,7 +1401,7 @@ fn route_cluster<T: ZeroCopyRecord + Indexable>(
     match op {
         OP_PUT_RAW_FRAME | OP_CAS_PUT | OP_DELETE | OP_BATCH_PUT | OP_TXN | OP_DOC_WRITE => {
             if !is_leader {
-                return Ok(reply(conn, cl.not_leader()));
+                return Ok(reply(conn, cl.not_leader(leader)));
             }
             let job_shared = Arc::clone(shared);
             let job = Box::new(move || write_reply(&job_shared, op, raw_id, &body));
@@ -1413,7 +1415,7 @@ fn route_cluster<T: ZeroCopyRecord + Indexable>(
         }
         OP_CLUSTER_CHANGE => {
             if !is_leader {
-                return Ok(reply(conn, cl.not_leader()));
+                return Ok(reply(conn, cl.not_leader(leader)));
             }
             // Waits for catch-up and consensus: on the worker pool, never on a reactor thread.
             let rt = Arc::clone(&cl.runtime);
@@ -1427,19 +1429,20 @@ fn route_cluster<T: ZeroCopyRecord + Indexable>(
             }
         }
         OP_DOC_ADMIN | OP_MIGRATE_VSHARD => {
-            if is_leader {
+            // Runs here rather than on a worker, so the answer must be a real one.
+            if cl.runtime.node().is_leader() {
                 Err(body)
             } else {
-                Ok(reply(conn, cl.not_leader()))
+                Ok(reply(conn, cl.not_leader(cl.runtime.node().leader_id())))
             }
         }
         OP_GET_RAW_FRAME | OP_BATCH_GET | OP_QUERY_HYBRID | OP_DOC_GET | OP_DOC_QUERY | OP_DOC_INFO | OP_DOC_AGGREGATE
         | OP_DOC_SCAN_COLUMNS => {
-            if conn.follower_reads || (is_leader && cl.runtime.lease_valid()) {
+            if conn.follower_reads || (is_leader && cl.runtime.lease_valid_now()) {
                 return Err(body);
             }
             if !is_leader {
-                return Ok(reply(conn, cl.not_leader()));
+                return Ok(reply(conn, cl.not_leader(leader)));
             }
             // Lease expired (e.g. right after an election): confirm leadership first.
             let rt = Arc::clone(&cl.runtime);

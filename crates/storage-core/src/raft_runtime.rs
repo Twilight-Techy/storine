@@ -369,7 +369,15 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
     /// have been elected (lease = 90% of the minimum election timeout, `RULE-SAFE-09`).
     pub fn lease_valid(&self) -> bool {
         let s = &self.shared;
-        s.node.is_leader() && s.node.applied_own_term() && quorum_acked_within(s, s.config.election_timeout_min.mul_f64(0.9))
+        s.node.is_leader() && s.node.applied_own_term() && quorum_acked_within(s, &s.node.membership(), s.node.current_term(), s.config.election_timeout_min.mul_f64(0.9))
+    }
+
+    /// [`Self::lease_valid`] for reactor threads: `false` also when the node state is busy, which
+    /// sends the caller to a read barrier on a worker instead of waiting here for a disk.
+    pub fn lease_valid_now(&self) -> bool {
+        let s = &self.shared;
+        let view = s.node.try_read_state(|leader, _, term, members| leader.then(|| (term, members.clone())));
+        view.flatten().is_some_and(|(term, members)| s.node.applied_own_term() && quorum_acked_within(s, &members, term, s.config.election_timeout_min.mul_f64(0.9)))
     }
 
     /// Stops all runtime threads (the node keeps its durable state).
@@ -466,14 +474,12 @@ fn election_timeout<T: ZeroCopyRecord + Indexable>(s: &Shared<T>) -> Duration {
 }
 
 /// `true` if a quorum of voters acknowledged this leader's current term within `window`.
-fn quorum_acked_within<T: ZeroCopyRecord + Indexable>(s: &Shared<T>, window: Duration) -> bool {
-    let members = s.node.membership();
+fn quorum_acked_within<T: ZeroCopyRecord + Indexable>(s: &Shared<T>, members: &Membership, term: u64, window: Duration) -> bool {
     let self_votes = members.is_voter(s.node.node_id());
     let peers: Vec<NodeId> = members.voters().filter(|&v| v != s.node.node_id()).collect();
     if peers.is_empty() {
         return self_votes;
     }
-    let term = s.node.current_term();
     let now = Instant::now();
     // Lock order: node state is never taken while `progress` is held.
     let progress = s.progress.lock().unwrap_or_else(|p| p.into_inner());
@@ -490,7 +496,7 @@ fn quorum_acked_within<T: ZeroCopyRecord + Indexable>(s: &Shared<T>, window: Dur
             fresh += 1;
         }
     }
-    fresh >= quorum(&members)
+    fresh >= quorum(members)
 }
 
 /// Election timer and leader housekeeping. Sleeps until the next deadline (no busy loop).
@@ -507,7 +513,7 @@ fn timer_loop<T: ZeroCopyRecord + Indexable + 'static>(s: &Arc<Shared<T>>) {
             // elsewhere. Two maximum election timeouts, so a slow round does not depose it.
             let window = s.config.election_timeout_max * 2;
             let seen = quorum_seen.get_or_insert_with(Instant::now);
-            if quorum_acked_within(s, window) {
+            if quorum_acked_within(s, &s.node.membership(), s.node.current_term(), window) {
                 *seen = Instant::now();
             } else if seen.elapsed() > window {
                 s.node.relinquish_leadership();

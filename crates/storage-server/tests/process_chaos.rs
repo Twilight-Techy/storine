@@ -123,8 +123,21 @@ fn pipe(mut from: TcpStream, mut to: TcpStream, mode: &AtomicU8, epoch: &AtomicU
     let _ = to.shutdown(std::net::Shutdown::Both);
 }
 
+/// A port no other cluster in this process was given, for a node to bind later and keep through
+/// restarts. Not `bind(0)` then release: tests run clusters side by side, and two drawing the same
+/// port left them sharing a node, each reading the other's writes. Below the kernel's ephemeral
+/// range (from 32768 on Linux, from 16000 under gVisor on Modal), so no client's source port can
+/// hold it while the node is down.
 fn free_addr() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let base = 10_000 + u64::from(std::process::id()) % 3_000;
+    loop {
+        let port = base + NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(port < 16_000, "out of ports below the ephemeral range");
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port as u16)) {
+            return listener.local_addr().unwrap();
+        }
+    }
 }
 
 struct Cluster {
@@ -147,6 +160,14 @@ impl Cluster {
         for i in 0..n {
             c.spawn(i);
         }
+        // A node that could not bind exits at once, and would leave its address to whoever holds it.
+        thread::sleep(Duration::from_millis(300));
+        for (i, p) in c.procs.iter_mut().enumerate() {
+            if let Some(status) = p.as_mut().unwrap().try_wait().unwrap() {
+                let said = std::fs::read_to_string(dir.join(format!("n{}.stderr", i + 1))).unwrap_or_default();
+                panic!("node {i} at {} exited at start: {status}: {said}", c.addrs[i]);
+            }
+        }
         c
     }
 
@@ -164,7 +185,7 @@ impl Cluster {
             .args(["--node-id", &(i + 1).to_string(), "--peers", &peers.join(",")])
             .args(if self.ranges { &["--ranges"][..] } else { &[][..] })
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(self.dir.join(format!("n{}.stderr", i + 1))).map_or(Stdio::null(), Stdio::from))
             .spawn()
             .unwrap();
         self.procs[i] = Some(child);
@@ -362,6 +383,21 @@ fn one_fault(cluster: &Mutex<Cluster>, rng: &mut SweepRng, faults: &mut BTreeMap
             cluster.lock().unwrap().heal();
         }
         _ => {}
+    }
+}
+
+/// What each node answers for each account, when the final read gave up.
+fn report_unreadable(addrs: &[SocketAddr], ranges: bool) {
+    for (n, a) in addrs.iter().enumerate() {
+        match StorageClient::connect_timeout(*a, client_timeout(ranges)) {
+            Err(e) => eprintln!("soak unreadable: node {n}: connect: {e:?}"),
+            Ok(mut c) => {
+                for i in 0..ACCOUNTS {
+                    let answer = c.doc_get("bank", &format!("a{i}"));
+                    eprintln!("soak unreadable: node {n} a{i}: {:?}", answer.map(|d| d.is_some()));
+                }
+            }
+        }
     }
 }
 
@@ -572,7 +608,10 @@ fn chaos(ranges: bool) {
             match read {
                 Some(t) => break t,
                 None if Instant::now() < deadline => thread::sleep(Duration::from_millis(200)),
-                None => panic!("accounts unreadable after the chaos"),
+                None => {
+                    report_unreadable(&addrs, ranges);
+                    panic!("accounts unreadable after the chaos");
+                }
             }
         };
         eprintln!("range cluster: {} transfers committed", transfers.load(Ordering::Relaxed));

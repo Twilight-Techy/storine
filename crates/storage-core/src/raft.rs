@@ -2265,6 +2265,18 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         self.lock_state().role == RaftRole::Leader
     }
 
+    /// Reads role, leader, term and configuration without waiting, or `None` if the state is busy
+    /// (it is held across `fsync`). For reactor threads, which serve every other connection on
+    /// their shard and must not wait for a disk: they treat `None` as "let a worker find out".
+    pub fn try_read_state<R>(&self, read: impl FnOnce(bool, Option<NodeId>, u64, &Membership) -> R) -> Option<R> {
+        let st = match self.state.try_lock() {
+            Ok(st) => st,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        Some(read(st.role == RaftRole::Leader, st.leader_id, st.current_term, st.membership().1))
+    }
+
     /// Processes an `AppendEntriesReq` from the leader, durably appends its entries, and applies
     /// newly committed entries to `StorageEngine<T>`.
     pub fn handle_append_entries(&self, req: AppendEntriesReq) -> Result<AppendEntriesResp> {
@@ -3645,6 +3657,21 @@ mod tests {
         drop(group);
         drop(nodes);
         drop(engines);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_try_read_state_never_waits_for_the_state_lock() {
+        let base = std::env::temp_dir().join(format!("stge_raft_try_read_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let engine = Arc::new(StorageEngine::<crate::DocumentRecord>::open(&base, EngineConfig::default()).unwrap());
+        let node = RaftNode::new(1, Arc::clone(&engine)).unwrap();
+        assert_eq!(node.try_read_state(|leader, _, _, _| leader), Some(false));
+        let held = node.lock_state();
+        assert!(node.try_read_state(|_, _, _, _| ()).is_none(), "a busy state is reported, not waited for");
+        drop(held);
+        drop(node);
+        drop(engine);
         let _ = std::fs::remove_dir_all(&base);
     }
 
