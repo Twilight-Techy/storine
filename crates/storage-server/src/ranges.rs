@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -48,6 +48,9 @@ pub struct TcpRangeTransport {
     token: Option<String>,
     timeout: Duration,
     senders: Mutex<HashMap<NodeId, SyncSender<Vec<u8>>>>,
+    /// Bytes of batches queued for every peer, and batches dropped on a full queue (metrics).
+    queued_bytes: Arc<AtomicU64>,
+    dropped: AtomicU64,
     idle: Mutex<HashMap<NodeId, Vec<StorageClient>>>,
     /// The local node: calls to ourselves skip the network.
     local: RwLock<Option<Arc<RangeNode>>>,
@@ -65,7 +68,7 @@ impl TcpRangeTransport {
     /// `peers`: node id -> address of every node (this one included); `token`: an Admin token
     /// every peer accepts.
     pub fn new(me: NodeId, peers: HashMap<NodeId, SocketAddr>, token: Option<String>, timeout: Duration) -> Arc<Self> {
-        Arc::new_cyclic(|weak| Self { me, peers, token, timeout, senders: Mutex::new(HashMap::new()), idle: Mutex::new(HashMap::new()), local: RwLock::new(None), weak: weak.clone() })
+        Arc::new_cyclic(|weak| Self { me, peers, token, timeout, senders: Mutex::new(HashMap::new()), queued_bytes: Arc::new(AtomicU64::new(0)), dropped: AtomicU64::new(0), idle: Mutex::new(HashMap::new()), local: RwLock::new(None), weak: weak.clone() })
     }
 
     pub fn set_local(&self, node: Arc<RangeNode>) {
@@ -88,8 +91,8 @@ impl TcpRangeTransport {
             return Some(s.clone());
         }
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(PEER_QUEUE);
-        let me = self.weak.clone();
-        std::thread::Builder::new().name(format!("range-send-{to}")).spawn(move || peer_sender(me, to, rx)).ok()?;
+        let (me, queued) = (self.weak.clone(), Arc::clone(&self.queued_bytes));
+        std::thread::Builder::new().name(format!("range-send-{to}")).spawn(move || peer_sender(me, to, rx, &queued)).ok()?;
         senders.insert(to, tx.clone());
         Some(tx)
     }
@@ -97,16 +100,19 @@ impl TcpRangeTransport {
 
 /// Sends one peer's batches in order, reconnecting after failures (with a short pause, so an
 /// unreachable peer costs no CPU).
-fn peer_sender(transport: std::sync::Weak<TcpRangeTransport>, to: NodeId, rx: Receiver<Vec<u8>>) {
+fn peer_sender(transport: std::sync::Weak<TcpRangeTransport>, to: NodeId, rx: Receiver<Vec<u8>>, queued: &AtomicU64) {
     let mut conn: Option<StorageClient> = None;
     while let Ok(batch) = rx.recv() {
+        queued.fetch_sub(batch.len() as u64, Ordering::Relaxed);
         let Some(t) = transport.upgrade() else { return };
         if conn.is_none() {
             match t.connect(to, t.timeout) {
                 Ok(c) => conn = Some(c),
                 Err(_) => {
                     // Drop what queued meanwhile: Raft resends what still matters.
-                    while rx.try_recv().is_ok() {}
+                    while let Ok(b) = rx.try_recv() {
+                        queued.fetch_sub(b.len() as u64, Ordering::Relaxed);
+                    }
                     std::thread::sleep(Duration::from_millis(100));
                     continue;
                 }
@@ -127,7 +133,12 @@ impl Transport for TcpRangeTransport {
         }
         if let Some(tx) = self.sender(to) {
             // Full queue: drop (bounded memory; Raft retries).
-            let _ = tx.try_send(batch);
+            let len = batch.len() as u64;
+            self.queued_bytes.fetch_add(len, Ordering::Relaxed);
+            if tx.try_send(batch).is_err() {
+                self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -235,6 +246,18 @@ impl RangeContext {
     /// `OP_CLUSTER_INFO` body: every node coordinates, so each reports itself as the node to
     /// write to; members are every node of the cluster (their client address is their range
     /// address: one port).
+    /// `OP_HEALTH` in range mode: what the node holds in memory, for operators and the soak.
+    pub(crate) fn health(&self) -> Vec<u8> {
+        format!(
+            "{{\"status\":\"ok\",\"mode\":\"ranges\",{},\"outbound_batch_bytes\":{},\"dropped_batches\":{}{}}}",
+            self.node.gauges(),
+            self.transport.queued_bytes.load(Ordering::Relaxed),
+            self.transport.dropped.load(Ordering::Relaxed),
+            crate::heap_fields()
+        )
+        .into_bytes()
+    }
+
     pub(crate) fn cluster_info(&self) -> Vec<u8> {
         use storage_core::document_wire::put_str;
         let me = self.transport.me;

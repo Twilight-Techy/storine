@@ -35,6 +35,10 @@
 
 use std::env;
 use std::process::ExitCode;
+
+#[cfg(feature = "heap-stats")]
+#[global_allocator]
+static ALLOCATOR: storage_codec::peak_alloc::LiveAlloc = storage_codec::peak_alloc::LiveAlloc;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;

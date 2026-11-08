@@ -334,10 +334,32 @@ fn add(key: &str, delta: i64) -> DocWrite {
 }
 
 /// One fault on a random node, held for a moment, then undone.
+/// `STORINE_SOAK_VERBOSE`: print each fault as it starts, and every sample of a node above
+/// [`soak_verbose_rss_kb`], so a memory peak can be matched to what the node went through.
+fn soak_verbose() -> bool {
+    std::env::var_os("STORINE_SOAK_VERBOSE").is_some()
+}
+
+/// Above this, a verbose soak prints a node's memory each sample (`STORINE_SOAK_VERBOSE_MB`,
+/// default 2,500).
+fn soak_verbose_rss_kb() -> u64 {
+    std::env::var("STORINE_SOAK_VERBOSE_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(2_500) << 10
+}
+
+/// Seconds since the first call (the soak's start).
+fn soak_secs() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs()
+}
+
 fn one_fault(cluster: &Mutex<Cluster>, rng: &mut SweepRng, faults: &mut BTreeMap<&'static str, usize>) {
     let node = rng.below(3);
     let mut c = cluster.lock().unwrap();
-    match rng.below(6) {
+    let kind = rng.below(6);
+    if soak_verbose() && kind < 5 {
+        eprintln!("soak fault at {}s: {} on node {}", soak_secs(), ["sigkill", "sigstop", "partition", "half-open", "delay"][kind], node + 1);
+    }
+    match kind {
         0 => {
             *faults.entry("sigkill").or_default() += 1;
             c.kill(node);
@@ -666,7 +688,8 @@ fn describe_memory(pid: u32, node_dir: &Path) -> String {
             *[&mut anon, &mut file, &mut deleted][kind as usize] += kb;
         }
     }
-    format!("anon {} MiB, files {} MiB, deleted files {} MiB, {maps} maps, disk {} MiB", anon >> 10, file >> 10, deleted >> 10, disk_bytes(node_dir) >> 20)
+    let threads = std::fs::read_to_string(format!("/proc/{pid}/status")).ok().and_then(|s| s.lines().find(|l| l.starts_with("Threads:")).and_then(|l| l.split_whitespace().nth(1).map(str::to_string))).unwrap_or_else(|| "?".into());
+    format!("anon {} MiB, files {} MiB, deleted files {} MiB, {maps} maps, {threads} threads, disk {} MiB", anon >> 10, file >> 10, deleted >> 10, disk_bytes(node_dir) >> 20)
 }
 
 /// What a node's descriptors are: sockets by TCP state on its client port, and files by extension.
@@ -705,6 +728,7 @@ fn describe_fds(pid: u32, port: u16) -> String {
 fn soak(ranges: bool) {
     use storage_core::analytics::{AggFunc, Aggregate, AggregateQuery, Expr as AExpr, GroupKey};
     let env_secs = |k: &str, d: u64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
+    soak_secs();
     let (secs, window_secs) = (env_secs("STORINE_SOAK_SECS", 1800), env_secs("STORINE_SOAK_WINDOW_SECS", 300));
     let dir = std::env::temp_dir().join(format!("storine_soak_{}_{ranges}", std::process::id()));
     let cluster = Arc::new(Mutex::new(Cluster::start(&dir, ranges)));
@@ -950,6 +974,11 @@ fn soak(ranges: bool) {
                         rss_max = rss;
                         mem_peak = describe_memory(pid, &dir.join(format!("n{}", i + 1)));
                     }
+                    if soak_verbose() && rss > soak_verbose_rss_kb() {
+                        // What the node says it holds (range mode reports its queues and logs).
+                        let health = StorageClient::connect_timeout(addrs[i], Duration::from_secs(1)).and_then(|mut c| c.health()).unwrap_or_else(|e| format!("health: {e}"));
+                        eprintln!("soak memory at {}s: node {} (pid {pid}): {}; {health}", soak_secs(), i + 1, describe_memory(pid, &dir.join(format!("n{}", i + 1))));
+                    }
                     busiest = busiest.max(fds);
                     if fds > fds_max {
                         fds_max = fds;
@@ -994,23 +1023,45 @@ fn soak(ranges: bool) {
     thread::sleep(Duration::from_secs(3));
     // Money is conserved, whatever was in flight.
     let deadline = Instant::now() + Duration::from_secs(60);
+    // Why each node last refused, kept for the report if no node ever answers.
+    let mut last_errors = vec![String::new(); addrs.len()];
     let total = loop {
         // Only the leader answers in a single group, and any node may be it.
-        let read = addrs.iter().find_map(|a| {
-            let mut c = StorageClient::connect_timeout(*a, client_timeout(ranges)).ok()?;
-            let mut t = 0;
-            for i in 0..ACCOUNTS {
-                let d = c.doc_get("bank", &format!("a{i}")).ok()??;
-                if let Some(PropertyValue::Int64(v)) = d.fields.get("bal") {
-                    t += v;
+        let mut read = None;
+        for (n, a) in addrs.iter().enumerate() {
+            let attempt = (|| {
+                let mut c = StorageClient::connect_timeout(*a, client_timeout(ranges)).map_err(|e| format!("connect: {e}"))?;
+                let mut t = 0;
+                for i in 0..ACCOUNTS {
+                    let d = c.doc_get("bank", &format!("a{i}")).map_err(|e| format!("a{i}: {e}"))?.ok_or(format!("a{i}: missing"))?;
+                    if let Some(PropertyValue::Int64(v)) = d.fields.get("bal") {
+                        t += v;
+                    }
                 }
+                Ok::<i64, String>(t)
+            })();
+            match attempt {
+                Ok(t) => {
+                    read = Some(t);
+                    break;
+                }
+                Err(e) => last_errors[n] = e,
             }
-            Some(t)
-        });
+        }
         match read {
             Some(t) => break t,
             None if Instant::now() < deadline => thread::sleep(Duration::from_millis(500)),
-            None => panic!("soak: accounts unreadable 60 s after healing"),
+            None => {
+                for (n, e) in last_errors.iter().enumerate() {
+                    let log = std::fs::read_to_string(dir.join(format!("n{}.stderr", n + 1))).unwrap_or_default();
+                    let tail: Vec<&str> = log.lines().rev().take(15).collect();
+                    eprintln!("soak final read: node {} last error: {e}", n + 1);
+                    for l in tail.iter().rev() {
+                        eprintln!("soak node {} stderr: {}", n + 1, l.chars().take(300).collect::<String>());
+                    }
+                }
+                panic!("soak: accounts unreadable 60 s after healing");
+            }
         }
     };
     assert_eq!(total, 100 * ACCOUNTS as i64, "money created or destroyed");

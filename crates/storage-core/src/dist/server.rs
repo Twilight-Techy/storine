@@ -397,6 +397,13 @@ impl NodeServer {
         &self.hlc
     }
 
+    /// Requests being evaluated, held latches, keys and spans in the timestamp caches, and
+    /// replies not yet taken (metrics).
+    pub fn gauges(&self) -> [u64; 4] {
+        let ts: usize = self.tscache.values().map(|c| c.keys.len() + c.spans.len()).sum();
+        [self.pending.len() as u64, self.latches.len() as u64, ts as u64, self.replies.len() as u64]
+    }
+
     /// The range of this node holding `key`, if any.
     pub fn range_of(&self, key: &Key) -> Option<RangeId> {
         self.range_at(key_id(key)?.as_bytes())

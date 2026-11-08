@@ -113,7 +113,7 @@ The latest instruction from the user is to do everything that remains, **except*
 - **TASK-148**: done. `exec/stats.rs`, `exec/optimizer.rs`, `tests/optimizer.rs`. Fixed a Raft §8 stale read in single-group mode.
 - **TASK-149**: done. `exec/temp.rs`, `exec/cursor.rs`, `exec/routine.rs`, `exec/notify.rs`, `parser/plpgsql.rs`, `nettypes.rs`, `tests/sql_surface.rs`.
 - **TASK-150**: done. `tools/modal/sweep.py --tools all`; 0 JDBC failures and 177 tool checks with 0 failures.
-- **TASK-151**: reopened 2026-11-08. The 2-hour soak passed on 2026-11-07, but a stricter rerun goes over the memory ceiling in both modes. Range mode reaches 6.9 GB of heap for 61 MB of data; single group spikes once to 4.7 GB. Both predate the fixes of 2026-11-08, and the cause is not yet found (`TASKS.md`).
+- **TASK-151**: reopened 2026-11-08 for memory. The causes were found and fixed: a leader resend flood, a single-group WAL that was never checkpointed, and allocator retention. Range mode now passes the 2-hour soak at under 1.6 GiB. Single group stays bounded but failed its final balance read after healing; the cause is not yet known (`TASKS.md`).
 - **TASK-152**: done. The final audit; findings and fixes are in `TASKS.md`.
 - **Stage 31**: complete apart from `TASK-151` (memory).
 
@@ -185,3 +185,11 @@ Yes:
   - Single group spikes to 4.7 GB on a node that is probably catching up by snapshot.
   - The 2026-11-07 pass had passed under a 6 GiB ceiling with little margin.
 - **Modal**: workspace, chaos and three soaks (one 2 h run that failed at 1 h, and two diagnostic runs). $2.98 on 2026-11-08 by the billing report at commit time (the last run may not be billed yet); about $30 for storine this month.
+- **Memory, fixed later the same day**:
+  - The range leader holds one bounded window in flight per follower.
+  - Single-group nodes checkpoint every 10 s.
+  - `malloc_trim` runs every 10 s.
+  - Non-voters grant no votes (sim seed 262).
+  - Range health reports its queues, and `heap-stats` reports the live heap.
+- **Result of the 2-hour soak**: range mode passes at a peak RSS of 757–1,546 MiB. Single group stays bounded at 563–1,864 MiB but fails the final balance read after healing. That failure is open, and diagnostics were added.
+- **Modal**: $8.94 on 2026-11-08 and $35.90 this month for storine, by the billing report at commit time.

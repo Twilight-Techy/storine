@@ -64,6 +64,11 @@ pub struct RaftConfig {
     pub max_bytes_per_append: usize,
     /// How often the leader proposes a TTL sweep (only when TTL records exist).
     pub sweep_interval: Duration,
+    /// How often every node checkpoints its engine when something applied since the last one.
+    /// A checkpoint flushes the applied writes into the data files and truncates the WAL, which
+    /// otherwise grows with every write for as long as the node runs, and is read whole into
+    /// memory by the next start.
+    pub checkpoint_interval: Duration,
 }
 
 impl Default for RaftConfig {
@@ -76,6 +81,7 @@ impl Default for RaftConfig {
             max_entries_per_append: 512,
             max_bytes_per_append: 4 * 1024 * 1024,
             sweep_interval: Duration::from_secs(60),
+            checkpoint_interval: Duration::from_secs(10),
         }
     }
 }
@@ -189,6 +195,12 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
                 .spawn(move || timer_loop(&s))
                 .map_err(|e| StorageError::io("spawn raft timer", e))?;
             shared.threads.lock().unwrap_or_else(|p| p.into_inner()).push(timer);
+            let s = Arc::clone(&shared);
+            let checkpointer = thread::Builder::new()
+                .name("storine-raft-checkpoint".into())
+                .spawn(move || checkpoint_loop(&s))
+                .map_err(|e| StorageError::io("spawn raft checkpointer", e))?;
+            shared.threads.lock().unwrap_or_else(|p| p.into_inner()).push(checkpointer);
         }
         reconcile_members(&shared);
         Ok(Arc::new(Self { shared }))
@@ -551,6 +563,27 @@ fn timer_loop<T: ZeroCopyRecord + Indexable + 'static>(s: &Arc<Shared<T>>) {
     }
 }
 
+/// Checkpoints the engine every `checkpoint_interval` when something applied since the last
+/// time. On its own thread: a checkpoint flushes and syncs, which would delay heartbeats and
+/// elections on the timer's.
+fn checkpoint_loop<T: ZeroCopyRecord + Indexable>(s: &Shared<T>) {
+    let mut last = Instant::now();
+    let mut done = s.node.last_applied();
+    while !s.shutdown.load(Ordering::Acquire) {
+        let elapsed = last.elapsed();
+        if elapsed < s.config.checkpoint_interval {
+            sleep_interruptibly(s, s.config.checkpoint_interval - elapsed);
+            continue;
+        }
+        last = Instant::now();
+        let applied = s.node.last_applied();
+        // A failure is retried next interval; the WAL keeps everything until one succeeds.
+        if applied != done && s.node.engine().checkpoint().is_ok() {
+            done = applied;
+        }
+    }
+}
+
 fn sleep_interruptibly<T: ZeroCopyRecord + Indexable>(s: &Shared<T>, d: Duration) {
     let g = s.wake_gen.lock().unwrap_or_else(|p| p.into_inner());
     if s.shutdown.load(Ordering::Acquire) {
@@ -871,6 +904,8 @@ mod tests {
             heartbeat_interval: Duration::from_millis(25),
             commit_timeout: Duration::from_secs(3),
             sweep_interval: Duration::from_millis(100),
+            // Often, so every runtime test also runs with checkpoints under it.
+            checkpoint_interval: Duration::from_millis(200),
             ..RaftConfig::default()
         }
     }
@@ -995,6 +1030,49 @@ mod tests {
 
     fn did(coll: &str, key: &str) -> InlineId {
         crate::document::document_id(coll, key).unwrap()
+    }
+
+    /// Bytes of every WAL file under `dir`.
+    fn wal_bytes(dir: &std::path::Path) -> u64 {
+        std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                wal_bytes(&p)
+            } else if p.extension().is_some_and(|x| x == "wal") {
+                e.metadata().map_or(0, |m| m.len())
+            } else {
+                0
+            }
+        }).sum()
+    }
+
+    /// Single-group nodes never checkpointed on their own, so the WAL held every write since
+    /// start (1.4 GB in 20 minutes of the soak), and a restart read all of it into memory.
+    #[test]
+    fn test_nodes_checkpoint_on_their_own_and_the_wal_stays_bounded() {
+        let c = Cluster::new("checkpoint", 3);
+        let l = c.leader(Duration::from_secs(10));
+        let blob = PropertyValue::Text("x".repeat(1024));
+        for i in 0..2_000 {
+            c.runtimes[l].commit(vec![WriteOp::put(did("m", &format!("k{i}")), doc("m", &format!("k{i}"), &[("b", blob.clone())]))]).unwrap();
+        }
+        c.wait_converged(&[0, 1, 2]);
+        // About 2 MB went through each WAL; a checkpoint after the last write truncates it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let sizes: Vec<u64> = (1..=3).map(|i| wal_bytes(&c.base.join(format!("n{i}")))).collect();
+            if sizes.iter().all(|&b| b < 256 << 10) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "WALs not truncated by a checkpoint: {sizes:?} bytes");
+            thread::sleep(Duration::from_millis(50));
+        }
+        // And nothing was lost: every replica still has every record.
+        for e in &c.engines {
+            for i in [0, 999, 1_999] {
+                assert!(e.get_owned(did("m", &format!("k{i}"))).is_ok(), "k{i} survives the checkpoint");
+            }
+        }
     }
 
     #[test]

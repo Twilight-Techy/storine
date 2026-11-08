@@ -6,6 +6,7 @@
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
 pub mod arena;
+pub mod heap;
 pub mod net_poll;
 pub mod path;
 pub mod persist;
@@ -13,6 +14,7 @@ pub mod pool;
 pub mod raw;
 
 pub use arena::{ArenaLocation, ArenaManager, ArenaSegment, DEFAULT_SEGMENT_CAPACITY};
+pub use heap::release_free_heap;
 pub use net_poll::{socket_token, SocketPoller};
 #[cfg(any(target_os = "linux", windows))]
 pub use net_poll::ReadyPoller;

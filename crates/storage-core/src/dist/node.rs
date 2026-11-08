@@ -163,7 +163,16 @@ struct Progress {
     snapshot_min: u64,
     /// The follower's applied index, as last reported.
     applied: u64,
+    /// Last index sent and not yet acknowledged (0: none), and when the oldest unacknowledged
+    /// window went. Nothing is sent twice while it is in flight, so a follower that is slow,
+    /// paused or cut off costs a bounded window per range, not a copy per proposal.
+    inflight_end: u64,
+    inflight_at: u64,
 }
+
+/// Append windows ([`NodeConfig::max_entries_per_append`] entries or
+/// [`NodeConfig::max_bytes_per_append`] bytes each) a leader keeps in flight to one follower.
+const MAX_INFLIGHT_WINDOWS: u64 = 4;
 
 #[derive(Debug)]
 enum Campaign {
@@ -345,6 +354,14 @@ impl NodeDriver {
 
     pub fn engine(&self) -> &Arc<StorageEngine<DocumentRecord>> {
         &self.engine
+    }
+
+    /// Replicas hosted, and the entries and bytes their in-memory logs hold (metrics).
+    pub fn log_memory(&self) -> (usize, usize, u64) {
+        self.replicas.values().fold((0, 0, 0), |(n, e, b), r| {
+            let (entries, bytes) = r.raft.log_memory();
+            (n + 1, e + entries, b + bytes)
+        })
     }
 
     pub fn stats(&self) -> NodeStats {
@@ -963,7 +980,7 @@ impl NodeDriver {
                         self.push(p, range, RaftMsg::Quiesce { term, commit });
                     }
                 } else {
-                    self.broadcast(range);
+                    self.broadcast(range, true);
                 }
             }
             return Ok(());
@@ -1058,7 +1075,7 @@ impl NodeDriver {
         r.progress = peers
             .iter()
             .filter(|&&p| p != me)
-            .map(|&p| (p, Progress { next, matched: 0, snapshot_offset: None, force_snapshot: learners.contains(&p), snapshot_min: if learners.contains(&p) { min } else { 0 }, applied: 0 }))
+            .map(|&p| (p, Progress { next, matched: 0, snapshot_offset: None, force_snapshot: learners.contains(&p), snapshot_min: if learners.contains(&p) { min } else { 0 }, applied: 0, inflight_end: 0, inflight_at: 0 }))
             .collect();
         r.acks.clear();
         r.closing = None;
@@ -1067,29 +1084,37 @@ impl NodeDriver {
         r.idle_beats = 0;
         r.quiescent = None;
         r.last_heartbeat = self.now;
-        self.broadcast(range);
+        self.broadcast(range, true);
         // A single-voter range is its own quorum: its no-op (and everything before it) commits
         // now, not when a follower answers (there is none).
         let _ = self.advance_commit(range);
     }
 
-    fn broadcast(&mut self, range: RangeId) {
+    /// Replicates `range` to every peer. `heartbeat`: every peer gets a message even if nothing
+    /// new can be sent (liveness, read-index confirmation, closed timestamps).
+    fn broadcast(&mut self, range: RangeId, heartbeat: bool) {
         for p in self.peer_ids(range) {
-            self.replicate(range, p);
+            self.replicate(range, p, heartbeat);
         }
     }
 
-    fn replicate(&mut self, range: RangeId, peer: NodeId) {
+    /// Sends `peer` what it lacks of `range`: a snapshot chunk, the next append window, or, with
+    /// `heartbeat`, an empty append when the windows in flight are all it may have.
+    fn replicate(&mut self, range: RangeId, peer: NodeId, heartbeat: bool) {
         let Some(r) = self.replicas.get_mut(&range) else { return };
         let raft = Arc::clone(&r.raft);
         if !raft.is_leader() || raft.current_term() != r.lead_term {
             return;
         }
-        let pr = r.progress.get(&peer).copied().unwrap_or(Progress { next: raft.last_log_index() + 1, matched: 0, snapshot_offset: None, force_snapshot: false, snapshot_min: 0, applied: 0 });
+        let pr = r.progress.get(&peer).copied().unwrap_or(Progress { next: raft.last_log_index() + 1, matched: 0, snapshot_offset: None, force_snapshot: false, snapshot_min: 0, applied: 0, inflight_end: 0, inflight_at: 0 });
         if pr.force_snapshot && raft.last_applied() < pr.snapshot_min {
             return; // the new replica's snapshot must include its own addition: wait for it
         }
         if pr.force_snapshot || raft.needs_snapshot(pr.next) {
+            // A chunk is out: its answer sends the next one. Only heartbeats send it again.
+            if pr.snapshot_offset.is_some() && !heartbeat {
+                return;
+            }
             let offset = pr.snapshot_offset.unwrap_or(0);
             if let Ok(req) = raft.build_install_snapshot_from(offset, self.cfg.snapshot_chunk, pr.snapshot_min) {
                 r.progress.entry(peer).or_insert(pr).snapshot_offset = Some(offset);
@@ -1102,10 +1127,36 @@ impl NodeDriver {
             }
             return;
         }
-        let hb = r.hb_seq;
+        let (hb, now) = (r.hb_seq, self.now);
         let closed = r.closed_next.unwrap_or(r.closed);
-        if let Ok(req) = raft.build_append_entries_bounded(pr.next, self.cfg.max_entries_per_append, self.cfg.max_bytes_per_append) {
-            self.push(peer, range, RaftMsg::Append { req, hb, closed });
+        // A window unacknowledged for an election timeout was lost (a dropped batch, a
+        // restarted follower): send again from what the follower confirmed.
+        let in_flight = pr.inflight_end > pr.matched && now.saturating_sub(pr.inflight_at) < self.cfg.election_min_us;
+        let from = if in_flight { pr.inflight_end + 1 } else { pr.next };
+        let window = (self.cfg.max_entries_per_append.max(1) as u64).saturating_mul(MAX_INFLIGHT_WINDOWS);
+        let room = !in_flight || pr.inflight_end - pr.matched < window;
+        if from <= raft.last_log_index() && room {
+            if let Ok(req) = raft.build_append_entries_bounded(from, self.cfg.max_entries_per_append, self.cfg.max_bytes_per_append) {
+                let end = req.prev_log_index + req.entries.len() as u64;
+                if let Some(p) = r.progress.get_mut(&peer) {
+                    if !in_flight {
+                        p.inflight_at = now;
+                    }
+                    p.inflight_end = end;
+                }
+                self.push(peer, range, RaftMsg::Append { req, hb, closed });
+            }
+        } else if !in_flight {
+            // Nothing in flight and nothing new: the usual heartbeat, at the end of the log.
+            if let Ok(req) = raft.build_append_entries_bounded(pr.next, self.cfg.max_entries_per_append, self.cfg.max_bytes_per_append) {
+                self.push(peer, range, RaftMsg::Append { req, hb, closed });
+            }
+        } else if heartbeat {
+            // Windows in flight: an empty append at what the follower confirmed. It checks out
+            // whatever has or has not arrived, and cannot truncate or commit beyond `matched`.
+            if let Ok(req) = raft.build_heartbeat(pr.matched) {
+                self.push(peer, range, RaftMsg::Append { req, hb, closed });
+            }
         }
     }
 
@@ -1200,7 +1251,7 @@ impl NodeDriver {
                 if req.pre_vote && (leading || recently_led) {
                     if leading {
                         self.wake(range);
-                        self.replicate(range, from);
+                        self.replicate(range, from, true);
                     }
                     let resp = RequestVoteResp { term: raft.current_term(), vote_granted: false };
                     self.push(from, range, RaftMsg::VoteResp { req, resp });
@@ -1251,14 +1302,19 @@ impl NodeDriver {
                 if resp.success {
                     p.matched = p.matched.max(resp.match_index.min(last_sent));
                     p.next = p.next.max(p.matched + 1);
+                    if p.matched >= p.inflight_end {
+                        p.inflight_end = 0;
+                    }
                     let behind = p.matched < raft.last_log_index();
                     self.advance_commit(range)?;
                     if behind {
-                        self.replicate(range, from);
+                        self.replicate(range, from, false);
                     }
                 } else {
                     p.next = (resp.match_index + 1).min(p.next.saturating_sub(1)).max(p.matched + 1).max(1);
-                    self.replicate(range, from);
+                    // What was in flight followed the rejected point: it is moot.
+                    p.inflight_end = 0;
+                    self.replicate(range, from, false);
                 }
             }
             RaftMsg::Snap(req) => {
@@ -1291,8 +1347,9 @@ impl NodeDriver {
                     p.next = p.matched + 1;
                     p.snapshot_offset = None;
                     p.force_snapshot = false;
+                    p.inflight_end = 0;
                     self.advance_commit(range)?;
-                    self.replicate(range, from);
+                    self.replicate(range, from, false);
                 } else if p.snapshot_offset.is_some() {
                     p.snapshot_offset = Some(resp.next_offset);
                     match raft.build_install_snapshot_from(resp.next_offset, chunk, p.snapshot_min) {
@@ -1321,7 +1378,7 @@ impl NodeDriver {
                             p.snapshot_offset = None;
                             p.snapshot_min = 0;
                             self.wake(range);
-                            self.replicate(range, from);
+                            self.replicate(range, from, false);
                         }
                     }
                 }
@@ -1442,7 +1499,7 @@ impl NodeDriver {
             }
         }
         self.wake(range);
-        self.broadcast(range);
+        self.broadcast(range, false);
         self.advance_commit(range)?;
         Ok((index, term))
     }
@@ -1461,7 +1518,7 @@ impl NodeDriver {
         }
         let index = r.raft.propose(crate::raft::RaftCommand::Split { at, right })?;
         self.wake(range);
-        self.broadcast(range);
+        self.broadcast(range, false);
         self.advance_commit(range)?;
         Ok(index)
     }
@@ -1490,7 +1547,7 @@ impl NodeDriver {
         let index = r.raft.propose(crate::raft::RaftCommand::Freeze)?;
         self.freezing.insert(range, self.now);
         self.wake(range);
-        self.broadcast(range);
+        self.broadcast(range, false);
         self.advance_commit(range)?;
         Ok(index)
     }
@@ -1523,7 +1580,7 @@ impl NodeDriver {
         let cmd = self.replicas[&left].raft.merge_command(&self.replicas[&right].raft)?;
         let index = self.replicas[&left].raft.propose(cmd)?;
         self.wake(left);
-        self.broadcast(left);
+        self.broadcast(left, false);
         self.advance_commit(left)?;
         Ok(index)
     }
@@ -1628,12 +1685,12 @@ impl NodeDriver {
                     // Re-added before its earlier removal finished: no longer being removed.
                     r.removing.retain(|&(n, _)| n != id);
                     let next_index = r.raft.last_log_index();
-                    r.progress.entry(id).or_insert(Progress { next: next_index, matched: 0, snapshot_offset: None, force_snapshot: false, snapshot_min: 0, applied: 0 });
+                    r.progress.entry(id).or_insert(Progress { next: next_index, matched: 0, snapshot_offset: None, force_snapshot: false, snapshot_min: 0, applied: 0, inflight_end: 0, inflight_at: 0 });
                 }
             }
         }
         self.wake(range);
-        self.broadcast(range);
+        self.broadcast(range, false);
         self.advance_commit(range)?;
         Ok(index)
     }
@@ -1710,7 +1767,7 @@ impl NodeDriver {
         let token = ReadToken { range, seq: self.next_read };
         r.reads.push(PendingRead { seq: token.seq, read_index: view.commit_index, hb_needed: r.hb_seq, term: view.current_term });
         self.wake(range);
-        self.broadcast(range);
+        self.broadcast(range, true);
         Ok(token)
     }
 
@@ -1804,7 +1861,7 @@ impl NodeDriver {
                 continue;
             }
             for n in pending {
-                self.replicate(range, n);
+                self.replicate(range, n, true);
             }
         }
         // Replicas whose committed configuration no longer includes this node go away.
@@ -1833,5 +1890,90 @@ impl NodeDriver {
             self.add_replica(ev.right, raft);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::document_id;
+    use crate::engine::EngineConfig;
+    use storage_codec::PropertyValue;
+
+    /// A follower cut off while the leader keeps writing must cost the leader a bounded window,
+    /// not a copy of its unacknowledged entries per proposal (the range-mode soak held gigabytes
+    /// of queued batches for a paused or blackholed peer). Once healed, it catches up.
+    #[test]
+    fn a_cut_off_follower_gets_a_bounded_window_and_catches_up() {
+        let root = std::env::temp_dir().join(format!("storine_inflight_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let members: Vec<NodeId> = vec![1, 2, 3];
+        let mut nodes: Vec<NodeDriver> = members
+            .iter()
+            .map(|&id| {
+                let engine = Arc::new(StorageEngine::<DocumentRecord>::open(root.join(format!("n{id}")), EngineConfig::default()).unwrap());
+                let mut d = NodeDriver::new(id, engine, NodeConfig { seed: u64::from(id), cluster: members.clone(), ..NodeConfig::default() });
+                d.open_range(1, KeySpan::new(Vec::new(), None), &members).unwrap();
+                d
+            })
+            .collect();
+        let (mut now, mut cut, mut entries_to_cut, mut proposed) = (0u64, None::<NodeId>, 0u64, 0u64);
+        let run = |nodes: &mut Vec<NodeDriver>, now: u64, cut: Option<NodeId>, counted: &mut u64| {
+            for d in nodes.iter_mut() {
+                d.tick(now).unwrap();
+            }
+            for _ in 0..4 {
+                let mut moved = false;
+                for i in 0..nodes.len() {
+                    let from = nodes[i].id();
+                    for (to, batch) in nodes[i].drain_outbox() {
+                        if Some(to) == cut {
+                            *counted += batch.msgs.iter().map(|(_, m)| if let RaftMsg::Append { req, .. } = m { req.entries.len() as u64 } else { 0 }).sum::<u64>();
+                        }
+                        if cut.is_some_and(|c| c == to || c == from) {
+                            continue;
+                        }
+                        moved = true;
+                        nodes[usize::from(to) - 1].step(batch, now).unwrap();
+                    }
+                }
+                if !moved {
+                    break;
+                }
+            }
+        };
+        // Elect, then cut a follower off and write 600 entries (2 per 10 ms for 3 s).
+        for _ in 0..300 {
+            now += 10_000;
+            run(&mut nodes, now, cut, &mut entries_to_cut);
+            let Some(leader) = nodes.iter().position(|d| d.is_leader(1)) else { continue };
+            let follower = members.iter().copied().find(|&m| usize::from(m) - 1 != leader).unwrap();
+            let cut_now = *cut.get_or_insert(follower);
+            if usize::from(cut_now) - 1 == leader || proposed >= 600 {
+                continue;
+            }
+            for _ in 0..2 {
+                let id = document_id("kv", &format!("k{proposed}")).unwrap();
+                let rec = DocumentRecord::new("kv", format!("k{proposed}")).with("v", PropertyValue::Int64(proposed as i64));
+                if nodes[leader].propose(1, &[WriteOp::put(id, rec)], now * 1_000).is_ok() {
+                    proposed += 1;
+                }
+            }
+        }
+        assert!(proposed >= 500, "the two connected nodes kept committing: {proposed} proposals");
+        // Before: each proposal re-sent up to 64 unacknowledged entries (about 38,000 for 600).
+        // Now: 4 windows of 64, plus a resend of one window per election timeout.
+        assert!(entries_to_cut <= 2_000, "{entries_to_cut} entries queued for a follower that answers nothing, for {proposed} proposals");
+        // Healed: the follower catches up with everything.
+        let lagging = usize::from(cut.unwrap()) - 1;
+        for _ in 0..300 {
+            now += 10_000;
+            run(&mut nodes, now, None, &mut entries_to_cut);
+        }
+        let leader = nodes.iter().position(|d| d.is_leader(1)).expect("a leader after healing");
+        let last = nodes[leader].replica(1).unwrap().log_view().last_index();
+        assert_eq!(nodes[lagging].replica(1).unwrap().log_view().last_index(), last, "the healed follower caught up");
+        drop(nodes);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

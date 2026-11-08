@@ -24,5 +24,11 @@ storage-index = { path = "../storage-index" }
 storage-graph = { path = "../storage-graph" }
 storage-core = { path = "../storage-core" }
 
+[features]
+# Counts the bytes the server holds allocated and reports them in `OP_HEALTH` (`heap_live`,
+# `heap_peak`): RSS beside them tells a growing heap from memory the allocator keeps after use.
+# Off by default: every allocation then pays two atomic operations.
+heap-stats = []
+
 [lints]
 workspace = true

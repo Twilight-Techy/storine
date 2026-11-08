@@ -67,6 +67,8 @@ pub struct RangeNode {
     /// Requests waiting for an answer, and bytes of batches not yet stepped.
     queued: Arc<AtomicU64>,
     batch_bytes: Arc<AtomicU64>,
+    /// [`GAUGES`], published by the event loop once a second.
+    gauges: Arc<[AtomicU64; GAUGES.len()]>,
     max_queued: usize,
     thread: Mutex<Option<JoinHandle<()>>>,
     stopped: AtomicBool,
@@ -83,6 +85,9 @@ fn now_us() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64)
 }
 
+/// What [`RangeNode::gauges`] reports, in order.
+const GAUGES: [&str; 8] = ["ranges", "log_entries", "log_bytes", "pending", "latches", "tscache_entries", "replies", "waiting"];
+
 /// Most bytes of peers' batches queued at a node.
 const MAX_QUEUED_BATCH_BYTES: u64 = 1 << 30;
 
@@ -96,15 +101,26 @@ impl RangeNode {
         let batch_bytes = Arc::new(AtomicU64::new(0));
         let b = Arc::clone(&batch_bytes);
         let tick = cfg.tick;
+        let gauges: Arc<[AtomicU64; GAUGES.len()]> = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
+        let g = Arc::clone(&gauges);
         let thread = std::thread::Builder::new()
             .name(format!("range-node-{id}"))
-            .spawn(move || event_loop(server, rx, transport, tick, q, b))
+            .spawn(move || event_loop(server, rx, transport, tick, q, b, g))
             .ok();
-        Arc::new(Self { id, tx, queued, batch_bytes, max_queued: cfg.max_queued, thread: Mutex::new(thread), stopped: AtomicBool::new(false) })
+        Arc::new(Self { id, tx, queued, batch_bytes, gauges, max_queued: cfg.max_queued, thread: Mutex::new(thread), stopped: AtomicBool::new(false) })
     }
 
     pub fn id(&self) -> NodeId {
         self.id
+    }
+
+    /// What this node holds in memory, as JSON fields (`"name":value,...`): its gauges, as of
+    /// the last second, plus the bytes of peers' batches and the requests queued now.
+    pub fn gauges(&self) -> String {
+        let mut out: Vec<String> = GAUGES.iter().zip(self.gauges.iter()).map(|(k, v)| format!("\"{k}\":{}", v.load(Ordering::Relaxed))).collect();
+        out.push(format!("\"inbound_batch_bytes\":{}", self.batch_bytes.load(Ordering::Relaxed)));
+        out.push(format!("\"queued_requests\":{}", self.queued.load(Ordering::Relaxed)));
+        out.join(",")
     }
 
     /// Hands an encoded batch from another node to the event loop.
@@ -161,7 +177,7 @@ impl Drop for RangeNode {
     }
 }
 
-fn event_loop(mut srv: NodeServer, rx: Receiver<Input>, transport: Arc<dyn Transport>, tick: Duration, queued: Arc<AtomicU64>, batch_bytes: Arc<AtomicU64>) {
+fn event_loop(mut srv: NodeServer, rx: Receiver<Input>, transport: Arc<dyn Transport>, tick: Duration, queued: Arc<AtomicU64>, batch_bytes: Arc<AtomicU64>, gauges: Arc<[AtomicU64; GAUGES.len()]>) {
     // Request ids are this loop's own: replies go back through their channels.
     let trace = std::env::var_os("STORINE_NODE_TRACE").is_some();
     if trace {
@@ -241,6 +257,11 @@ fn event_loop(mut srv: NodeServer, rx: Receiver<Input>, transport: Arc<dyn Trans
         // change, say) is forgotten after a minute; its caller has long timed out.
         if last_sweep.elapsed() >= Duration::from_secs(1) {
             last_sweep = Instant::now();
+            let (ranges, entries, bytes) = srv.driver.log_memory();
+            let [pending, latches, ts, replies] = srv.gauges();
+            for (g, v) in gauges.iter().zip([ranges as u64, entries as u64, bytes, pending, latches, ts, replies, waiting.len() as u64]) {
+                g.store(v, Ordering::Relaxed);
+            }
             let expired: HashSet<u64> = waiting.iter().filter(|(_, (since, _))| since.elapsed() >= Duration::from_secs(60)).map(|(id, _)| *id).collect();
             if !expired.is_empty() {
                 waiting.retain(|id, _| !expired.contains(id));

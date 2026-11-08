@@ -1821,13 +1821,22 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 return RequestVoteResp { term: st.current_term, vote_granted: false };
             }
         }
+        // Not a voter in its own latest configuration (a learner, a removed member): it votes for
+        // nobody. Its configuration is at least as new as any that counted it, and a vote could
+        // let a candidate with a stale one win next to the real leader: a learner still waiting
+        // for its snapshot has an empty log, so every candidate looks up to date to it. An empty
+        // configuration is unknown (legacy clusters, a node waiting to join) and votes as before.
+        let non_voter = {
+            let m = st.membership().1;
+            !m.is_empty() && !m.is_voter(self.node_id)
+        };
         if req.pre_vote {
             let (my_last_idx, my_last_term) = st.last_log_index_and_term();
             let up_to_date = req.last_log_term > my_last_term
                 || (req.last_log_term == my_last_term && req.last_log_index >= my_last_idx);
             return RequestVoteResp {
                 term: st.current_term,
-                vote_granted: req.term > st.current_term && up_to_date,
+                vote_granted: req.term > st.current_term && up_to_date && !non_voter,
             };
         }
         let mut dirty = false;
@@ -1854,7 +1863,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         let can_vote = st.voted_for.is_none() || st.voted_for == Some(req.candidate_id);
 
         let mut granted = false;
-        if can_vote && candidate_up_to_date {
+        if can_vote && candidate_up_to_date && !non_voter {
             let prev_vote = st.voted_for;
             st.voted_for = Some(req.candidate_id);
             if self.storage.save_hard_state(&st).is_ok() {
@@ -2020,6 +2029,12 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
 
     /// The log as terms, for invariant checks (`F-SIM-02`): entry `snapshot_index + 1 + i`
     /// has term `terms[i]`.
+    /// Entries held in the in-memory log, and their payload bytes (metrics).
+    pub fn log_memory(&self) -> (usize, u64) {
+        let st = self.lock_state();
+        (st.log.len(), st.log.iter().map(entry_bytes).sum())
+    }
+
     pub fn log_view(&self) -> RaftLogView {
         let st = self.lock_state();
         RaftLogView {
@@ -2166,6 +2181,25 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             prev_log_index,
             prev_log_term,
             entries: st.log[start..end].to_vec(),
+            leader_commit: st.commit_index,
+        })
+    }
+
+    /// An `AppendEntries` with no entries at `prev_index` (clamped to the log): a heartbeat to a
+    /// follower that has entries in flight. Matching at an index the follower confirmed, it
+    /// truncates nothing, and the follower commits no further than that index.
+    pub fn build_heartbeat(&self, prev_index: u64) -> Result<AppendEntriesReq> {
+        let st = self.lock_state();
+        if st.role != RaftRole::Leader {
+            return Err(StorageError::NotLeader { leader: st.leader_id.map(u64::from) });
+        }
+        let prev_log_index = prev_index.min(st.last_log_index()).max(st.snapshot_index);
+        Ok(AppendEntriesReq {
+            term: st.current_term,
+            leader_id: self.node_id,
+            prev_log_index,
+            prev_log_term: st.term_at(prev_log_index).unwrap_or(0),
+            entries: Vec::new(),
             leader_commit: st.commit_index,
         })
     }
@@ -3657,6 +3691,33 @@ mod tests {
         drop(group);
         drop(nodes);
         drop(engines);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A learner (or a removed member) votes for nobody, though every candidate looks up to date
+    /// to its empty log: the multi-range simulation (seed 262) had a restarted node with a stale
+    /// configuration win a term next to the real leader with a learner's vote.
+    #[test]
+    fn test_a_non_voter_grants_no_votes() {
+        let base = std::env::temp_dir().join(format!("stge_raft_non_voter_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let open = |id: NodeId, me_voter: bool| {
+            let dir = base.join(format!("n{id}"));
+            let engine = Arc::new(StorageEngine::<crate::DocumentRecord>::open(&dir, EngineConfig::default()).unwrap());
+            let node = RaftNode::new(id, engine).unwrap();
+            let members = [(1, true), (3, true), (id, me_voter)].into_iter().map(|(id, voter)| Member { id, addr: String::new(), voter }).collect();
+            node.initialize_membership(Membership::new(members).unwrap()).unwrap();
+            node
+        };
+        let ask = |node: &RaftNode<crate::DocumentRecord>, pre_vote: bool| node.handle_request_vote(RequestVoteReq { term: 2, candidate_id: 3, last_log_index: 3, last_log_term: 1, pre_vote }).vote_granted;
+        let learner = open(2, false);
+        assert!(!ask(&learner, true), "a learner refuses pre-votes");
+        assert!(!ask(&learner, false), "a learner refuses votes");
+        assert_eq!(learner.voted_for(), None);
+        assert_eq!(learner.current_term(), 2, "it still adopts the newer term");
+        let voter = open(4, true);
+        assert!(ask(&voter, true) && ask(&voter, false), "a voter with an empty log votes for an up-to-date candidate");
+        drop((learner, voter));
         let _ = std::fs::remove_dir_all(&base);
     }
 

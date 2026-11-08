@@ -797,3 +797,17 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - Range mode: 6.9 GB private for 61 MB on disk.
   - Single group: 1.0–1.6 GB, with one 4.7 GB spike on a node holding 370 MB on disk.
   - `TASK-151` is reopened.
+
+## 2026-11-08 (later): TASK-151 memory causes found and fixed; single-group final read open
+
+- **Range mode, leader resend flood**: unacknowledged entries were resent every tick. Now one bounded window is in flight per follower, and heartbeats carry no entries. Test `a_cut_off_follower_gets_a_bounded_window_and_catches_up` sees at most 2,000 entries, against 35,447 before.
+- **Single group, WAL never checkpointed**: now checkpointed every 10 s (`RaftConfig::checkpoint_interval`). Test `test_nodes_checkpoint_on_their_own_and_the_wal_stays_bounded`.
+- **Allocator retention**: the live heap was about 100 MB under 2 GB RSS. `malloc_trim(0)` now runs every 10 s (`storage_mmap::release_free_heap`).
+- **Raft**: non-voters grant no votes (sim seed 262, which the replication change exposed). All sims pass at 300 seeds.
+- **Visibility**: range-mode `OP_HEALTH` gauges, and a `heap-stats` feature for live and peak heap.
+- **Verified**: workspace tests (66 binaries), 40 of 40 chaos runs, clippy with and without `heap-stats`.
+- **2-hour soak, both modes**:
+  - Range mode passed: peak RSS 757–1,546 MiB.
+  - Single group stayed bounded (563–1,864 MiB) but failed the final balance read after healing. The soak now reports why each node refused, and a rerun is under way.
+- **Modal**: $8.94 today, $35.90 this month for storine.
+

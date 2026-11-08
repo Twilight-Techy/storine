@@ -495,8 +495,14 @@ pub struct StorageServer<T: ZeroCopyRecord + Indexable> {
     shards: Vec<Arc<ReactorShard>>,
     accept_thread: Option<JoinHandle<()>>,
     worker_threads: Vec<JoinHandle<()>>,
+    /// Gives freed heap back to the OS every [`HEAP_TRIM_INTERVAL`] (see `storage_mmap::heap`).
+    trim_thread: Option<JoinHandle<()>>,
     shared: Arc<ServerShared<T>>,
 }
+
+/// How often a server returns the heap it freed to the operating system. Process-wide: an
+/// application embedding a server has its own freed memory returned too.
+const HEAP_TRIM_INTERVAL: Duration = Duration::from_secs(10);
 
 impl<T: ZeroCopyRecord + Indexable> core::fmt::Debug for StorageServer<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -709,6 +715,22 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
             }
         });
 
+        let shutdown_trim = Arc::clone(&shutdown);
+        let trim_thread = thread::Builder::new()
+            .name("storine-heap-trim".into())
+            .spawn(move || {
+                let mut last = Instant::now();
+                while !shutdown_trim.load(Ordering::Relaxed) {
+                    // Short sleeps, so `stop` is not held up for the interval.
+                    thread::sleep(Duration::from_millis(100));
+                    if last.elapsed() >= HEAP_TRIM_INTERVAL {
+                        last = Instant::now();
+                        storage_mmap::release_free_heap();
+                    }
+                }
+            })
+            .ok();
+
         Ok(Self {
             local_addr,
             shutdown,
@@ -718,6 +740,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
             shards,
             accept_thread: Some(accept_thread),
             worker_threads,
+            trim_thread,
             shared,
         })
     }
@@ -768,6 +791,9 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
             let _ = handle.join();
         }
         for handle in self.worker_threads.drain(..) {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.trim_thread.take() {
             let _ = handle.join();
         }
         if let Some(ref c) = self.shared.cluster {
@@ -1362,7 +1388,7 @@ fn route_ranges(conn: &mut NonBlockingConn, rc: &ranges::RangeContext, security:
             conn.follower_reads = body.first().is_some_and(|f| f & 1 != 0);
             return reply(conn, (STATUS_OK, 0, Vec::new()));
         }
-        OP_HEALTH => return reply(conn, (STATUS_OK, 0, b"{\"status\":\"ok\",\"mode\":\"ranges\"}".to_vec())),
+        OP_HEALTH => return reply(conn, (STATUS_OK, 0, rc.health())),
         OP_CLUSTER_INFO => return reply(conn, (STATUS_OK, 0, rc.cluster_info())),
         _ => return reply(conn, (STATUS_INVALID, 0, b"this opcode is not available on a range cluster (use the document API)".to_vec())),
     };
@@ -1684,8 +1710,8 @@ fn execute_local<T: ZeroCopyRecord + Indexable>(
         OP_HEALTH => {
             let st = engine.stats();
             let health = format!(
-                "{{\"status\":\"ok\",\"live_records\":{},\"total_reads\":{},\"total_writes\":{},\"hot_dirty_bytes\":{}}}",
-                st.live_records, st.total_reads, st.total_writes, st.hot_dirty_bytes,
+                "{{\"status\":\"ok\",\"live_records\":{},\"total_reads\":{},\"total_writes\":{},\"hot_dirty_bytes\":{}{}}}",
+                st.live_records, st.total_reads, st.total_writes, st.hot_dirty_bytes, heap_fields(),
             );
             conn.send_or_queue_response(STATUS_OK, st.live_records as u64, health.as_bytes())
         }
@@ -1704,6 +1730,15 @@ const CLUSTER_CATCH_UP: Duration = Duration::from_secs(60);
 
 /// Runs one `OP_CLUSTER_CHANGE` request: `u8 action | u16 node_id | str addr` (`addr` is used
 /// by the add actions).
+/// `,"heap_live":..,"heap_peak":..` for `OP_HEALTH` when the binary counts its allocations
+/// (`heap-stats`), else nothing.
+pub(crate) fn heap_fields() -> String {
+    match storage_codec::peak_alloc::live_bytes() {
+        (0, 0) => String::new(),
+        (live, peak) => format!(",\"heap_live\":{live},\"heap_peak\":{peak}"),
+    }
+}
+
 /// Handles one `OP_RAFT_*` request on the Raft worker pool (see `ServerShared::raft_pool`).
 fn raft_rpc<T: ZeroCopyRecord + Indexable>(raft: &RaftNode<T>, op: u8, body: &[u8]) -> cluster::JobResponse {
     let answer = match op {

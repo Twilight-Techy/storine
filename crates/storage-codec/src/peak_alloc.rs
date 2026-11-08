@@ -86,3 +86,57 @@ unsafe impl GlobalAlloc for ProcessPeakAlloc {
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
+
+/// The system's allocator, counting the bytes held allocated now and at most. With RSS beside
+/// it, a heap that grows (live bytes rise) tells apart from one the allocator keeps after use
+/// (live bytes fall, RSS does not). A server installs it behind its `heap-stats` feature.
+#[derive(Debug)]
+pub struct LiveAlloc;
+
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static LIVE_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// Bytes held allocated through a [`LiveAlloc`] now, and the most at any time.
+pub fn live_bytes() -> (usize, usize) {
+    (LIVE.load(Ordering::Relaxed), LIVE_PEAK.load(Ordering::Relaxed))
+}
+
+fn grew(by: usize) {
+    let now = LIVE.fetch_add(by, Ordering::Relaxed).wrapping_add(by);
+    LIVE_PEAK.fetch_max(now, Ordering::Relaxed);
+}
+
+// SAFETY: every call is forwarded unchanged to `System`; the bookkeeping is atomics only, and
+// counts a block only once `System` returned it.
+unsafe impl GlobalAlloc for LiveAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller's contract is `System`'s.
+        let p = unsafe { System.alloc(layout) };
+        if !p.is_null() {
+            grew(layout.size());
+        }
+        p
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller's contract is `System`'s.
+        let p = unsafe { System.alloc_zeroed(layout) };
+        if !p.is_null() {
+            grew(layout.size());
+        }
+        p
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: the caller's contract is `System`'s.
+        unsafe { System.dealloc(ptr, layout) };
+        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: the caller's contract is `System`'s.
+        let p = unsafe { System.realloc(ptr, layout, new_size) };
+        if !p.is_null() {
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            grew(new_size);
+        }
+        p
+    }
+}
