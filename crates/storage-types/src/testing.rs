@@ -88,3 +88,26 @@ impl SweepRng {
         out
     }
 }
+
+/// A loopback address no other caller in this process was given, for a server a test binds
+/// later and keeps through restarts.
+///
+/// Not `bind(0)` then release: tests run clusters side by side, and two drawing the same port
+/// left them sharing a node, each reading the other's writes. Ports come from below the kernel's
+/// ephemeral range (from 32768 on Linux, from 16000 under gVisor on Modal), so no client's source
+/// port can take one while its server is down. The base varies with the process id, so test
+/// binaries run at once are unlikely to overlap; a port already in use is skipped.
+pub fn free_local_addr() -> std::net::SocketAddr {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let base = 10_000 + u64::from(std::process::id()) % 3_000;
+    loop {
+        let port = base + NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(port < 16_000, "out of ports below the ephemeral range");
+        if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port as u16)) {
+            if let Ok(addr) = listener.local_addr() {
+                return addr;
+            }
+        }
+    }
+}

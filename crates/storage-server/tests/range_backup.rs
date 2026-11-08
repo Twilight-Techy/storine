@@ -3,7 +3,7 @@
 //! restart and continues from the backup's timestamp.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,8 +21,9 @@ use storage_types::StorageError;
 const ACCOUNTS: usize = 40;
 const OPENING: i64 = 1000;
 
+/// A port no other cluster in this test binary was given (see `free_local_addr`).
 fn free_addr() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
+    storage_types::testing::free_local_addr()
 }
 
 struct Cluster {

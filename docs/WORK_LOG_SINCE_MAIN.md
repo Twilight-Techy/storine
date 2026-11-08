@@ -113,9 +113,9 @@ The latest instruction from the user is to do everything that remains, **except*
 - **TASK-148**: done. `exec/stats.rs`, `exec/optimizer.rs`, `tests/optimizer.rs`. Fixed a Raft §8 stale read in single-group mode.
 - **TASK-149**: done. `exec/temp.rs`, `exec/cursor.rs`, `exec/routine.rs`, `exec/notify.rs`, `parser/plpgsql.rs`, `nettypes.rs`, `tests/sql_surface.rs`.
 - **TASK-150**: done. `tools/modal/sweep.py --tools all`; 0 JDBC failures and 177 tool checks with 0 failures.
-- **TASK-151**: done. A 2-hour soak under faults passes in both modes (`process_chaos::soak_*`). Fixed along the way: connections held after clients hung up, leaders that never stepped down without a quorum, and reactors waiting on the Raft lock.
+- **TASK-151**: reopened 2026-11-08. The 2-hour soak passed on 2026-11-07, but a stricter rerun goes over the memory ceiling in both modes. Range mode reaches 6.9 GB of heap for 61 MB of data; single group spikes once to 4.7 GB. Both predate the fixes of 2026-11-08, and the cause is not yet found (`TASKS.md`).
 - **TASK-152**: done. The final audit; findings and fixes are in `TASKS.md`.
-- **Stage 31 is complete.** Nothing planned is left apart from the two items below.
+- **Stage 31**: complete apart from `TASK-151` (memory).
 
 ### Stage 31 — Enterprise SQL (TASK-145 – 152)
 - Enforced `GRANT` / `REVOKE` and row-level security.
@@ -172,3 +172,16 @@ Yes:
 - **Harness bugs**: parallel chaos clusters could share ports and read each other's data, which looked like a linearizability failure until the reads showed the other cluster's values. Ports are now unique and kept below gVisor's ephemeral range.
 - **Cost**: preemption restarted two runs from zero before `--steady` existed. The final run cost about $3; the month's Modal total for storine is about $27.
 - **Not fully explained**: in single-group mode, 17–120 sockets sit in `CLOSE_WAIT` at each sample, bounded but not zero.
+
+### Stage 31: soak follow-up (`TASK-151` reopened) — 2026-11-08
+
+- **Fixed**:
+  - Single-group nodes handled Raft RPCs on reactor threads, behind a lock held across `fsync`, which is where the `CLOSE_WAIT` sockets came from. They now run on a worker pool of their own. `CLOSE_WAIT` went to 0, and single-group throughput more than doubled.
+  - The linearizability check stopped at the first undecided key, leaving later keys unchecked. Soak keys now rotate every 2 s, and an undecided key fails the run.
+  - Every TCP test uses one port allocator.
+- **Verified**: workspace tests (66 binaries), clippy, and 40 of 40 chaos runs on Modal.
+- **Found, not fixed**: memory, read from `smaps`.
+  - Range mode holds 2.6–6.9 GB of heap for about 60 MB of data, more with more distinct keys.
+  - Single group spikes to 4.7 GB on a node that is probably catching up by snapshot.
+  - The 2026-11-07 pass had passed under a 6 GiB ceiling with little margin.
+- **Modal**: workspace, chaos and three soaks (one 2 h run that failed at 1 h, and two diagnostic runs). $2.98 on 2026-11-08 by the billing report at commit time (the last run may not be billed yet); about $30 for storine this month.

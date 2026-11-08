@@ -784,3 +784,16 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - `--steady` for long runs
   - smaller CPU and memory requests
 - Known limits: 17–120 single-group sockets in `CLOSE_WAIT` at each sample (bounded, cause not proven); other TCP test files still pick ports the old way.
+
+## 2026-11-08: TASK-151 follow-up; memory found over the ceiling
+
+- Raft RPCs moved off the reactors (`raft_pool`, `raft_rpc`) after the single-group `CLOSE_WAIT` sockets were traced to reactors waiting on the Raft lock across `fsync`.
+  - Regression test: `test_raft_rpcs_waiting_on_the_lock_do_not_stall_other_connections`.
+  - Soak after the fix: 0 `CLOSE_WAIT`, at most 74 descriptors, and single-group register writes more than doubled.
+- `linearizability::check_each_key` checks every key and puts a violation ahead of an undecided key. Soak keys rotate every 2 s, and undecided keys fail the soak: 0 since.
+- `storage_types::testing::free_local_addr` is shared by every TCP test.
+- Verified on Modal: `--workspace` (66 binaries, exit 0), 40 of 40 `process_chaos`, clippy clean.
+- Soak: fails on memory in both modes. The soak now reports private memory, mapped files, deleted mapped files and disk size from `smaps`.
+  - Range mode: 6.9 GB private for 61 MB on disk.
+  - Single group: 1.0–1.6 GB, with one 4.7 GB spike on a node holding 370 MB on disk.
+  - `TASK-151` is reopened.

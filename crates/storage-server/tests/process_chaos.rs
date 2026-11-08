@@ -25,7 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use storage_codec::PropertyValue;
-use storage_core::linearizability::{check_keyed, CheckError, Event, RegisterOp};
+use storage_core::linearizability::{check_each_key, check_keyed, CheckError, Event, RegisterOp};
 use storage_core::{DocOp, DocWrite, Precondition};
 use storage_server::StorageClient;
 use storage_types::testing::SweepRng;
@@ -123,21 +123,9 @@ fn pipe(mut from: TcpStream, mut to: TcpStream, mode: &AtomicU8, epoch: &AtomicU
     let _ = to.shutdown(std::net::Shutdown::Both);
 }
 
-/// A port no other cluster in this process was given, for a node to bind later and keep through
-/// restarts. Not `bind(0)` then release: tests run clusters side by side, and two drawing the same
-/// port left them sharing a node, each reading the other's writes. Below the kernel's ephemeral
-/// range (from 32768 on Linux, from 16000 under gVisor on Modal), so no client's source port can
-/// hold it while the node is down.
+/// A port no other cluster in this process was given (`free_local_addr` says why).
 fn free_addr() -> SocketAddr {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let base = 10_000 + u64::from(std::process::id()) % 3_000;
-    loop {
-        let port = base + NEXT.fetch_add(1, Ordering::Relaxed);
-        assert!(port < 16_000, "out of ports below the ephemeral range");
-        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port as u16)) {
-            return listener.local_addr().unwrap();
-        }
-    }
+    storage_types::testing::free_local_addr()
 }
 
 struct Cluster {
@@ -326,6 +314,9 @@ fn abandoned_requests(name: &str, mode: Option<u8>) {
 }
 
 const ACCOUNTS: usize = 6;
+
+/// Soak register keys: the window in the high bits, a 2-second slot and one of three keys below.
+const KEY_WINDOW_SHIFT: u32 = 40;
 
 /// Connect and request timeout. A range-cluster write is a distributed transaction (several
 /// consensus rounds), so it gets longer than a single-group write.
@@ -649,6 +640,35 @@ fn process_usage(pid: u32) -> Option<(u64, u64)> {
     Some((rss, fds))
 }
 
+/// What a node's memory is, at a window's peak: private memory (heap, stacks), which can leak;
+/// mapped files, page cache the kernel can take back, which follows the data on disk; mapped
+/// files already deleted, which nothing but an unmap frees; and the data's size on disk.
+fn describe_memory(pid: u32, node_dir: &Path) -> String {
+    fn disk_bytes(p: &Path) -> u64 {
+        std::fs::read_dir(p).into_iter().flatten().flatten().map(|e| match e.metadata() {
+            Ok(m) if m.is_dir() => disk_bytes(&e.path()),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        }).sum()
+    }
+    // smaps rather than `RssAnon` / `RssFile`, which gVisor (Modal) does not report.
+    let smaps = std::fs::read_to_string(format!("/proc/{pid}/smaps")).unwrap_or_default();
+    let (mut anon, mut file, mut deleted, mut maps, mut kind) = (0u64, 0u64, 0u64, 0u64, 0u8);
+    for line in smaps.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(first) = fields.next() else { continue };
+        if first.contains('-') && first.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            maps += 1;
+            let path = line.split_whitespace().nth(5).unwrap_or("");
+            kind = if path.starts_with('/') { if line.ends_with("(deleted)") { 2 } else { 1 } } else { 0 };
+        } else if first == "Rss:" {
+            let kb: u64 = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            *[&mut anon, &mut file, &mut deleted][kind as usize] += kb;
+        }
+    }
+    format!("anon {} MiB, files {} MiB, deleted files {} MiB, {maps} maps, disk {} MiB", anon >> 10, file >> 10, deleted >> 10, disk_bytes(node_dir) >> 20)
+}
+
 /// What a node's descriptors are: sockets by TCP state on its client port, and files by extension.
 /// A number alone cannot tell a leak from a burst, so the soak prints this at each window's peak.
 fn describe_fds(pid: u32, port: u16) -> String {
@@ -741,7 +761,9 @@ fn soak(ranges: bool) {
                 let client = c.get_or_insert_with(|| client_of(&addrs, &mut target));
                 let current = window.load(Ordering::Relaxed);
                 in_window[w as usize].store(current, Ordering::Relaxed);
-                let key = current as usize * 3 + rng.below(3);
+                // Fresh keys every 2 s: a key that lived a whole window gathered tens of thousands
+                // of operations, hundreds of them of unknown outcome, more than a search decides.
+                let key = ((current as usize) << KEY_WINDOW_SHIFT) | ((now() / 2_000_000) as usize * 3 + rng.below(3));
                 let name = format!("k{key}");
                 let call = now();
                 if rng.below(2) == 0 {
@@ -914,23 +936,26 @@ fn soak(ranges: bool) {
         let window_end = Instant::now() + Duration::from_secs(window_secs);
         let (mut rss_max, mut fds_max) = (0u64, 0u64);
         // The lowest the busiest node fell to: a burst drains, a leak does not.
-        let (mut fds_floor, mut peak) = (u64::MAX, String::new());
+        let (mut fds_floor, mut peak, mut mem_peak) = (u64::MAX, String::new(), String::new());
         while Instant::now() < window_end && Instant::now() < end {
             thread::sleep(Duration::from_secs(5));
-            let pids: Vec<(u32, u16)> = {
+            let pids: Vec<(u32, u16, usize)> = {
                 let c = cluster.lock().unwrap();
-                c.procs.iter().zip(&c.addrs).filter_map(|(p, a)| Some((p.as_ref()?.id(), a.port()))).collect()
+                c.procs.iter().zip(&c.addrs).enumerate().filter_map(|(i, (p, a))| Some((p.as_ref()?.id(), a.port(), i))).collect()
             };
             let mut busiest = 0;
-            for (pid, port) in pids {
+            for (pid, port, i) in pids {
                 if let Some((rss, fds)) = process_usage(pid) {
-                    rss_max = rss_max.max(rss);
+                    if rss > rss_max {
+                        rss_max = rss;
+                        mem_peak = describe_memory(pid, &dir.join(format!("n{}", i + 1)));
+                    }
                     busiest = busiest.max(fds);
                     if fds > fds_max {
                         fds_max = fds;
                         peak = describe_fds(pid, port);
                     }
-                    assert!(rss <= SOAK_RSS_CEILING_KB, "a node holds {rss} kB, beyond the ceiling");
+                    assert!(rss <= SOAK_RSS_CEILING_KB, "a node holds {rss} kB, beyond the ceiling: {}", describe_memory(pid, &dir.join(format!("n{}", i + 1))));
                     assert!(fds <= SOAK_FD_CEILING, "a node has {fds} descriptors open, beyond the ceiling");
                 }
             }
@@ -946,18 +971,19 @@ fn soak(ranges: bool) {
             thread::sleep(Duration::from_millis(50));
         }
         let done: History = std::mem::take(&mut *history.lock().unwrap());
-        let closed: History = done.iter().filter(|(k, _)| *k < n as usize * 3).cloned().collect();
-        history.lock().unwrap().extend(done.into_iter().filter(|(k, _)| *k >= n as usize * 3));
-        match check_keyed(&closed, 50_000_000) {
-            Ok(()) => {}
-            Err((_, CheckError::Inconclusive)) => eprintln!("soak window {n}: a key was too concurrent to decide"),
+        let closed: History = done.iter().filter(|(k, _)| *k >> KEY_WINDOW_SHIFT < n as usize).cloned().collect();
+        history.lock().unwrap().extend(done.into_iter().filter(|(k, _)| *k >> KEY_WINDOW_SHIFT >= n as usize));
+        let checked = match check_each_key(&closed, 50_000_000) {
+            Ok(report) => report,
             Err((k, e)) => {
                 report_unlinearized(&closed, k, &e);
                 panic!("soak window {n}: key {k} not linearizable");
             }
-        }
+        };
+        // An undecided key would be a gap in the check, not a pass.
+        assert!(checked.inconclusive.is_empty(), "soak window {n}: {} of {} keys too concurrent to decide", checked.inconclusive.len(), checked.keys);
         let counted = *counts.lock().unwrap();
-        eprintln!("soak: window {n} at {}s: rss max {} MiB, fds max {fds_max} floor {fds_floor} ({peak}); writes {} reads {} transfers {} event batches {} aggregates {} scans {} failures {}", t0.elapsed().as_secs(), rss_max / 1024, counted[0], counted[1], counted[2], counted[3], counted[4], counted[5], counted[6]);
+        eprintln!("soak: window {n} at {}s: rss max {} MiB ({mem_peak}), fds max {fds_max} floor {fds_floor} ({peak}); {} keys checked; writes {} reads {} transfers {} event batches {} aggregates {} scans {} failures {}", t0.elapsed().as_secs(), rss_max / 1024, checked.keys, counted[0], counted[1], counted[2], counted[3], counted[4], counted[5], counted[6]);
         windows.push((rss_max, fds_max));
     }
     stop.store(true, Ordering::Relaxed);

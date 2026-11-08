@@ -2,7 +2,7 @@
 //! connected to all of them. Transactions span ranges and are serializable; constraints hold.
 
 use std::collections::HashMap;
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use storage_server::ranges::{start_range_server, RangeServerConfig};
@@ -32,8 +32,9 @@ fn ok(s: &mut Session, sql: &str) {
     exec(s, sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
 }
 
+/// A port no other cluster in this test binary was given (see `free_local_addr`).
 fn free_addr() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
+    storage_types::testing::free_local_addr()
 }
 
 #[test]

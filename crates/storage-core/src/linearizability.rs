@@ -175,9 +175,18 @@ impl Model for Register {
     }
 }
 
-/// Checks a key-value history one key at a time (P-compositionality). Returns the first key
-/// whose history is not linearizable, with the error.
-pub fn check_keyed<K: Ord + Clone + core::fmt::Debug>(history: &[(K, Event<RegisterOp>)], budget: u64) -> Result<(), (K, CheckError)> {
+/// What [`check_each_key`] decided.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyedReport<K> {
+    /// Keys checked, including undecided ones.
+    pub keys: usize,
+    /// Keys whose search exceeded the budget: neither proven nor refuted.
+    pub inconclusive: Vec<K>,
+}
+
+/// Checks a key-value history one key at a time (P-compositionality), every key, even past
+/// one the budget could not decide. `Err` is the first key that is not linearizable.
+pub fn check_each_key<K: Ord + Clone + core::fmt::Debug>(history: &[(K, Event<RegisterOp>)], budget: u64) -> Result<KeyedReport<K>, (K, CheckError)> {
     let mut by_key: BTreeMap<K, Vec<Event<RegisterOp>>> = BTreeMap::new();
     for (k, e) in history {
         // A read whose result is unknown constrains nothing.
@@ -186,10 +195,25 @@ pub fn check_keyed<K: Ord + Clone + core::fmt::Debug>(history: &[(K, Event<Regis
         }
         by_key.entry(k.clone()).or_default().push(e.clone());
     }
+    let mut report = KeyedReport { keys: by_key.len(), inconclusive: Vec::new() };
     for (k, events) in by_key {
-        check(&Register, &events, budget).map_err(|e| (k, e))?;
+        match check(&Register, &events, budget) {
+            Ok(()) => {}
+            Err(CheckError::Inconclusive) => report.inconclusive.push(k),
+            Err(e) => return Err((k, e)),
+        }
     }
-    Ok(())
+    Ok(report)
+}
+
+/// [`check_each_key`] as one verdict: a key that is not linearizable if there is one, else the
+/// first undecided key, else `Ok`.
+pub fn check_keyed<K: Ord + Clone + core::fmt::Debug>(history: &[(K, Event<RegisterOp>)], budget: u64) -> Result<(), (K, CheckError)> {
+    let report = check_each_key(history, budget)?;
+    match report.inconclusive.into_iter().next() {
+        Some(k) => Err((k, CheckError::Inconclusive)),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +274,17 @@ mod tests {
         ];
         let err = check_keyed(&h, 1_000).unwrap_err();
         assert_eq!(err.0, "b");
+    }
+
+    #[test]
+    fn an_undecided_key_does_not_hide_a_violation_after_it() {
+        // "a" is linearizable but needs more steps than the budget; "b" is a stale read.
+        let mut h: Vec<(&str, Event<RegisterOp>)> = (0..40).map(|i| ("a", ev(2 * i, Some(2 * i + 1), Write(i as i64)))).collect();
+        h.extend([("b", ev(0, Some(1), Write(1))), ("b", ev(2, Some(3), Write(2))), ("b", ev(4, Some(5), Read(Some(1))))]);
+        assert_eq!(check_each_key(&h[..40], 20), Ok(KeyedReport { keys: 1, inconclusive: vec!["a"] }));
+        let err = check_keyed(&h, 20).unwrap_err();
+        assert_eq!(err.0, "b");
+        assert!(matches!(err.1, CheckError::NotLinearizable { .. }));
     }
 
     #[test]

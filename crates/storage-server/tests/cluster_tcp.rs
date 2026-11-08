@@ -2,7 +2,7 @@
 //! writes, follower redirects, opt-in follower reads, leader failover and catch-up.
 
 use std::collections::{BTreeMap, HashMap};
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,9 +16,9 @@ use storage_server::cluster::{ClusterOptions, TcpRaftTransport};
 use storage_server::{SecurityConfig, StorageClient, StorageServer, OP_CLUSTER_INFO, OP_SET_OPTIONS};
 use storage_types::StorageError;
 
+/// A port no other cluster in this test binary was given (see `free_local_addr`).
 fn free_port() -> SocketAddr {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap()
+    storage_types::testing::free_local_addr()
 }
 
 struct Node {

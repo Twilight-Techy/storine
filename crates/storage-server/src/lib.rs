@@ -460,6 +460,10 @@ struct ServerShared<T: ZeroCopyRecord + Indexable> {
     engine: Arc<StorageEngine<T>>,
     security: SecurityConfig,
     raft: Option<Arc<RaftNode<T>>>,
+    /// Runs `OP_RAFT_*` off the reactors: handling one takes the Raft state lock and may `fsync`,
+    /// and a reactor waiting there stops serving every other connection it holds. Not the
+    /// cluster's write pool: writes waiting for a quorum must not delay the appends that form it.
+    raft_pool: Option<Arc<cluster::WorkerPool>>,
     /// Document API (`OP_DOC_*`); `None` when the server hosts only typed records.
     documents: Option<Arc<DocumentStore>>,
     /// Raft cluster membership (writes through consensus, leader-only reads by default).
@@ -617,10 +621,13 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
             .map_or(4, |n| n.get().clamp(2, 16));
         let shards: Vec<Arc<ReactorShard>> =
             (0..num_workers).map(|_| Arc::new(ReactorShard::new())).collect();
+        // Peers send one RPC at a time per connection, so a few workers cover every peer.
+        let raft_pool = raft.as_ref().map(|_| cluster::WorkerPool::new(4, 1024));
         let shared = Arc::new(ServerShared {
             engine,
             security,
             raft,
+            raft_pool,
             documents,
             cluster: cluster_opts.map(|o| cluster::ClusterContext {
                 runtime: o.runtime,
@@ -765,6 +772,9 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
         }
         if let Some(ref c) = self.shared.cluster {
             c.pool.stop();
+        }
+        if let Some(ref p) = self.shared.raft_pool {
+            p.stop();
         }
     }
 }
@@ -1597,40 +1607,24 @@ fn execute_local<T: ZeroCopyRecord + Indexable>(
             conn.send_or_queue_response(STATUS_OK, st.live_records as u64, prom.as_bytes())
         }
         // ── Raft Consensus RPCs (`TASK-063`, `F-DIST-02`) ──────────────────────────
-        OP_RAFT_VOTE => {
-            let Some(ref raft) = shared.raft else {
+        OP_RAFT_VOTE | OP_RAFT_APPEND | OP_RAFT_SNAPSHOT => {
+            let (Some(raft), Some(pool)) = (shared.raft.as_ref(), shared.raft_pool.as_ref()) else {
                 let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"raft is not enabled on this server");
                 return ConnStep::Progress;
             };
-            match RequestVoteReq::from_wire_bytes(&body) {
-                Ok(req) => {
-                    let resp: RequestVoteResp = raft.handle_request_vote(req);
-                    conn.send_or_queue_response(STATUS_OK, resp.term, &resp.to_wire_bytes())
+            let raft = Arc::clone(raft);
+            let wake: Arc<dyn Fn() + Send + Sync> = {
+                let sh = Arc::clone(shard);
+                Arc::new(move || sh.wake())
+            };
+            // The connection reads nothing more until this answers, so replies keep their order.
+            match pool.submit(Box::new(move || raft_rpc(&raft, op, &body)), wake) {
+                Ok(rx) => {
+                    conn.pending_job = Some(rx);
+                    return ConnStep::Progress;
                 }
-                Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
-            }
-        }
-        OP_RAFT_APPEND => {
-            let Some(ref raft) = shared.raft else {
-                let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"raft is not enabled on this server");
-                return ConnStep::Progress;
-            };
-            match AppendEntriesReq::from_wire_bytes(&body).and_then(|req| raft.handle_append_entries(req)) {
-                Ok(resp) => {
-                    let resp: AppendEntriesResp = resp;
-                    conn.send_or_queue_response(STATUS_OK, resp.term, &resp.to_wire_bytes())
-                }
-                Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
-            }
-        }
-        OP_RAFT_SNAPSHOT => {
-            let Some(ref raft) = shared.raft else {
-                let _ = conn.send_or_queue_response(STATUS_ERROR, 0, b"raft is not enabled on this server");
-                return ConnStep::Progress;
-            };
-            match InstallSnapshotReq::from_wire_bytes(&body).and_then(|req| raft.handle_install_snapshot(req)) {
-                Ok(resp) => conn.send_or_queue_response(STATUS_OK, resp.term, &resp.to_wire_bytes()),
-                Err(e) => conn.send_or_queue_response(STATUS_ERROR, 0, e.to_string().as_bytes()),
+                // The peer retries; Raft resends what was not acknowledged.
+                Err(()) => conn.send_or_queue_response(STATUS_OVERLOADED, 0, b"raft queue is full"),
             }
         }
         // ── Long-running admin RPCs run on a bounded background worker ──────────────
@@ -1710,6 +1704,26 @@ const CLUSTER_CATCH_UP: Duration = Duration::from_secs(60);
 
 /// Runs one `OP_CLUSTER_CHANGE` request: `u8 action | u16 node_id | str addr` (`addr` is used
 /// by the add actions).
+/// Handles one `OP_RAFT_*` request on the Raft worker pool (see `ServerShared::raft_pool`).
+fn raft_rpc<T: ZeroCopyRecord + Indexable>(raft: &RaftNode<T>, op: u8, body: &[u8]) -> cluster::JobResponse {
+    let answer = match op {
+        OP_RAFT_VOTE => RequestVoteReq::from_wire_bytes(body).map(|req| {
+            let resp: RequestVoteResp = raft.handle_request_vote(req);
+            (resp.term, resp.to_wire_bytes().to_vec())
+        }),
+        OP_RAFT_APPEND => AppendEntriesReq::from_wire_bytes(body)
+            .and_then(|req| raft.handle_append_entries(req))
+            .map(|resp: AppendEntriesResp| (resp.term, resp.to_wire_bytes().to_vec())),
+        _ => InstallSnapshotReq::from_wire_bytes(body)
+            .and_then(|req| raft.handle_install_snapshot(req))
+            .map(|resp| (resp.term, resp.to_wire_bytes().to_vec())),
+    };
+    match answer {
+        Ok((term, bytes)) => (STATUS_OK, term, bytes),
+        Err(e) => (STATUS_ERROR, 0, e.to_string().into_bytes()),
+    }
+}
+
 fn cluster_change<T: ZeroCopyRecord + Indexable>(rt: &storage_core::raft_runtime::RaftRuntime<T>, body: &[u8]) -> cluster::JobResponse {
     let parsed = (|| {
         let action = *body.first()?;
@@ -3322,6 +3336,64 @@ mod tests {
         assert_eq!(c.put(id, &AgentObjectRecord::new(id, "ok", 1, 1)).unwrap(), Version(1));
 
         server.stop();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A Raft RPC waiting for the state lock (held across `fsync`) must not stall the reactor:
+    /// every other connection on it would go unserved, and clients that gave up meanwhile would
+    /// leave their sockets in `CLOSE_WAIT` (the single-group soak, `TASK-151`).
+    #[test]
+    fn test_raft_rpcs_waiting_on_the_lock_do_not_stall_other_connections() {
+        let dir = std::env::temp_dir().join(format!("stge_test_raft_off_reactor_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Arc::new(StorageEngine::<AgentObjectRecord>::open(&dir, EngineConfig::default()).unwrap());
+        let raft = Arc::new(RaftNode::new(1, Arc::clone(&engine)).unwrap());
+        let mut server =
+            StorageServer::start_with_raft("127.0.0.1:0", Arc::clone(&engine), 256, SecurityConfig::default(), Some(Arc::clone(&raft)))
+                .unwrap();
+        let addr = server.local_addr();
+
+        // Hold the state lock, as a node does while it syncs its log.
+        let (held_tx, held_rx) = mpsc::channel();
+        let holder = {
+            let raft = Arc::clone(&raft);
+            thread::spawn(move || {
+                raft.try_read_state(|_, _, _, _| {
+                    held_tx.send(()).unwrap();
+                    thread::sleep(Duration::from_millis(1500));
+                })
+                .expect("nothing else holds the lock yet");
+            })
+        };
+        held_rx.recv().unwrap();
+
+        // One vote per reactor at least (connections are spread across them), each now waiting.
+        let voters: Vec<_> = (0..32)
+            .map(|i| {
+                thread::spawn(move || {
+                    let mut c = StorageClient::connect(addr).unwrap();
+                    let req = RequestVoteReq { term: 1, candidate_id: 100 + i, last_log_index: 0, last_log_term: 0, pre_vote: true };
+                    c.raft_vote(&req).map(|(status, _, _)| status)
+                })
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(200));
+
+        // Every reactor still answers at once.
+        for _ in 0..32 {
+            let started = Instant::now();
+            let mut c = StorageClient::connect_timeout(addr, Duration::from_secs(5)).unwrap();
+            assert!(c.health().unwrap().contains("\"status\":\"ok\""));
+            assert!(started.elapsed() < Duration::from_millis(500), "a reactor waited {:?} behind a Raft RPC", started.elapsed());
+        }
+
+        holder.join().unwrap();
+        for v in voters {
+            assert_eq!(v.join().unwrap().unwrap(), STATUS_OK, "votes are answered once the lock is free");
+        }
+        server.stop();
+        drop(raft);
         drop(engine);
         let _ = std::fs::remove_dir_all(&dir);
     }
