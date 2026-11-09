@@ -1,6 +1,7 @@
 # Work Log Since the Last `main` Fast-Forward
 
 - **Branch**: `claude/intelligent-carson-x9hkkg`
+- **Merged**: on 2026-11-09, `main` was merged into the branch, and `main` was then fast-forwarded to it. Work continues on `main`, and this file is kept as the record of the branch.
 - **Base**: `main` at `2fb4dc1` (2026-10-27, "TASK-091 size budget to 1 MiB; TASK-090 epoll reactor on Linux")
 - **Head when written**: `5389fd8` (2026-10-29), 90 commits ahead of `main`
 - **Detailed status per task**: [`TASKS.md`](TASKS.md). This file is the summary: what was done, what was in progress when work stopped, and what is left.
@@ -193,3 +194,9 @@ Yes:
   - Range health reports its queues, and `heap-stats` reports the live heap.
 - **Result of the 2-hour soak**: range mode passes at a peak RSS of 757–1,546 MiB. Single group stays bounded at 563–1,864 MiB but fails the final balance read after healing. That failure is open, and diagnostics were added.
 - **Modal**: $8.94 on 2026-11-08 and $35.90 this month for storine, by the billing report at commit time.
+
+### Merge into `main` — 2026-11-09
+
+- `main` (`TASK-102` on Windows, plus Windows test fixes) was merged in. The only conflict was in `PROGRESS_LOG.md`, and both entries were kept.
+- The workspace run after the merge exposed a rare columnar snapshot race, which dates from `TASK-126`. It is fixed, with a deterministic unit test (`TASKS.md`, `TASK-126`).
+- Modal runs are now named, and their output is kept on the volume `storine-runs` (`--collect <name>`).

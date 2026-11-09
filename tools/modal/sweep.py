@@ -22,6 +22,13 @@ Usage (from the repository root):
     modal run tools/modal/sweep.py --sdks all            # all 8 SDK suites against range clusters
     modal run tools/modal/sweep.py --sdks python --plain # against a plain server
 
+Every run has a name (`--name`, default: a timestamp) and keeps its output on the Modal volume
+`storine-runs`, written as it goes, so a run started with `modal run --detach` can be read back
+even after the machine that started it is gone:
+
+    modal run tools/modal/sweep.py --collect <name>      # result so far, or the final one
+    modal volume get storine-runs <name>/output.log .    # a suite's whole output
+
 Tests whose body calls `sweep(` are seeded: seeds 1..=N in shards (`STORINE_SIM_SEED_RANGE`),
 plus one run at their default seeds for their aggregate checks; the others run once.
 """
@@ -38,6 +45,9 @@ import modal
 
 RUST = "1.99.1"
 app = modal.App("storine-sweeps")
+# Results of every run, by run name: they outlive the client that started the run.
+runs = modal.Volume.from_name("storine-runs", create_if_missing=True)
+RUNS = "/runs"
 # Resources are (request, limit): Modal bills the higher of the request and actual use, so builds can
 # burst to the limit while the waiting parts of a run cost only what they use.
 #
@@ -127,8 +137,18 @@ def build(src: bytes, tests: list[str]) -> dict[str, bytes]:
     return bins
 
 
-@app.function(image=image, cpu=2, memory=4096, timeout=3600, max_containers=200, retries=2)
-def run_shard(binary: bytes, name: str, test: str, lo: int, hi: int) -> list[dict]:
+@app.function(image=image, cpu=2, memory=4096, timeout=3600, max_containers=200, retries=2, volumes={RUNS: runs})
+def run_shard(binary: bytes, name: str, test: str, lo: int, hi: int, run: str = "") -> list[dict]:
+    failures = shard_failures(binary, name, test, lo, hi)
+    if run:
+        os.makedirs(f"{RUNS}/{run}/shards", exist_ok=True)
+        with open(f"{RUNS}/{run}/shards/{test}-{lo}.json", "w") as f:
+            json.dump(failures, f)
+        runs.commit()
+    return failures
+
+
+def shard_failures(binary: bytes, name: str, test: str, lo: int, hi: int) -> list[dict]:
     """Runs `test` over seeds `lo..=hi` in one process (`lo == 0`: once, at its default seeds,
     which also enforces the test's aggregate checks). A seeded shard stops at its first
     failing seed, so after one it resumes past it. Only per-seed failures (with a `replay:`
@@ -165,22 +185,38 @@ def run_shard(binary: bytes, name: str, test: str, lo: int, hi: int) -> list[dic
         lo = seed + 1
 
 
-@app.function(image=image, cpu=(4, 16), memory=(4096, 32768), timeout=14400)
-def suite(src: bytes, cargo_args: str, env: dict[str, str], repeat: int = 1) -> tuple[int, str]:
-    return run_suite(src, cargo_args, env, repeat)
+@app.function(image=image, cpu=(4, 16), memory=(4096, 32768), timeout=14400, volumes={RUNS: runs})
+def suite(src: bytes, cargo_args: str, env: dict[str, str], repeat: int = 1, run: str = "") -> tuple[int, str]:
+    return run_suite(src, cargo_args, env, repeat, run)
 
 
 # A preempted container restarts its input from zero, so a run of hours may never finish on
 # preemptible capacity. This costs more: use it (`--steady`) only for long runs.
-@app.function(image=image, cpu=(8, 16), memory=(16384, 32768), timeout=14400, nonpreemptible=True)
-def suite_steady(src: bytes, cargo_args: str, env: dict[str, str], repeat: int = 1) -> tuple[int, str]:
-    return run_suite(src, cargo_args, env, repeat)
+@app.function(image=image, cpu=(8, 16), memory=(16384, 32768), timeout=14400, nonpreemptible=True, volumes={RUNS: runs})
+def suite_steady(src: bytes, cargo_args: str, env: dict[str, str], repeat: int = 1, run: str = "") -> tuple[int, str]:
+    return run_suite(src, cargo_args, env, repeat, run)
 
 
-def run_suite(src: bytes, cargo_args: str, env: dict[str, str], repeat: int) -> tuple[int, str]:
+def run_suite(src: bytes, cargo_args: str, env: dict[str, str], repeat: int, run: str = "") -> tuple[int, str]:
     """Runs `cargo test --release <cargo_args>` with `env` up to `repeat` times, stopping at the
-    first failure; returns (exit code, summary, with the end of the output on a failure)."""
+    first failure; returns (exit code, summary, with the end of the output on a failure).
+    With `run`, the whole output goes to `<run>/output.log` on the volume as it comes (committed
+    every 30 s) and the result to `<run>/result.txt`."""
+    code, summary = suite_attempts(src, cargo_args, env, repeat, run)
+    if run:
+        with open(f"{RUNS}/{run}/result.txt", "w") as f:
+            f.write(f"{summary}\ncargo test exit code {code}\n")
+        runs.commit()
+    return code, summary
+
+
+def suite_attempts(src: bytes, cargo_args: str, env: dict[str, str], repeat: int, run: str) -> tuple[int, str]:
     unpack(src)
+    log = None
+    if run:
+        os.makedirs(f"{RUNS}/{run}", exist_ok=True)
+        log = open(f"{RUNS}/{run}/output.log", "a")
+    committed = time.time()
     summary = []
     for attempt in range(1, repeat + 1):
         proc = subprocess.Popen(f"cargo test --release --no-fail-fast {cargo_args} 2>&1", shell=True, cwd="/src", stdout=subprocess.PIPE, text=True, env={**os.environ, **env})
@@ -188,10 +224,19 @@ def run_suite(src: bytes, cargo_args: str, env: dict[str, str], repeat: int) -> 
         for line in proc.stdout:
             line = line.rstrip("\n")
             all_lines.append(line)
+            if log:
+                log.write(line + "\n")
+                if time.time() - committed > 30:
+                    log.flush()
+                    runs.commit()
+                    committed = time.time()
             # Readable meanwhile with `modal app logs`; the summary only comes back at the end.
             if line.startswith("soak"):
                 print(line, flush=True)
         proc.wait()
+        if log:
+            log.write(f"--- run {attempt}/{repeat}: exit {proc.returncode}\n")
+            log.flush()
         # A panic's message is the line after its header.
         after_panic = [all_lines[k + 1] for k, l in enumerate(all_lines[:-1]) if "panicked" in l]
         lines = [l for l in all_lines if l in after_panic or l.startswith("  call ") or l.startswith("key ") or l.startswith("first operation left out") or l.startswith("test result") or "FAILED" in l or "panicked" in l or l.startswith("error") or "process chaos" in l or "range cluster" in l or l.startswith("bench:") or l.startswith("soak")]
@@ -280,7 +325,11 @@ def seeded_tests(root: str, name: str) -> tuple[list[str], list[str]]:
 
 
 @app.local_entrypoint()
-def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300, only: str = "", shard: int = 10, suite_args: str = "", env: str = "", sdks: str = "", plain: bool = False, repeat: int = 1, tools: str = "", steady: bool = False):
+def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300, only: str = "", shard: int = 10, suite_args: str = "", env: str = "", sdks: str = "", plain: bool = False, repeat: int = 1, tools: str = "", steady: bool = False, name: str = "", collect: str = ""):
+    if collect:
+        if code := collect_run(collect):
+            raise SystemExit(code)
+        return
     root = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True).stdout.strip()
     if tools:
         # BI and GUI tools against the gateway; `all`, or suite functions of test_tools.py.
@@ -308,9 +357,12 @@ def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300,
         return
     src = source_tarball(root)
     print(f"source: {len(src) / 1e6:.1f} MB")
+    run = name or time.strftime("%Y%m%d-%H%M%S")
+    print(f"run {run}: read back with `modal run tools/modal/sweep.py --collect {run}`", flush=True)
     if suite_args:
         extra = dict(kv.split("=", 1) for kv in env.split(",") if "=" in kv)
-        code, summary = (suite_steady if steady else suite).remote(src, suite_args, extra, repeat)
+        put_meta(run, {"kind": "suite", "suite_args": suite_args, "env": extra, "repeat": repeat, "steady": steady, "started": time.time()})
+        code, summary = (suite_steady if steady else suite).remote(src, suite_args, extra, repeat, run)
         print(summary)
         print(f"cargo test exit code {code}")
         if code:
@@ -325,11 +377,12 @@ def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300,
             if only and t not in only.split(","):
                 continue
             for lo in range(1, seeds + 1, shard):
-                jobs.append((bins[name], name, t, lo, min(lo + shard - 1, seeds)))
-            jobs.append((bins[name], name, t, 0, 0))
+                jobs.append((bins[name], name, t, lo, min(lo + shard - 1, seeds), run))
+            jobs.append((bins[name], name, t, 0, 0, run))
         for t in single:
             if not only or t in only.split(","):
-                jobs.append((bins[name], name, t, 0, 0))
+                jobs.append((bins[name], name, t, 0, 0, run))
+    put_meta(run, {"kind": "sweep", "tests": names, "seeds": seeds, "shards": len(jobs), "started": time.time()})
     print(f"{len(jobs)} shards")
     t0 = time.time()
     failures = [f for shard_failures in run_shard.starmap(jobs) for f in shard_failures]
@@ -343,3 +396,50 @@ def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300,
         env = f"STORINE_SIM_SEED={f['seed']} " if f["seed"] else ""
         print(f"FAILED {f['test']} {what} ({f['secs']}s)\n  {f['message']}\n  replay: {env}cargo test --release -p storage-core --test {f['test'].split('::')[0]} {f['test'].split('::')[1]}")
     raise SystemExit(1)
+
+
+def put_meta(run: str, meta: dict) -> None:
+    with runs.batch_upload(force=True) as b:
+        b.put_file(io.BytesIO(json.dumps(meta).encode()), f"/{run}/meta.json")
+
+
+def read_text(path: str) -> str | None:
+    try:
+        return b"".join(runs.read_file(path)).decode(errors="replace")
+    except Exception:  # not written (yet)
+        return None
+
+
+def collect_run(run: str) -> int:
+    """Prints what run `run` has left on the volume; returns 0 if it passed, 1 if it failed,
+    2 if it is not finished (or its client died before the sweep's shards were all sent)."""
+    meta = json.loads(read_text(f"/{run}/meta.json") or "{}")
+    if not meta:
+        print(f"no run named {run} on volume storine-runs")
+        return 2
+    print(f"run {run}: {json.dumps(meta)}")
+    if meta["kind"] == "suite":
+        result = read_text(f"/{run}/result.txt")
+        if result is None:
+            log = read_text(f"/{run}/output.log") or ""
+            tail = [l for l in log.splitlines() if l.startswith(("soak", "test result", "error")) or "panicked" in l or "FAILED" in l]
+            print("\n".join(tail[-30:]))
+            print(f"not finished: {len(log.splitlines())} lines so far (whole output: `modal volume get storine-runs {run}/output.log`)")
+            return 2
+        print(result)
+        return 0 if result.rstrip().endswith("exit code 0") else 1
+    try:
+        done = [e.path for e in runs.listdir(f"/{run}/shards")]
+    except Exception:  # no shard finished yet
+        done = []
+    failures = [f for p in done for f in json.loads(read_text(p) or "[]")]
+    for f in sorted(failures, key=lambda f: (f["test"], f["seed"])):
+        print(f"FAILED {f['test']} seed {f['seed']} ({f['secs']}s)\n  {f['message']}")
+    print(f"{len(done)} of {meta['shards']} shards done, {len(failures)} failures")
+    if len(done) < meta["shards"]:
+        return 2
+    if failures:
+        return 1
+    print(f"ALL PASSED: {', '.join(meta['tests'])} at {meta['seeds']} seeds")
+    return 0
+

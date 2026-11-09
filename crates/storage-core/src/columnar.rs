@@ -442,11 +442,17 @@ impl ColumnarCollection {
     /// A consistent analytic view of the collection: live segment rows plus the delta
     /// documents, both as of one MVCC snapshot.
     pub fn snapshot(&self) -> Result<ColumnarSnapshot<'_>> {
-        // Snapshot first, then drain: every write visible at the snapshot is in the delta.
-        let read = self.engine.begin_read_snapshot();
-        let built = self.built.load(Ordering::Acquire);
-        let (segs, ids, hidden) = {
+        // Under the delta lock, so no merge publishes between the snapshot and the segments
+        // taken here: a merge writes segment rows from the current state, so segments published
+        // after the snapshot could hold writes it must not see (one leg of a transfer, with the
+        // other leg read from the delta at the snapshot). Snapshot first, then drain: every
+        // write visible at the snapshot is in the delta.
+        #[cfg(test)]
+        tests::before_snapshot_lock();
+        let (read, built, segs, ids, hidden) = {
             let mut delta = self.delta.lock().unwrap_or_else(|p| p.into_inner());
+            let read = self.engine.begin_read_snapshot();
+            let built = self.built.load(Ordering::Acquire);
             self.absorb_locked(&mut delta);
             let segs = Arc::clone(&self.segments.read().unwrap_or_else(|p| p.into_inner()));
             let index_of: FastHashMap<u64, usize> = segs.iter().enumerate().map(|(i, s)| (s.gen, i)).collect();
@@ -459,7 +465,7 @@ impl ColumnarCollection {
                 }
             }
             let ids: Vec<InlineId> = if built { delta.keys().copied().collect() } else { Vec::new() };
-            (segs, ids, hidden)
+            (read, built, segs, ids, hidden)
         };
         let mut hidden = hidden;
         for h in &mut hidden {
@@ -907,6 +913,70 @@ impl ColumnarRegistry {
         for c in self.map.write().unwrap_or_else(|p| p.into_inner()).drain().map(|(_, c)| c) {
             c.close();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use storage_codec::types::PropertyValue as P;
+
+    use crate::{DocOp, DocWrite, DocumentStore, EngineConfig, Precondition};
+
+    thread_local! {
+        /// Runs once where `snapshot` is about to take the delta lock (this thread only).
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_snapshot_lock() {
+        if let Some(f) = HOOK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+
+    fn put(key: &str, balance: i64) -> DocWrite {
+        DocWrite { collection: "acct".into(), key: key.into(), op: DocOp::Put(BTreeMap::from([("balance".to_owned(), P::Int64(balance))])), precondition: Precondition::None }
+    }
+
+    #[test]
+    fn a_merge_racing_a_snapshot_never_shows_half_a_transfer() {
+        // A merge writes segment rows from the current state. If one publishes after a snapshot
+        // took its read point, the snapshot would read `b` from the new segment (after the
+        // first transfer) and `a` from the delta at its read point (before it): 1,600, not 1,500.
+        let d = std::env::temp_dir().join(format!("stge_columnar_race_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let s = Arc::new(DocumentStore::open(&d, EngineConfig::default()).unwrap());
+        s.write(vec![put("a", 500), put("b", 500), put("c", 500)], None).unwrap();
+        s.create_columnar("acct").unwrap();
+        let c = s.columnar("acct").unwrap().unwrap();
+        c.merge().unwrap();
+        let racer = Arc::clone(&s);
+        HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                racer.write(vec![put("a", 400), put("b", 600)], None).unwrap();
+                racer.columnar("acct").unwrap().unwrap().merge().unwrap();
+                racer.write(vec![put("a", 300), put("c", 600)], None).unwrap();
+            }));
+        });
+        let snap = c.snapshot().unwrap();
+        assert!(HOOK.with(|h| h.borrow().is_none()), "the race ran");
+        let total: i64 = snap
+            .documents()
+            .unwrap()
+            .iter()
+            .map(|doc| match doc.fields.get("balance") {
+                Some(P::Int64(b)) => *b,
+                other => panic!("balance {other:?}"),
+            })
+            .sum();
+        assert_eq!(total, 1_500, "a snapshot saw a transfer half done");
+        drop(snap);
+        drop(c);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 

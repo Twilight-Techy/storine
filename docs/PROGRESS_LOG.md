@@ -817,3 +817,17 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - `cargo run --release -p storage-benches --bin reactor-scale` (2 interleaved A/B pairs at `0 / 1,000 / 4,000 / 8,000` idle connections):
   - Default (`AfdPoller`): `8,589 / 8,281 / 9,246 / 9,671 ops/s` (`p50=84.1 µs`, `p99=288.9 µs` at 8,000) and `7,837 / 7,317 / 7,023 / 7,996 ops/s` (`p50=90.4 µs`, `p99=815.8 µs` at 8,000) — flat across all idle counts.
   - `STORINE_REACTOR=poll` (`WSAPoll`): `8,949 / 1,731 / 346 / 49 ops/s` (`p50=11.06 ms`, `p99=198.15 ms` at 8,000) and `5,814 / 920 / 168 / 42 ops/s` (`p50=10.79 ms`, `p99=185.91 ms` at 8,000) — ~190× slower at 8,000 idle connections.
+
+## 2026-11-09: merged `main`; columnar snapshot race fixed; runs kept on a Modal volume
+
+- **Merge**: merged `origin/main` (the `TASK-102` Windows verification and Windows test fixes). Only this log conflicted, and both sides were kept. Work continues on `main`.
+- **Columnar snapshot race (`TASK-126`)**:
+  - The workspace run after the merge failed once in `snapshots_are_consistent_while_writers_and_merges_run`: a snapshot saw a transfer half done.
+  - Cause: the snapshot took its read point before the delta lock, so a merge could publish segments newer than that point in between. The read point is now taken under the lock.
+  - The failure is rare: 200 repeats on Modal and 100 four-at-a-time repeats locally never hit it. The deterministic unit test `a_merge_racing_a_snapshot_never_shows_half_a_transfer` fails on the old order (1,600 against 1,500) and passes on the fixed one.
+  - Neither the merge nor the soak fixes caused it: the code dates from `TASK-126`.
+- **Modal runs**:
+  - `tools/modal/sweep.py` names every run (`--name`) and writes its output to the volume `storine-runs` as it goes.
+  - `--collect <name>` reads a run back.
+  - Checked by killing the local client of a running suite and collecting its result afterwards. A seed sweep was collected the same way.
+
