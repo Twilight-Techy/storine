@@ -879,7 +879,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
                     _ => 0,
                 },
             };
-            let body = format_datetime(&Datum::Timestamp(ns.abs()), &text(arg(args, 1)), true)?;
+            let body = format_datetime(&Datum::Timestamp(ns.saturating_abs()), &text(arg(args, 1)), true)?;
             Datum::Text(if ns < 0 { format!("-{body}") } else { body })
         }
         "timediff" => {
@@ -895,7 +895,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
                     },
                 })
             };
-            Datum::Time(moment(&a0)? - moment(arg(args, 1))?)
+            Datum::Time(moment(&a0)?.checked_sub(moment(arg(args, 1))?).ok_or_else(|| SqlError::new("22008", "interval out of range"))?)
         }
         "make_date" => {
             if null_if_any(args) {
@@ -926,7 +926,7 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
                     let Datum::Timestamp(ns) = cast(&a0, &DataType::Timestamp)? else {
                         return Ok(Datum::Null);
                     };
-                    Datum::Timestamp(ns + (to - from) * 1_000_000_000)
+                    Datum::Timestamp(ns.checked_add((to - from) * 1_000_000_000).ok_or_else(|| SqlError::new("22008", "timestamp out of range"))?)
                 }
                 _ => Datum::Null,
             }

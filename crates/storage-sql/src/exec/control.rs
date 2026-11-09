@@ -42,6 +42,7 @@ pub struct Control {
     idle_since: AtomicI64,
     idle_limit_ms: AtomicU64,
     socket: Mutex<Option<TcpStream>>,
+    aborted: Mutex<Option<Arc<AtomicBool>>>,
     pub(crate) identity: Mutex<Identity>,
 }
 
@@ -79,12 +80,14 @@ impl Control {
             idle_since: AtomicI64::new(0),
             idle_limit_ms: AtomicU64::new(0),
             socket: Mutex::new(None),
+            aborted: Mutex::new(None),
             identity: Mutex::new(Identity { backend_start_ns: now_ns(), state_change_ns: now_ns(), ..Identity::default() }),
         })
     }
 
     /// Gives the control the connection's socket, so a terminate reaches an idle connection.
-    pub fn attach_socket(&self, stream: &TcpStream) {
+    pub fn attach_socket(&self, stream: &TcpStream, login: &crate::listener::Login) {
+        *self.aborted.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(login.aborted());
         if let Ok(peer) = stream.peer_addr() {
             self.identity.lock().unwrap_or_else(std::sync::PoisonError::into_inner).client = peer.ip().to_string();
         }
@@ -103,6 +106,9 @@ impl Control {
     }
 
     fn wake(&self) {
+        if let Some(a) = self.aborted.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
+            a.store(true, Ordering::Release);
+        }
         if let Some(s) = self.socket.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
             let _ = s.shutdown(Shutdown::Read);
         }

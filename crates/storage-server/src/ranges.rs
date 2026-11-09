@@ -300,7 +300,7 @@ impl FileBackupStore {
     }
 
     fn sync_dir(&self) -> Result<()> {
-        std::fs::File::open(&self.dir).and_then(|d| d.sync_all()).map_err(|e| StorageError::io("sync backup directory", e))
+        storage_types::vfs::at(&self.dir).sync_dir(&self.dir).map_err(|e| StorageError::io("sync backup directory", e))
     }
 }
 
@@ -398,7 +398,7 @@ impl JsonlSink {
         let f = std::fs::OpenOptions::new().create(true).append(true).open(file).map_err(|e| StorageError::io("open changefeed file", e))?;
         if !existing.is_empty() && existing.last() != Some(&b'\n') {
             let keep = existing.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-            f.set_len(keep as u64).map_err(|e| StorageError::io("cut torn changefeed line", e))?;
+            std::fs::OpenOptions::new().write(true).open(file).and_then(|w| w.set_len(keep as u64)).map_err(|e| StorageError::io("cut torn changefeed line", e))?;
         }
         Ok(Self { file: f, cursor_path: cursor_path.to_path_buf() })
     }

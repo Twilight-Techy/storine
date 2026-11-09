@@ -29,11 +29,44 @@ pub fn set_login_deadline(deadline: Duration) {
 
 /// A connection's login in progress. Dropping it, or `done`, ends the deadline.
 #[derive(Debug)]
-pub struct Login(Arc<AtomicBool>);
+pub struct Login {
+    done: Arc<AtomicBool>,
+    aborted: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+pub struct ReadHalf {
+    stream: TcpStream,
+    aborted: Arc<AtomicBool>,
+}
+
+impl io::Read for ReadHalf {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.aborted.load(Ordering::Acquire) {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            match self.stream.read(buf) {
+                Err(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {}
+                other => return other,
+            }
+        }
+    }
+}
 
 impl Login {
     pub fn done(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.done.store(true, Ordering::Relaxed);
+    }
+
+    pub fn aborted(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.aborted)
+    }
+
+    pub fn reader(&self, stream: &TcpStream) -> io::Result<ReadHalf> {
+        let s = stream.try_clone()?;
+        let _ = s.set_read_timeout(Some(Duration::from_millis(50)));
+        Ok(ReadHalf { stream: s, aborted: Arc::clone(&self.aborted) })
     }
 }
 
@@ -43,7 +76,7 @@ impl Drop for Login {
     }
 }
 
-type Pending = Vec<(Instant, TcpStream, Arc<AtomicBool>)>;
+type Pending = Vec<(Instant, TcpStream, Arc<AtomicBool>, Arc<AtomicBool>)>;
 
 /// One thread enforces every deadline: closing the socket ends whatever read the connection is in.
 fn watch_login(stream: &TcpStream) -> io::Result<Login> {
@@ -54,13 +87,14 @@ fn watch_login(stream: &TcpStream) -> io::Result<Login> {
         thread::spawn(move || loop {
             thread::sleep(Duration::from_millis(250));
             let now = Instant::now();
-            list.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|(deadline, socket, done)| {
+            list.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|(deadline, socket, done, aborted)| {
                 if done.load(Ordering::Relaxed) {
                     return false;
                 }
                 if now < *deadline {
                     return true;
                 }
+                aborted.store(true, Ordering::Release);
                 let _ = socket.shutdown(Shutdown::Both);
                 false
             });
@@ -69,9 +103,10 @@ fn watch_login(stream: &TcpStream) -> io::Result<Login> {
     });
     let done = Arc::new(AtomicBool::new(false));
     let deadline = Instant::now() + Duration::from_millis(LOGIN_DEADLINE_MS.load(Ordering::Relaxed));
-    let entry = (deadline, stream.try_clone()?, Arc::clone(&done));
+    let aborted = Arc::new(AtomicBool::new(false));
+    let entry = (deadline, stream.try_clone()?, Arc::clone(&done), Arc::clone(&aborted));
     pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(entry);
-    Ok(Login(done))
+    Ok(Login { done, aborted })
 }
 
 /// Gives back a connection's place however its thread ends.
@@ -125,7 +160,7 @@ where
             let _place = place;
             let _ = stream.set_nodelay(true);
             if let Err(e) = handle(stream, login) {
-                if !matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset) {
+                if !matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::TimedOut) {
                     eprintln!("storine-sql: {name} connection ended: {e}");
                 }
             }

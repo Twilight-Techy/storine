@@ -891,7 +891,7 @@ mod tests {
             let mut engines = Vec::new();
             let mut nodes = Vec::new();
             for i in 1..=n {
-                let e = Arc::new(StorageEngine::<DocumentRecord>::open(base.join(format!("n{i}")), EngineConfig::default()).unwrap());
+                let e = Arc::new(StorageEngine::<DocumentRecord>::open(base.join(format!("n{i}")), EngineConfig { layout_mode: crate::engine::StorageLayoutMode::AdaptiveArena { arena_threshold_bytes: 256 * 1024, segment_capacity: 16 * 1024 * 1024 }, wal_sync_policy: storage_wal::SyncPolicy::AsyncMemoryFirst, ..EngineConfig::default() }).unwrap());
                 let node = Arc::new(RaftNode::new(i, Arc::clone(&e)).unwrap());
                 net.add(Arc::clone(&node));
                 engines.push(e);
@@ -908,7 +908,7 @@ mod tests {
         /// Starts node `id` with no configuration: it waits to be added to the cluster.
         fn join(&mut self, id: NodeId) -> usize {
             let e = Arc::new(
-                StorageEngine::<DocumentRecord>::open(self.base.join(format!("n{id}")), EngineConfig::default()).unwrap(),
+                StorageEngine::<DocumentRecord>::open(self.base.join(format!("n{id}")), EngineConfig { layout_mode: crate::engine::StorageLayoutMode::AdaptiveArena { arena_threshold_bytes: 256 * 1024, segment_capacity: 16 * 1024 * 1024 }, wal_sync_policy: storage_wal::SyncPolicy::AsyncMemoryFirst, ..EngineConfig::default() }).unwrap(),
             );
             let node = Arc::new(RaftNode::new(id, Arc::clone(&e)).unwrap());
             self.net.add(Arc::clone(&node));

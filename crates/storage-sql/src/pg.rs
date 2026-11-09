@@ -241,7 +241,7 @@ impl Conn {
         let socket = stream.try_clone()?;
         // Encryption negotiation: SSLRequest -> 'S' and a TLS handshake when TLS is configured,
         // 'N' otherwise (and always for GSSENCRequest); the startup packet follows.
-        let mut plain_r = BufReader::new(stream.try_clone()?);
+        let mut plain_r = BufReader::new(login.reader(&stream)?);
         let mut plain_w = BufWriter::new(stream);
         let (mut r, mut w, mut pending): (Reader, Writer, Option<Vec<u8>>) = loop {
             let body = read_startup(&mut plain_r)?;
@@ -365,7 +365,7 @@ impl Conn {
             w.flush()?;
             return Ok(());
         }
-        session.control.attach_socket(&socket);
+        session.control.attach_socket(&socket, login);
         if let Some(app) = params.get("application_name") {
             session.vars.insert("application_name".into(), app.clone());
             session

@@ -50,7 +50,8 @@ fn signalled(e: &Arc<Engine>, dialect: Dialect, signal: impl FnOnce(u64)) -> (St
         let r = exec(&mut s, SLOW);
         (r.map(|_| ()), start.elapsed(), s)
     });
-    std::thread::sleep(Duration::from_millis(200));
+    while !e.registry.get(id).is_some_and(|c| c.busy()) { std::thread::sleep(Duration::from_millis(10)); }
+    std::thread::sleep(Duration::from_millis(100));
     assert!(!t.is_finished(), "the slow query should still be running");
     signal(id);
     let (r, took, s) = t.join().unwrap();
@@ -335,7 +336,8 @@ fn over_the_postgres_wire() {
 
     // The wrong secret does nothing, and the right one stops the query.
     c.send(SLOW);
-    std::thread::sleep(Duration::from_millis(200));
+    while !e.registry.get(c.pid as u64).is_some_and(|s| s.busy()) { std::thread::sleep(Duration::from_millis(10)); }
+    std::thread::sleep(Duration::from_millis(100));
     cancel_request(addr, c.pid, c.secret.wrapping_add(1));
     cancel_request(addr, c.pid + 1, c.secret);
     std::thread::sleep(Duration::from_millis(300));

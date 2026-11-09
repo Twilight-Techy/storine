@@ -1171,6 +1171,9 @@ struct RaftStorage {
     span_path: PathBuf,
     /// Tombstone of a destroyed replica: the configuration index that removed it.
     tomb_path: PathBuf,
+    sync_data: bool,
+    meta_file: Mutex<Option<File>>,
+    log_file: Mutex<Option<File>>,
 }
 
 impl RaftStorage {
@@ -1190,6 +1193,9 @@ impl RaftStorage {
             members_path: dir.join(format!("{stem}_raft.members")),
             span_path: dir.join(format!("{stem}_raft.span")),
             tomb_path: dir.join(format!("{stem}_raft.tomb")),
+            sync_data: true,
+            meta_file: Mutex::new(None),
+            log_file: Mutex::new(None),
         }
     }
 
@@ -1208,7 +1214,7 @@ impl RaftStorage {
         full.extend_from_slice(&RAFT_SPAN_MAGIC.to_le_bytes());
         full.extend_from_slice(&checksum_payload(&body).to_le_bytes());
         full.extend_from_slice(&body);
-        atomic_write_replace(&self.span_path, &full, true)
+        atomic_write_replace(&self.span_path, &full, self.sync_data)
     }
 
     fn load_span(&self) -> Result<Option<KeySpan>> {
@@ -1269,7 +1275,7 @@ impl RaftStorage {
         let mut full = MEMBERS_MAGIC.to_le_bytes().to_vec();
         full.extend_from_slice(&checksum_payload(&payload).to_le_bytes());
         full.extend_from_slice(&payload);
-        atomic_write_replace(&self.members_path, &full, true)
+        atomic_write_replace(&self.members_path, &full, self.sync_data)
     }
 
     fn load_members(&self) -> Result<Option<(u64, Membership)>> {
@@ -1315,7 +1321,15 @@ impl RaftStorage {
         full.extend_from_slice(&RAFT_META_MAGIC.to_le_bytes());
         full.extend_from_slice(&crc.to_le_bytes());
         full.extend_from_slice(&payload);
-        atomic_write_replace(&self.meta_path, &full, true)
+        if !self.sync_data && !storage_types::vfs::at(&self.meta_path).is_simulated() {
+            let mut g = self.meta_file.lock().unwrap_or_else(|p| p.into_inner());
+            let f = match g.as_mut() {
+                Some(f) => f,
+                None => g.insert(fs::OpenOptions::new().create(true).truncate(false).write(true).open(&self.meta_path).map_err(|e| StorageError::io("open raft meta", e))?),
+            };
+            return f.seek(SeekFrom::Start(0)).and_then(|_| f.write_all(&full)).map_err(|e| StorageError::io("write raft meta", e));
+        }
+        atomic_write_replace(&self.meta_path, &full, self.sync_data)
     }
 
     fn encode_log_frame(entry: &RaftLogEntry, out: &mut Vec<u8>) {
@@ -1339,14 +1353,22 @@ impl RaftStorage {
             Self::encode_log_frame(e, &mut buf);
         }
         let vfs = storage_types::vfs::at(&self.log_path);
+        if !self.sync_data && !vfs.is_simulated() {
+            let mut g = self.log_file.lock().unwrap_or_else(|p| p.into_inner());
+            let f = match g.as_mut() {
+                Some(f) => f,
+                None => g.insert(fs::OpenOptions::new().create(true).append(true).open(&self.log_path).map_err(|e| StorageError::io("open raft log", e))?),
+            };
+            return f.write_all(&buf).map_err(|e| StorageError::io("append raft log", e));
+        }
         let created = !vfs.exists(&self.log_path);
         let mut file = vfs.open(&self.log_path, storage_types::vfs::OpenOpts::append())
             .map_err(|e| StorageError::io("open raft log", e))?;
         file.write_all(&buf)
             .map_err(|e| StorageError::io("append raft log", e))?;
-        file.sync_data()
-            .map_err(|e| StorageError::io("fsync raft log", e))?;
-        if created {
+        if self.sync_data { file.sync_data().map_err(|e| StorageError::io("fsync raft log", e))?; }
+        if self.sync_data && created {
+
             // Acknowledged entries in a new log file survive a power cut only once its
             // directory entry is durable too.
             sync_parent(&self.log_path).map_err(|e| StorageError::io("fsync raft log directory", e))?;
@@ -1355,11 +1377,12 @@ impl RaftStorage {
     }
 
     fn rewrite_log(&self, log: &[RaftLogEntry]) -> Result<()> {
+        *self.log_file.lock().unwrap_or_else(|p| p.into_inner()) = None;
         let mut buf = Vec::new();
         for e in log {
             Self::encode_log_frame(e, &mut buf);
         }
-        atomic_write_replace(&self.log_path, &buf, true)
+        atomic_write_replace(&self.log_path, &buf, self.sync_data)
     }
 
     fn load(&self) -> Result<Option<RaftState>> {
@@ -1540,7 +1563,8 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     pub fn open_group(node_id: NodeId, engine: Arc<StorageEngine<T>>, group: Option<u64>, span: KeySpan) -> Result<Self> {
         let stem = crate::engine::collection_file_stem(engine.collection_name())?;
         let dir = engine.base_dir().to_path_buf();
-        let storage = RaftStorage::for_group(&dir, &stem, group);
+        let mut storage = RaftStorage::for_group(&dir, &stem, group);
+        storage.sync_data = engine.data_sync() || storage_types::vfs::at(&dir).is_simulated();
         let (span, span_state) = match storage.load_span_state()? {
             Some(saved) => saved,
             None => {
@@ -1714,8 +1738,10 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 let _ = self.engine.delete_internal(id)?;
             }
         }
-        self.engine.sync_wal()?;
+        if self.storage.sync_data { self.engine.sync_wal()?; }
         let st = &self.storage;
+        *st.meta_file.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *st.log_file.lock().unwrap_or_else(|p| p.into_inner()) = None;
         for p in [&st.span_path, &st.meta_path, &st.log_path, &st.members_path, &st.snapshot_path, &st.recv_path, &st.installing_path] {
             if p.exists() {
                 storage_types::vfs::at(p).remove_file(p).map_err(|e| StorageError::io("remove raft group file", e))?;
@@ -2519,7 +2545,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     /// [`Self::compact_log_through`] with `apply_lock` already held.
     fn compact_locked(&self, index: u64) -> Result<u64> {
         // Applied entries must be durable in the engine before the log forgets them.
-        self.engine.sync_wal()?;
+        if self.storage.sync_data { self.engine.sync_wal()?; }
         let mut st = self.lock_state();
         // (`apply_lock` is held: everything applied is in the WAL just synced.)
         if st.durable_applied.is_some() {
@@ -2821,7 +2847,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 let _ = self.engine.delete_internal(id)?;
             }
         }
-        self.engine.sync_wal()?;
+        if self.storage.sync_data { self.engine.sync_wal()?; }
         // 4. Raft state: keep log entries after the snapshot only if the log agrees at its end.
         //    The snapshot's configuration becomes the base one (persisted first).
         {
@@ -2849,7 +2875,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             st.last_applied = last_index;
             if st.durable_applied.is_some() {
                 // The installed records must be durable before the index claims them.
-                self.engine.sync_wal()?;
+                if self.storage.sync_data { self.engine.sync_wal()?; }
                 st.durable_applied = Some(last_index);
             }
             self.storage.save_hard_state(&st)?;
@@ -2886,7 +2912,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             for id in self.span_ids() {
                 let _ = self.engine.delete_internal(id)?;
             }
-            self.engine.sync_wal()?;
+            if self.storage.sync_data { self.engine.sync_wal()?; }
             let mut st = self.lock_state();
             st.clear_log();
             st.snapshot_index = 0;
@@ -2952,7 +2978,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             }
             // Writes before the split must be durable first: replayed after a crash under the
             // narrower span, those for the right half would be refused.
-            self.engine.sync_wal()?;
+            if self.storage.sync_data { self.engine.sync_wal()?; }
             let left = KeySpan::new(span.start.clone(), Some(at.to_vec()));
             self.set_span(left, SpanState { frozen: false, index: entry.index })?;
         }
@@ -2991,7 +3017,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 let _ = self.engine.delete_internal(id)?;
             }
         }
-        self.engine.sync_wal()?;
+        if self.storage.sync_data { self.engine.sync_wal()?; }
         if !redo {
             self.set_span(grown, SpanState { frozen: false, index: entry.index })?;
         }
@@ -3467,7 +3493,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let open = |name: &str| {
             Arc::new(
-                StorageEngine::<AgentObjectRecord>::open(base.join(name), EngineConfig::default())
+                StorageEngine::<AgentObjectRecord>::open(base.join(name), EngineConfig { layout_mode: crate::engine::StorageLayoutMode::AdaptiveArena { arena_threshold_bytes: 256 * 1024, segment_capacity: 16 * 1024 * 1024 }, wal_sync_policy: storage_wal::SyncPolicy::AsyncMemoryFirst, ..EngineConfig::default() })
                     .unwrap(),
             )
         };
@@ -3580,7 +3606,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let open = |name: &str| {
             Arc::new(
-                StorageEngine::<AgentObjectRecord>::open(base.join(name), EngineConfig::default())
+                StorageEngine::<AgentObjectRecord>::open(base.join(name), EngineConfig { layout_mode: crate::engine::StorageLayoutMode::AdaptiveArena { arena_threshold_bytes: 256 * 1024, segment_capacity: 16 * 1024 * 1024 }, wal_sync_policy: storage_wal::SyncPolicy::AsyncMemoryFirst, ..EngineConfig::default() })
                     .unwrap(),
             )
         };
