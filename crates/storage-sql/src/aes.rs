@@ -131,10 +131,8 @@ impl Aes {
 
     pub fn encrypt_block(&self, b: &mut [u8; 16]) {
         #[cfg(target_arch = "x86_64")]
-        if self.ni {
-            if storage_codec::aes_ni::encrypt(&self.enc, b) {
-                return;
-            }
+        if self.ni && storage_codec::aes_ni::encrypt(&self.enc, b) {
+            return;
         }
         let k = &self.enc;
         xor16(b, &k[0]);
@@ -152,10 +150,8 @@ impl Aes {
 
     pub fn decrypt_block(&self, b: &mut [u8; 16]) {
         #[cfg(target_arch = "x86_64")]
-        if self.ni {
-            if storage_codec::aes_ni::decrypt(&self.enc, b) {
-                return;
-            }
+        if self.ni && storage_codec::aes_ni::decrypt(&self.enc, b) {
+            return;
         }
         let k = &self.enc;
         xor16(b, &k[self.rounds]);

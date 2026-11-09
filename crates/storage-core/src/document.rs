@@ -1987,7 +1987,7 @@ mod tests {
     fn store(name: &str) -> (DocumentStore, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("stge_doc_{name}_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        (DocumentStore::open(&dir, EngineConfig::default()).unwrap(), dir)
+        (DocumentStore::open(&dir, EngineConfig { layout_mode: crate::engine::StorageLayoutMode::AdaptiveArena { arena_threshold_bytes: 256 * 1024, segment_capacity: 16 * 1024 * 1024 }, wal_sync_policy: storage_wal::SyncPolicy::AsyncMemoryFirst, ..EngineConfig::default() }).unwrap(), dir)
     }
 
     fn fields(pairs: &[(&str, PropertyValue)]) -> BTreeMap<String, PropertyValue> {

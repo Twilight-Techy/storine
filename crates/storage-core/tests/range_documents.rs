@@ -40,7 +40,7 @@ fn start(name: &str) -> Cluster {
     let transport = LocalTransport::new();
     let mut nodes = Vec::new();
     for &id in &MEMBERS {
-        let engine = StorageEngine::<DocumentRecord>::open(root.join(format!("n{id}")), EngineConfig { background_flush: false, collection_name: "node".into(), ..EngineConfig::default() }).unwrap();
+        let engine = StorageEngine::<DocumentRecord>::open(root.join(format!("n{id}")), EngineConfig { background_flush: false, collection_name: "node".into(), layout_mode: storage_core::StorageLayoutMode::AdaptiveArena { arena_threshold_bytes: 256 * 1024, segment_capacity: 16 * 1024 * 1024 }, wal_sync_policy: storage_wal::SyncPolicy::AsyncMemoryFirst, ..EngineConfig::default() }).unwrap();
         let cfg = NodeConfig { seed: u64::from(id), cluster: MEMBERS.to_vec(), max_offset_ns: 500_000_000, ..NodeConfig::default() };
         let mut d = NodeDriver::new(id, Arc::new(engine), cfg);
         d.open_range(1, KeySpan::all(), &MEMBERS).unwrap();

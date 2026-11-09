@@ -372,6 +372,6 @@ fn test_protocol_vectors_are_pinned() {
         std::fs::write(&path, &generated).unwrap();
         return;
     }
-    let existing = std::fs::read_to_string(&path).unwrap();
+    let existing = std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
     assert_eq!(existing, generated, "protocol vectors changed: rerun with STORINE_UPDATE_VECTORS=1 if intentional");
 }

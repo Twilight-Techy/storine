@@ -803,6 +803,13 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
     #[inline]
     pub fn base_dir(&self) -> &Path {
         self.inner.paths.base_dir()
+
+    }
+
+    #[inline]
+    pub(crate) fn data_sync(&self) -> bool {
+        self.inner.data_sync()
+
     }
 
     #[inline]
@@ -2925,7 +2932,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
 
     /// Whether data-file writes must be `fsync`ed (mirrors the WAL durability policy).
     #[inline]
-    fn data_sync(&self) -> bool {
+    pub(crate) fn data_sync(&self) -> bool {
         !matches!(self.config.wal_sync_policy, SyncPolicy::AsyncMemoryFirst)
     }
 

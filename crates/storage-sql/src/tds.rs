@@ -191,6 +191,7 @@ impl AttentionWatch {
         let state = Arc::new((std::sync::Mutex::new(0u64), std::sync::Condvar::new()));
         let (shared, peek) = (Arc::clone(&state), socket.try_clone());
         if let Ok(peek) = peek {
+            let _ = peek.set_read_timeout(Some(ATTENTION_POLL));
             let _ = std::thread::Builder::new().name("tds-attention".into()).spawn(move || {
                 let mut byte = [0u8; 1];
                 loop {
@@ -615,7 +616,7 @@ const ENCRYPT_REQ: u8 = 3;
 /// The socket under TLS. During a TDS 7.x handshake (`framed`), TLS records travel inside
 /// PRELOGIN packets; afterwards, and in TDS 8 strict mode, they go straight on the socket.
 struct SocketReader {
-    inner: BufReader<TcpStream>,
+    inner: BufReader<crate::listener::ReadHalf>,
     framed: Arc<AtomicBool>,
     /// Payload bytes left in the current PRELOGIN packet.
     left: usize,
@@ -681,7 +682,7 @@ impl Write for SocketWriter {
 }
 
 enum Input {
-    Plain(BufReader<TcpStream>),
+    Plain(BufReader<crate::listener::ReadHalf>),
     Tls(crate::tls::TlsReader<SocketReader>),
     Switching,
 }
@@ -753,13 +754,13 @@ impl Conn {
         deadline: &crate::listener::Login,
     ) -> io::Result<()> {
         let session = engine.new_session(Dialect::MsSql, "", None);
-        session.control.attach_socket(&stream);
+        session.control.attach_socket(&stream, deadline);
         let attention = AttentionWatch::start(stream.try_clone()?, Arc::clone(&session.control));
         let mut c = Conn {
             attention,
             max_message: MAX_LOGIN_MESSAGE,
             reset: None,
-            r: Input::Plain(BufReader::new(stream.try_clone()?)),
+            r: Input::Plain(BufReader::new(deadline.reader(&stream)?)),
             w: Output::Plain(BufWriter::new(stream)),
             session,
             version: TDS74,

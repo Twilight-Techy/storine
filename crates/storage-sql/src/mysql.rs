@@ -109,8 +109,9 @@ struct Prepared {
 
 /// The connection's input: plaintext, or TLS once the client asked for it.
 enum Input {
-    Plain(BufReader<TcpStream>),
-    Tls(crate::tls::TlsReader<BufReader<TcpStream>>),
+    Plain(BufReader<crate::listener::ReadHalf>),
+    Tls(crate::tls::TlsReader<BufReader<crate::listener::ReadHalf>>),
+
     Switching,
 }
 
@@ -381,7 +382,7 @@ impl Conn {
         login: &crate::listener::Login,
     ) -> io::Result<()> {
         let socket = stream.try_clone()?;
-        let r = Input::Plain(BufReader::new(stream.try_clone()?));
+        let r = Input::Plain(BufReader::new(login.reader(&stream)?));
         let w = Output::Plain(BufWriter::new(stream));
         let server_caps = SERVER_CAPS | if auth.tls.is_some() { CLIENT_SSL } else { 0 };
         let session = engine.new_session(Dialect::MySql, "", None);
@@ -507,7 +508,7 @@ impl Conn {
             c.err(&e)?;
             return c.w.flush();
         }
-        c.session.control.attach_socket(&socket);
+        c.session.control.attach_socket(&socket, login);
         if let Some(db) = database.filter(|d| !d.is_empty()) {
             if let Err(e) = c.session.use_database(&db) {
                 c.err(&e)?;
