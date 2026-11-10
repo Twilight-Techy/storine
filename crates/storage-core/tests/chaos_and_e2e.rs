@@ -655,3 +655,59 @@ fn test_minimal_footprint_invariants_and_arena_compaction() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// Dead arena space is counted again after a restart and reclaimed by the automatic
+/// compaction a checkpoint runs (`TASK-151`): before, the counters started at zero on every
+/// open, so space freed before a crash was never compacted and a node's disk grew without end.
+#[test]
+fn test_dead_arena_space_survives_restart_and_is_compacted_automatically() {
+    let dir = std::env::temp_dir().join(format!("storage_e2e_auto_compact_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let cfg = || EngineConfig {
+        layout_mode: StorageLayoutMode::AdaptiveArena { arena_threshold_bytes: 4096, segment_capacity: 64 * 1024 },
+        background_flush: false,
+        ..EngineConfig::default()
+    };
+    fn disk(d: &std::path::Path) -> u64 {
+        fs::read_dir(d).unwrap().flatten().map(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                disk(&p)
+            } else if p.extension().is_some_and(|x| x == "dat") {
+                e.metadata().unwrap().len()
+            } else {
+                0
+            }
+        }).sum()
+    }
+    let id = |i: u32| InlineId::new(&format!("ac_{i:03}")).unwrap();
+    {
+        let engine = StorageEngine::<AgentObjectRecord>::open(&dir, cfg()).unwrap();
+        // Each round changes the 64B size class, so the old slots cannot be reused in place.
+        for round in 1..=6u32 {
+            for i in 0..100u32 {
+                let mut rec = AgentObjectRecord::new(id(i), format!("t{i}"), i64::from(i), i64::from(i * round));
+                rec.body = vec![b'x'; round as usize * 96];
+                engine.put(id(i), &rec).unwrap();
+            }
+        }
+        engine.flush_all().unwrap();
+    }
+    let before = disk(&dir);
+    let engine = StorageEngine::<AgentObjectRecord>::open(&dir, cfg()).unwrap();
+    // A floor this high leaves the space alone.
+    assert_eq!(engine.maybe_compact_arenas_at(usize::MAX).unwrap(), 0);
+    let removed = engine.maybe_compact_arenas_at(1).unwrap();
+    assert!(removed >= 1, "dead space from before the restart was not compacted");
+    let after = disk(&dir);
+    assert!(after * 2 < before, "segments still hold {after} bytes of {before}");
+    drop(engine);
+    // The compacted state is what the next open finds.
+    let engine = StorageEngine::<AgentObjectRecord>::open(&dir, cfg()).unwrap();
+    for i in 0..100u32 {
+        engine.with_ref(id(i), |view| assert_eq!(view.score, i64::from(i * 6))).unwrap();
+    }
+    assert_eq!(engine.maybe_compact_arenas_at(1).unwrap(), 0, "nothing left to compact");
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}

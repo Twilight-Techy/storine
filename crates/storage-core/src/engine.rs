@@ -766,8 +766,8 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         };
 
         // Arena segments referenced by no record (left over from compaction whose deletion
-        // failed, or superseded by replay) are reclaimed.
-        inner.remove_unreferenced_segments();
+        // failed, or superseded by replay) are reclaimed; the rest get their dead bytes back.
+        inner.reconcile_arena_segments();
 
         // Rebuild the secondary indexes from the records unless reusable paged indexes were
         // loaded (TTL bitmap and vector graph are always reconciled).
@@ -1812,10 +1812,31 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         }
     }
 
-    /// Full durable checkpoint (alias of [`Self::flush_all`]).
-    #[inline]
+    /// Full durable checkpoint ([`Self::flush_all`]), followed by
+    /// [`Self::maybe_compact_arenas`] so dead arena space is reclaimed without an operator.
     pub fn checkpoint(&self) -> Result<usize> {
-        self.flush_all()
+        let flushed = self.flush_all()?;
+        self.maybe_compact_arenas()?;
+        Ok(flushed)
+    }
+
+    /// Compacts arena segments once dead space is worth it: at least
+    /// [`AUTO_COMPACT_MIN_DEAD_BYTES`] dead and at least half of all segment bytes.
+    /// Only segments at least half dead are rewritten. Returns the number of segments removed.
+    pub fn maybe_compact_arenas(&self) -> Result<usize> {
+        self.maybe_compact_arenas_at(AUTO_COMPACT_MIN_DEAD_BYTES)
+    }
+
+    /// [`Self::maybe_compact_arenas`] with its own dead-byte floor `min_dead_bytes`.
+    pub fn maybe_compact_arenas_at(&self, min_dead_bytes: usize) -> Result<usize> {
+        let Some(ref arena) = self.inner.arena else {
+            return Ok(0);
+        };
+        let (dead, used) = arena.dead_and_used_bytes();
+        if dead < min_dead_bytes.max(1) || dead.saturating_mul(2) < used {
+            return Ok(0);
+        }
+        self.compact_arenas(0.5)
     }
 
     /// Appends an incremental $O(\Delta)$ delta frame (`STGEDLT2`) of modified `upserted_ids` and
@@ -1974,16 +1995,17 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             }
         }
 
+        // Evacuated frames must be durable, and the checkpoint must stop referencing the old
+        // segments, before those segment files are deleted: a crash in between would otherwise
+        // leave a checkpoint pointing at records that are gone.
+        arena.sync_all()?;
+        self.inner.save_checkpoint_files()?;
         let mut removed_segments = 0usize;
         for seg_id in frag_ids {
             if !still_referenced.contains(&seg_id) && arena.remove_segment(seg_id) {
                 removed_segments += 1;
             }
         }
-
-        // Evacuated frames must be durable before the checkpoint stops referencing old segments.
-        arena.sync_all()?;
-        self.inner.save_checkpoint_files()?;
         Ok(removed_segments)
     }
 
@@ -3217,23 +3239,25 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         Ok(())
     }
 
-    /// Deletes arena segment files that no record references (except the active segment).
-    fn remove_unreferenced_segments(&self) {
+    /// Deletes arena segment files that no record references (except the active segment), and
+    /// recounts each remaining segment's dead bytes from what the index still references.
+    fn reconcile_arena_segments(&self) {
         let Some(ref arena) = self.arena else {
             return;
         };
-        let mut referenced: FastHashSet<u32> = FastHashSet::default();
+        let mut live: FastHashMap<u32, usize> = FastHashMap::default();
         for entry in self.primary.entries_snapshot() {
             if let DiskLocation::Arena(loc) = entry.location {
-                referenced.insert(loc.segment_id);
+                *live.entry(loc.segment_id).or_default() += (loc.len as usize).next_multiple_of(HEADER_SIZE);
             }
         }
         let active = arena.active_segment_id();
         for seg_id in arena.segment_ids() {
-            if seg_id != active && !referenced.contains(&seg_id) {
+            if seg_id != active && !live.contains_key(&seg_id) {
                 arena.remove_segment(seg_id);
             }
         }
+        arena.recount_dead_bytes(&live);
     }
 
     #[inline]
@@ -4118,6 +4142,10 @@ impl<'a, T: ZeroCopyRecord + Indexable> TransactionBatch<'a, T> {
         }
     }
 }
+
+/// Dead arena bytes below which [`StorageEngine::maybe_compact_arenas`] does nothing: rewriting
+/// segments costs I/O, and a little dead space is cheaper to keep than to reclaim.
+pub const AUTO_COMPACT_MIN_DEAD_BYTES: usize = 64 << 20;
 
 const VERSION_FLOOR_MAGIC: u32 = 0x5346_4C52; // "SFLR"
 

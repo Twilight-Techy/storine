@@ -114,7 +114,7 @@ The latest instruction from the user is to do everything that remains, **except*
 - **TASK-148**: done. `exec/stats.rs`, `exec/optimizer.rs`, `tests/optimizer.rs`. Fixed a Raft §8 stale read in single-group mode.
 - **TASK-149**: done. `exec/temp.rs`, `exec/cursor.rs`, `exec/routine.rs`, `exec/notify.rs`, `parser/plpgsql.rs`, `nettypes.rs`, `tests/sql_surface.rs`.
 - **TASK-150**: done. `tools/modal/sweep.py --tools all`; 0 JDBC failures and 177 tool checks with 0 failures.
-- **TASK-151**: reopened 2026-11-08 for memory. The causes were found and fixed: a leader resend flood, a single-group WAL that was never checkpointed, and allocator retention. Range mode now passes the 2-hour soak at under 1.6 GiB. Single group stays bounded but failed its final balance read after healing; the cause is not yet known (`TASKS.md`).
+- **TASK-151**: reopened 2026-11-08 for memory. The causes were found and fixed: a leader resend flood, a single-group WAL that was never checkpointed, and allocator retention. Range mode now passes the 2-hour soak at under 1.6 GiB. Single group passed its final read in a 2026-11-09 rerun but failed the memory check: arena segments were never compacted on their own. That was fixed on 2026-11-10, and a single-group rerun is still to do (`TASKS.md`).
 - **TASK-152**: done. The final audit; findings and fixes are in `TASKS.md`.
 - **Stage 31**: complete apart from `TASK-151` (memory).
 
@@ -200,3 +200,10 @@ Yes:
 - `main` (`TASK-102` on Windows, plus Windows test fixes) was merged in. The only conflict was in `PROGRESS_LOG.md`, and both entries were kept.
 - The workspace run after the merge exposed a rare columnar snapshot race, which dates from `TASK-126`. It is fixed, with a deterministic unit test (`TASKS.md`, `TASK-126`).
 - Modal runs are now named, and their output is kept on the volume `storine-runs` (`--collect <name>`).
+
+### Single-group soak rerun and arena compaction (`TASK-151`) — 2026-11-10
+
+- **`soak19`** (2 h, single group): the final read, balances and linearizability all passed. The memory check failed (peak RSS 1,808 → 4,156 MiB): one node held 3.9 GB of arena segments for about 440,000 live records.
+- **Fixed**: dead bytes are recounted on open, `StorageEngine::checkpoint` compacts automatically, and compaction deletes old segment files only after the checkpoint is saved. There is a regression test.
+- **Verified (locally)**: clippy for the whole workspace with `-D warnings`; `storage-mmap` and `storage-core` (21 test binaries, 174 tests); `storage-server` (12 binaries, 22 tests; the 2 soaks are ignored). No Modal run.
+- **Modal**: soak19 cost $3.07 (2026-11-09 and 2026-11-10). Storine has spent $41.93 on Modal this month, by the billing report at commit time.

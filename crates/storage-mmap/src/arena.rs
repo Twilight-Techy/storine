@@ -435,6 +435,28 @@ impl ArenaSegment {
         w.dead_bytes = w.dead_bytes.saturating_add(aligned);
     }
 
+    /// Sets the dead-byte count from the bytes still referenced (`live_aligned`, summed over
+    /// 64B-aligned frames). The count lives only in memory, so an open recomputes it from the
+    /// index; otherwise space freed before a restart would never be compacted.
+    pub fn recount_dead_bytes(&self, live_aligned: usize) {
+        let mut w = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let used = w.write_head.saturating_sub(HEADER_SIZE);
+        w.dead_bytes = used.saturating_sub(live_aligned);
+    }
+
+    /// Bytes written past the superblock (live and dead).
+    #[inline]
+    pub fn used_bytes(&self) -> usize {
+        self.writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .write_head
+            .saturating_sub(HEADER_SIZE)
+    }
+
     /// Marks an old slot at `(offset, len)` as dead AND pushes its 64B-aligned coordinate into
     /// the segment's size-class free list for immediate in-place reuse (`TASK-052`).
     #[inline]
@@ -719,6 +741,30 @@ impl ArenaManager {
             .flatten()
             .map(|s| s.segment_id)
             .collect()
+    }
+
+    /// Recomputes every segment's dead bytes from `live_aligned` (segment id → bytes of the
+    /// 64B-aligned frames the index still references; a missing id has none).
+    pub fn recount_dead_bytes(&self, live_aligned: &FastHashMap<u32, usize>) {
+        let segs = self
+            .segments
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for seg in segs.iter().flatten() {
+            seg.recount_dead_bytes(live_aligned.get(&seg.segment_id).copied().unwrap_or(0));
+        }
+    }
+
+    /// `(dead, used)` bytes summed over every segment, the active one included: compaction
+    /// rolls it over first, and a small database may never fill more than one.
+    pub fn dead_and_used_bytes(&self) -> (usize, usize) {
+        let segs = self
+            .segments
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        segs.iter()
+            .flatten()
+            .fold((0, 0), |(d, u), s| (d + s.dead_bytes(), u + s.used_bytes()))
     }
 
     /// Returns the id of the segment currently receiving appends.

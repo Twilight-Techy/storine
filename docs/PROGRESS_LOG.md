@@ -831,3 +831,18 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - `--collect <name>` reads a run back.
   - Checked by killing the local client of a running suite and collecting its result afterwards. A seed sweep was collected the same way.
 
+
+## 2026-11-10: single-group soak rerun; arena segments now compacted automatically (`TASK-151`)
+
+- **Soak rerun (`soak19`, 2 h, single group, `--steady`)**:
+  - The final balance read passed, balances were conserved at 600, and every key was linearizable.
+  - It failed the memory check: peak RSS went from 1,808 MiB early to 4,156 MiB in the last window. The growth was mapped segment files. Node 1 held 3.9 GB of arena segments for about 440,000 live records.
+  - The earlier final-read failure did not come back, so its cause is still unknown.
+- **Cause**: arena segments were compacted only on `OP_ADMIN_COMPACT`. Each segment's dead-byte count started at 0 on every open, so space freed before a restart was never counted.
+- **Fixed**:
+  - Opening the engine recounts dead bytes from the index.
+  - `StorageEngine::checkpoint` ends with `maybe_compact_arenas`, which runs at 64 MiB of dead space once half of all segment bytes are dead.
+  - Compaction now deletes old segment files only after the new frames are synced and the checkpoint is saved. Before, a crash could leave a checkpoint pointing at deleted files.
+  - Test `test_dead_arena_space_survives_restart_and_is_compacted_automatically` fails without the fix.
+- **Verified (locally)**: clippy for the whole workspace with `-D warnings`; `storage-mmap` and `storage-core` (21 test binaries, 174 tests); `storage-server` (12 binaries, 22 tests; the 2 soaks are ignored). No Modal run.
+- **Left**: a single-group 2-hour rerun on Modal to close `TASK-151`.
