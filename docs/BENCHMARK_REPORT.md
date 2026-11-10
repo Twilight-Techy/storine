@@ -154,3 +154,63 @@ olap-bench gen-hits <dir> 1000000 && python3 benches/olap/duckdb_bench.py <dir> 
 olap-bench query <dir> <q1|q6|h0..h15> 7    and    python3 benches/olap/duckdb_bench.py <dir> <same> 7
 ```
 
+
+## 7. Today Against the Earliest Benchmarks, and Against LMDB and RocksDB (2026-11-10)
+
+**Setup.**
+- Hardware: one AWS `c7i.xlarge` spot instance (4 vCPU, Intel Xeon 8488C (Sapphire Rapids), 2 cores × 2 threads), Ubuntu 24.04, gp3 EBS.
+- Build: Rust 1.99.1, `release` profile (fat LTO, `target-cpu=native`).
+- x86 was chosen because Storine's SIMD paths (CRC32C, checksums, crypto) are x86-only; on ARM it runs scalar fallbacks.
+- The Windows numbers in sections 1–2 came from another machine. They cannot be compared with these, so every comparison below is on this one machine.
+
+### 7.1 Current code against the first benchmarked commits
+
+`bench-runner` (2,000 records, all in cache) was built from `b9024bf`, the first commit, from `5d6b008`, the commit of section 2's table, and from the current code. The three ran alternately for three rounds; below are medians, as p50 latency and throughput.
+
+| Operation | `b9024bf` | `5d6b008` | now | now against `5d6b008` |
+| :--- | ---: | ---: | ---: | :--- |
+| `with_ref` hot read | 50 ns · 18.0 M/s | 49 ns · 20.0 M/s | 63 ns · 15.8 M/s | **21 % slower** |
+| `get_ref` arena (mmap) read | 66 ns · 14.6 M/s | 64 ns · 14.6 M/s | 67 ns · 12.7 M/s | 13 % slower; p99 about 2× (100 → 200 ns) |
+| `update` (32 hot keys) | 815 ns · 0.97 M/s | 807 ns · 1.07 M/s | 1,122 ns · 0.79 M/s | **26 % slower** |
+| Secondary index query | 1,969 ns | 2,339 ns | 2,290 ns | same (16 % slower than `b9024bf`) |
+| Checksum, 4 KiB | 413 ns | 414 ns | 376 ns | 9 % faster |
+| `RecordView` decode (unchecked) | 1 ns | 1 ns | 2 ns | the bounds checks added in the 2026-10-20 audit |
+| TCP `GET` round trip | 8.5 µs · 115 k/s | 18.6 µs · 52 k/s | 19.1 µs · 51 k/s | same as `5d6b008`; **2.2× slower than `b9024bf`** |
+
+Features added since (encryption, MVCC, cold tier, Raft, safety checks) cost 13–26 % on the hot read and write paths. The TCP round trip doubled between the first commit and `5d6b008`, when the reactor replaced one thread per connection, and has not recovered.
+
+### 7.2 Against LMDB and RocksDB
+
+The harness is `benches/kv-compare` (outside the workspace, so LMDB and RocksDB never enter Storine's dependencies):
+- 1,000,000 records, 16-byte keys and 288-byte values: LMDB and RocksDB store Storine's own encoded frame.
+- Reads fetch the value and read one field, without copying.
+- LMDB (`heed` 0.20.5) opens one read transaction per get.
+- RocksDB 0.22: no compression, a 2 GiB block cache, 10-bit Bloom filters, and compaction after the load.
+- Storine encodes inside `put` and maintains its secondary indexes (tag bitmap, timestamp B+tree); the others store prebuilt bytes and index nothing.
+- Two full runs, shown as run 1 / run 2.
+
+**No fsync** (Storine `AsyncMemoryFirst` can lose the last flush interval in a process crash, as RocksDB without its WAL can; RocksDB with its WAL, and LMDB `NO_SYNC`, survive one):
+
+| ops/s | Storine | RocksDB no WAL | RocksDB WAL | LMDB `NO_SYNC` | Storine is |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| read, 1 thread | **1.20 M / 1.16 M** | 326 k / 310 k | 318 k / 317 k | 766 k / 792 k | **1.5× LMDB, 3.7× RocksDB** |
+| read, 4 threads | **4.17 M / 4.06 M** | 938 k / 899 k | 949 k / 940 k | 2.85 M / 2.96 M | **1.4× LMDB, 4.4× RocksDB** |
+| read p99, 1 thread | 1.3 µs | 6.4 µs | 6.1 µs | 1.8 µs | lowest |
+| fill (random order) | 293 k / 286 k | **544 k / 512 k** | 339 k / 339 k | 176 k / 181 k | 1.6× LMDB; **RocksDB no WAL 1.8× Storine** |
+| overwrite, 1 thread | 261 k / 249 k | **542 k / 508 k** | 355 k / 366 k | 168 k / 177 k | 1.5× LMDB; **RocksDB 1.4–2.1× Storine** |
+| overwrite, 4 threads | 459 k / 436 k | **515 k / 513 k** | 287 k / 291 k | 123 k / 129 k | 1.5× RocksDB WAL, 3.5× LMDB; RocksDB no WAL 1.15× Storine |
+| overwrite p99, 4 threads | 72–75 µs | 23–30 µs | 36–39 µs | 20 µs | **highest** |
+
+**fsync per commit** (Storine `GroupCommit`, RocksDB `sync = true`, LMDB default):
+
+| ops/s | Storine | RocksDB | LMDB |
+| :--- | ---: | ---: | ---: |
+| put, 1 thread | 396 / 373 | 360 / 355 | **477 / 477** |
+| put, 4 threads | 615 / 623 | **801 / 833** | 476 / 476 |
+
+**Where Storine stands.**
+- **Reads:** it is the fastest of the three. It is 1.4–1.5× faster than LMDB and 3.7–4.4× faster than RocksDB, with the lowest p99. The primary index lives in RAM, at 96 bytes per record (section 3); LMDB walks a B+tree in its map.
+- **Writes without fsync:** it beats LMDB by 1.5–3.5×, and RocksDB with its WAL on 4 threads by 1.5×. It loses to RocksDB without a WAL by 1.15–2.1× at the same durability, and to RocksDB with its WAL on one thread by 1.4×, even though that WAL is the stronger guarantee. Its p99 on 4 writing threads is 2–3× RocksDB's.
+- **Durable writes:** it is 20–30 % behind LMDB on one thread, and 25 % behind RocksDB on four.
+
+**So it is not yet faster than or as fast as both everywhere.** It leads on reads and trails on writes.

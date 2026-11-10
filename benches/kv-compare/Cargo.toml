@@ -1,0 +1,31 @@
+# Storine against LMDB and RocksDB on the same key-value workloads.
+#
+# Outside the workspace on purpose: LMDB (`heed`) and RocksDB (`rocksdb`) are external crates,
+# and Storine's own crates and binaries take none (`RULE-MEM-03`). Nothing here is linked into
+# Storine; this is a measuring tool only.
+[package]
+name = "kv-compare"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+storage-core = { path = "../../crates/storage-core" }
+storage-codec = { path = "../../crates/storage-codec" }
+storage-types = { path = "../../crates/storage-types" }
+storage-wal = { path = "../../crates/storage-wal" }
+heed = "=0.20.5"
+rocksdb = { version = "0.22", default-features = false, optional = true }
+
+[features]
+default = ["rocks"]
+rocks = ["dep:rocksdb"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false

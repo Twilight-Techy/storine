@@ -15,7 +15,7 @@ members = [
     "benches",
 ]
 # Client SDKs are standalone projects (the Rust one has its own workspace).
-exclude = ["sdks"]
+exclude = ["sdks", "benches/kv-compare"]
 
 [workspace.package]
 version = "0.1.0"
