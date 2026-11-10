@@ -20,6 +20,7 @@ Usage (from the repository root):
     modal run tools/modal/sweep.py --suite-args "-p storage-server --test process_chaos soak -- --ignored --nocapture" --env STORINE_SOAK_SECS=7200 --steady  # hours: no preemption
     modal run tools/modal/sweep.py --tools all           # BI and GUI tools against the SQL gateway
     modal run tools/modal/sweep.py --sdks all            # all 8 SDK suites against range clusters
+    modal run tools/modal/sweep.py --clients go,java,dotnet,prisma  # driver suites of tests/clients/run_all.sh
     modal run tools/modal/sweep.py --sdks python --plain # against a plain server
 
 Every run has a name (`--name`, default: a timestamp) and keeps its output on the Modal volume
@@ -66,11 +67,14 @@ image = (
 
 # Every SDK's toolchain, for their end-to-end suites.
 sdk_image = (
-    image.apt_install("python3", "nodejs", "npm", "default-jdk-headless", "maven", "php-cli", "libicu-dev", "libssl-dev", "libyaml-dev", "zlib1g-dev", "libffi-dev", "autoconf", "bison", "patch")
+    image.apt_install("python3", "default-jdk-headless", "maven", "php-cli", "libicu-dev", "libssl-dev", "libyaml-dev", "zlib1g-dev", "libffi-dev", "autoconf", "bison", "patch")
     .run_commands(
         # The Ruby SDK needs 3.2+ (Debian packages 3.1).
         "git clone --depth 1 https://github.com/rbenv/ruby-build /tmp/ruby-build && /tmp/ruby-build/bin/ruby-build 3.3.6 /usr/local",
-        "curl -sSfL https://go.dev/dl/go1.23.4.linux-amd64.tar.gz | tar -C /usr/local -xz",
+        "curl -sSfL https://go.dev/dl/go1.27.3.linux-amd64.tar.gz | tar -C /usr/local -xz",
+        # Node 22 from nodejs.org: Debian's Node 18 is past end of life and cannot `require` the
+        # ES modules current drivers (tedious) depend on.
+        "curl -sSfL https://nodejs.org/dist/v22.23.4/node-v22.23.4-linux-x64.tar.gz | tar -C /usr/local --strip-components=1 -xz",
         "curl -sSfL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 8.0 --install-dir /usr/local/dotnet",
     )
     .env({"PATH": "/usr/local/go/bin:/usr/local/dotnet:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "DOTNET_ROOT": "/usr/local/dotnet", "DOTNET_CLI_TELEMETRY_OPTOUT": "1"})
@@ -289,6 +293,38 @@ def run_tools(src: bytes, gateway: bytes, only: str) -> tuple[int, str]:
     return proc.returncode, proc.stdout[-60000:]
 
 
+@app.function(image=sdk_image, cpu=8, memory=16384, timeout=3600, volumes={RUNS: runs})
+def run_clients(src: bytes, gateway: bytes, names: str, run: str) -> tuple[int, str]:
+    """Runs driver suites of `tests/clients/run_all.sh` (`STORINE_CLIENTS=names`) against a
+    fresh gateway; returns (exit code, their output), also kept as `<run>/` on the volume."""
+    unpack(src)
+    with open("/tmp/storine-sql", "wb") as f:
+        f.write(gateway)
+    os.chmod("/tmp/storine-sql", 0o755)
+    clients = "/src/crates/storage-sql/tests/clients"
+    env = {**os.environ, "STORINE_SQL_BIN": "/tmp/storine-sql", "STORINE_CLIENTS": names,
+           "NODE_PATH": f"{clients}/prisma/node_modules:/tmp/nm/node_modules"}
+    if "prisma" in names.split():
+        subprocess.run(f"npm ci --ignore-scripts --silent --prefix {clients}/prisma && npm install --silent --prefix /tmp/nm pg mysql2 tedious", shell=True, check=True)
+    server = subprocess.Popen(["/tmp/storine-sql", "--data", "/tmp/clientsdb", "--pg", "127.0.0.1:55432", "--mysql", "127.0.0.1:53306", "--mssql", "127.0.0.1:51433"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(2)
+    try:
+        proc = subprocess.run(f"bash {clients}/run_all.sh 2>&1", shell=True, env=env, capture_output=True, text=True, timeout=3000)
+        code, out = proc.returncode, proc.stdout[-60000:]
+    except subprocess.TimeoutExpired as e:
+        code, out = 124, f"timed out\n{e.stdout}"
+    finally:
+        server.kill()
+    os.makedirs(f"{RUNS}/{run}", exist_ok=True)
+    with open(f"{RUNS}/{run}/output.log", "w") as f:
+        f.write(out)
+    with open(f"{RUNS}/{run}/result.txt", "w") as f:
+        f.write(out[-4000:] + f"\nclient suites exit code {code}\n")
+    runs.commit()
+    return code, out
+
+
 @app.function(image=sdk_image, cpu=4, memory=8192, timeout=3600, retries=1)
 def run_sdk(src: bytes, server: bytes, lang: str, ranges: bool) -> tuple[str, int, str]:
     """Runs one SDK's conformance and end-to-end suite against `server` (range mode if asked)."""
@@ -325,7 +361,7 @@ def seeded_tests(root: str, name: str) -> tuple[list[str], list[str]]:
 
 
 @app.local_entrypoint()
-def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300, only: str = "", shard: int = 10, suite_args: str = "", env: str = "", sdks: str = "", plain: bool = False, repeat: int = 1, tools: str = "", steady: bool = False, name: str = "", collect: str = ""):
+def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300, only: str = "", shard: int = 10, suite_args: str = "", env: str = "", sdks: str = "", plain: bool = False, repeat: int = 1, tools: str = "", steady: bool = False, name: str = "", collect: str = "", clients: str = ""):
     if collect:
         if code := collect_run(collect):
             raise SystemExit(code)
@@ -337,6 +373,18 @@ def main(tests: str = "txn_simulation,multi_range_simulation", seeds: int = 300,
         code, out = run_tools.remote(src, build_sql.remote(src), "" if tools == "all" else tools.replace(",", " "))
         print(out)
         print(f"tool suites exit code {code}")
+        if code:
+            raise SystemExit(1)
+        return
+    if clients:
+        # Real drivers and ORMs against the gateway (`TASK-115`).
+        src = source_tarball(root, clients=True)
+        run = name or time.strftime("clients-%Y%m%d-%H%M%S")
+        print(f"run {run}: read back with `modal run tools/modal/sweep.py --collect {run}`", flush=True)
+        put_meta(run, {"kind": "suite", "clients": clients, "started": time.time()})
+        code, out = run_clients.remote(src, build_sql.remote(src), clients.replace(",", " "), run)
+        print(out)
+        print(f"client suites exit code {code}")
         if code:
             raise SystemExit(1)
         return

@@ -15,6 +15,7 @@
 #   ELOQUENT_AUTOLOAD  vendor/autoload.php of `composer require illuminate/database:^11`
 #   GEM_HOME/GEM_PATH  with activerecord, pg, trilogy (GEM_PATH also listing the default gems)
 # The PgBouncer suite runs when `pgbouncer` is installed (it starts its own instance).
+#   STORINE_CLIENTS    space-separated suite names to run (e.g. "go java dotnet prisma"); default all
 set -u
 cd "$(dirname "$0")"
 PG=${STORINE_PG_PORT:-55432}
@@ -65,6 +66,7 @@ trap cleanup EXIT
 
 run() {
   local name=$1; shift
+  if [ -n "${STORINE_CLIENTS:-}" ] && [[ " $STORINE_CLIENTS " != *" $name "* ]]; then return 0; fi
   echo "== $name"
   if "$@"; then echo "   passed"; else echo "   FAILED"; failed+=("$name"); fi
 }
