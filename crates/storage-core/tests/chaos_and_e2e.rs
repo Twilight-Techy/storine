@@ -697,8 +697,14 @@ fn test_dead_arena_space_survives_restart_and_is_compacted_automatically() {
     let engine = StorageEngine::<AgentObjectRecord>::open(&dir, cfg()).unwrap();
     // A floor this high leaves the space alone.
     assert_eq!(engine.maybe_compact_arenas_at(usize::MAX).unwrap(), 0);
+    let before_stats = engine.stats();
+    assert!(before_stats.arena_dead_bytes > 0 && before_stats.arena_dead_bytes <= before_stats.arena_used_bytes);
+    assert_eq!(before_stats.arena_used_bytes - before_stats.arena_dead_bytes, engine.arena_live_bytes(), "every byte is live or counted dead after a restart");
     let removed = engine.maybe_compact_arenas_at(1).unwrap();
     assert!(removed >= 1, "dead space from before the restart was not compacted");
+    let st = engine.stats();
+    assert_eq!((st.arena_compactions, st.arena_compacted_segments as usize, st.arena_compaction_errors), (1, removed, 0));
+    assert!(engine.last_compaction_error().is_none());
     let after = disk(&dir);
     assert!(after * 2 < before, "segments still hold {after} bytes of {before}");
     drop(engine);
@@ -711,3 +717,69 @@ fn test_dead_arena_space_survives_restart_and_is_compacted_automatically() {
     drop(engine);
     let _ = fs::remove_dir_all(&dir);
 }
+
+/// A record whose frame cannot be read does not stop compaction (`TASK-151`): before, the first
+/// bad frame aborted every compaction, which still rolled a new segment each time, so a node's
+/// segments and disk grew with every checkpoint. Now the bad record keeps its segment, the error
+/// is counted, and everything else is compacted.
+#[test]
+fn test_compaction_moves_everything_but_an_unreadable_record() {
+    let dir = std::env::temp_dir().join(format!("storage_e2e_compact_bad_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let cfg = || EngineConfig {
+        layout_mode: StorageLayoutMode::AdaptiveArena { arena_threshold_bytes: 4096, segment_capacity: 64 * 1024 },
+        background_flush: false,
+        ..EngineConfig::default()
+    };
+    let id = |i: u32| InlineId::new(&format!("bad_{i:03}")).unwrap();
+    {
+        let engine = StorageEngine::<AgentObjectRecord>::open(&dir, cfg()).unwrap();
+        for round in 1..=6u32 {
+            for i in 0..100u32 {
+                let mut rec = AgentObjectRecord::new(id(i), format!("t{i}"), i64::from(i), i64::from(i * round));
+                // Record 7's last version carries a body no other frame has, to find it on disk.
+                rec.body = if i == 7 && round == 6 { vec![b'Q'; 600] } else { vec![b'x'; round as usize * 96] };
+                engine.put(id(i), &rec).unwrap();
+            }
+        }
+        engine.flush_all().unwrap();
+    }
+    // Flip a byte inside record 7's frame.
+    let seg = fs::read_dir(dir.join("segments")).unwrap().flatten().flat_map(|d| fs::read_dir(d.path()).unwrap().flatten()).map(|e| e.path()).find(|p| {
+        p.extension().is_some_and(|x| x == "dat") && fs::read(p).unwrap().windows(64).any(|w| w.iter().all(|&b| b == b'Q'))
+    }).expect("record 7's frame on disk");
+    let mut bytes = fs::read(&seg).unwrap();
+    let at = bytes.windows(64).position(|w| w.iter().all(|&b| b == b'Q')).unwrap();
+    bytes[at + 10] ^= 0xFF;
+    fs::write(&seg, &bytes).unwrap();
+
+    let engine = StorageEngine::<AgentObjectRecord>::open(&dir, cfg()).unwrap();
+    let used_before = engine.stats().arena_used_bytes;
+    engine.maybe_compact_arenas_at(1).unwrap();
+    let st = engine.stats();
+    assert_eq!(st.arena_compaction_errors, 1, "the unreadable record is reported");
+    assert!(engine.last_compaction_error().is_some());
+    // Everything else moved: what is left is the live data plus record 7's old segment.
+    for i in (0..100u32).filter(|&i| i != 7) {
+        engine.with_ref(id(i), |view| assert_eq!(view.score, i64::from(i * 6))).unwrap();
+    }
+    // Retrying (each checkpoint does) neither adds segments nor stops on the bad record.
+    let segments = engine.stats().arena_segments;
+    for _ in 0..5 {
+        engine.maybe_compact_arenas_at(1).unwrap();
+    }
+    assert_eq!(engine.stats().arena_segments, segments, "a compaction that moves nothing must not leave a new segment");
+    // Once record 7 is written again, nothing holds its old segment and it is reclaimed.
+    let mut rec = AgentObjectRecord::new(id(7), "t7", 7, 42);
+    rec.body = vec![b'y'; 96];
+    engine.put(id(7), &rec).unwrap();
+    engine.flush_all().unwrap();
+    engine.maybe_compact_arenas_at(1).unwrap();
+    let after = engine.stats();
+    assert!(after.arena_compaction_errors >= 1);
+    assert!(after.arena_used_bytes * 2 < used_before, "{} of {used_before} bytes still used", after.arena_used_bytes);
+    engine.with_ref(id(7), |view| assert_eq!(view.score, 42)).unwrap();
+    drop(engine);
+    let _ = fs::remove_dir_all(&dir);
+}
+

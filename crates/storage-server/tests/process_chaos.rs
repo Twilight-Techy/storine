@@ -662,17 +662,19 @@ fn process_usage(pid: u32) -> Option<(u64, u64)> {
     Some((rss, fds))
 }
 
+/// Bytes of every file under `p`.
+fn disk_bytes(p: &Path) -> u64 {
+    std::fs::read_dir(p).into_iter().flatten().flatten().map(|e| match e.metadata() {
+        Ok(m) if m.is_dir() => disk_bytes(&e.path()),
+        Ok(m) => m.len(),
+        Err(_) => 0,
+    }).sum()
+}
+
 /// What a node's memory is, at a window's peak: private memory (heap, stacks), which can leak;
 /// mapped files, page cache the kernel can take back, which follows the data on disk; mapped
 /// files already deleted, which nothing but an unmap frees; and the data's size on disk.
 fn describe_memory(pid: u32, node_dir: &Path) -> String {
-    fn disk_bytes(p: &Path) -> u64 {
-        std::fs::read_dir(p).into_iter().flatten().flatten().map(|e| match e.metadata() {
-            Ok(m) if m.is_dir() => disk_bytes(&e.path()),
-            Ok(m) => m.len(),
-            Err(_) => 0,
-        }).sum()
-    }
     // smaps rather than `RssAnon` / `RssFile`, which gVisor (Modal) does not report.
     let smaps = std::fs::read_to_string(format!("/proc/{pid}/smaps")).unwrap_or_default();
     let (mut anon, mut file, mut deleted, mut maps, mut kind) = (0u64, 0u64, 0u64, 0u64, 0u8);
@@ -1014,6 +1016,14 @@ fn soak(ranges: bool) {
         let counted = *counts.lock().unwrap();
         eprintln!("soak: window {n} at {}s: rss max {} MiB ({mem_peak}), fds max {fds_max} floor {fds_floor} ({peak}); {} keys checked; writes {} reads {} transfers {} event batches {} aggregates {} scans {} failures {}", t0.elapsed().as_secs(), rss_max / 1024, checked.keys, counted[0], counted[1], counted[2], counted[3], counted[4], counted[5], counted[6]);
         windows.push((rss_max, fds_max));
+        if soak_verbose() {
+            // Each node's arena: live, counted dead, and the rest (`TASK-151`).
+            for (i, a) in addrs.iter().enumerate() {
+                let health = StorageClient::connect_timeout(*a, Duration::from_secs(1)).and_then(|mut c| c.health()).unwrap_or_else(|e| format!("health: {e}"));
+                let arena = health.find("\"arena\":").map_or(health.as_str(), |at| health[at..].split('}').next().unwrap_or(""));
+                eprintln!("soak arena at {}s: node {}: {arena}}}, disk {} MiB", soak_secs(), i + 1, disk_bytes(&dir.join(format!("n{}", i + 1))) >> 20);
+            }
+        }
     }
     stop.store(true, Ordering::Relaxed);
     for w in workers {

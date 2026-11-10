@@ -228,6 +228,14 @@ pub struct EngineStats {
     pub mapped_bytes: usize,
     pub mmap_cache_hits: u64,
     pub mmap_cache_misses: u64,
+    /// Arena segment files open, their bytes past the superblock, and the bytes counted dead.
+    pub arena_segments: usize,
+    pub arena_used_bytes: usize,
+    pub arena_dead_bytes: usize,
+    /// Arena compactions run, segments they removed, and compactions that failed.
+    pub arena_compactions: u64,
+    pub arena_compacted_segments: u64,
+    pub arena_compaction_errors: u64,
 }
 
 enum BackingSource {
@@ -400,6 +408,11 @@ struct SharedEngineInner<T: ZeroCopyRecord + Indexable> {
     total_reads: StripedCounter,
     total_writes: StripedCounter,
     coalesced_flushes: CachePadded<AtomicU64>,
+    /// Automatic and manual arena compactions: runs, segments removed, failures, last failure.
+    arena_compactions: AtomicU64,
+    arena_compacted_segments: AtomicU64,
+    arena_compaction_errors: AtomicU64,
+    last_compaction_error: Mutex<Option<String>>,
     /// Ordinals of records carrying a TTL, so queries can exclude expired records cheaply.
     ttl_ordinals: RwLock<CompressedBitmap>,
     /// `<base>/indexes/<collection>_primary.idx`.
@@ -705,6 +718,10 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             total_reads: StripedCounter::new(),
             total_writes: StripedCounter::new(),
             coalesced_flushes: CachePadded::new(AtomicU64::new(0)),
+            arena_compactions: AtomicU64::new(0),
+            arena_compacted_segments: AtomicU64::new(0),
+            arena_compaction_errors: AtomicU64::new(0),
+            last_compaction_error: Mutex::new(None),
             ttl_ordinals: RwLock::new(CompressedBitmap::new()),
             idx_path: idx_path.clone(),
             cold_manifest,
@@ -922,7 +939,10 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         // dead-byte counters do not survive restarts, so every segment is rewritten.
         if report.resealed > 0 {
             if let Some(ref arena) = self.inner.arena {
-                self.evacuate_segments(arena.segment_ids())?;
+                // Every superseded copy must go: a record left behind fails the reseal.
+                if let Some(e) = self.evacuate_segments(arena.segment_ids())?.first_error {
+                    return Err(e);
+                }
             }
         }
         Ok(report)
@@ -1882,105 +1902,153 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             return Ok(0);
         };
         let frag_ids = arena.fragmented_segment_ids(min_fragmentation_ratio);
-        self.evacuate_segments(frag_ids)
+        self.inner.arena_compactions.fetch_add(1, Ordering::Relaxed);
+        let ev = match self.evacuate_segments(frag_ids) {
+            Ok(ev) => ev,
+            Err(e) => {
+                self.note_compaction_error(1, &e);
+                return Err(e);
+            }
+        };
+        self.inner
+            .arena_compacted_segments
+            .fetch_add(ev.removed as u64, Ordering::Relaxed);
+        // Records that could not be moved keep their segments; everything else was compacted.
+        if let Some(ref e) = ev.first_error {
+            self.note_compaction_error(ev.failed, e);
+        }
+        Ok(ev.removed)
     }
 
-    /// Moves every live record out of `frag_ids` into a fresh segment and deletes those segment
-    /// files (also used by [`Self::reseal_all`] to scrub superseded frames).
-    fn evacuate_segments(&self, frag_ids: Vec<u32>) -> Result<usize> {
+    fn note_compaction_error(&self, count: u64, e: &StorageError) {
+        self.inner
+            .arena_compaction_errors
+            .fetch_add(count, Ordering::Relaxed);
+        *self
+            .inner
+            .last_compaction_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(e.to_string());
+    }
+
+    /// Moves record `id` out of the segments in `frag_set` (under its stripe lock): flushes it
+    /// if it is dirty, otherwise copies its frame, upgrading an old schema, to the active segment.
+    fn evacuate_record(
+        &self,
+        arena: &ArenaManager,
+        id: InlineId,
+        frag_set: &FastHashSet<u32>,
+    ) -> Result<()> {
+        let _lock = self.inner.locks.lock_one(id);
+        let Some(cur) = self.inner.primary.get(id) else {
+            return Ok(());
+        };
+        if cur.hot_dirty.is_some() {
+            let _ = self.inner.flush_single_record_to_disk_locked(cur.id, false)?;
+            return Ok(());
+        }
+        let DiskLocation::Arena(cur_loc) = cur.location else {
+            return Ok(());
+        };
+        if !frag_set.contains(&cur_loc.segment_id) {
+            return Ok(());
+        }
+        let region = arena.get_region(cur_loc.segment_id)?;
+        let slice =
+            region.subslice_aligned(cur_loc.offset as usize, cur_loc.len as usize)?;
+        let raw_hdr = RecordHeader::from_slice_verified(slice)?;
+        // Encrypted frames: authenticate (decrypt) before trusting them; migrations
+        // decode the plaintext and re-seal the upgraded frame.
+        let plain = match self.inner.crypto() {
+            Some(ref enc)
+                if RecordCodec::frame_protection(slice) != FrameProtection::Plain =>
+            {
+                Some(RecordCodec::unprotect_frame(&enc.keys, cur.id, slice)?)
+            }
+            Some(ref enc) if !enc.accept_unencrypted => {
+                return Err(StorageError::invalid_archive(
+                    "plaintext record frame found in an encrypted database",
+                ));
+            }
+            _ => None,
+        };
+        let plain_slice = plain.as_ref().map_or(slice, |p| p.as_slice());
+        if raw_hdr.schema_version != T::SCHEMA_VERSION {
+            let (_, upgraded) = self.inner.decode_or_migrate_frame(plain_slice)?;
+            let flags = raw_hdr
+                .flags_typed()
+                .without(RecordFlags::COMPRESSED_LZ4)
+                .without(RecordFlags::ENCRYPTED)
+                .without(RecordFlags::AUTHENTICATED);
+            let reencoded = RecordCodec::encode_aligned(
+                &upgraded,
+                cur.version,
+                current_time_ns(),
+                flags,
+                cur.ttl_expires_at_ns,
+            );
+            let sealed = self.inner.seal_for_disk(cur.id, reencoded.as_slice())?;
+            let to_write = sealed.as_ref().map_or(reencoded.as_slice(), |s| s.as_slice());
+            let new_loc = arena.write_record(to_write, false)?;
+            self.inner.decrypted.remove(cur.id);
+            self.inner.primary.upsert(PrimaryEntry {
+                id: cur.id,
+                ordinal: cur.ordinal,
+                version: cur.version,
+                ttl_expires_at_ns: cur.ttl_expires_at_ns,
+                location: DiskLocation::Arena(new_loc),
+                disk_verified: sealed.is_none(),
+                hot_dirty: None,
+            });
+        } else {
+            let hdr = RecordCodec::validate_frame::<T>(plain_slice)?;
+            // Ciphertext is copied unchanged: it is bound to the record id, not to
+            // its location.
+            let new_loc = arena.write_record(slice, false)?;
+            let verified = plain.is_none()
+                && !hdr.is_tombstone()
+                && !hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4);
+            self.inner.primary.upsert(PrimaryEntry {
+                id: cur.id,
+                ordinal: cur.ordinal,
+                version: cur.version,
+                ttl_expires_at_ns: cur.ttl_expires_at_ns,
+                location: DiskLocation::Arena(new_loc),
+                disk_verified: verified,
+                hot_dirty: None,
+            });
+        }
+        Ok(())
+    }
+
+    /// Moves every live record out of `frag_ids` and deletes the segment files left with none
+    /// (also used by [`Self::reseal_all`] to scrub superseded frames). A record that cannot be
+    /// moved is counted in [`Evacuation::failed`] and keeps its segment.
+    fn evacuate_segments(&self, frag_ids: Vec<u32>) -> Result<Evacuation> {
         let Some(ref arena) = self.inner.arena else {
-            return Ok(0);
+            return Ok(Evacuation::default());
         };
         if frag_ids.is_empty() {
-            return Ok(0);
+            return Ok(Evacuation::default());
         }
         let frag_set: FastHashSet<u32> = frag_ids.iter().copied().collect();
 
-        // Roll active segment so evacuated records are packed into a fresh segment.
-        let _ = arena.roll_active_segment()?;
+        // Evacuated records go to the active segment; roll it first only when it is itself
+        // being evacuated (each roll leaves a partly filled segment behind).
+        if frag_set.contains(&arena.active_segment_id()) {
+            let _ = arena.roll_active_segment()?;
+        }
 
+        // A record that cannot be moved stays where it is (its segment is then kept) and the
+        // rest are still moved: one bad frame must not stop all space from being reclaimed.
+        let (mut failed, mut first_error) = (0u64, None);
         let entries = self.inner.primary.entries_snapshot();
         for snap_entry in entries {
             if let DiskLocation::Arena(loc) = snap_entry.location {
                 if frag_set.contains(&loc.segment_id) {
-                    let _lock = self.inner.locks.lock_one(snap_entry.id);
-                    let Some(cur) = self.inner.primary.get(snap_entry.id) else {
-                        continue;
-                    };
-                    if cur.hot_dirty.is_some() {
-                        let _ = self.inner.flush_single_record_to_disk_locked(cur.id, false)?;
-                        continue;
-                    }
-                    let DiskLocation::Arena(cur_loc) = cur.location else {
-                        continue;
-                    };
-                    if !frag_set.contains(&cur_loc.segment_id) {
-                        continue;
-                    }
-                    let region = arena.get_region(cur_loc.segment_id)?;
-                    let slice =
-                        region.subslice_aligned(cur_loc.offset as usize, cur_loc.len as usize)?;
-                    let raw_hdr = RecordHeader::from_slice_verified(slice)?;
-                    // Encrypted frames: authenticate (decrypt) before trusting them; migrations
-                    // decode the plaintext and re-seal the upgraded frame.
-                    let plain = match self.inner.crypto() {
-                        Some(ref enc)
-                            if RecordCodec::frame_protection(slice) != FrameProtection::Plain =>
-                        {
-                            Some(RecordCodec::unprotect_frame(&enc.keys, cur.id, slice)?)
-                        }
-                        Some(ref enc) if !enc.accept_unencrypted => {
-                            return Err(StorageError::invalid_archive(
-                                "plaintext record frame found in an encrypted database",
-                            ));
-                        }
-                        _ => None,
-                    };
-                    let plain_slice = plain.as_ref().map_or(slice, |p| p.as_slice());
-                    if raw_hdr.schema_version != T::SCHEMA_VERSION {
-                        let (_, upgraded) = self.inner.decode_or_migrate_frame(plain_slice)?;
-                        let flags = raw_hdr
-                            .flags_typed()
-                            .without(RecordFlags::COMPRESSED_LZ4)
-                            .without(RecordFlags::ENCRYPTED)
-                            .without(RecordFlags::AUTHENTICATED);
-                        let reencoded = RecordCodec::encode_aligned(
-                            &upgraded,
-                            cur.version,
-                            current_time_ns(),
-                            flags,
-                            cur.ttl_expires_at_ns,
-                        );
-                        let sealed = self.inner.seal_for_disk(cur.id, reencoded.as_slice())?;
-                        let to_write = sealed.as_ref().map_or(reencoded.as_slice(), |s| s.as_slice());
-                        let new_loc = arena.write_record(to_write, false)?;
-                        self.inner.decrypted.remove(cur.id);
-                        self.inner.primary.upsert(PrimaryEntry {
-                            id: cur.id,
-                            ordinal: cur.ordinal,
-                            version: cur.version,
-                            ttl_expires_at_ns: cur.ttl_expires_at_ns,
-                            location: DiskLocation::Arena(new_loc),
-                            disk_verified: sealed.is_none(),
-                            hot_dirty: None,
-                        });
-                    } else {
-                        let hdr = RecordCodec::validate_frame::<T>(plain_slice)?;
-                        // Ciphertext is copied unchanged: it is bound to the record id, not to
-                        // its location.
-                        let new_loc = arena.write_record(slice, false)?;
-                        let verified = plain.is_none()
-                            && !hdr.is_tombstone()
-                            && !hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4);
-                        self.inner.primary.upsert(PrimaryEntry {
-                            id: cur.id,
-                            ordinal: cur.ordinal,
-                            version: cur.version,
-                            ttl_expires_at_ns: cur.ttl_expires_at_ns,
-                            location: DiskLocation::Arena(new_loc),
-                            disk_verified: verified,
-                            hot_dirty: None,
-                        });
+                    if let Err(e) = self.evacuate_record(arena, snap_entry.id, &frag_set) {
+                        failed += 1;
+                        first_error.get_or_insert(e);
                     }
                 }
             }
@@ -2006,7 +2074,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
                 removed_segments += 1;
             }
         }
-        Ok(removed_segments)
+        Ok(Evacuation { removed: removed_segments, failed, first_error })
     }
 
     /// Creates a consistent point-in-time snapshot of the entire database at `dest_dir` (`TASK-027`, `F-OPS-04`).
@@ -2039,6 +2107,11 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             .as_ref()
             .map_or((0, 0), |w| w.stats());
 
+        let (arena_segments, arena_used_bytes, arena_dead_bytes) =
+            self.inner.arena.as_ref().map_or((0, 0, 0), |a| {
+                let (dead, used) = a.dead_and_used_bytes();
+                (a.segment_count(), used, dead)
+            });
         EngineStats {
             live_records: self.inner.primary.len(),
             hot_dirty_bytes: self.inner.primary.hot_dirty_bytes(),
@@ -2051,7 +2124,37 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             mapped_bytes: pool_stats.mapped_bytes,
             mmap_cache_hits: pool_stats.cache_hits,
             mmap_cache_misses: pool_stats.cache_misses,
+            arena_segments,
+            arena_used_bytes,
+            arena_dead_bytes,
+            arena_compactions: self.inner.arena_compactions.load(Ordering::Relaxed),
+            arena_compacted_segments: self.inner.arena_compacted_segments.load(Ordering::Relaxed),
+            arena_compaction_errors: self.inner.arena_compaction_errors.load(Ordering::Relaxed),
         }
+    }
+
+    /// Bytes of the 64B-aligned arena frames the index references (one pass over the index):
+    /// with [`EngineStats::arena_used_bytes`] and `arena_dead_bytes`, shows space that is
+    /// neither live nor counted dead.
+    pub fn arena_live_bytes(&self) -> usize {
+        self.inner
+            .primary
+            .entries_snapshot()
+            .iter()
+            .map(|e| match e.location {
+                DiskLocation::Arena(loc) => (loc.len as usize).next_multiple_of(HEADER_SIZE),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Why the last arena compaction failed, if one has.
+    pub fn last_compaction_error(&self) -> Option<String> {
+        self.inner
+            .last_compaction_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     #[inline]
@@ -4141,6 +4244,16 @@ impl<'a, T: ZeroCopyRecord + Indexable> TransactionBatch<'a, T> {
             Err(e) => Err(e),
         }
     }
+}
+
+/// What [`StorageEngine::evacuate_segments`] did.
+#[derive(Default)]
+struct Evacuation {
+    /// Segment files deleted.
+    removed: usize,
+    /// Records that could not be moved (their segments were kept).
+    failed: u64,
+    first_error: Option<StorageError>,
 }
 
 /// Dead arena bytes below which [`StorageEngine::maybe_compact_arenas`] does nothing: rewriting

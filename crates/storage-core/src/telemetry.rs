@@ -191,6 +191,32 @@ impl EngineStats {
             self.coalesced_flushes,
             self.hot_dirty_bytes,
         ));
+        out.push_str(&format!(
+            "# HELP storine_arena_segments Arena segment files open\n\
+             # TYPE storine_arena_segments gauge\n\
+             storine_arena_segments {}\n\
+             # HELP storine_arena_used_bytes Arena segment bytes written (live and dead)\n\
+             # TYPE storine_arena_used_bytes gauge\n\
+             storine_arena_used_bytes {}\n\
+             # HELP storine_arena_dead_bytes Arena segment bytes counted dead\n\
+             # TYPE storine_arena_dead_bytes gauge\n\
+             storine_arena_dead_bytes {}\n\
+             # HELP storine_arena_compactions Arena compactions run\n\
+             # TYPE storine_arena_compactions counter\n\
+             storine_arena_compactions {}\n\
+             # HELP storine_arena_compacted_segments Arena segments removed by compaction\n\
+             # TYPE storine_arena_compacted_segments counter\n\
+             storine_arena_compacted_segments {}\n\
+             # HELP storine_arena_compaction_errors Arena compactions that failed\n\
+             # TYPE storine_arena_compaction_errors counter\n\
+             storine_arena_compaction_errors {}\n",
+            self.arena_segments,
+            self.arena_used_bytes,
+            self.arena_dead_bytes,
+            self.arena_compactions,
+            self.arena_compacted_segments,
+            self.arena_compaction_errors,
+        ));
         if let Some(rh) = read_hist {
             out.push_str(&format!(
                 "# TYPE storine_read_latency_ns summary\n\

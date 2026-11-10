@@ -869,3 +869,23 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - The first Modal attempt (`ws157`) failed the new WAL test: the test expected too much. A frame whose LSN was handed out before the cutoff, but written after truncation noted the WAL's length, is kept, as the old rewrite also did. The test now allows such frames.
 - **Modal**: $6.26 today and $46.31 this month for storine, by the billing report at commit time. The latest runs may not be billed yet. Five runs (`ws157`, `chaos157`, `readprobe1`–`4`) were cancelled when a local benchmark ran this machine out of memory and took their clients down; they were rerun.
 
+## 2026-11-11: arena segment growth investigated; compaction survives an unreadable record (`TASK-151`)
+
+- **Question**: why one 30-minute probe (`readprobe7`) grew to 86 segment files and 1,033 MiB, about one segment per 10 s checkpoint.
+- **Visibility added**:
+  - Single-group `OP_HEALTH` reports `"arena"`: segments, used, dead and live bytes, compactions, segments removed, errors and the last error.
+  - Prometheus has the same as `storine_arena_*`.
+  - A verbose soak prints each node's arena every window.
+- **Measured**: dead-byte accounting is exact in every sample of the instrumented probes, and the growth did not reproduce.
+- **Found and fixed**:
+  - One record that could not be moved aborted the whole compaction. The compaction had already rolled over to a new segment, so a persistent failure added a segment at every checkpoint and reclaimed nothing. The checkpoint loop only checks `is_ok()`, so this was invisible.
+  - Now the record keeps its segment, the error is counted and reported, and everything else is compacted.
+  - Compaction rolls over only when the active segment is itself being compacted.
+  - `reseal_all` still fails on any record left behind.
+  - Test `test_compaction_moves_everything_but_an_unreadable_record` fails on the old code (`ChecksumMismatch`) and passes now.
+- **Not confirmed**: that `readprobe7` hit this. It ran before the counters existed.
+- **Verified**:
+  - Locally: clippy `-D warnings` for the workspace; `storage-mmap`, `storage-core` and `storage-server` (33 binaries, 197 tests).
+  - Modal: the workspace suite (`ws159`), and 20 of 40 chaos runs (`chaos159`), all passing. The Modal workspace hit its spend limit after 20; the remaining chaos runs and the last window of two probes did not run.
+- **Modal**: $7.06 today and $47.11 this month for storine ($52.54 for the whole workspace), by the billing report at commit time.
+
