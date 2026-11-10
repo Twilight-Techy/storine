@@ -845,4 +845,4 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - Compaction now deletes old segment files only after the new frames are synced and the checkpoint is saved. Before, a crash could leave a checkpoint pointing at deleted files.
   - Test `test_dead_arena_space_survives_restart_and_is_compacted_automatically` fails without the fix.
 - **Verified (locally)**: clippy for the whole workspace with `-D warnings`; `storage-mmap` and `storage-core` (21 test binaries, 174 tests); `storage-server` (12 binaries, 22 tests; the 2 soaks are ignored). No Modal run.
-- **Left**: a single-group 2-hour rerun on Modal to close `TASK-151`.
+- **Rerun with the fix (`soak20`, `3604c24`) passed**: peak RSS 484–1,270 MiB per window, disk 121–378 MiB, at most 71 descriptors, balances conserved, and every key linearizable. `TASK-151` is closed. It made 7.30 million writes, against 9.22 million in `soak19` (not investigated). Modal: $3.09.
