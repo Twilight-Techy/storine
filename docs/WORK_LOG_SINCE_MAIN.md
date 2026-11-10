@@ -225,5 +225,5 @@ Yes:
 - `OP_HEALTH` and Prometheus report the arena: segments, live/dead/used bytes, compactions and errors. The soak prints them each window.
 - The accounting is exact. The `readprobe7` growth did not reproduce in six probes.
 - **Fixed**: one unmovable record no longer aborts compaction and adds a segment at every checkpoint. There is a regression test. Whether `readprobe7` hit this is not confirmed.
-- **Verified**: local tests (197), the Modal workspace suite, and 20 of 40 chaos runs. The Modal spend limit was reached ($52.54 this month for the workspace, $47.11 for storine).
+- **Verified**: local tests (197), the Modal workspace suite, and 40 of 40 chaos runs (20 on Modal, then 20 on an AWS spot `c7g.xlarge` for about $0.03 once the Modal spend limit was reached: $52.54 this month for the workspace, $47.11 for storine).
 

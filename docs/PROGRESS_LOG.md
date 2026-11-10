@@ -886,6 +886,7 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Not confirmed**: that `readprobe7` hit this. It ran before the counters existed.
 - **Verified**:
   - Locally: clippy `-D warnings` for the workspace; `storage-mmap`, `storage-core` and `storage-server` (33 binaries, 197 tests).
-  - Modal: the workspace suite (`ws159`), and 20 of 40 chaos runs (`chaos159`), all passing. The Modal workspace hit its spend limit after 20; the remaining chaos runs and the last window of two probes did not run.
+  - Modal: the workspace suite (`ws159`), and 20 of 40 chaos runs (`chaos159`), all passing. The Modal workspace hit its spend limit after 20, and the last window of two probes did not run.
+  - AWS: the other 20 chaos runs ran on one spot `c7g.xlarge` (arm64, us-east-1d) and all passed. That makes 40 of 40. The instance ran about 24 minutes, roughly $0.03 at $0.077/h, and was terminated right after.
 - **Modal**: $7.06 today and $47.11 this month for storine ($52.54 for the whole workspace), by the billing report at commit time.
 
