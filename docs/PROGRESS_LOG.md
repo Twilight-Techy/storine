@@ -846,3 +846,26 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - Test `test_dead_arena_space_survives_restart_and_is_compacted_automatically` fails without the fix.
 - **Verified (locally)**: clippy for the whole workspace with `-D warnings`; `storage-mmap` and `storage-core` (21 test binaries, 174 tests); `storage-server` (12 binaries, 22 tests; the 2 soaks are ignored). No Modal run.
 - **Rerun with the fix (`soak20`, `3604c24`) passed**: peak RSS 484–1,270 MiB per window, disk 121–378 MiB, at most 71 descriptors, balances conserved, and every key linearizable. `TASK-151` is closed. It made 7.30 million writes, against 9.22 million in `soak19` (not investigated). Modal: $3.09.
+
+## 2026-11-10 (later): driver updates, compaction cost, checkpoint write stalls (`TASK-115`, `TASK-151`)
+
+- **Dependabot (26 alerts, 8 critical)**: all were in the real-client test harnesses under `crates/storage-sql/tests/clients/`, none in storine's crates.
+  - Updated Go `x/crypto` and `x/net`, pgJDBC, `mssql-jdbc`, `MySqlConnector`, and Prisma's `deepmerge-ts` (an npm override).
+  - The Java suite now pins `maven-compiler-plugin` 3.13.0. Debian's Maven defaulted to 3.1, which compiled for Java 5.
+  - The Modal SDK image moved to Go 1.27.3 and Node 22.23.4.
+  - New `sweep.py --clients` mode, and `STORINE_CLIENTS` in `run_all.sh`.
+  - Verified on Modal: Go, Java, .NET (10/10) and Prisma on all three protocols (`clients5`), plus the TypeScript and Go SDK suites (2/2).
+- **Compaction throughput**: no measurable cost (new bench `compaction-cost`; see `TASKS.md`, `TASK-151`). The `soak19`/`soak20` write gap was variance.
+- **Checkpoint write stalls (fixed)**:
+  - Writes waited 5–9 s behind each checkpoint, because WAL truncation rewrote the whole log under its I/O lock.
+  - Truncation now streams the prefix without the lock, catches up in unlocked rounds, and locks only for the last piece and the swap. The worst write is now 0.10–0.30 s, close to the 0.08–0.14 s seen with no checkpoints.
+  - Truncation no longer holds the whole WAL in memory.
+  - Test `test_truncation_keeps_every_frame_appended_while_it_runs`.
+- **Range mode**: it stores records in their own files, not arena segments, so it has nothing to compact. The doc that said it lacked automatic compaction was wrong.
+- **`soak17` final-read failure**: not reproduced in six runs since (four new 30-minute probes); still unexplained. One probe's arena disk reached 1,033 MiB; not explained.
+- **Verified**:
+  - Locally: clippy `-D warnings` for the workspace; `storage-wal`, `storage-mmap`, `storage-core` and `storage-server` (36 binaries, 204 tests).
+  - Modal: the workspace suite (`ws158`) and 40 of 40 chaos runs (`chaos158`).
+  - The first Modal attempt (`ws157`) failed the new WAL test: the test expected too much. A frame whose LSN was handed out before the cutoff, but written after truncation noted the WAL's length, is kept, as the old rewrite also did. The test now allows such frames.
+- **Modal**: $6.26 today and $46.31 this month for storine, by the billing report at commit time. The latest runs may not be billed yet. Five runs (`ws157`, `chaos157`, `readprobe1`–`4`) were cancelled when a local benchmark ran this machine out of memory and took their clients down; they were rerun.
+

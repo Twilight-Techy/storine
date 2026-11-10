@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -24,6 +24,11 @@ use std::sync::{Condvar, Mutex};
 use storage_codec::{checksum_payload, compress_lz4, decompress_lz4};
 use storage_types::vfs::{OpenOpts, VfsHandle, VfsRef};
 use storage_types::{CachePadded, InlineId, Result, StorageError, Version, MAX_PAYLOAD_SIZE};
+
+/// Unlocked catch-up copies a checkpoint truncation makes before its locked final copy.
+const TRUNCATE_CATCH_UP_ROUNDS: usize = 16;
+/// A tail this short is left for the locked final copy (writers wait while it is copied).
+const TRUNCATE_LOCKED_TAIL_BYTES: u64 = 1 << 20;
 
 const WAL_MAGIC: u32 = 0x5741_4C31; // "WAL1"
 const WAL_FRAME_HEADER_LEN: usize = 72;
@@ -156,6 +161,8 @@ pub struct GroupCommitWal {
     vfs: VfsRef,
     total_batches: CachePadded<AtomicU64>,
     total_frames: CachePadded<AtomicU64>,
+    /// One checkpoint truncation at a time: between its two phases the file only grows.
+    truncating: Mutex<()>,
 }
 
 impl core::fmt::Debug for GroupCommitWal {
@@ -168,11 +175,9 @@ impl core::fmt::Debug for GroupCommitWal {
     }
 }
 
-/// Parsed frame plus its raw byte range inside the file.
+/// A parsed frame.
 struct RawFrame {
     entry: WalEntry,
-    start: usize,
-    end: usize,
 }
 
 /// Parses all valid frames from `raw`, stopping at the first torn/corrupt frame.
@@ -224,12 +229,37 @@ fn parse_frames(raw: &[u8]) -> (Vec<RawFrame>, usize) {
                 version: h.version,
                 frame_bytes,
             },
-            start: pos,
-            end: frame_end,
         });
         pos = frame_end;
     }
     (out, pos)
+}
+
+/// Reads the next valid frame from `r` into `buf` (header and body, as on disk) and returns
+/// its header; `None` at the end or at the first torn or corrupt frame. Unlike
+/// [`parse_frames`], nothing is decompressed and only one frame is held at a time.
+fn read_raw_frame(r: &mut impl Read, buf: &mut Vec<u8>) -> Option<DecodedHeader> {
+    buf.clear();
+    buf.resize(WAL_FRAME_HEADER_LEN, 0);
+    r.read_exact(buf).ok()?;
+    let h = decode_wal_frame_header(buf)?;
+    if h.body_len > MAX_PAYLOAD_SIZE as usize || h.uncompressed_len > MAX_PAYLOAD_SIZE as usize {
+        return None;
+    }
+    buf.resize(WAL_FRAME_HEADER_LEN + h.body_len, 0);
+    r.read_exact(&mut buf[WAL_FRAME_HEADER_LEN..]).ok()?;
+    let sum = compute_wal_checksum(
+        h.lsn,
+        h.txn_id,
+        h.collection_id,
+        h.kind,
+        h.flags,
+        h.record_id,
+        h.version,
+        &buf[WAL_FRAME_HEADER_LEN..],
+        h.uncompressed_len as u32,
+    );
+    (sum == h.checksum).then_some(h)
 }
 
 /// Resolves committed entries from parsed frames (transactions only when their commit barrier
@@ -341,6 +371,7 @@ impl GroupCommitWal {
             vfs,
             total_batches: CachePadded::new(AtomicU64::new(0)),
             total_frames: CachePadded::new(AtomicU64::new(0)),
+            truncating: Mutex::new(()),
         })
     }
 
@@ -706,6 +737,14 @@ impl GroupCommitWal {
     /// `archive_dir` is set, the removed frames are first written to
     /// `archive_dir/wal_<first_lsn>.log` for Point-in-Time Recovery.
     ///
+    /// Writers are held up only for the short second phase. The first phase notes how far the
+    /// WAL reaches and, without blocking appends, reads, filters and syncs that prefix, then
+    /// copies what was appended meanwhile (up to [`TRUNCATE_CATCH_UP_ROUNDS`] times, until less
+    /// than [`TRUNCATE_LOCKED_TAIL_BYTES`] is left). The second copies the rest, unfiltered, and
+    /// swaps the files. Those frames were
+    /// all logged after the caller chose `cutoff_lsn` (or are still to be applied), so the old
+    /// single-phase rewrite kept them too.
+    ///
     /// Callers must guarantee that every committed operation with `lsn <= cutoff_lsn` has been
     /// applied and durably checkpointed into the data files.
     pub fn checkpoint_truncate_before(
@@ -714,59 +753,29 @@ impl GroupCommitWal {
         keep_collection: &dyn Fn(u16) -> bool,
         archive_dir: Option<&Path>,
     ) -> Result<()> {
-        self.with_exclusive_io(|io, poison| {
+        let _one = self.truncating.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Phase 1: how far the WAL reaches now. Only appends can follow until phase 2.
+        let head_len = self.with_exclusive_io(|io, _| {
             io.flush()
                 .map_err(|e| StorageError::io("flush WAL before checkpoint truncate", e))?;
-            let raw = read_file_if_exists(&self.vfs, &self.path)?;
-            let (frames, _) = parse_frames(&raw);
-
-            let mut kept_txns: HashSet<u64> = HashSet::new();
-            let keep_op = |f: &RawFrame| {
-                f.entry.kind != WalOpKind::Checkpoint
-                    && f.entry.kind != WalOpKind::TxnCommit
-                    && (f.entry.lsn > cutoff_lsn || keep_collection(f.entry.collection_id))
-            };
-            for f in &frames {
-                if keep_op(f) && f.entry.txn_id != 0 {
-                    kept_txns.insert(f.entry.txn_id);
-                }
-            }
-            let mut kept = Vec::with_capacity(raw.len().min(1 << 20));
-            let mut removed = Vec::new();
-            let mut first_removed_lsn = None;
-            for f in &frames {
-                let keep = keep_op(f)
-                    || (f.entry.kind == WalOpKind::TxnCommit
-                        && (f.entry.lsn > cutoff_lsn || kept_txns.contains(&f.entry.txn_id)));
-                if keep {
-                    kept.extend_from_slice(&raw[f.start..f.end]);
-                } else if f.entry.kind != WalOpKind::Checkpoint {
-                    first_removed_lsn.get_or_insert(f.entry.lsn);
-                    removed.extend_from_slice(&raw[f.start..f.end]);
-                }
-            }
-
-            if let (Some(dir), Some(first_lsn)) = (archive_dir, first_removed_lsn) {
-                self.vfs
-                    .create_dir_all(dir)
-                    .map_err(|e| StorageError::io("create WAL archive directory", e))?;
-                let seg_path = dir.join(format!("wal_{first_lsn:020}.log"));
-                let mut seg = self
-                    .vfs
-                    .open(&seg_path, OpenOpts::create_truncate())
-                    .map_err(|e| StorageError::io("create archived WAL segment", e))?;
-                seg.write_all(&removed)
-                    .map_err(|e| StorageError::io("write archived WAL segment", e))?;
-                seg.sync_all()
-                    .map_err(|e| StorageError::io("fsync archived WAL segment", e))?;
-                sync_parent_dir(&self.vfs, &seg_path)?;
-            }
-
-            // Head marker preserving the LSN / txn-id high-water marks across restarts.
-            let mut new_contents = Vec::with_capacity(WAL_FRAME_HEADER_LEN + kept.len());
+            io.get_ref()
+                .len()
+                .map_err(|e| StorageError::io("stat WAL before checkpoint truncate", e))
+        })?;
+        let mut next_path = self.path.as_os_str().to_os_string();
+        next_path.push(".next");
+        let next_path = PathBuf::from(next_path);
+        let mut next = self
+            .vfs
+            .open(&next_path, OpenOpts::create_truncate())
+            .map_err(|e| StorageError::io("create replacement WAL file", e))?;
+        {
+            // Head marker preserving the LSN / txn-id high-water marks across restarts (frames
+            // appended later carry higher ones, which recovery takes from the frames themselves).
+            let mut out = BufWriter::with_capacity(1 << 20, &mut next);
             let next_txn = self.next_txn_id.load(Ordering::Acquire);
             Self::write_frame(
-                &mut new_contents,
+                &mut out,
                 self.current_lsn.load(Ordering::Acquire),
                 0,
                 0,
@@ -775,17 +784,82 @@ impl GroupCommitWal {
                 Version(next_txn.saturating_sub(1)),
                 &[],
             )?;
-            new_contents.extend_from_slice(&kept);
-
-            let mut next_path = self.path.as_os_str().to_os_string();
-            next_path.push(".next");
-            let next_path = PathBuf::from(next_path);
-            let mut next = self
+            // One pass over the prefix, one frame in memory at a time. A transaction's commit
+            // barrier follows its operations, so whether it has a kept one is known by then.
+            let src = self
                 .vfs
-                .open(&next_path, OpenOpts::create_truncate())
-                .map_err(|e| StorageError::io("create replacement WAL file", e))?;
-            next.write_all(&new_contents)
+                .open(&self.path, OpenOpts::read())
+                .map_err(|e| StorageError::io("open WAL for checkpoint truncate", e))?;
+            let mut src = BufReader::with_capacity(1 << 20, src.take(head_len));
+            let mut kept_txns: HashSet<u64> = HashSet::new();
+            let mut archive: Option<(PathBuf, BufWriter<VfsHandle>)> = None;
+            let mut frame = Vec::new();
+            while let Some(h) = read_raw_frame(&mut src, &mut frame) {
+                let keep = match h.kind {
+                    WalOpKind::Checkpoint => continue,
+                    WalOpKind::TxnCommit => h.lsn > cutoff_lsn || kept_txns.contains(&h.txn_id),
+                    _ => {
+                        let keep = h.lsn > cutoff_lsn || keep_collection(h.collection_id);
+                        if keep && h.txn_id != 0 {
+                            kept_txns.insert(h.txn_id);
+                        }
+                        keep
+                    }
+                };
+                if keep {
+                    out.write_all(&frame)
+                        .map_err(|e| StorageError::io("write replacement WAL file", e))?;
+                } else if let Some(dir) = archive_dir {
+                    if archive.is_none() {
+                        self.vfs
+                            .create_dir_all(dir)
+                            .map_err(|e| StorageError::io("create WAL archive directory", e))?;
+                        let seg_path = dir.join(format!("wal_{:020}.log", h.lsn));
+                        let seg = self
+                            .vfs
+                            .open(&seg_path, OpenOpts::create_truncate())
+                            .map_err(|e| StorageError::io("create archived WAL segment", e))?;
+                        archive = Some((seg_path, BufWriter::with_capacity(1 << 20, seg)));
+                    }
+                    if let Some((_, seg)) = archive.as_mut() {
+                        seg.write_all(&frame)
+                            .map_err(|e| StorageError::io("write archived WAL segment", e))?;
+                    }
+                }
+            }
+            if let Some((seg_path, seg)) = archive {
+                let seg = seg
+                    .into_inner()
+                    .map_err(|e| StorageError::io("write archived WAL segment", e.into_error()))?;
+                seg.sync_all()
+                    .map_err(|e| StorageError::io("fsync archived WAL segment", e))?;
+                sync_parent_dir(&self.vfs, &seg_path)?;
+            }
+            out.flush()
                 .map_err(|e| StorageError::io("write replacement WAL file", e))?;
+        }
+        next.sync_data()
+            .map_err(|e| StorageError::io("fsync replacement WAL file", e))?;
+
+        // Catch up without the lock while appends keep coming: the file only grows, so its
+        // bytes can be copied as they are (a frame cut in two is finished by the next copy).
+        let mut copied = head_len;
+        for _ in 0..TRUNCATE_CATCH_UP_ROUNDS {
+            let len = self.vfs.open(&self.path, OpenOpts::read()).and_then(|f| f.len()).map_err(|e| StorageError::io("stat WAL tail", e))?;
+            if len.saturating_sub(copied) < TRUNCATE_LOCKED_TAIL_BYTES {
+                break;
+            }
+            copied = self.copy_wal_bytes(copied, Some(len), &mut next)?;
+            // Synced now, so the locked final sync only has the last copy to write out.
+            next.sync_data()
+                .map_err(|e| StorageError::io("fsync replacement WAL file", e))?;
+        }
+
+        // Phase 2: copy the rest, appended since the last copy, and swap the files.
+        self.with_exclusive_io(|io, poison| {
+            io.flush()
+                .map_err(|e| StorageError::io("flush WAL before checkpoint swap", e))?;
+            self.copy_wal_bytes(copied, None, &mut next)?;
             next.sync_all()
                 .map_err(|e| StorageError::io("fsync replacement WAL file", e))?;
 
@@ -798,6 +872,9 @@ impl GroupCommitWal {
             let placeholder = BufWriter::with_capacity(256 * 1024, reopened);
             let old = std::mem::replace(io, placeholder);
             drop(old.into_parts().0);
+            // Freeing the old file's blocks can take a while for a large WAL: keep it open, so
+            // that happens when this handle is dropped, after writers are let go.
+            let old_file = self.vfs.open(&self.path, OpenOpts::read()).ok();
             if let Err(e) = self.vfs.rename(&next_path, &self.path) {
                 // The old handle is closed and the new file is not in place: stop accepting writes.
                 *poison = true;
@@ -810,8 +887,23 @@ impl GroupCommitWal {
             io.get_mut()
                 .seek(SeekFrom::End(0))
                 .map_err(|e| StorageError::io("seek replacement WAL end", e))?;
-            Ok(())
+            Ok(old_file)
         })
+        .map(drop)
+    }
+
+    /// Appends the active WAL's bytes `[from, to)` (to its end when `to` is `None`) to `dst`;
+    /// returns the offset copied up to.
+    fn copy_wal_bytes(&self, from: u64, to: Option<u64>, dst: &mut VfsHandle) -> Result<u64> {
+        let mut src = self
+            .vfs
+            .open(&self.path, OpenOpts::read())
+            .map_err(|e| StorageError::io("open WAL tail", e))?;
+        src.seek(SeekFrom::Start(from))
+            .map_err(|e| StorageError::io("seek WAL tail", e))?;
+        let mut src = src.take(to.map_or(u64::MAX, |t| t.saturating_sub(from)));
+        let n = std::io::copy(&mut src, dst).map_err(|e| StorageError::io("copy WAL tail to replacement", e))?;
+        Ok(from + n)
     }
 
     /// Removes every frame up to the current LSN (all operations are known to be checkpointed).
@@ -1357,6 +1449,51 @@ mod tests {
             entries.windows(2).all(|w| w[0].lsn < w[1].lsn),
             "file order must equal LSN order"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Truncation copies the frames appended while it runs (`TASK-151`): writers keep appending
+    /// through repeated truncations, and afterwards the log holds every frame above the last
+    /// cutoff, in order, and at most one late frame per writer at or below it. Frames of 3 KiB are cut in two by the 256 KiB write buffer, so unlocked
+    /// catch-up copies end mid-frame and the next copy finishes them.
+    #[test]
+    fn test_truncation_keeps_every_frame_appended_while_it_runs() {
+        let dir = temp_dir("storage_wal_truncate_concurrent");
+        let wal_path = dir.join("engine.wal");
+        let wal = Arc::new(GroupCommitWal::open(&wal_path, SyncPolicy::AsyncMemoryFirst).unwrap());
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for t in 0..4u64 {
+            let (w, done) = (Arc::clone(&wal), Arc::clone(&done));
+            handles.push(std::thread::spawn(move || {
+                let id = InlineId::new(&format!("t{t}")).unwrap();
+                let lsns: Vec<u64> = (0..4_000u64)
+                    .map(|v| w.append_single(1, WalOpKind::Upsert, id, Version(v), &[t as u8; 3 * 1024]).unwrap())
+                    .collect();
+                done.fetch_add(1, Ordering::Relaxed);
+                lsns
+            }));
+        }
+        let (mut last_cutoff, mut truncations) = (0, 0);
+        while done.load(Ordering::Relaxed) < 4 {
+            last_cutoff = wal.current_lsn();
+            wal.checkpoint_truncate_before(last_cutoff, &|_| false, None).unwrap();
+            truncations += 1;
+        }
+        assert!(truncations >= 2, "the writers finished before truncations overlapped them");
+        let mut expected: Vec<u64> = handles.into_iter().flat_map(|h| h.join().unwrap()).filter(|&l| l > last_cutoff).collect();
+        expected.sort_unstable();
+        wal.flush_buffered().unwrap();
+        let got: Vec<u64> = GroupCommitWal::recover_committed(&wal_path).unwrap().iter().map(|e| e.lsn).collect();
+        assert!(got.windows(2).all(|w| w[0] < w[1]), "file order must equal LSN order");
+        let missing: Vec<u64> = expected.iter().copied().filter(|l| got.binary_search(l).is_err()).collect();
+        assert!(missing.is_empty(), "frames above the last cutoff were lost: {missing:?}");
+        // A frame whose LSN was handed out before the cutoff but reached the file only after the
+        // truncation noted its length stays (the single-phase rewrite kept those too); nothing
+        // else at or below the cutoff may.
+        let extra: Vec<u64> = got.iter().copied().filter(|l| expected.binary_search(l).is_err()).collect();
+        assert!(extra.iter().all(|&l| l <= last_cutoff) && extra.len() <= 4, "frames the truncation should have removed: {extra:?}");
+        drop(wal);
         let _ = fs::remove_dir_all(&dir);
     }
 }

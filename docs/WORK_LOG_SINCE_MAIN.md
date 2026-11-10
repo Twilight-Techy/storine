@@ -208,3 +208,15 @@ Yes:
 - **Verified (locally)**: clippy for the whole workspace with `-D warnings`; `storage-mmap` and `storage-core` (21 test binaries, 174 tests); `storage-server` (12 binaries, 22 tests; the 2 soaks are ignored). No Modal run.
 - **`soak20`** (the rerun with the fix) passed: peak RSS 484–1,270 MiB per window, disk 121–378 MiB, balances conserved, and every key linearizable. `TASK-151` is done.
 - **Modal**: soak20 cost $3.09 and soak19 cost $3.07 (2026-11-09 and 2026-11-10). Storine has spent $45.02 on Modal this month, by the billing report at commit time.
+
+### Follow-ups: drivers, compaction cost, checkpoint stalls — 2026-11-10
+
+- **Dependabot**: 26 alerts, all in the driver test harnesses. The drivers were updated and the Java build fixed. The Modal image now has Go 1.27.3 and Node 22.23.4, and there is a new `sweep.py --clients` mode. The Go, Java, .NET and Prisma suites pass on Modal (`TASKS.md`, `TASK-115`).
+- **Compaction**: no measurable throughput cost (bench `compaction-cost`).
+- **Checkpoint write stalls, 5–9 s**: fixed. WAL truncation no longer rewrites the log under its lock, and the worst write is now 0.10–0.30 s.
+- **Range mode**: it uses no arena segments; the doc is corrected.
+- **`soak17` read failure**: not reproduced in six runs; still unexplained. One 30-minute probe's arena disk reached 1,033 MiB; not explained.
+- **Verified**: local tests (204) and clippy; Modal workspace suite and 40/40 chaos runs.
+- **Binary size**: set aside by the user ("ignore the binary size for now"). Measured on arm64: `storage-server` 3,461 KiB, `storine-sql` 5,253 KiB and `storage-cli` 1,029 KiB, against the `< 1 MiB` rule.
+- **Modal**: $6.26 today and $46.31 this month for storine, by the billing report at commit time.
+

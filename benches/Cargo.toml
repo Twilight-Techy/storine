@@ -35,3 +35,7 @@ path = "src/bin/olap_bench.rs"
 [[bin]]
 name = "reactor-scale"
 path = "src/bin/reactor_scale.rs"
+
+[[bin]]
+name = "compaction-cost"
+path = "src/bin/compaction_cost.rs"
