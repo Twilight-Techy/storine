@@ -465,6 +465,26 @@ impl BitmapTagIndex {
         guard.entry((field_id, tag)).or_default().insert(ord);
     }
 
+    /// Removes `removed` and adds `added` for one record under a single write lock.
+    pub fn update(&self, ord: RecordOrdinal, removed: &[(u16, InlineId)], added: &[(u16, InlineId)]) {
+        if removed.is_empty() && added.is_empty() {
+            return;
+        }
+        let mut guard = storage_types::write_spinning(&self.map);
+        for &(field_id, tag) in removed {
+            let prune = guard.get_mut(&(field_id, tag)).is_some_and(|bm| {
+                bm.remove(ord);
+                bm.is_empty()
+            });
+            if prune {
+                guard.remove(&(field_id, tag));
+            }
+        }
+        for &(field_id, tag) in added {
+            guard.entry((field_id, tag)).or_default().insert(ord);
+        }
+    }
+
     pub fn remove(&self, field_id: u16, tag: InlineId, ord: RecordOrdinal) {
         let mut guard = self
             .map
@@ -797,5 +817,31 @@ mod tests {
             vec![RecordOrdinal(150), RecordOrdinal(162), RecordOrdinal(174)]
         );
     }
-}
 
+    /// `BitmapTagIndex::update` matches separate removes and inserts.
+    #[test]
+    fn tag_update_matches_separate_calls() {
+        let a = BitmapTagIndex::new();
+        let b = BitmapTagIndex::new();
+        let t = |i: u32| InlineId::new(&format!("t{i}")).unwrap();
+        for ord in 0..40u32 {
+            for idx in [&a, &b] {
+                idx.insert(1, t(ord % 3), RecordOrdinal(ord));
+            }
+        }
+        for ord in 0..40u32 {
+            let o = RecordOrdinal(ord);
+            let removed = [(1u16, t(ord % 3))];
+            let added = [(1u16, t(ord % 3 + 10)), (2u16, t(ord % 2))];
+            a.update(o, &removed, &added);
+            b.remove(1, t(ord % 3), o);
+            for &(f, tag) in &added {
+                b.insert(f, tag, o);
+            }
+        }
+        for (f, tag) in [(1, t(0)), (1, t(10)), (1, t(12)), (2, t(0)), (2, t(1))] {
+            assert_eq!(a.get_bitmap(f, tag).to_vec(), b.get_bitmap(f, tag).to_vec(), "{f} {tag:?}");
+        }
+        assert!(a.get_bitmap(1, t(0)).to_vec().is_empty());
+    }
+}

@@ -404,3 +404,50 @@ Moving entries one by one into a table not yet in cache costs more per entry tha
 - **Durable p99.9 and p99.99:** behind LMDB's 2.9–3.2 ms on four writers and its 3.4–4.4 ms one-writer p99.99. LMDB's four-writer figures come from starving three writers for 4.3 s or more each phase. Storine's worst durable put is 8.3 ms, but at p99.9 it trails. Both tries at moving the WAL preallocation step off the commit path were slower.
 
 **Verified:** the release workspace suite (all pass) and 40 of 40 process chaos runs on the final code. One on-demand `c7i.xlarge` for about 2 h 25 min, about $0.43, terminated.
+
+### 8.4 Network round trip, ARM checksums and indexed records (2026-11-12)
+
+All on an on-demand `c7i.xlarge` except the ARM rows; "before" is the code of section 8.3.
+
+**TCP `GET` round trip** (`bench-runner`, one client, loopback, five runs each):
+
+| | p50 | requests/s |
+| :--- | ---: | ---: |
+| first commit (`b9024bf`, thread per connection, section 7.1) | 8.5 µs | 115 k |
+| before | 19.4–20.2 µs | 49–50 k |
+| block as soon as idle | 19.4–20.0 µs | 49–50 k |
+| **keep polling 50 µs after the last work** | **8.5–8.6 µs** | **112–115 k** |
+
+- **What changed.** A reactor that has just done work now keeps polling its sockets for 50 µs before it sleeps. A request arriving meanwhile is served without waking a sleeping thread. An idle server still sleeps: the spin only follows work.
+- **Cost.** Up to 50 µs of CPU after each burst of work. A server under steady load polls anyway.
+
+**Hot paths against the first commits** (section 7.1's `bench-runner` rows, now):
+
+| | `b9024bf` | `5d6b008` | 7.1 | now |
+| :--- | ---: | ---: | ---: | ---: |
+| `with_ref` hot read | 50 ns | 49 ns | 63 ns | 58 ns |
+| `update` (32 hot keys) | 815 ns | 807 ns | 1,122 ns | 855–870 ns |
+
+Reads are 18 % behind the first commits, and `update` is 6 % behind `5d6b008`. That is what is left of the cost of encryption, MVCC and the safety checks added since.
+
+**ARM checksums.** The record checksum's CRC32C used a lookup table on ARM, a third of a write's CPU time there. It now uses the ARMv8 `crc32c` instructions, which give bit-identical output: the on-disk format is unchanged, and golden values pin it. On the dev machine (Graviton `t4g.large`, 2 vCPU), the one-writer overwrite went from 311 k to 580–615 k per second.
+
+**Indexed records** (`AgentObjectRecord`: timestamp and score in the range index, tags in the bitmap index). A write now applies a record's index changes under one lock acquisition per index, which spins briefly before parking, instead of one acquisition per change. Four rounds, 1,000,000 records:
+
+| overwrite, 4 writers | before | one lock, plain | one lock, spinning (kept) |
+| :--- | ---: | ---: | ---: |
+| ops/s | 548–569 k | 602–621 k | **731–742 k** |
+| p99 | 27–31 µs | 26–31 µs | **11.3–11.9 µs** |
+| p99.9 | **185–196 µs** | 190–313 µs | 282–300 µs |
+| p99.99 | **0.54–0.80 ms** | 0.67–1.73 ms | 2.0–2.2 ms |
+
+- **Kept: spinning.** It is a third faster with a p99 2.5× lower. Its p99.9 and p99.99 are worse: four writers and the flusher share four vCPUs, and spinners take CPU from the lock holder. Its p99.99 is where records without indexes already are (2.1–2.5 ms).
+- **One writer, and records without indexes:** unchanged within noise.
+- **What is left.** The rest of the indexed cost is the ordered index itself: an overwrite moves the record's score in a one-million-entry `BTreeMap`.
+
+**Still open:**
+- The 4-writer overwrite p99.99 (2.1–2.5 ms; RocksDB 0.5–1.3 ms). Traces show the flusher falling behind at 1.3 M writes per second, with writers then growing shared structures.
+- Fill p99.99 (whole-shard rehash).
+- Durable p99.9 and p99.99 against LMDB (section 8.3).
+
+**Verified:** the release workspace suite (all pass) and 40 of 40 process chaos runs on this code. Locally: clippy `-D warnings` across the workspace; new tests for the ARM checksum against the portable one and the golden values, and for batched index updates matching separate ones. One on-demand `c7i.xlarge` for about 1 h 25 min, about $0.25, terminated.

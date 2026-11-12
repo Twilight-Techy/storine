@@ -1391,8 +1391,14 @@ This document defines the strict chronological execution order for building the 
   - **Done (2026-11-12, tail)**: spinning hot locks, capacity kept across staging and flush-queue swaps, appenders write the WAL staging buffer only past 4 MiB. The 4-thread overwrite p99.9 fell from 252–288 µs to 54–103 µs, and the p99 from 14–20 µs to 5–6 µs (section 8.1).
   - **Done (2026-11-12, traced tails)**: chunked WAL staging, a flush queue pre-grown outside its lock, and the harness's `sync` before durable phases. The 4-writer overwrite p99.9 is 25.5–27.5 µs against RocksDB's 54–66 µs (section 8.2). Two `fsync`s in flight was measured slower on gp3/ext4 and is set to one.
   - **Tried and dropped (2026-11-12)**: incrementally growing hash maps for the primary index and the flush queue, and WAL zeros written by a background direct-I/O job. Each cost more than it saved (section 8.3). The flush queue keeps its ids in 512-id chunks.
+  - **Done (2026-11-12, other gaps)** (section 8.4):
+    - The TCP `GET` round trip is back to 8.5 µs from 19.5 µs: reactors poll for 50 µs after work before sleeping.
+    - ARM uses hardware CRC32C (on-disk format unchanged); one-writer overwrites there went from 311 k to 580–615 k per second.
+    - Indexed records apply their index changes under one lock per index: 4-writer overwrite +32 %, p99 2.5× lower, worse p99.9/p99.99.
+    - Hot `with_ref` (58 ns) and `update` (855–870 ns) re-measured: mostly recovered from the earlier regression.
   - **Open**:
     - Fill p99.99: 0.74 ms against RocksDB's 16–20 µs. Whole-shard rehashes; a capacity hint at open is the option left.
     - 4-writer overwrite p99.99: 2.3–3.0 ms against 0.46–1.32 ms; not traced.
     - Durable p99.9 and p99.99 against LMDB: four writers 6.0–6.4 ms against 2.9–3.2 ms (LMDB starves three writers for over 4 s); one writer p99.99 6.3–11.5 ms against 3.4–4.4 ms.
-    - The path for record types with secondary indexes is not measured.
+    - Indexed records: the remaining cost is the ordered index (`BTreeMap`) itself.
+    - Not investigated in this task: `soak17`'s final-read failure and `readprobe7`'s arena growth (from `TASK-151`), the arena's space amplification of up to 2× until compaction, and whether 64 MiB is the right default dirty budget.

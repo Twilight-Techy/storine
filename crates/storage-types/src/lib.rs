@@ -22,7 +22,7 @@ pub use header::{
 };
 pub use id::{InlineId, MAX_INLINE_ID_LEN};
 pub use padded::{CachePadded, StripedCounter};
-pub use spin::lock_spinning;
+pub use spin::{lock_spinning, write_spinning};
 
 /// Dense 32-bit internal ordinal assigned to each record for compact secondary
 /// index storage (B+Tree leaves and compressed Roaring-style bitmaps).

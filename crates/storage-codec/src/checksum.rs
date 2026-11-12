@@ -136,10 +136,54 @@ pub fn crc32c_64(bytes: &[u8]) -> u64 {
             crc32c_portable_dual(bytes)
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(all(target_arch = "aarch64", target_feature = "crc"))]
+    {
+        // SAFETY: this build statically enables `crc`.
+        unsafe { crc32c_arm_dual(bytes) }
+    }
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "crc")))]
+    {
+        if std::arch::is_aarch64_feature_detected!("crc") {
+            // SAFETY: the running CPU supports `crc` (checked above; the result is cached).
+            unsafe { crc32c_arm_dual(bytes) }
+        } else {
+            crc32c_portable_dual(bytes)
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         crc32c_portable_dual(bytes)
     }
+}
+
+/// The ARMv8 `crc32c` instructions compute the same CRC as SSE4.2's `crc32` (no pre/post
+/// inversion), so this matches [`crc32c_sse42_dual`] bit for bit. On ARM the table-driven
+/// path was a third of a write's CPU time.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+#[inline]
+#[allow(clippy::chunks_exact_to_as_chunks)]
+unsafe fn crc32c_arm_dual(bytes: &[u8]) -> u64 {
+    use core::arch::aarch64::{__crc32cb, __crc32cd};
+
+    let mut crc_lo: u32 = 0xFFFF_FFFF;
+    let mut crc_hi: u32 = 0xA5A5_5A5A ^ (bytes.len() as u32);
+
+    let mut chunks = bytes.chunks_exact(16);
+    for chunk in &mut chunks {
+        let w0 = storage_types::wire::read_u64_le(chunk, 0);
+        let w1 = storage_types::wire::read_u64_le(chunk, 8);
+        crc_lo = __crc32cd(crc_lo, w0);
+        crc_hi = __crc32cd(crc_hi, w1);
+        crc_lo = __crc32cd(crc_lo, w1.rotate_left(13));
+    }
+
+    for &b in chunks.remainder() {
+        crc_lo = __crc32cb(crc_lo, b);
+        crc_hi = __crc32cb(crc_hi, b.wrapping_mul(17));
+    }
+
+    (u64::from(!crc_hi) << 32) | u64::from(!crc_lo)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -170,7 +214,10 @@ unsafe fn crc32c_sse42_dual(bytes: &[u8]) -> u64 {
 }
 
 /// Portable equivalent of [`crc32c_sse42_dual`] (identical output on every input).
-#[cfg_attr(all(target_arch = "x86_64", target_feature = "sse4.2"), allow(dead_code))]
+#[cfg_attr(
+    any(all(target_arch = "x86_64", target_feature = "sse4.2"), all(target_arch = "aarch64", target_feature = "crc")),
+    allow(dead_code)
+)]
 #[allow(clippy::chunks_exact_to_as_chunks)]
 fn crc32c_portable_dual(bytes: &[u8]) -> u64 {
     let mut crc_lo: u32 = 0xFFFF_FFFF;
@@ -262,6 +309,15 @@ mod tests {
                 let data = pattern(len);
                 // SAFETY: `sse4.2` support was detected at runtime above.
                 let hw = unsafe { crc32c_sse42_dual(&data) };
+                assert_eq!(hw, crc32c_portable_dual(&data), "len {len}");
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("crc") {
+            for len in 0..300 {
+                let data = pattern(len);
+                // SAFETY: `crc` support was detected at runtime above.
+                let hw = unsafe { crc32c_arm_dual(&data) };
                 assert_eq!(hw, crc32c_portable_dual(&data), "len {len}");
             }
         }

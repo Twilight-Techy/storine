@@ -41,6 +41,21 @@ impl RangeIndex {
         dispatch!(self, i => i.remove(field_id, value, ord))
     }
 
+    /// One record's numeric changes; the memory tier applies them under one lock.
+    pub fn update(&self, ord: RecordOrdinal, removed: &[(u16, i64)], added: &[(u16, i64)]) {
+        match self {
+            Self::Memory(i) => i.update(ord, removed, added),
+            Self::Paged(i) => {
+                for &(f, v) in removed {
+                    i.remove(f, v, ord);
+                }
+                for &(f, v) in added {
+                    i.insert(f, v, ord);
+                }
+            }
+        }
+    }
+
     pub fn range_collect<R: RangeBounds<i64>>(
         &self,
         field_id: u16,
@@ -113,6 +128,21 @@ impl TagIndex {
     #[inline]
     pub fn remove(&self, field_id: u16, tag: InlineId, ord: RecordOrdinal) {
         dispatch!(self, i => i.remove(field_id, tag, ord))
+    }
+
+    /// One record's tag changes; the memory tier applies them under one lock.
+    pub fn update(&self, ord: RecordOrdinal, removed: &[(u16, InlineId)], added: &[(u16, InlineId)]) {
+        match self {
+            Self::Memory(i) => i.update(ord, removed, added),
+            Self::Paged(i) => {
+                for &(f, t) in removed {
+                    i.remove(f, t, ord);
+                }
+                for &(f, t) in added {
+                    i.insert(f, t, ord);
+                }
+            }
+        }
     }
 
     pub fn get_bitmap(&self, field_id: u16, tag: InlineId) -> CompressedBitmap {

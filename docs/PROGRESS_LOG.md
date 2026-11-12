@@ -944,3 +944,17 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - Ahead of LMDB and RocksDB in every throughput and p99 row.
   - Behind in fill p99.99 (RocksDB), 4-writer overwrite p99.99 (RocksDB), and durable p99.9/p99.99 (LMDB, which starves three of four writers for over 4 s).
 - **Verified**: the release workspace suite and 40 of 40 chaos runs on AWS. One on-demand `c7i.xlarge`, about $0.43, terminated.
+
+## 2026-11-12: network round trip, ARM checksums, indexed records (`TASK-153`)
+
+- **TCP `GET`**: 19.5 µs → 8.5 µs (back to the thread-per-connection first commit) and 49 k → 113 k requests per second on one connection. A reactor that just did work keeps polling for 50 µs before sleeping (`REACTOR_SPIN_AFTER_WORK`). Blocking at once changed nothing.
+- **ARM**: CRC32C uses the ARMv8 `crc32c` instructions, bit-identical to the x86 and portable paths, with golden values pinning the format. The table-driven version was a third of a write's CPU time. One-writer overwrite 311 k → 580–615 k per second on a Graviton `t4g.large`.
+- **Indexed records**:
+  - `RangeIndex::update` and `TagIndex::update` apply a record's index changes under one lock acquisition (`storage_types::write_spinning`).
+  - 4-writer overwrite 548–569 k → 731–742 k per second, p99 27–31 → 11.3–11.9 µs.
+  - Worse: p99.9 185–196 → 282–300 µs and p99.99 0.54–0.80 → 2.0–2.2 ms, measured and accepted. A plain lock kept the old tails, with less of the gain.
+- **Re-measured**: `with_ref` 58 ns (50 at the first commit), `update` 855–870 ns (807 at `5d6b008`).
+- **Verified**:
+  - New tests: ARM CRC equals the portable CRC for lengths 0–299 and the golden values; `update_matches_separate_calls`; `tag_update_matches_separate_calls`.
+  - On AWS: the release workspace suite and 40 of 40 chaos runs. One on-demand `c7i.xlarge`, about $0.25, terminated.
+  - A stale-binary mistake (a copied build directory newer than the copied sources) made one run measure old code. It was caught by binary timestamps and rerun.

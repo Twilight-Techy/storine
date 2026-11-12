@@ -8,7 +8,7 @@
 //! [`lock_spinning`] keeps trying for a few microseconds first, which is far longer than these
 //! locks are held, then parks as usual.
 
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{Mutex, MutexGuard, RwLock, RwLockWriteGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 /// How long [`lock_spinning`] spins before it blocks: long against the critical sections it
@@ -27,6 +27,37 @@ pub fn lock_spinning<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
         Err(TryLockError::WouldBlock) => {}
     }
     lock_spinning_slow(m)
+}
+
+/// [`lock_spinning`] for the write side of an `RwLock`.
+#[inline]
+pub fn write_spinning<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    match l.try_write() {
+        Ok(g) => return g,
+        Err(TryLockError::Poisoned(p)) => return p.into_inner(),
+        Err(TryLockError::WouldBlock) => {}
+    }
+    write_spinning_slow(l)
+}
+
+#[cold]
+fn write_spinning_slow<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    let start = Instant::now();
+    let mut pause = 1u32;
+    loop {
+        for _ in 0..pause {
+            std::hint::spin_loop();
+        }
+        pause = (pause * 2).min(64);
+        match l.try_write() {
+            Ok(g) => return g,
+            Err(TryLockError::Poisoned(p)) => return p.into_inner(),
+            Err(TryLockError::WouldBlock) => {}
+        }
+        if start.elapsed() >= SPIN_BUDGET {
+            return l.write().unwrap_or_else(|p| p.into_inner());
+        }
+    }
 }
 
 #[cold]

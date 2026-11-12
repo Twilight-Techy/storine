@@ -251,3 +251,8 @@ Yes:
 - Incrementally growing hash maps and background WAL preallocation each cost more than they saved; dropped. The flush queue now stores ids in chunks.
 - Still behind: fill and 4-writer overwrite p99.99 (RocksDB), and durable p99.9/p99.99 (LMDB).
 - **Verified**: workspace suite and 40 of 40 chaos runs on AWS (about $0.43).
+
+### Network, ARM, indexed records (`TASK-153`) — 2026-11-12
+
+- TCP `GET` 19.5 → 8.5 µs (reactor polls 50 µs after work); ARM hardware CRC32C (writes about 1.9× there); indexed index updates under one spinning lock (+32 % throughput on 4 writers, worse p99.9/p99.99).
+- **Verified**: workspace suite and 40 of 40 chaos runs on AWS (about $0.25).

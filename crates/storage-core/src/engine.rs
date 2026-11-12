@@ -3285,18 +3285,17 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
     ) {
         let delta = IndexDelta::diff(old_snap, new_snap);
         if !delta.is_empty() {
-            for &(field_id, val) in &delta.removed_numerics[..delta.removed_numerics_len] {
-                self.range_index.remove(field_id, val, ordinal);
-            }
-            for &(field_id, val) in &delta.added_numerics[..delta.added_numerics_len] {
-                self.range_index.insert(field_id, val, ordinal);
-            }
-            for &(field_id, tag) in &delta.removed_tags[..delta.removed_tags_len] {
-                self.tag_index.remove(field_id, tag, ordinal);
-            }
-            for &(field_id, tag) in &delta.added_tags[..delta.added_tags_len] {
-                self.tag_index.insert(field_id, tag, ordinal);
-            }
+            // One lock acquisition per index for the whole record, not one per change.
+            self.range_index.update(
+                ordinal,
+                &delta.removed_numerics[..delta.removed_numerics_len],
+                &delta.added_numerics[..delta.added_numerics_len],
+            );
+            self.tag_index.update(
+                ordinal,
+                &delta.removed_tags[..delta.removed_tags_len],
+                &delta.added_tags[..delta.added_tags_len],
+            );
         }
     }
 

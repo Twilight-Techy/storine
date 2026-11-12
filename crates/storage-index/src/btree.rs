@@ -164,6 +164,35 @@ impl NumericRangeIndex {
             .insert(ord);
     }
 
+    /// Removes `removed` and adds `added` for one record under a single write lock: an update
+    /// that changes a value costs one acquisition instead of one per change.
+    pub fn update(&self, ord: RecordOrdinal, removed: &[(u16, i64)], added: &[(u16, i64)]) {
+        if removed.is_empty() && added.is_empty() {
+            return;
+        }
+        let mut guard = storage_types::write_spinning(&self.trees);
+        for &(field_id, value) in removed {
+            Self::remove_locked(&mut guard, field_id, value, ord);
+        }
+        for &(field_id, value) in added {
+            guard.entry(field_id).or_default().entry(value).or_default().insert(ord);
+        }
+    }
+
+    fn remove_locked(trees: &mut FastHashMap<u16, BTreeMap<i64, LeafPostingList>>, field_id: u16, value: i64, ord: RecordOrdinal) {
+        if let Some(tree) = trees.get_mut(&field_id) {
+            let empty_leaf = if let Some(leaf) = tree.get_mut(&value) {
+                leaf.remove(ord);
+                leaf.is_empty()
+            } else {
+                false
+            };
+            if empty_leaf {
+                tree.remove(&value);
+            }
+        }
+    }
+
     pub fn remove(&self, field_id: u16, value: i64, ord: RecordOrdinal) {
         let mut guard = self
             .trees
@@ -595,5 +624,32 @@ mod tests {
         assert_eq!(bm.to_vec(), vec![RecordOrdinal(2), RecordOrdinal(3), RecordOrdinal(4)]);
         assert!(sortable_u64_to_i64(0) < sortable_u64_to_i64(u64::MAX));
     }
-}
 
+    /// `update` leaves the same index as the separate removes and inserts, including pruning a
+    /// value whose last ordinal moves away.
+    #[test]
+    fn update_matches_separate_calls() {
+        let a = NumericRangeIndex::new();
+        let b = NumericRangeIndex::new();
+        for ord in 0..50u32 {
+            for idx in [&a, &b] {
+                idx.insert(1, i64::from(ord % 7), RecordOrdinal(ord));
+                idx.insert(2, i64::from(ord), RecordOrdinal(ord));
+            }
+        }
+        for ord in 0..50u32 {
+            let o = RecordOrdinal(ord);
+            let removed = [(1u16, i64::from(ord % 7)), (2u16, i64::from(ord))];
+            let added = [(1u16, i64::from(ord % 7) + 100), (2u16, -i64::from(ord))];
+            a.update(o, &removed, &added);
+            for &(f, v) in &removed {
+                b.remove(f, v, o);
+            }
+            for &(f, v) in &added {
+                b.insert(f, v, o);
+            }
+        }
+        assert_eq!(a.snapshot_all(), b.snapshot_all());
+        assert!(a.range_collect(1, 0..7, None).is_empty(), "moved values must be pruned");
+    }
+}
