@@ -332,39 +332,86 @@ impl<T: ZeroCopyRecord> Deref for RecordRef<T> {
 }
 
 /// Deduplicated dirty-record queue for Write Coalescing (`TASK-015`, `F-CONC-04`).
+///
+/// Writers add to it under one lock at up to millions of ids a second, and when the flusher
+/// falls behind it grows to hundreds of thousands. The ids sit in chunks of [`FLUSH_BATCH`]
+/// (each one flush batch), so the list grows without copying what it holds; a `VecDeque`
+/// doubled and copied whole under the lock. The deduplicating set is a plain `HashSet` that
+/// keeps its capacity between takes: an incrementally growing map (tried 2026-11-12) cost
+/// more on every insert than its rehashes saved.
 #[derive(Default)]
 struct CoalescingQueue {
-    order: VecDeque<InlineId>,
+    /// Ids in arrival order; every chunk but the last is full.
+    chunks: VecDeque<Vec<InlineId>>,
+    len: usize,
     in_queue: FastHashSet<InlineId>,
+    /// Emptied chunks kept for reuse (already resident, so no page faults under the lock).
+    free: Vec<Vec<InlineId>>,
 }
 
 impl CoalescingQueue {
     #[inline]
     fn enqueue(&mut self, id: InlineId) -> bool {
-        if self.in_queue.insert(id) {
-            self.order.push_back(id);
-            true
-        } else {
-            false
+        if !self.in_queue.insert(id) {
+            return false;
         }
+        if self.chunks.back().is_none_or(|c| c.len() == FLUSH_BATCH) {
+            let chunk = self.free.pop().unwrap_or_else(|| Vec::with_capacity(FLUSH_BATCH));
+            self.chunks.push_back(chunk);
+        }
+        if let Some(c) = self.chunks.back_mut() {
+            c.push(id);
+        }
+        self.len += 1;
+        true
     }
 
     #[inline]
     fn drain_batch(&mut self, max_items: usize) -> Vec<InlineId> {
-        let count = self.order.len().min(max_items);
-        let mut batch = Vec::with_capacity(count);
-        for _ in 0..count {
-            if let Some(id) = self.order.pop_front() {
+        let mut batch = Vec::with_capacity(self.len.min(max_items));
+        while batch.len() < max_items {
+            let Some(front) = self.chunks.front_mut() else { break };
+            let take = (max_items - batch.len()).min(front.len());
+            for id in front.drain(..take) {
                 self.in_queue.remove(&id);
                 batch.push(id);
             }
+            if front.is_empty() {
+                if let Some(c) = self.chunks.pop_front() {
+                    self.recycle(c);
+                }
+            }
         }
+        self.len -= batch.len();
         batch
     }
 
     #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
     fn is_empty(&self) -> bool {
-        self.order.is_empty()
+        self.len == 0
+    }
+
+    /// Empties the queue, keeping its chunks and set capacity for reuse; at most `max_ids` of
+    /// chunk capacity is kept.
+    fn clear_for_reuse(&mut self, max_ids: usize) {
+        while let Some(c) = self.chunks.pop_front() {
+            self.recycle(c);
+        }
+        self.free.truncate(max_ids / FLUSH_BATCH);
+        self.len = 0;
+        self.in_queue.clear();
+    }
+
+    fn recycle(&mut self, mut chunk: Vec<InlineId>) {
+        if chunk.capacity() == FLUSH_BATCH {
+            chunk.clear();
+            self.free.push(chunk);
+        }
     }
 }
 
@@ -3097,7 +3144,6 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         Ok(())
     }
 
-    /// Adds `id` to the coalescing flush queue and wakes the background flusher when useful.
     /// Ids the flusher keeps room for in its spare queue: one per 256 bytes of the hot-dirty
     /// budget (about 262,000, some 13 MB, for the default 64 MiB), which no frame is smaller
     /// than in practice. Only a load that fills the budget uses it.
@@ -3105,6 +3151,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         (self.config.max_hot_dirty_bytes / 256).max(4096)
     }
 
+    /// Adds `id` to the coalescing flush queue and wakes the background flusher when useful.
     fn enqueue_flush(&self, id: InlineId) {
         let mut q = storage_types::lock_spinning(&self.flush_queue);
         let was_empty = q.is_empty();
@@ -3112,7 +3159,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             // `id` was already in the flush queue! This update coalesced in memory (`F-CONC-04`)!
             self.coalesced_flushes.fetch_add(1, Ordering::Relaxed);
         }
-        if self.config.background_flush && (was_empty || q.order.len() == 256) {
+        if self.config.background_flush && (was_empty || q.len() == 256) {
             self.flush_cv.notify_one();
         }
     }
@@ -3622,7 +3669,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                     break;
                 }
                 // Coalesce rapid updates over `interval` unless batch threshold (`256`) is already reached
-                if q.order.len() < 256 && !self.shutdown.load(Ordering::Relaxed) {
+                if q.len() < 256 && !self.shutdown.load(Ordering::Relaxed) {
                     let (q2, _) = self
                         .flush_cv
                         .wait_timeout(q, interval)
@@ -3634,28 +3681,25 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                 // anew; a flush that finds a record clean skips it.
                 std::mem::replace(&mut *q, std::mem::take(&mut spare))
             };
-            let ids = queued.order.make_contiguous();
-            for (n, batch) in ids.chunks(FLUSH_BATCH).enumerate() {
+            let mut failed_at = None;
+            for (n, batch) in queued.chunks.iter().enumerate() {
                 if !self.flush_ids(batch, interval) {
-                    for &id in ids.iter().skip((n + 1) * FLUSH_BATCH) {
-                        self.enqueue_flush(id);
-                    }
+                    failed_at = Some(n);
                     break;
                 }
             }
-            // Keep room for half again what was just taken, grown here rather than under the
-            // queue lock: a writer that outgrows the queue rehashes it while every other
-            // writer waits (milliseconds once the flusher falls behind).
-            let taken = queued.order.len();
-            let limit = self.spare_flush_queue_ids();
-            if queued.order.capacity() <= 2 * limit {
-                queued.order.clear();
-                queued.in_queue.clear();
-                let want = (taken + taken / 2).min(limit);
-                queued.order.reserve(want);
-                queued.in_queue.reserve(want);
-                spare = queued;
+            if let Some(n) = failed_at {
+                // `flush_ids` re-queued its own batch; the batches after it go back too.
+                for batch in queued.chunks.iter().skip(n + 1) {
+                    for &id in batch {
+                        self.enqueue_flush(id);
+                    }
+                }
             }
+            // Kept for the next take: its chunks and set stay allocated and resident, so
+            // writers refilling it touch no fresh memory.
+            queued.clear_for_reuse(self.spare_flush_queue_ids());
+            spare = queued;
         }
     }
 
@@ -4480,4 +4524,42 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<usize> {
         }
     }
     Ok(files_copied)
+}
+
+#[cfg(test)]
+mod coalescing_queue_tests {
+    use super::{CoalescingQueue, FLUSH_BATCH};
+    use storage_types::InlineId;
+
+    fn id(i: usize) -> InlineId {
+        InlineId::new(&format!("r{i}")).unwrap()
+    }
+
+    /// Ids come out once each, in arrival order, across chunk boundaries and partial drains,
+    /// and a cleared queue is reusable with its chunks kept.
+    #[test]
+    fn dedupes_keeps_order_and_reuses_chunks() {
+        let mut q = CoalescingQueue::default();
+        for round in 0..2 {
+            let n = 3 * FLUSH_BATCH + 17;
+            for i in 0..n {
+                assert!(q.enqueue(id(i)), "round {round}: {i} is new");
+                if i % 3 == 0 {
+                    assert!(!q.enqueue(id(i)), "round {round}: {i} queued twice");
+                }
+            }
+            assert_eq!(q.len(), n);
+            let mut out = Vec::new();
+            for size in [1, 700, 256, 3000] {
+                out.extend(q.drain_batch(size));
+            }
+            assert!(q.is_empty());
+            assert_eq!(out, (0..n).map(id).collect::<Vec<_>>(), "round {round}: order");
+            // Drained ids can be queued again.
+            assert!(q.enqueue(id(5)));
+            q.clear_for_reuse(10 * FLUSH_BATCH);
+            assert!(q.is_empty());
+            assert!(!q.free.is_empty(), "chunks are kept for reuse");
+        }
+    }
 }

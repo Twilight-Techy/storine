@@ -366,3 +366,41 @@ The "now" durable rows were measured with two `fsync`s in flight. The committed 
 - **4-writer overwrite p99.99:** 2.5 ms against RocksDB's 0.7 ms.
 
 **Verified on the same instance:** the release workspace suite (all pass) and 40 of 40 process chaos runs, with two `fsync`s in flight, the stricter case. Locally with one in flight: the WAL suite and clippy. Two on-demand `c7i.xlarge` sessions, about 2 h 40 min together, cost about $0.47 and were terminated.
+
+### 8.3 Three experiments that did not pay (2026-11-12)
+
+Each was measured on the same instance against the code of section 8.2. All three runs had the change and the variants interleaved, four rounds each.
+
+| Tried | Gain | Cost | Kept |
+| :--- | :--- | :--- | :--- |
+| Primary-index shards that grow 8 entries per write instead of rehashing at once | fill p99.99 730 → 153 µs | fill 13 % slower, fill p99 2.4 → 5.5 µs, 1-writer overwrite p99.99 12 → 130 µs | no |
+| The same map for the flush queue's dedup set | none | 4-writer overwrite p99.9 30 → 54–89 µs | no |
+| WAL zeros written ahead by a background job with direct I/O and its own `fdatasync` | none | 4-writer durable puts 16 % fewer, p99.9 6.2 → 11 ms | no |
+| Flush queue ids in chunks of 512 (no `VecDeque` doubling under the lock) | none measurable (4-writer overwrite p99.9 32–60 µs against 32–34 µs) | none measurable | yes |
+
+Moving entries one by one into a table not yet in cache costs more per entry than hashbrown's bulk rehash. On gp3, background zero-filling competes with every commit for the same disk and journal.
+
+**Three rounds, final code** (`c7i.xlarge`, 8,000 durable puts per thread):
+
+| | Storine | RocksDB no WAL | RocksDB WAL | LMDB |
+| :--- | ---: | ---: | ---: | ---: |
+| fill, ops/s | **651–682 k** | 462–478 k | 311–321 k | 161–164 k |
+| fill p99.9 / p99.99 | 10.5–14.6 µs / 742–754 µs | 12.9–13.2 µs / **16.4–19.9 µs** | 14.7–15.0 µs / 24 µs | 19.6–19.9 µs / 30–33 µs |
+| read, 1 / 4 threads | **1.03–1.09 M / 3.83–3.87 M** | 286–295 k / 823–853 k | 287–295 k / 849–865 k | 722–742 k / 2.69–2.78 M |
+| overwrite, 1 thread | **685–722 k** | 442–494 k | 309–322 k | 157–163 k |
+| overwrite p99.99, 1 thread | **11.7–16.3 µs** | 17.0–23.6 µs | 24.7–32.3 µs | 22.0–22.7 µs |
+| overwrite, 4 threads | **1.17–1.21 M** | 440–471 k | 254–275 k | 116–119 k |
+| overwrite p99 / p99.9, 4 threads | **5.9–6.4 µs / 32–60 µs** | 20–34 µs / 163–212 µs | 38–43 µs / 63–70 µs | 21–22 µs / 7.9–8.5 ms |
+| overwrite p99.99, 4 threads | 2.3–3.0 ms | 0.75–1.32 ms | **0.46–0.96 ms** | 29–32 ms |
+| durable put, 1 thread | **1,091–1,093** | 303–310 | | 477–480 |
+| durable p99.9 / p99.99, 1 thread | 1.45–2.92 ms / 6.3–11.5 ms | 4.3–5.0 ms / 5.6–9.0 ms | | **2.73–2.85 ms / 3.4–4.4 ms** |
+| durable put, 4 threads | **2,691–2,789** | 801–826 | | 468–469 |
+| durable p99 / p99.9, 4 threads | 2.42–2.45 ms / 6.0–6.4 ms | 8.0–8.2 ms / 8.4–8.9 ms | | 2.44–2.51 ms / **2.9–3.2 ms** |
+| durable p99.99 / max, 4 threads | **7.4–7.6 ms / 7.5–8.3 ms** | 9.2–12.3 ms / 9.6–16.5 ms | | 4.3 s or more |
+
+**Where Storine stands.** It leads every throughput row (1.4–5.8×) and every p99 row; the 4-writer durable p99 is level with LMDB. Not won:
+- **Fill p99.99:** 0.74 ms against RocksDB's 16–20 µs. A shard's hash table rehashes whole as it grows, and a million-record load does that about 380 times over 16 µs (p99.99 is the 100 slowest). Spreading the rehash cost more than it saved (above). What remains is sizing the index up front from a capacity the caller gives, as LMDB's map size is given.
+- **4-writer overwrite p99.99:** 2.3–3.0 ms against 0.46–1.32 ms. Not traced to a cause yet.
+- **Durable p99.9 and p99.99:** behind LMDB's 2.9–3.2 ms on four writers and its 3.4–4.4 ms one-writer p99.99. LMDB's four-writer figures come from starving three writers for 4.3 s or more each phase. Storine's worst durable put is 8.3 ms, but at p99.9 it trails. Both tries at moving the WAL preallocation step off the commit path were slower.
+
+**Verified:** the release workspace suite (all pass) and 40 of 40 process chaos runs on the final code. One on-demand `c7i.xlarge` for about 2 h 25 min, about $0.43, terminated.

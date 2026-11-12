@@ -932,3 +932,15 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Measured**: the 4-writer overwrite p99.9 is 25.5–27.5 µs, against 51–113 µs before and RocksDB's 54–66 µs. LMDB's 4-writer durable p99.99 is 4.3 s or more: its unfair lock starves three writers.
 - **Open**: 4-writer durable p99.9 against LMDB; fill and 4-writer overwrite p99.99 against RocksDB.
 - **Verified**: new tests `test_staged_log_seals_chunks_keeps_order_and_drops_failed_writes` and `power_loss_keeps_every_frame_acknowledged_by_concurrent_writers`. On AWS: the release workspace suite and 40 of 40 chaos runs (with two `fsync`s in flight). Locally: the WAL suite and clippy with one. AWS: about $0.47 (two on-demand `c7i.xlarge` sessions, terminated).
+
+## 2026-11-12: three experiments dropped (`TASK-153`)
+
+- **Tried, measured, dropped** (`BENCHMARK_REPORT.md` section 8.3):
+  - Primary-index shards growing 8 entries per write: fill p99.99 730 → 153 µs, but fill 13 % slower and 1-writer overwrite p99.99 12 → 130 µs.
+  - The same map for the flush queue's dedup set: 4-writer overwrite p99.9 worse.
+  - Background direct-I/O WAL preallocation: 4-writer durable puts 16 % fewer, p99.9 6.2 → 11 ms.
+- **Kept**: flush queue ids in 512-id chunks, measured neutral, with a test (`dedupes_keeps_order_and_reuses_chunks`). The comments at the queue and at `preallocate_after` record why the alternatives were dropped.
+- **Final standing**:
+  - Ahead of LMDB and RocksDB in every throughput and p99 row.
+  - Behind in fill p99.99 (RocksDB), 4-writer overwrite p99.99 (RocksDB), and durable p99.9/p99.99 (LMDB, which starves three of four writers for over 4 s).
+- **Verified**: the release workspace suite and 40 of 40 chaos runs on AWS. One on-demand `c7i.xlarge`, about $0.43, terminated.

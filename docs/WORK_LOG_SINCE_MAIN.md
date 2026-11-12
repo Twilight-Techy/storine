@@ -245,3 +245,9 @@ Yes:
 - Chunked WAL staging, a pre-grown flush queue, group-commit `fsync` outside the I/O lock with ordered acknowledgement, a simulated-disk sync fix, and harness `sync`/p99.99/max.
 - 4-writer overwrite p99.9 at 25.5–27.5 µs, ahead of RocksDB. Still open: durable 4-writer p99.9 (WAL preallocation), and the fill and overwrite p99.99.
 - **Verified**: workspace suite and 40 of 40 chaos runs on AWS (about $0.47).
+
+### Experiments dropped (`TASK-153`) — 2026-11-12
+
+- Incrementally growing hash maps and background WAL preallocation each cost more than they saved; dropped. The flush queue now stores ids in chunks.
+- Still behind: fill and 4-writer overwrite p99.99 (RocksDB), and durable p99.9/p99.99 (LMDB).
+- **Verified**: workspace suite and 40 of 40 chaos runs on AWS (about $0.43).

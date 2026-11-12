@@ -1390,4 +1390,9 @@ This document defines the strict chronological execution order for building the 
   - **Done (2026-11-12)**: pooled frames, batched arena flushes, a staging buffer for the memory-first WAL, adaptive group-commit linger, WAL preallocation, one lookup per `put`. Storine now leads every throughput row and every p99 row (`BENCHMARK_REPORT.md` section 8).
   - **Done (2026-11-12, tail)**: spinning hot locks, capacity kept across staging and flush-queue swaps, appenders write the WAL staging buffer only past 4 MiB. The 4-thread overwrite p99.9 fell from 252–288 µs to 54–103 µs, and the p99 from 14–20 µs to 5–6 µs (section 8.1).
   - **Done (2026-11-12, traced tails)**: chunked WAL staging, a flush queue pre-grown outside its lock, and the harness's `sync` before durable phases. The 4-writer overwrite p99.9 is 25.5–27.5 µs against RocksDB's 54–66 µs (section 8.2). Two `fsync`s in flight was measured slower on gp3/ext4 and is set to one.
-  - **Open**: 4-writer durable p99.9 (6.3 ms against LMDB's 4.1–6.3 ms), from WAL preallocation on the commit path; fill p99.99 (0.73 ms against RocksDB's 15 µs); 4-writer overwrite p99.99 (2.5 ms against 0.7 ms). The path for record types with secondary indexes is not measured.
+  - **Tried and dropped (2026-11-12)**: incrementally growing hash maps for the primary index and the flush queue, and WAL zeros written by a background direct-I/O job. Each cost more than it saved (section 8.3). The flush queue keeps its ids in 512-id chunks.
+  - **Open**:
+    - Fill p99.99: 0.74 ms against RocksDB's 16–20 µs. Whole-shard rehashes; a capacity hint at open is the option left.
+    - 4-writer overwrite p99.99: 2.3–3.0 ms against 0.46–1.32 ms; not traced.
+    - Durable p99.9 and p99.99 against LMDB: four writers 6.0–6.4 ms against 2.9–3.2 ms (LMDB starves three writers for over 4 s); one writer p99.99 6.3–11.5 ms against 3.4–4.4 ms.
+    - The path for record types with secondary indexes is not measured.
