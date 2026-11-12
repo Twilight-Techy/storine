@@ -139,6 +139,10 @@ trait Kv: Sync {
     /// After a bulk load: make the data the read benchmarks see the steady state (flush,
     /// compact).
     fn settle(&self);
+    /// Engine counters after a phase (`KV_STATS=1`; Storine only).
+    fn note(&self) -> Option<String> {
+        None
+    }
 }
 
 // ---------- Storine ----------
@@ -180,6 +184,14 @@ impl<T: BenchRecord> Kv for Storine<T> {
     }
     fn settle(&self) {
         self.engine.flush_all().expect("flush");
+    }
+    fn note(&self) -> Option<String> {
+        let st = self.engine.stats();
+        Some(format!(
+            "hot_dirty {} KiB, coalesced {}, wal batches {} frames {}, mmaps {} ({} MiB), arena segments {} used {} MiB dead {} MiB, compactions {}",
+            st.hot_dirty_bytes >> 10, st.coalesced_flushes, st.wal_batches, st.wal_frames, st.active_mmaps, st.mapped_bytes >> 20,
+            st.arena_segments, st.arena_used_bytes >> 20, st.arena_dead_bytes >> 20, st.arena_compactions
+        ))
     }
 }
 
@@ -352,17 +364,32 @@ impl Result {
         l.sort_unstable();
         let q = |p: f64| l.get(((l.len() as f64 * p) as usize).min(l.len().saturating_sub(1))).copied().unwrap_or(0);
         format!(
-            "{bench:<22} {system:<24} {:>12.0} ops/s   p50 {:>8} ns   p99 {:>9} ns   p99.9 {:>10} ns",
+            "{bench:<22} {system:<24} {:>12.0} ops/s   p50 {:>8} ns   p99 {:>9} ns   p99.9 {:>10} ns   p99.99 {:>10} ns   max {:>11} ns",
             self.ops as f64 / self.wall.as_secs_f64(),
             q(0.50),
             q(0.99),
-            q(0.999)
+            q(0.999),
+            q(0.9999),
+            l.last().copied().unwrap_or(0)
         )
     }
 }
 
+/// `KV_SLOW_NS`: operations at least this slow are printed to stderr with their thread id,
+/// index and `CLOCK_MONOTONIC` start (to match against a `perf record -k CLOCK_MONOTONIC`
+/// trace). Diagnostics only; off by default.
+fn slow_threshold() -> Option<u32> {
+    std::env::var("KV_SLOW_NS").ok().and_then(|v| v.parse().ok())
+}
+
+/// The calling thread's kernel id (Linux), for matching slow operations against a trace.
+fn thread_id() -> String {
+    std::fs::read_link("/proc/thread-self").ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default()
+}
+
 /// Runs `per_thread` operations on each of `threads` threads; `op(thread, i, rng)`.
 fn run(threads: usize, per_thread: usize, op: &(dyn Fn(usize, &mut Rng) + Sync)) -> Result {
+    let slow = slow_threshold();
     let start = Instant::now();
     let lats: Vec<Vec<u32>> = std::thread::scope(|s| {
         let hs: Vec<_> = (0..threads)
@@ -370,10 +397,22 @@ fn run(threads: usize, per_thread: usize, op: &(dyn Fn(usize, &mut Rng) + Sync))
                 s.spawn(move || {
                     let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ ((t as u64 + 1) * 0x1234_5678_9ABC));
                     let mut lat = Vec::with_capacity(per_thread);
-                    for _ in 0..per_thread {
+                    let mut slow_ops = Vec::new();
+                    for i in 0..per_thread {
                         let t0 = Instant::now();
                         op(t, &mut rng);
-                        lat.push(t0.elapsed().as_nanos().min(u128::from(u32::MAX)) as u32);
+                        let ns = t0.elapsed().as_nanos().min(u128::from(u32::MAX)) as u32;
+                        if slow.is_some_and(|thr| ns >= thr) {
+                            slow_ops.push((i, t0, ns));
+                        }
+                        lat.push(ns);
+                    }
+                    if !slow_ops.is_empty() {
+                        let tid = thread_id();
+                        for (i, t0, ns) in slow_ops {
+                            // `Instant`'s Debug form carries the raw `CLOCK_MONOTONIC` time.
+                            eprintln!("SLOW tid={tid} i={i} ns={ns} at={t0:?}");
+                        }
                     }
                     lat
                 })
@@ -382,6 +421,19 @@ fn run(threads: usize, per_thread: usize, op: &(dyn Fn(usize, &mut Rng) + Sync))
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     Result { ops: threads * per_thread, wall: start.elapsed(), lat: lats.concat() }
+}
+
+/// `KV_STATS=1`: the engine's counters after a phase; with `KV_SLOW_NS`, a phase-end marker on
+/// stderr in the same clock as the slow operations.
+fn note(kv: &dyn Kv, out: &mut Vec<String>) {
+    if std::env::var_os("KV_STATS").is_some() {
+        if let Some(n) = kv.note() {
+            out.push(format!("{:<22} {n}", "  stats"));
+        }
+    }
+    if slow_threshold().is_some() {
+        eprintln!("PHASE_END at={:?}", Instant::now());
+    }
 }
 
 fn bench_fast(kv: &dyn Kv, n: usize, threads: usize, out: &mut Vec<String>) {
@@ -399,6 +451,7 @@ fn bench_fast(kv: &dyn Kv, n: usize, threads: usize, out: &mut Vec<String>) {
         kv.put(k, 0);
     });
     out.push(r.line(&name, "fillrandom"));
+    note(kv, out);
     let t = Instant::now();
     kv.settle();
     out.push(format!("{:<22} {name:<24} {:>12.3} s", "settle (flush)", t.elapsed().as_secs_f64()));
@@ -409,27 +462,42 @@ fn bench_fast(kv: &dyn Kv, n: usize, threads: usize, out: &mut Vec<String>) {
             std::hint::black_box(kv.get((rng.next() % n as u64) as usize));
         });
         out.push(r.line(&name, "readrandom 1 thread"));
+        note(kv, out);
         let r = run(threads, 2 * n / threads.max(1), &|_, rng| {
             std::hint::black_box(kv.get((rng.next() % n as u64) as usize));
         });
         out.push(r.line(&name, &format!("readrandom {threads} threads")));
+        note(kv, out);
     }
     let r = run(1, n / 2, &|_, rng| {
         kv.put((rng.next() % n as u64) as usize, 7);
     });
     out.push(r.line(&name, "overwrite 1 thread"));
+    note(kv, out);
     let r = run(threads, n / 2 / threads.max(1), &|_, rng| {
         kv.put((rng.next() % n as u64) as usize, 9);
     });
     out.push(r.line(&name, &format!("overwrite {threads} threads")));
+    note(kv, out);
+}
+
+/// Writes every dirty page on the machine back to disk. Called before each durable phase, for
+/// every engine alike: otherwise the hundreds of megabytes the load left in the page cache are
+/// still being written back (gp3 sustains 125 MB/s) while the phase runs, and every `fsync`
+/// waits behind them (traced: `wbt_wait` and `folio_wait_writeback` for 10–30 ms).
+fn quiesce() {
+    let _ = std::process::Command::new("sync").status();
 }
 
 fn bench_durable(kv: &dyn Kv, n: usize, threads: usize, ops: usize, out: &mut Vec<String>) {
+    quiesce();
     let name = kv.name();
     let r = run(1, ops, &|_, rng| kv.put((rng.next() % n as u64) as usize, 11));
     out.push(r.line(&name, "durable put 1 thread"));
+    note(kv, out);
     let r = run(threads, ops, &|_, rng| kv.put((rng.next() % n as u64) as usize, 13));
     out.push(r.line(&name, &format!("durable put {threads} thr")));
+    note(kv, out);
 }
 
 fn fresh(root: &Path, name: &str) -> PathBuf {
@@ -445,7 +513,8 @@ fn main() {
     let n: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(1_000_000);
     let threads: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(4);
     let only = args.next().unwrap_or_default();
-    let durable_ops = 2_000;
+    // `KV_DURABLE_OPS`: puts per durable phase and thread (default 2,000).
+    let durable_ops = std::env::var("KV_DURABLE_OPS").ok().and_then(|v| v.parse().ok()).unwrap_or(2_000);
     let values = Arc::new(Values::new(n));
     println!("records {n}, value {} bytes, threads {threads}", values.vals[0].len());
     let mut out = Vec::new();

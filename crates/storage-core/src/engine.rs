@@ -150,9 +150,6 @@ pub struct ResealReport {
     pub unchanged: usize,
 }
 
-/// A flush queue taken with at most this many ids is kept for reuse (about 2 MiB at most).
-const SPARE_FLUSH_QUEUE_IDS: usize = 32 * 1024;
-
 /// Configuration for `StorageEngine<T>`.
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -3101,6 +3098,13 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
     }
 
     /// Adds `id` to the coalescing flush queue and wakes the background flusher when useful.
+    /// Ids the flusher keeps room for in its spare queue: one per 256 bytes of the hot-dirty
+    /// budget (about 262,000, some 13 MB, for the default 64 MiB), which no frame is smaller
+    /// than in practice. Only a load that fills the budget uses it.
+    fn spare_flush_queue_ids(&self) -> usize {
+        (self.config.max_hot_dirty_bytes / 256).max(4096)
+    }
+
     fn enqueue_flush(&self, id: InlineId) {
         let mut q = storage_types::lock_spinning(&self.flush_queue);
         let was_empty = q.is_empty();
@@ -3639,9 +3643,17 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                     break;
                 }
             }
-            if queued.order.capacity() <= SPARE_FLUSH_QUEUE_IDS {
+            // Keep room for half again what was just taken, grown here rather than under the
+            // queue lock: a writer that outgrows the queue rehashes it while every other
+            // writer waits (milliseconds once the flusher falls behind).
+            let taken = queued.order.len();
+            let limit = self.spare_flush_queue_ids();
+            if queued.order.capacity() <= 2 * limit {
                 queued.order.clear();
                 queued.in_queue.clear();
+                let want = (taken + taken / 2).min(limit);
+                queued.order.reserve(want);
+                queued.in_queue.reserve(want);
                 spare = queued;
             }
         }

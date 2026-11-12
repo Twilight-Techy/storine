@@ -916,3 +916,19 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Measured**: the 4-thread overwrite p99.9 fell from 252–288 µs to 54–103 µs (25–30 µs writes-only), and the p99 from 14–20 µs to 5–6 µs. Throughput is the same or higher. Storine still leads every throughput and p99 row (`BENCHMARK_REPORT.md` section 8.1).
 - **Not won**: the 4-thread overwrite p99.9 against RocksDB with its WAL (59–63 µs) in two of three rounds; the fill p99.9, level; the one-thread durable p99.9, noisy.
 - **Verified**: clippy `-D warnings`, and new tests for `lock_spinning` and for staging swaps under concurrent writers and a flusher. On AWS: the release workspace suite and 40 of 40 chaos runs. One on-demand `c7i.xlarge` for 3 h 25 min, about $0.61, terminated after.
+
+## 2026-11-12: traced tails (`TASK-153`)
+
+- **Found** by matching slow operations to `perf` traces:
+  - The 4-writer overwrite tail was writers growing the flush queue and the WAL staging buffer under their shared locks once the flusher fell behind.
+  - The durable 4-writer tail was the 1 MiB WAL preallocation step (6–8 ms on gp3).
+  - Durable tails in general included page-cache writeback left over from the load.
+- **Changed**:
+  - WAL staging is a list of 256 KiB chunks (sealed, not grown; 4 pooled).
+  - The flusher pre-grows the queue it keeps, outside the lock (capped at one id per 256 bytes of the dirty budget).
+  - Group commit `fsync`s on a second handle without the I/O lock and acknowledges batches in ticket order. One `fsync` in flight: two measured 34 % slower on gp3/ext4.
+  - The simulated disk now serialises syncs. Two concurrent syncs could finish out of order and cut durable bytes, which no kernel does.
+  - Harness: `sync` before durable phases for every engine, p99.99 and max columns, `KV_DURABLE_OPS`, and `KV_SLOW_NS`/`KV_STATS` diagnostics.
+- **Measured**: the 4-writer overwrite p99.9 is 25.5–27.5 µs, against 51–113 µs before and RocksDB's 54–66 µs. LMDB's 4-writer durable p99.99 is 4.3 s or more: its unfair lock starves three writers.
+- **Open**: 4-writer durable p99.9 against LMDB; fill and 4-writer overwrite p99.99 against RocksDB.
+- **Verified**: new tests `test_staged_log_seals_chunks_keeps_order_and_drops_failed_writes` and `power_loss_keeps_every_frame_acknowledged_by_concurrent_writers`. On AWS: the release workspace suite and 40 of 40 chaos runs (with two `fsync`s in flight). Locally: the WAL suite and clippy with one. AWS: about $0.47 (two on-demand `c7i.xlarge` sessions, terminated).

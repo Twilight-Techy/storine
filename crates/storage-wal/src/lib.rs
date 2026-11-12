@@ -19,7 +19,7 @@ use std::fs;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use storage_codec::{checksum_payload, compress_lz4, decompress_lz4};
 use storage_types::vfs::{OpenOpts, VfsHandle, VfsRef};
@@ -46,11 +46,21 @@ static WAL_ZEROS: [u8; 64 << 10] = [0; 64 << 10];
 /// in the middle of its `put`. At 256 KiB appenders hit it about once in 2,000 puts, which was
 /// the 4-writer p99.9 (90–105 µs against 25–30 µs at 4 MiB on a `c7i.xlarge`).
 const STAGED_FLUSH_BYTES: usize = 4 << 20;
-/// Capacity of a fresh staging buffer: above what the flusher's cadence lets accumulate, so a
-/// buffer rarely regrows under `staged`'s lock, and small next to `STAGED_FLUSH_BYTES`.
-const STAGED_INITIAL_BYTES: usize = 320 << 10;
-/// A staging buffer that grew past this is freed after its drain instead of kept as the spare.
-const STAGED_SPARE_MAX_BYTES: usize = 1 << 20;
+/// Capacity of one staging chunk. Frames are appended to chunks of this size, and a full
+/// chunk is sealed rather than grown, so appending never copies what is already staged (a
+/// growing `Vec` copies megabytes under the lock when the flusher falls behind).
+const STAGED_CHUNK_BYTES: usize = 256 << 10;
+/// Emptied chunks kept for reuse after a drain (1 MiB): reused chunks are already resident,
+/// so appenders take no page faults on them.
+const STAGED_POOL_CHUNKS: usize = 4;
+
+/// Batches whose `fsync` may be in flight at once. The `fsync` runs on a second handle without
+/// holding `io`, so a value of 2 lets the next batch be written and synced while one is still
+/// syncing; batches are always written in LSN order and acknowledged in that order. Measured
+/// on ext4 over gp3 EBS (`BENCHMARK_REPORT.md` section 8.2), 2 cost 34% of 4-writer durable
+/// throughput and raised p99 from 2.5 ms to 4.4 ms: concurrent `fdatasync`s of one file do not
+/// overlap there, and batches only got smaller. So one at a time.
+const MAX_SYNCS_IN_FLIGHT: u32 = 1;
 
 /// Unlocked catch-up copies a checkpoint truncation makes before its locked final copy.
 const TRUNCATE_CATCH_UP_ROUNDS: usize = 16;
@@ -176,6 +186,12 @@ struct GroupCommitState {
     last_batch: usize,
     /// Set after any I/O failure; the WAL is fail-stop from then on.
     broken: Option<String>,
+    /// Batches written whose `fsync` has not been published yet (at most
+    /// [`MAX_SYNCS_IN_FLIGHT`]).
+    syncing: u32,
+    /// Order tickets of `fsync`ing batches: the next to hand out, and the next to publish.
+    next_ticket: u64,
+    done_ticket: u64,
 }
 
 /// High-throughput Group-Commit Write-Ahead Log (`RULE-CONC-03`).
@@ -191,14 +207,17 @@ pub struct GroupCommitWal {
     state: Mutex<GroupCommitState>,
     cv: Condvar,
     io: Mutex<BufWriter<VfsHandle>>,
+    /// A second handle on the WAL file, `fsync`ed without holding `io` so the next batch can be
+    /// written meanwhile (`fdatasync` covers the file, whichever handle wrote). Replaced when a
+    /// checkpoint swaps the file.
+    sync_file: Mutex<Arc<VfsHandle>>,
     /// `AsyncMemoryFirst` only: frames appended since the last flush, in LSN order. Appenders
     /// copy into it under this short lock; [`Self::flush_buffered`] swaps it out and writes it
     /// holding only `io`, so an append never waits for a `write` syscall.
-    staged: Mutex<Vec<u8>>,
-    /// The buffer `staged` last swapped out, emptied, kept so the next one starts at full
-    /// capacity: regrowing from empty copies the staged frames again under `staged`'s lock
-    /// while every other appender waits. Touched only under `io`.
-    staged_spare: Mutex<Vec<u8>>,
+    staged: Mutex<StagedLog>,
+    /// Emptied staging chunks for reuse, at most [`STAGED_POOL_CHUNKS`]. Lock order: `staged`
+    /// before this.
+    staged_pool: Mutex<Vec<Vec<u8>>>,
     vfs: VfsRef,
     total_batches: CachePadded<AtomicU64>,
     total_frames: CachePadded<AtomicU64>,
@@ -400,6 +419,9 @@ impl GroupCommitWal {
         }
         let end = file.seek(SeekFrom::End(0))
             .map_err(|e| StorageError::io("seek WAL end", e))?;
+        let sync_file = vfs
+            .open(&path, OpenOpts::read())
+            .map_err(|e| StorageError::io("open WAL sync handle", e))?;
 
         Ok(Self {
             path,
@@ -415,11 +437,15 @@ impl GroupCommitWal {
                 waiters: 0,
                 last_batch: 0,
                 broken: None,
+                syncing: 0,
+                next_ticket: 0,
+                done_ticket: 0,
             }),
             cv: Condvar::new(),
             io: Mutex::new(BufWriter::with_capacity(256 * 1024, file)),
-            staged: Mutex::new(Vec::new()),
-            staged_spare: Mutex::new(Vec::new()),
+            sync_file: Mutex::new(Arc::new(sync_file)),
+            staged: Mutex::new(StagedLog::default()),
+            staged_pool: Mutex::new(Vec::new()),
             vfs,
             total_batches: CachePadded::new(AtomicU64::new(0)),
             total_frames: CachePadded::new(AtomicU64::new(0)),
@@ -459,7 +485,10 @@ impl GroupCommitWal {
             self.current_lsn.store(lsn, Ordering::Release);
             let full = {
                 let mut staged = storage_types::lock_spinning(&self.staged);
-                prepared.write(&mut staged, lsn, 0, collection_id, kind, record_id, version);
+                let need = WAL_FRAME_HEADER_LEN + prepared.bytes.len();
+                staged.append(need, &self.staged_pool, |buf| {
+                    prepared.write(buf, lsn, 0, collection_id, kind, record_id, version);
+                });
                 staged.len() >= STAGED_FLUSH_BYTES
             };
             guard.enqueued_seq += 1;
@@ -482,7 +511,7 @@ impl GroupCommitWal {
             return Ok(lsn);
         }
         let concurrent = self.policy.syncs() && guard.last_batch > 1;
-        if !guard.flushing && guard.queue.is_empty() && !concurrent {
+        if !guard.flushing && guard.syncing < MAX_SYNCS_IN_FLIGHT && guard.queue.is_empty() && !concurrent {
             // Uncontended fast path: become leader for a single frame without allocating a batch.
             guard.flushing = true;
             guard.last_batch = 1;
@@ -491,17 +520,24 @@ impl GroupCommitWal {
             self.current_lsn.store(lsn, Ordering::Release);
             guard.enqueued_seq += 1;
             let my_seq = guard.enqueued_seq;
+            let ticket = guard.next_ticket;
+            if self.policy.syncs() {
+                guard.next_ticket += 1;
+            }
             drop(guard);
 
-            let res = if self.policy.syncs() {
-                let mut io = self.lock_io();
-                Self::write_frame(&mut *io, lsn, 0, collection_id, kind, record_id, version, frame_bytes)
-                    .and_then(|()| self.finish_batch_io(&mut io))
-            } else {
-                self.stage(|buf| Self::write_frame(buf, lsn, 0, collection_id, kind, record_id, version, frame_bytes))
-            };
             self.total_frames.fetch_add(1, Ordering::Relaxed);
-            self.complete_batch(my_seq, res)?;
+            if self.policy.syncs() {
+                let written = {
+                    let mut io = self.lock_io();
+                    Self::write_frame(&mut *io, lsn, 0, collection_id, kind, record_id, version, frame_bytes)
+                        .and_then(|()| self.prepare_sync(&mut io))
+                };
+                self.sync_and_publish(ticket, my_seq, written)?;
+            } else {
+                let res = self.stage(|buf| Self::write_frame(buf, lsn, 0, collection_id, kind, record_id, version, frame_bytes));
+                self.complete_batch(my_seq, res)?;
+            }
             if kind != WalOpKind::Upsert {
                 // Only the hot upsert path is left buffered under `AsyncMemoryFirst`.
                 self.flush_buffered()?;
@@ -581,12 +617,12 @@ impl GroupCommitWal {
     }
 
     #[inline]
-    /// Appends frames to the staged buffer (`AsyncMemoryFirst`); past 256 KiB the appender
-    /// pushes them to the OS itself, as a full `BufWriter` would.
+    /// Appends frames to the staged buffer (`AsyncMemoryFirst`); past [`STAGED_FLUSH_BYTES`]
+    /// the appender pushes them to the OS itself. A failed write leaves nothing staged.
     fn stage(&self, write: impl FnOnce(&mut Vec<u8>) -> Result<()>) -> Result<()> {
         let full = {
             let mut staged = storage_types::lock_spinning(&self.staged);
-            write(&mut staged)?;
+            staged.try_append(&self.staged_pool, write)?;
             staged.len() >= STAGED_FLUSH_BYTES
         };
         if full {
@@ -598,26 +634,31 @@ impl GroupCommitWal {
 
     /// Moves the staged frames into `io` (whose lock the caller holds, which orders drains).
     fn drain_staged(&self, io: &mut BufWriter<VfsHandle>) -> Result<()> {
-        // Syncing policies never stage, so they never allocate a spare. Only appenders add to
-        // `staged` and drains are ordered by `io`, so it stays non-empty once seen so.
+        // Keep a chunk ready, allocated outside `staged`'s lock, for the appender that opens
+        // the next one. Syncing policies never stage, so they never allocate one.
         if storage_types::lock_spinning(&self.staged).is_empty() {
             return Ok(());
         }
-        let mut spare = std::mem::take(&mut *self.staged_spare.lock().unwrap_or_else(|p| p.into_inner()));
-        if spare.capacity() < STAGED_INITIAL_BYTES {
-            // Allocated here, outside `staged`'s lock.
-            spare = Vec::with_capacity(STAGED_INITIAL_BYTES);
+        {
+            let mut pool = self.staged_pool.lock().unwrap_or_else(|p| p.into_inner());
+            if pool.is_empty() {
+                pool.push(Vec::with_capacity(STAGED_CHUNK_BYTES));
+            }
         }
-        let mut taken = {
-            let mut staged = storage_types::lock_spinning(&self.staged);
-            std::mem::replace(&mut *staged, spare)
-        };
-        io.write_all(&taken)
-            .map_err(|e| StorageError::io("write staged WAL frames", e))?;
-        // Keep the allocation for the next swap, unless one huge frame grew it.
-        if taken.capacity() <= STAGED_SPARE_MAX_BYTES {
-            taken.clear();
-            *self.staged_spare.lock().unwrap_or_else(|p| p.into_inner()) = taken;
+        let taken = std::mem::take(&mut *storage_types::lock_spinning(&self.staged));
+        let mut written = Vec::with_capacity(taken.sealed.len() + 1);
+        for chunk in taken.sealed.into_iter().chain(std::iter::once(taken.open)) {
+            io.write_all(&chunk)
+                .map_err(|e| StorageError::io("write staged WAL frames", e))?;
+            written.push(chunk);
+        }
+        let mut pool = self.staged_pool.lock().unwrap_or_else(|p| p.into_inner());
+        for mut chunk in written {
+            // A chunk one huge frame grew is freed, not pooled.
+            if pool.len() < STAGED_POOL_CHUNKS && chunk.capacity() == STAGED_CHUNK_BYTES {
+                chunk.clear();
+                pool.push(chunk);
+            }
         }
         Ok(())
     }
@@ -648,7 +689,7 @@ impl GroupCommitWal {
             if let Some(ref msg) = guard.broken {
                 return Err(Self::broken_error(msg));
             }
-            if !guard.flushing {
+            if !guard.flushing && guard.syncing < MAX_SYNCS_IN_FLIGHT {
                 guard.flushing = true;
                 if self.policy.syncs() && guard.last_batch > 1 && guard.queue.len() < guard.last_batch {
                     // Writers are concurrent: the ones just served are about to queue again.
@@ -661,6 +702,10 @@ impl GroupCommitWal {
                 let drained = std::mem::take(&mut guard.queue);
                 guard.last_batch = drained.len();
                 let batch_seq = guard.enqueued_seq;
+                let ticket = guard.next_ticket;
+                if self.policy.syncs() {
+                    guard.next_ticket += 1;
+                }
                 drop(guard);
 
                 let res = if !self.policy.syncs() {
@@ -697,12 +742,16 @@ impl GroupCommitWal {
                             break;
                         }
                     }
-                    r.and_then(|()| self.finish_batch_io(&mut io))
+                    r.and_then(|()| self.prepare_sync(&mut io))
                 };
                 // Reuse the drained queue's allocation for the next batch.
                 let mut drained = drained;
                 drained.clear();
-                let res = self.complete_batch(batch_seq, res);
+                let res = if self.policy.syncs() {
+                    self.sync_and_publish(ticket, batch_seq, res)
+                } else {
+                    self.complete_batch(batch_seq, res)
+                };
                 guard = self.lock_state();
                 if guard.queue.is_empty() && guard.queue.capacity() < drained.capacity() {
                     guard.queue = drained;
@@ -719,10 +768,10 @@ impl GroupCommitWal {
         }
     }
 
-    /// Completes a batch: under `Immediate` / `GroupCommit` flushes to the OS and `fsync`s;
-    /// under `AsyncMemoryFirst` leaves the frames buffered for [`Self::flush_buffered`].
-    fn finish_batch_io(&self, io: &mut BufWriter<VfsHandle>) -> Result<()> {
-        if self.policy.syncs() {
+    /// Readies a written batch of an `fsync`ing policy for [`Self::sync_and_publish`]: pushes
+    /// it to the OS and preallocates ahead of it.
+    fn prepare_sync(&self, io: &mut BufWriter<VfsHandle>) -> Result<()> {
+        {
             io.flush()
                 .map_err(|e| StorageError::io("flush WAL buffer", e))?;
             let pos = io
@@ -748,17 +797,60 @@ impl GroupCommitWal {
                 self.alloc_end.store(start + WAL_PREALLOC_CHUNK, Ordering::Relaxed);
             }
             self.logical_end.store(pos, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// `fsync`s the WAL without holding `io`, then publishes the batch: `completed_seq` moves
+    /// only in ticket order, so a later batch never acknowledges its writers before an earlier
+    /// batch's `fsync` has succeeded (or reported the failure that stops the WAL).
+    fn sync_and_publish(&self, ticket: u64, batch_seq: u64, written: Result<()>) -> Result<()> {
+        {
+            let mut guard = self.lock_state();
+            // The next leader may write its batch while this one syncs.
+            guard.flushing = false;
+            guard.syncing += 1;
+            if guard.waiters > 0 {
+                self.cv.notify_all();
+            }
+        }
+        let res = written.and_then(|()| {
+            let file = Arc::clone(&self.sync_file.lock().unwrap_or_else(|p| p.into_inner()));
             let t = std::time::Instant::now();
-            io.get_ref()
-                .sync_data()
+            file.sync_data()
                 .map_err(|e| StorageError::io("fsync WAL file", e))?;
             let took = t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
             let avg = self.fsync_ns.load(Ordering::Relaxed);
             let next = if avg == 0 { took } else { avg - avg / 8 + took / 8 };
             self.fsync_ns.store(next, Ordering::Relaxed);
+            Ok(())
+        });
+        let mut guard = self.lock_state();
+        while guard.done_ticket != ticket && guard.broken.is_none() {
+            guard.waiters += 1;
+            guard = self.cv.wait(guard).unwrap_or_else(|p| p.into_inner());
+            guard.waiters -= 1;
         }
-        Ok(())
+        guard.syncing -= 1;
+        guard.done_ticket = guard.done_ticket.max(ticket + 1);
+        let out = match (res, guard.broken.clone()) {
+            (Err(e), _) => {
+                guard.broken = Some(e.to_string());
+                Err(e)
+            }
+            (Ok(()), Some(msg)) => Err(Self::broken_error(&msg)),
+            (Ok(()), None) => {
+                guard.completed_seq = guard.completed_seq.max(batch_seq);
+                self.total_batches.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        };
+        if guard.waiters > 0 || out.is_err() {
+            self.cv.notify_all();
+        }
+        out
     }
+
 
     /// How long the next group-commit leader waits for concurrent writers.
     fn group_commit_linger(&self) -> std::time::Duration {
@@ -1099,6 +1191,14 @@ impl GroupCommitWal {
                 *poison = true;
                 return Err(e);
             }
+            match self.vfs.open(&self.path, OpenOpts::read()) {
+                Ok(h) => *self.sync_file.lock().unwrap_or_else(|p| p.into_inner()) = Arc::new(h),
+                Err(e) => {
+                    // Batches would be `fsync`ed on the old file: stop accepting writes.
+                    *poison = true;
+                    return Err(StorageError::io("open replacement WAL sync handle", e));
+                }
+            }
             let end = io
                 .get_mut()
                 .seek(SeekFrom::End(0))
@@ -1230,11 +1330,71 @@ impl GroupCommitWal {
     }
 }
 
+/// Frames staged under `AsyncMemoryFirst`, in LSN order: sealed chunks, oldest first, then the
+/// open one. Appending seals a full chunk and opens another instead of growing one buffer.
+#[derive(Default)]
+struct StagedLog {
+    sealed: Vec<Vec<u8>>,
+    open: Vec<u8>,
+    bytes: usize,
+}
+
+impl StagedLog {
+    fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
+    fn len(&self) -> usize {
+        self.bytes
+    }
+
+    /// The chunk to append about `need` bytes to: the open one while it has room, otherwise a
+    /// fresh one (from `pool` when it has one) with the full chunk sealed.
+    fn room(&mut self, need: usize, pool: &Mutex<Vec<Vec<u8>>>) -> &mut Vec<u8> {
+        let fits = self.open.len() + need <= self.open.capacity();
+        if (!fits && !self.open.is_empty()) || self.open.len() >= STAGED_CHUNK_BYTES {
+            let next = pool.lock().unwrap_or_else(|p| p.into_inner()).pop();
+            let next = next.unwrap_or_else(|| Vec::with_capacity(STAGED_CHUNK_BYTES));
+            self.sealed.push(std::mem::replace(&mut self.open, next));
+        } else if self.open.capacity() == 0 {
+            if let Some(chunk) = pool.lock().unwrap_or_else(|p| p.into_inner()).pop() {
+                self.open = chunk;
+            } else {
+                self.open.reserve_exact(STAGED_CHUNK_BYTES);
+            }
+        }
+        // A frame larger than a chunk still fits: the fresh chunk grows once, copying nothing.
+        &mut self.open
+    }
+
+    fn append(&mut self, need: usize, pool: &Mutex<Vec<Vec<u8>>>, write: impl FnOnce(&mut Vec<u8>)) {
+        let buf = self.room(need, pool);
+        let before = buf.len();
+        write(buf);
+        self.bytes += buf.len() - before;
+    }
+
+    /// Like [`Self::append`] for a write of unknown size that can fail; on failure nothing it
+    /// wrote is kept.
+    fn try_append(&mut self, pool: &Mutex<Vec<Vec<u8>>>, write: impl FnOnce(&mut Vec<u8>) -> Result<()>) -> Result<()> {
+        let buf = self.room(0, pool);
+        let before = buf.len();
+        if let Err(e) = write(buf) {
+            buf.truncate(before);
+            return Err(e);
+        }
+        self.bytes += buf.len() - before;
+        Ok(())
+    }
+}
+
 impl Drop for GroupCommitWal {
     fn drop(&mut self) {
         let mut io = self.io.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let staged = std::mem::take(&mut *storage_types::lock_spinning(&self.staged));
-        let _ = io.write_all(&staged);
+        for chunk in staged.sealed.iter().chain(std::iter::once(&staged.open)) {
+            let _ = io.write_all(chunk);
+        }
         let _ = io.flush();
         if self.policy.syncs() {
             let _ = io.get_ref().sync_data();
@@ -1406,6 +1566,57 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{name}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// Pipelined group commit under power loss: four writers, two `fsync`s in flight, and an
+    /// I/O failure injected at a different operation for each seed. Every frame a writer was
+    /// told is durable is recovered, per writer in order; a failed earlier `fsync` never lets a
+    /// later batch acknowledge its frames.
+    #[test]
+    fn power_loss_keeps_every_frame_acknowledged_by_concurrent_writers() {
+        use storage_types::vfs::{CutMode, SimVfs};
+        let dir = temp_dir("storage_wal_power_loss_concurrent");
+        let wal_path = dir.join("engine.wal");
+        for seed in 1..=60u64 {
+            let _ = fs::remove_dir_all(&dir);
+            let sim = SimVfs::new(&dir, seed).unwrap();
+            if seed % 7 == 0 {
+                sim.set_mode(CutMode::LoseAll);
+            }
+            let wal = Arc::new(GroupCommitWal::open_with(&wal_path, SyncPolicy::GroupCommit { max_batch_entries: 64 }, sim.as_ref()).unwrap());
+            sim.fail_at(20 + (seed * 13) % 200);
+            let writers: Vec<_> = (0..4u64)
+                .map(|t| {
+                    let w = Arc::clone(&wal);
+                    std::thread::spawn(move || {
+                        let id = InlineId::new(&format!("w{t}")).unwrap();
+                        let mut acked = Vec::new();
+                        for v in 1..=400u64 {
+                            let body = vec![(v % 251) as u8; 64 + (v as usize * 31) % 900];
+                            match w.append_single(1, WalOpKind::Upsert, id, Version(v), &body) {
+                                Ok(_) => acked.push(v),
+                                Err(_) => break,
+                            }
+                        }
+                        acked
+                    })
+                })
+                .collect();
+            let acked: Vec<Vec<u64>> = writers.into_iter().map(|h| h.join().unwrap()).collect();
+            drop(wal);
+            sim.power_cut().unwrap();
+            let got = GroupCommitWal::recover_committed(&wal_path).unwrap();
+            assert!(got.windows(2).all(|w| w[0].lsn < w[1].lsn), "seed {seed}: frames out of LSN order");
+            for (t, acked) in acked.iter().enumerate() {
+                let id = InlineId::new(&format!("w{t}")).unwrap();
+                let versions: Vec<u64> = got.iter().filter(|e| e.record_id == id).map(|e| e.version.0).collect();
+                assert!(versions.windows(2).all(|w| w[0] < w[1]), "seed {seed} writer {t}: out of order {versions:?}");
+                for v in acked {
+                    assert!(versions.contains(v), "seed {seed} writer {t}: acknowledged v{v} lost; recovered {versions:?}");
+                }
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// `F-SIM-01`: under simulated power loss and crash points, every acknowledged frame is
@@ -1696,6 +1907,30 @@ mod tests {
         assert_eq!(GroupCommitWal::recover_committed(&wal_path).unwrap().len(), 2);
         drop(wal);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_staged_log_seals_chunks_keeps_order_and_drops_failed_writes() {
+        let pool = Mutex::new(Vec::new());
+        let mut log = StagedLog::default();
+        let mut expect = Vec::new();
+        // Frames of 1 KiB to 600 KiB: some fill chunks, one is larger than a chunk.
+        for (n, len) in [1024usize, 200 << 10, 100 << 10, 600 << 10, 3000].into_iter().enumerate() {
+            let bytes = vec![n as u8; len];
+            log.append(len, &pool, |b| b.extend_from_slice(&bytes));
+            expect.extend_from_slice(&bytes);
+        }
+        let before = log.len();
+        let err = log.try_append(&pool, |b| {
+            b.extend_from_slice(&[9; 100]);
+            Err(StorageError::io("test", std::io::Error::other("fail")))
+        });
+        assert!(err.is_err());
+        assert_eq!(log.len(), before, "a failed write must leave nothing staged");
+        assert!(!log.sealed.is_empty(), "full chunks are sealed, not grown");
+        let all: Vec<u8> = log.sealed.iter().chain(std::iter::once(&log.open)).flatten().copied().collect();
+        assert_eq!(all.len(), log.len());
+        assert!(all == expect, "staged bytes must be the frames in order");
     }
 
     /// Memory-first frames from concurrent writers survive many staging-buffer swaps (the spare

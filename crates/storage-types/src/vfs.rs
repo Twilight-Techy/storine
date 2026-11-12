@@ -731,13 +731,15 @@ impl SimVfs {
         // Only the bytes from the first unsynced write on need reading, unless the file was
         // mapped (any byte may have changed).
         let from = if node.mapped { 0 } else { node.dirty_from.min(dlen) };
-        drop(st);
+        // The read happens under the lock, so writes (which mark under it) cannot slip in
+        // between it and the update. Without that, two concurrent syncs of one file could
+        // finish out of order, and the older one would cut what the newer made durable: a
+        // kernel's `fdatasync` never does that.
         let len = file.metadata()?.len();
         if from == dlen && len == dlen {
             return Ok(());
         }
         let tail = read_from(file, from)?;
-        let mut st = self.lock();
         if let Some(node) = st.inodes.get_mut(&ino) {
             node.durable.truncate(from as usize);
             node.durable.extend_from_slice(&tail);

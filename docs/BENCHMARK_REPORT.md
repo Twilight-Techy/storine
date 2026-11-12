@@ -312,3 +312,57 @@ Durable throughput is lower on this instance than in the table above (1.39–1.5
 - The one-thread durable put swings between 1.4 and 4.7 ms on this volume, against LMDB's 2.7–3.4 ms.
 
 **Verified on the same instance:** the release workspace suite (all pass), 40 of 40 process chaos runs, and the new test `test_memory_first_staging_swaps_keep_every_frame_in_order`. One on-demand `c7i.xlarge` ran 3 h 25 min for the experiments and this verification, about $0.61, and was terminated when it finished.
+
+### 8.2 Remaining tails, traced (2026-11-12)
+
+**Harness changes, the same for every engine:**
+- Each line now also shows p99.99 and the maximum.
+- `sync` runs before each durable phase. Without it, the hundreds of megabytes a load leaves in the page cache are still being written back (gp3 sustains 125 MB/s) when the phase starts. Every engine's `fsync` then waits behind them: traced, the WAL leader sat 10–31 ms in `wbt_wait` and `folio_wait_writeback`.
+- `KV_DURABLE_OPS` sets the durable puts per thread. These runs use 8,000 (default 2,000), so p99.9 is the eighth-slowest put of 8,000 on one thread rather than the second of 2,000.
+- `KV_SLOW_NS` and `KV_STATS` print slow operations with their thread and `CLOCK_MONOTONIC` time, and engine counters after each phase. They are for matching against `perf` traces and are off by default.
+
+**4-writer overwrite tail**, found with `perf` (scheduler switches and CPU samples matched to the slow operations):
+- 88 % of puts over 25 µs never left the CPU. Inside them, the time went to growing the flush queue (rehashing it, faulting in fresh memory) and to `realloc` of the WAL staging buffer.
+- Both happen under a lock every writer takes. Both grow only when the flusher falls behind: at the end of the phase 28–39 MiB of the 64 MiB dirty budget was waiting.
+- Fixes:
+  - The staging buffer is a list of 256 KiB chunks. A full chunk is sealed, not grown, and emptied chunks are pooled (4 at most).
+  - The flusher keeps the queue it took, with room for half again its length, grown outside the lock. It is capped at one id per 256 bytes of the dirty budget: about 262,000 ids, 13 MB at the default 64 MiB.
+
+**Durable 4-writer tail**: each 1 MiB WAL preallocation step costs the commit that makes it 6–8 ms. Writing 1 MiB at gp3 bandwidth alone takes about 8 ms. Without preallocation every commit is 3× slower, and 256 KiB steps cost 5.4 ms each, four times as often.
+
+**Tried and not kept:** two `fsync`s in flight (the next batch writes and syncs while one is still syncing). On ext4 over gp3 it cost 34 % of 4-writer durable throughput (1,635 against 2,480 per second) and raised p99 from 2.5 ms to 4.4 ms. The code stays, set to one in flight: the `fsync` runs on a second handle without the I/O lock, and batches are acknowledged in order. Its test is below.
+
+**Found by the new test:** the simulated disk used by the crash tests let two concurrent syncs of one file finish out of order, so the older one cut bytes the newer had made durable. A kernel never does that. Each sync now reads and updates under the simulator's lock.
+
+**Three rounds** on an on-demand `c7i.xlarge`. "Committed" is the code of section 8.1; both builds use the harness above.
+
+| | Storine, committed | Storine, now | RocksDB no WAL | RocksDB WAL | LMDB |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| fill, ops/s | 704–712 k | **699–711 k** | 523–537 k | 346–358 k | 175–178 k |
+| fill p99.9 | 10.5–12.5 µs | 10.4–13.0 µs | 11.8–12.0 µs | 13.4–13.7 µs | 18.4–19.4 µs |
+| fill p99.99 | 725–757 µs | 731–740 µs | **15.0–15.6 µs** | 21–24 µs | 25–33 µs |
+| read, 1 thread | 1.11–1.17 M | **1.11–1.18 M** | 303–321 k | 303–321 k | 756–789 k |
+| read, 4 threads | 4.02–4.04 M | **3.98–4.11 M** | 887–924 k | 899–947 k | 2.73–2.89 M |
+| overwrite, 1 thread | 731–774 k | **701–793 k** | 510–546 k | 348–358 k | 174–177 k |
+| overwrite p99.9, 1 thread | 9.3–12.9 µs | 9.2–12.6 µs | 12.1–12.2 µs | 13.5–14.0 µs | 17.9–18.3 µs |
+| overwrite, 4 threads | 1.29–1.34 M | **1.28–1.30 M** | 487–535 k | 287–301 k | 125–128 k |
+| overwrite p99, 4 threads | 5.3–5.6 µs | **5.7–6.1 µs** | 18.6–23.0 µs | 33.6–38.0 µs | 20.7–21.0 µs |
+| overwrite p99.9, 4 threads | 51–113 µs | **25.5–27.5 µs** | 193–199 µs | 54–66 µs | 6.8–8.3 ms |
+| overwrite p99.99, 4 threads | 2.2–2.6 ms | 2.5–2.6 ms | 0.58–0.98 ms | **0.71–0.75 ms** | 18–23 ms |
+| durable put, 1 thread | **1,087–1,093** | (two in flight) | 305–314 | | 477–478 |
+| durable p99.9, 1 thread | **1.3–4.1 ms** | | 4.8–9.9 ms | | 3.1–5.1 ms |
+| durable put, 4 threads | **2,462–2,505** | 1,635–1,638 | 825–921 | | 467–468 |
+| durable p99, 4 threads | 2.5–2.6 ms | 4.4–4.6 ms | 7.5–8.2 ms | | 2.5–2.6 ms |
+| durable p99.9, 4 threads | 6.3 ms | 6.4–9.0 ms | 9.4–11.6 ms | | **4.1–6.3 ms** |
+| durable p99.99, 4 threads | **7.5–8.0 ms** | 8.6–12.9 ms | 12–19 ms | | 4,295 ms (the harness's cap) |
+
+The "now" durable rows were measured with two `fsync`s in flight. The committed code keeps one, which is the "committed" path, so the committed column is what ships for durable puts.
+
+**LMDB's 4-writer durable percentiles** look as good as one writer's because its write lock is unfair. One thread commits in a run while the other three wait 4.3 s or more (the harness caps a sample at 4.29 s), and those three waits per phase sit past p99.9. By p99.99 and the maximum, Storine leads by three orders of magnitude.
+
+**Where Storine stands.** It leads every throughput row by 1.3–5× and every p99 row except the 4-writer durable put, where it is level with LMDB (2.5–2.6 ms). In p99.9 it leads every no-fsync row except the fill, which is level with RocksDB without its WAL. It also leads the one-writer durable put. Not won:
+- **4-writer durable p99.9:** 6.3 ms against LMDB's 4.1–6.3 ms. It is the WAL preallocation step, and moving that off the commit path is the open work.
+- **Fill p99.99:** 0.73 ms against RocksDB's 15 µs.
+- **4-writer overwrite p99.99:** 2.5 ms against RocksDB's 0.7 ms.
+
+**Verified on the same instance:** the release workspace suite (all pass) and 40 of 40 process chaos runs, with two `fsync`s in flight, the stricter case. Locally with one in flight: the WAL suite and clippy. Two on-demand `c7i.xlarge` sessions, about 2 h 40 min together, cost about $0.47 and were terminated.

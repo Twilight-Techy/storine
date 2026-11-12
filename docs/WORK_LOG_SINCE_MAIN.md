@@ -239,3 +239,9 @@ Yes:
 - Spinning hot locks, staging and flush-queue capacity kept across swaps, a 4 MiB appender threshold for the WAL staging buffer, and a fairer overwrite in the harness.
 - 4-thread overwrite p99.9 from 252–288 µs to 54–103 µs; p99 from 14–20 µs to 5–6 µs. Still behind RocksDB with its WAL in that p99.9 in two of three rounds.
 - **Verified**: workspace suite and 40 of 40 chaos runs on AWS (about $0.61).
+
+### Traced tails (`TASK-153`) — 2026-11-12
+
+- Chunked WAL staging, a pre-grown flush queue, group-commit `fsync` outside the I/O lock with ordered acknowledgement, a simulated-disk sync fix, and harness `sync`/p99.99/max.
+- 4-writer overwrite p99.9 at 25.5–27.5 µs, ahead of RocksDB. Still open: durable 4-writer p99.9 (WAL preallocation), and the fill and overwrite p99.99.
+- **Verified**: workspace suite and 40 of 40 chaos runs on AWS (about $0.47).
