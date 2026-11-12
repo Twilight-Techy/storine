@@ -214,3 +214,52 @@ The harness is `benches/kv-compare` (outside the workspace, so LMDB and RocksDB 
 - **Durable writes:** it is 20–30 % behind LMDB on one thread, and 25 % behind RocksDB on four.
 
 **So it is not yet faster than or as fast as both everywhere.** It leads on reads and trails on writes.
+
+## 8. Write Path Rework Against LMDB and RocksDB (`TASK-153`, 2026-11-12)
+
+**Setup.** As in section 7.2: one on-demand AWS `c7i.xlarge` (4 vCPU Sapphire Rapids, gp3 EBS, Ubuntu 24.04, Rust 1.99.1, `target-cpu=native`), `benches/kv-compare`, 1,000,000 records of 288 bytes. The three engines ran in turn for three rounds; ranges below are the lowest and highest of the three.
+
+One difference from 7.2: the record type here declares no secondary indexes (`Indexable::INDEXED = false`), so Storine encodes inside `put` but maintains no tag or timestamp index. LMDB and RocksDB index nothing either. A record type with indexes still pays for them (`NumericRangeIndex` is one `RwLock<BTreeMap>`), and that path was not measured in this run.
+
+**What changed.**
+- Frames come from a pool with thread-local caches. glibc's arena lock was contended when the flusher freed frames that writers had allocated.
+- The flusher takes the whole dirty queue at once and writes up to 512 frames per positional write (`ArenaManager::write_records`). Each record still completes under its stripe lock, and only if its version and location are unchanged.
+- In memory-first mode the WAL frame is checksummed and compressed before the lock and then copied into a staging buffer, with no queue or condvar. The buffer is written out at 256 KiB, and before any flush, sync, truncation or drop.
+- Group commit waits briefly (one twelfth of the measured fsync time, at most 250 µs) when the last batch had more than one writer, and only wakes waiters that exist.
+- Syncing WALs preallocate 1 MiB of zeros ahead of the write position. On this ext4/EBS volume, `fdatasync` after an append that grows the file took 2.77 ms, against 0.87 ms into blocks already written. Truncation and recovery use the logical end, not the file length.
+- `put` looks a record up once instead of twice.
+
+**No fsync** (Storine `AsyncMemoryFirst`; the same durability tiers as 7.2):
+
+| | Storine | RocksDB no WAL | RocksDB WAL | LMDB `NO_SYNC` | Storine against the fastest other |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| fill, ops/s | **645–669 k** | 452–459 k | 309–322 k | 163 k | 1.4× RocksDB no WAL |
+| read, 1 thread | **1.04–1.06 M** | 286–290 k | 288–296 k | 716–721 k | 1.45× LMDB |
+| read, 4 threads | **3.75–3.82 M** | 817–846 k | 777–838 k | 2.70–2.72 M | 1.4× LMDB |
+| overwrite, 1 thread | **799–800 k** | 463–477 k | 314–318 k | 160–161 k | 1.7× RocksDB no WAL |
+| overwrite, 4 threads | **1.18–1.19 M** | 471–481 k | 259–267 k | 118–119 k | 2.5× RocksDB no WAL |
+| overwrite p99, 1 thread | **2.3–2.4 µs** | 4.5–4.7 µs | 6.4–6.5 µs | 8.0–8.1 µs | lowest |
+| overwrite p99, 4 threads | **18.4–20.2 µs** | 24.8–31.3 µs | 39–42 µs | 21.3–21.6 µs | lowest |
+| overwrite p99.9, 4 threads | 261–288 µs | 159–240 µs | **67–83 µs** | 7.4–9.0 ms | **behind both RocksDB modes** |
+| read p99, 4 threads | **1.5–1.6 µs** | 10.3–11.0 µs | 10.4–10.9 µs | 2.0 µs | lowest |
+| settle (flush to disk) | **0.42–0.49 s** | 3.9 s | 3.6 s | 2.8 s | fastest |
+
+**fsync per commit** (Storine `GroupCommit`, RocksDB `sync = true`, LMDB default; "recycle" reuses RocksDB's WAL files, as Storine's preallocation reuses blocks):
+
+| | Storine | RocksDB | RocksDB recycle | LMDB |
+| :--- | ---: | ---: | ---: | ---: |
+| put, 1 thread, ops/s | **1,875–1,908** | 347–356 | 339–353 | 468–471 |
+| put, 4 threads, ops/s | **2,606–2,616** | 800–818 | 802–845 | 412–413 |
+| p99, 1 thread | **0.75–0.77 ms** | 3.8–3.9 ms | 3.9–4.0 ms | 2.4–2.5 ms |
+| p99, 4 threads | **2.4 ms** (5.5 ms in one round) | 8.1–8.2 ms | 7.8–8.1 ms | 2.6 ms |
+| p99.9, 4 threads | 5.7–10.2 ms | **9.4–9.9 ms** (recycle 11.9–14.9) | | 58–86 ms |
+
+**Against section 7.2** (same instance type): fill 2.3× faster, overwrite 3.1× on one thread and 2.6× on four, durable puts 4.9× on one thread and 4.2× on four. The 4-thread overwrite p99 fell from 72–75 µs to 18–20 µs.
+
+**Where Storine stands.** It is the fastest of the three in every throughput row, and has the lowest p99 in every row. Two tails are not won:
+- The 4-thread overwrite p99.9 is 261–288 µs, against 67–83 µs for RocksDB with its WAL and 159–240 µs without it. Four writers and the flusher share four vCPUs, so a writer is sometimes descheduled for a scheduler slice.
+- The 4-thread durable p99.9 is 5.7–10.2 ms against RocksDB's 9.4–9.9 ms: ahead in two rounds and behind in one.
+
+**Trade-off.** A batched flush appends records to the arena instead of rewriting their old slots in place, so arena files can hold about twice the live data until compaction reclaims the dead slots. The auto-compaction threshold is unchanged.
+
+**Verified on the same instance:** the release workspace suite (all pass) and 40 of 40 process chaos runs. The instance ran about 1 h 30 min on demand at $0.1785/h, about $0.27, and was terminated when the job finished.

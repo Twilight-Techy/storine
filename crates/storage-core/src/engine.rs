@@ -1316,9 +1316,20 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         self.inner.ensure_writable()?;
         let _lock = self.inner.locks.lock_one(id);
         let now_ns = current_time_ns();
-        let next_ver = self.inner.next_version(self.inner.primary.version_of(id));
-        self.inner
-            .write_record_locked(id, parent_group, record, next_ver, now_ns, 0, RecordFlags::NONE)
+        // One index lookup serves both the next version and the publish below (the stripe lock
+        // keeps the entry from changing in between).
+        let existing = self.inner.primary.get(id);
+        let next_ver = self.inner.next_version(existing.as_ref().map(|e| e.version));
+        self.inner.write_record_locked_known(
+            id,
+            Some(existing),
+            parent_group,
+            record,
+            next_ver,
+            now_ns,
+            0,
+            RecordFlags::NONE,
+        )
     }
 
     /// Inserts or overwrites a record under `id`.
@@ -2872,6 +2883,23 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         ttl_expires_at_ns: u64,
         flags: RecordFlags,
     ) -> Result<Version> {
+        self.write_record_locked_known(id, None, parent_group, record, version, now_ns, ttl_expires_at_ns, flags)
+    }
+
+    /// [`Self::write_record_locked`] with the record's current entry already read (`known`) by
+    /// the caller under the same stripe lock, saving a second index lookup. `None` reads it here.
+    #[allow(clippy::too_many_arguments)]
+    fn write_record_locked_known(
+        &self,
+        id: InlineId,
+        known: Option<Option<PrimaryEntry>>,
+        parent_group: Option<InlineId>,
+        record: &T,
+        version: Version,
+        now_ns: u64,
+        ttl_expires_at_ns: u64,
+        flags: RecordFlags,
+    ) -> Result<Version> {
         let frame = RecordCodec::encode_aligned(record, version, now_ns, flags, ttl_expires_at_ns);
 
         if let Some(ref wal) = self.wal {
@@ -2882,12 +2910,13 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         }
 
         let _mvcc_gate = self.mvcc.writer_guard();
-        self.apply_encoded_upsert_locked(
+        let existing = known.unwrap_or_else(|| self.primary.get(id));
+        self.apply_upsert_with_existing(
             id,
+            existing,
             parent_group,
             record,
             version,
-            now_ns,
             ttl_expires_at_ns,
             frame,
         )?;
@@ -2910,6 +2939,22 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         frame: AlignedBytes,
     ) -> Result<()> {
         let existing = self.primary.get(id);
+        self.apply_upsert_with_existing(id, existing, parent_group, record, version, ttl_expires_at_ns, frame)
+    }
+
+    /// [`Self::apply_encoded_upsert_locked`] with the record's current entry already read under
+    /// the same stripe lock (no other writer, flush or compaction can change it meanwhile).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_upsert_with_existing(
+        &self,
+        id: InlineId,
+        existing: Option<PrimaryEntry>,
+        parent_group: Option<InlineId>,
+        record: &T,
+        version: Version,
+        ttl_expires_at_ns: u64,
+        frame: AlignedBytes,
+    ) -> Result<()> {
         // History must be recorded BEFORE the new version becomes visible (snapshot readers
         // re-check the chain after reading the current state).
         if self.mvcc.has_active_snapshots() {
@@ -2930,10 +2975,14 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             Some(e) => e.ordinal,
             None => self.primary.allocate_ordinal(id),
         };
-        let old_snap = existing
-            .as_ref()
-            .and_then(|e| self.extract_snapshot_for_entry(e))
-            .unwrap_or_default();
+        let old_snap = if T::INDEXED {
+            existing
+                .as_ref()
+                .and_then(|e| self.extract_snapshot_for_entry(e))
+                .unwrap_or_default()
+        } else {
+            IndexSnapshot::default()
+        };
 
         // A record moved to a different parent group leaves its old file behind; it is removed
         // once the new location has been written.
@@ -2976,8 +3025,10 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         };
 
         // Differential secondary index update without any global IndexSnapshot map (`TASK-016`, `F-INDX-05`, `RULE-MEM-02`)
-        let new_snap = record.extract_index_snapshot();
-        self.apply_index_snapshot_diff(ordinal, &old_snap, &new_snap);
+        let new_snap = if T::INDEXED { record.extract_index_snapshot() } else { IndexSnapshot::default() };
+        if T::INDEXED {
+            self.apply_index_snapshot_diff(ordinal, &old_snap, &new_snap);
+        }
         self.notify_watches(id, &old_snap, &new_snap);
         if T::NAMED_EMBEDDINGS {
             self.sync_named_vectors(ordinal, record.named_embeddings());
@@ -3541,7 +3592,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
 
     fn background_flush_loop(&self, interval: Duration) {
         while !self.shutdown.load(Ordering::Relaxed) {
-            let batch = {
+            let queued = {
                 let mut q = self
                     .flush_queue
                     .lock()
@@ -3564,23 +3615,108 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     q = q2;
                 }
-                q.drain_batch(128)
+                // Take the whole queue in O(1): writers wait on this lock for no longer than a
+                // swap, not for hundreds of removals. Ids written again meanwhile are queued
+                // anew; a flush that finds a record clean skips it.
+                std::mem::take(&mut *q)
             };
-
-            // Memory-first WAL frames reach the OS at least once per flush interval.
-            if let Some(ref wal) = self.wal {
-                let _ = wal.flush_buffered();
-            }
-            let sync = self.data_sync();
-            for id in batch {
-                if self.flush_single_record_impl(id, sync, false, true).is_err() {
-                    // Retain `hot_dirty` in RAM and re-enqueue `id` for retry after a short
-                    // back-off (no busy loop on persistent errors such as a full disk).
-                    self.enqueue_flush(id);
-                    thread::sleep(interval);
+            let ids: Vec<InlineId> = queued.order.into();
+            drop(queued.in_queue);
+            for (n, batch) in ids.chunks(FLUSH_BATCH).enumerate() {
+                if !self.flush_ids(batch, interval) {
+                    for &id in ids.iter().skip((n + 1) * FLUSH_BATCH) {
+                        self.enqueue_flush(id);
+                    }
+                    break;
                 }
             }
         }
+    }
+
+    /// Flushes `batch` (one background-flush step); `false` after an error, with the batch's
+    /// records re-queued and a short back-off already taken.
+    fn flush_ids(&self, batch: &[InlineId], interval: Duration) -> bool {
+        // Memory-first WAL frames reach the OS at least once per flush interval.
+        if let Some(ref wal) = self.wal {
+            let _ = wal.flush_buffered();
+        }
+        let sync = self.data_sync();
+        // Common case: unencrypted frames headed for the arena, written as one batch.
+        let rest = if self.arena.is_some() && !self.crypto_on.load(Ordering::Acquire) {
+            match self.flush_arena_batch(batch) {
+                Ok(rest) => rest,
+                Err(_) => {
+                    // Nothing was published: everything stays dirty in RAM and is retried
+                    // after a short back-off.
+                    for &id in batch {
+                        self.enqueue_flush(id);
+                    }
+                    thread::sleep(interval);
+                    return false;
+                }
+            }
+        } else {
+            batch.to_vec()
+        };
+        for id in rest {
+            if self.flush_single_record_impl(id, sync, false, true).is_err() {
+                // Retain `hot_dirty` in RAM and re-enqueue `id` for retry after a short
+                // back-off (no busy loop on persistent errors such as a full disk).
+                self.enqueue_flush(id);
+                thread::sleep(interval);
+            }
+        }
+        true
+    }
+
+    /// Flushes the dirty arena-bound records among `ids` with one positional write per segment
+    /// (instead of one per record), and returns the ids it did not take (other layouts, frames
+    /// above the arena threshold, grouped records), for the per-record path.
+    ///
+    /// Frames are read without the record's stripe lock and written; each record is then
+    /// completed under its stripe lock, and only if no write, flush or compaction changed it
+    /// meanwhile (`PrimaryIndex::complete_flush_at`). Otherwise the new frame is marked dead and
+    /// the record stays as the other party left it. Batched frames are appended, never written
+    /// into reused dead slots; the old slots are counted dead for compaction.
+    fn flush_arena_batch(&self, ids: &[InlineId]) -> Result<Vec<InlineId>> {
+        let (Some(arena), StorageLayoutMode::AdaptiveArena { arena_threshold_bytes, .. }) =
+            (self.arena.as_ref(), self.config.layout_mode)
+        else {
+            return Ok(ids.to_vec());
+        };
+        let mut rest = Vec::new();
+        let mut items: Vec<(InlineId, Version, AlignedBytes, DiskLocation)> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let Some(entry) = self.primary.get(id) else { continue };
+            let Some(frame) = entry.hot_dirty else { continue };
+            match entry.location {
+                DiskLocation::Unflushed | DiskLocation::Arena(_) if frame.len() <= arena_threshold_bytes => {
+                    items.push((id, entry.version, frame, entry.location));
+                }
+                _ => rest.push(id),
+            }
+        }
+        if items.is_empty() {
+            return Ok(rest);
+        }
+        let frames: Vec<&[u8]> = items.iter().map(|(_, _, f, _)| f.as_slice()).collect();
+        let locs = arena.write_records(&frames, false)?;
+        drop(frames);
+        for ((id, version, frame, old), loc) in items.into_iter().zip(locs) {
+            let hdr = RecordCodec::header_ref(frame.as_slice())?;
+            let verified = !hdr.is_tombstone() && !hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4);
+            let _lock = self.locks.lock_one(id);
+            if self.primary.complete_flush_at(id, version, old, DiskLocation::Arena(loc), verified) {
+                if let DiskLocation::Arena(old_loc) = old {
+                    // Counted dead (for compaction) without offering the slot for reuse:
+                    // batched frames are only ever appended.
+                    arena.mark_dead(old_loc);
+                }
+            } else {
+                arena.mark_dead(loc);
+            }
+        }
+        Ok(rest)
     }
 
     /// Writes the primary checkpoint and, for the paged index tier, the secondary indexes, all
@@ -4245,6 +4381,9 @@ impl<'a, T: ZeroCopyRecord + Indexable> TransactionBatch<'a, T> {
         }
     }
 }
+
+/// Records the background flusher writes per step (one arena write each).
+const FLUSH_BATCH: usize = 512;
 
 /// What [`StorageEngine::evacuate_segments`] did.
 #[derive(Default)]

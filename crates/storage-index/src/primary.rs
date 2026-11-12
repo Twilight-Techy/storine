@@ -494,6 +494,34 @@ impl PrimaryIndex {
         true
     }
 
+    /// [`Self::complete_background_flush`] for a flush that read the entry before taking the
+    /// record's stripe lock: completes only if the entry is still `flushed_version`, still dirty
+    /// and still at `expected_location` (no other flush or compaction got there first). On
+    /// `false` the caller's new frame is dead and the old location is still in use.
+    pub fn complete_flush_at(
+        &self,
+        id: InlineId,
+        flushed_version: Version,
+        expected_location: DiskLocation,
+        new_location: DiskLocation,
+        disk_verified: bool,
+    ) -> bool {
+        let mut shard = self.write_shard(Self::shard_idx(id));
+        let Some(entry) = shard.by_id.get_mut(&id) else {
+            return false;
+        };
+        if entry.version != flushed_version || entry.location != expected_location || entry.hot_dirty.is_none() {
+            return false;
+        }
+        entry.location = new_location;
+        entry.disk_verified = disk_verified;
+        if let Some(removed_buf) = entry.hot_dirty.take() {
+            self.hot_dirty_bytes
+                .fetch_sub(removed_buf.len(), Ordering::Relaxed);
+        }
+        true
+    }
+
     /// Marks the on-disk frame of `id` as validated, but only if it is still at `location`.
     ///
     /// Tier-only entries are not promoted into RAM (a scan would otherwise pull the whole tier

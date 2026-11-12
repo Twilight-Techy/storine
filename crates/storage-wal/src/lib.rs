@@ -25,6 +25,22 @@ use storage_codec::{checksum_payload, compress_lz4, decompress_lz4};
 use storage_types::vfs::{OpenOpts, VfsHandle, VfsRef};
 use storage_types::{CachePadded, InlineId, Result, StorageError, Version, MAX_PAYLOAD_SIZE};
 
+/// Upper bound on how long a group-commit leader waits for concurrent writers before an
+/// `fsync` (only after a batch of more than one frame; a lone writer never waits).
+const GROUP_COMMIT_LINGER_MAX: std::time::Duration = std::time::Duration::from_micros(250);
+/// The wait is this fraction of the measured `fsync` time: about 225 µs on a network disk
+/// (2.7 ms `fsync`), a few microseconds on local NVMe.
+const GROUP_COMMIT_LINGER_DIVISOR: u64 = 12;
+
+/// Bytes of zeros written ahead of the log at a time (`fsync`ing policies).
+const WAL_PREALLOC_CHUNK: u64 = 1 << 20;
+/// A new chunk is written once less than this much preallocated space is left.
+const WAL_PREALLOC_LOW_WATER: u64 = 256 << 10;
+static WAL_ZEROS: [u8; 64 << 10] = [0; 64 << 10];
+
+/// Staged (`AsyncMemoryFirst`) bytes past which the appender pushes them to the OS itself.
+const STAGED_FLUSH_BYTES: usize = 256 * 1024;
+
 /// Unlocked catch-up copies a checkpoint truncation makes before its locked final copy.
 const TRUNCATE_CATCH_UP_ROUNDS: usize = 16;
 /// A tail this short is left for the locked final copy (writers wait while it is copied).
@@ -141,6 +157,12 @@ struct GroupCommitState {
     /// All submissions with `seq <= completed_seq` are durably written.
     completed_seq: u64,
     flushing: bool,
+    /// Threads blocked on `cv` (counted under this lock): a completed batch wakes them only if
+    /// there are any, so the uncontended path makes no futex wake syscall.
+    waiters: u32,
+    /// Frames in the last batch written. Above one, writers are concurrent, and the next leader
+    /// of an `fsync`ing policy waits [`GROUP_COMMIT_LINGER`] for them before syncing.
+    last_batch: usize,
     /// Set after any I/O failure; the WAL is fail-stop from then on.
     broken: Option<String>,
 }
@@ -158,9 +180,20 @@ pub struct GroupCommitWal {
     state: Mutex<GroupCommitState>,
     cv: Condvar,
     io: Mutex<BufWriter<VfsHandle>>,
+    /// `AsyncMemoryFirst` only: frames appended since the last flush, in LSN order. Appenders
+    /// copy into it under this short lock; [`Self::flush_buffered`] swaps it out and writes it
+    /// holding only `io`, so an append never waits for a `write` syscall.
+    staged: Mutex<Vec<u8>>,
     vfs: VfsRef,
     total_batches: CachePadded<AtomicU64>,
     total_frames: CachePadded<AtomicU64>,
+    /// Moving average of a batch `fsync`, in nanoseconds (sizes the group-commit wait).
+    fsync_ns: AtomicU64,
+    /// End of the frames written to the file (a lower bound while a write is in flight); the
+    /// file can extend past it with preallocated zeros.
+    logical_end: AtomicU64,
+    /// File length including preallocated zeros (`fsync`ing policies; changed under `io`).
+    alloc_end: AtomicU64,
     /// One checkpoint truncation at a time: between its two phases the file only grows.
     truncating: Mutex<()>,
 }
@@ -350,7 +383,7 @@ impl GroupCommitWal {
             file.sync_data()
                 .map_err(|e| StorageError::io("fsync truncated WAL tail", e))?;
         }
-        file.seek(SeekFrom::End(0))
+        let end = file.seek(SeekFrom::End(0))
             .map_err(|e| StorageError::io("seek WAL end", e))?;
 
         Ok(Self {
@@ -364,13 +397,19 @@ impl GroupCommitWal {
                 enqueued_seq: 0,
                 completed_seq: 0,
                 flushing: false,
+                waiters: 0,
+                last_batch: 0,
                 broken: None,
             }),
             cv: Condvar::new(),
             io: Mutex::new(BufWriter::with_capacity(256 * 1024, file)),
+            staged: Mutex::new(Vec::new()),
             vfs,
             total_batches: CachePadded::new(AtomicU64::new(0)),
             total_frames: CachePadded::new(AtomicU64::new(0)),
+            fsync_ns: AtomicU64::new(0),
+            logical_end: AtomicU64::new(end),
+            alloc_end: AtomicU64::new(end),
             truncating: Mutex::new(()),
         })
     }
@@ -389,13 +428,48 @@ impl GroupCommitWal {
         version: Version,
         frame_bytes: &[u8],
     ) -> Result<u64> {
+        // Hashed (and compressed) before the lock, which then covers only the header and copy.
+        let prepared = (!self.policy.syncs()).then(|| PreparedBody::new(frame_bytes));
         let mut guard = self.lock_state();
         if let Some(ref msg) = guard.broken {
             return Err(Self::broken_error(msg));
         }
-        if !guard.flushing && guard.queue.is_empty() {
+        if let (Some(prepared), false, true) = (prepared.as_ref(), guard.flushing, guard.queue.is_empty()) {
+            // `AsyncMemoryFirst` with nothing pending: there is no `fsync` to share, so the frame
+            // is staged right here, with its LSN, under the state lock: no batch can be staged
+            // in between (file order stays LSN order) and no writer waits on the condvar.
+            guard.last_lsn += 1;
+            let lsn = guard.last_lsn;
+            self.current_lsn.store(lsn, Ordering::Release);
+            let full = {
+                let mut staged = self.staged.lock().unwrap_or_else(|p| p.into_inner());
+                prepared.write(&mut staged, lsn, 0, collection_id, kind, record_id, version);
+                staged.len() >= STAGED_FLUSH_BYTES
+            };
+            guard.enqueued_seq += 1;
+            guard.completed_seq = guard.enqueued_seq;
+            drop(guard);
+            self.total_frames.fetch_add(1, Ordering::Relaxed);
+            self.total_batches.fetch_add(1, Ordering::Relaxed);
+            if full {
+                let mut io = self.lock_io();
+                if let Err(e) = self.drain_staged(&mut io) {
+                    drop(io);
+                    self.lock_state().broken = Some(e.to_string());
+                    return Err(e);
+                }
+            }
+            if kind != WalOpKind::Upsert {
+                // Only the hot upsert path is left buffered under `AsyncMemoryFirst`.
+                self.flush_buffered()?;
+            }
+            return Ok(lsn);
+        }
+        let concurrent = self.policy.syncs() && guard.last_batch > 1;
+        if !guard.flushing && guard.queue.is_empty() && !concurrent {
             // Uncontended fast path: become leader for a single frame without allocating a batch.
             guard.flushing = true;
+            guard.last_batch = 1;
             guard.last_lsn += 1;
             let lsn = guard.last_lsn;
             self.current_lsn.store(lsn, Ordering::Release);
@@ -403,10 +477,12 @@ impl GroupCommitWal {
             let my_seq = guard.enqueued_seq;
             drop(guard);
 
-            let res = {
+            let res = if self.policy.syncs() {
                 let mut io = self.lock_io();
                 Self::write_frame(&mut *io, lsn, 0, collection_id, kind, record_id, version, frame_bytes)
                     .and_then(|()| self.finish_batch_io(&mut io))
+            } else {
+                self.stage(|buf| Self::write_frame(buf, lsn, 0, collection_id, kind, record_id, version, frame_bytes))
             };
             self.total_frames.fetch_add(1, Ordering::Relaxed);
             self.complete_batch(my_seq, res)?;
@@ -489,6 +565,41 @@ impl GroupCommitWal {
     }
 
     #[inline]
+    /// Appends frames to the staged buffer (`AsyncMemoryFirst`); past 256 KiB the appender
+    /// pushes them to the OS itself, as a full `BufWriter` would.
+    fn stage(&self, write: impl FnOnce(&mut Vec<u8>) -> Result<()>) -> Result<()> {
+        let full = {
+            let mut staged = self.staged.lock().unwrap_or_else(|p| p.into_inner());
+            write(&mut staged)?;
+            staged.len() >= STAGED_FLUSH_BYTES
+        };
+        if full {
+            let mut io = self.lock_io();
+            self.drain_staged(&mut io)?;
+        }
+        Ok(())
+    }
+
+    /// Moves the staged frames into `io` (whose lock the caller holds, which orders drains).
+    fn drain_staged(&self, io: &mut BufWriter<VfsHandle>) -> Result<()> {
+        let mut taken = {
+            let mut staged = self.staged.lock().unwrap_or_else(|p| p.into_inner());
+            if staged.is_empty() {
+                return Ok(());
+            }
+            std::mem::take(&mut *staged)
+        };
+        io.write_all(&taken)
+            .map_err(|e| StorageError::io("write staged WAL frames", e))?;
+        // Give the allocation back for the next frames if nothing was staged meanwhile.
+        taken.clear();
+        let mut staged = self.staged.lock().unwrap_or_else(|p| p.into_inner());
+        if staged.is_empty() && staged.capacity() < taken.capacity() {
+            *staged = taken;
+        }
+        Ok(())
+    }
+
     fn lock_io(&self) -> std::sync::MutexGuard<'_, BufWriter<VfsHandle>> {
         self.io.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -517,11 +628,36 @@ impl GroupCommitWal {
             }
             if !guard.flushing {
                 guard.flushing = true;
+                if self.policy.syncs() && guard.last_batch > 1 && guard.queue.len() < guard.last_batch {
+                    // Writers are concurrent: the ones just served are about to queue again.
+                    // Waiting for them makes one `fsync` cover all instead of alternating
+                    // small and large batches (each costing a full `fsync`).
+                    drop(guard);
+                    std::thread::sleep(self.group_commit_linger());
+                    guard = self.lock_state();
+                }
                 let drained = std::mem::take(&mut guard.queue);
+                guard.last_batch = drained.len();
                 let batch_seq = guard.enqueued_seq;
                 drop(guard);
 
-                let res = {
+                let res = if !self.policy.syncs() {
+                    self.stage(|buf| {
+                        for item in &drained {
+                            Self::write_frame(
+                                buf,
+                                item.lsn,
+                                item.txn_id,
+                                item.collection_id,
+                                item.kind,
+                                item.record_id,
+                                item.version,
+                                &item.frame_bytes,
+                            )?;
+                        }
+                        Ok(())
+                    })
+                } else {
                     let mut io = self.lock_io();
                     let mut r = Ok(());
                     for item in &drained {
@@ -551,10 +687,12 @@ impl GroupCommitWal {
                 }
                 res?;
             } else {
+                guard.waiters += 1;
                 guard = self
                     .cv
                     .wait(guard)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.waiters -= 1;
             }
         }
     }
@@ -565,11 +703,45 @@ impl GroupCommitWal {
         if self.policy.syncs() {
             io.flush()
                 .map_err(|e| StorageError::io("flush WAL buffer", e))?;
+            let pos = io
+                .stream_position()
+                .map_err(|e| StorageError::io("locate WAL end", e))?;
+            let alloc = self.alloc_end.load(Ordering::Relaxed);
+            if pos.saturating_add(WAL_PREALLOC_LOW_WATER) > alloc {
+                // Zeros written ahead of the log: later appends overwrite blocks the file
+                // already has, so their `fdatasync` commits no size or extent change (about
+                // 3x faster on ext4: 0.9 ms against 2.8 ms on EBS). This `fdatasync` makes the
+                // zeros durable once. Recovery stops at them like at any torn tail.
+                let start = alloc.max(pos);
+                io.seek(SeekFrom::Start(start))
+                    .map_err(|e| StorageError::io("seek WAL preallocation", e))?;
+                for _ in 0..WAL_PREALLOC_CHUNK / WAL_ZEROS.len() as u64 {
+                    io.write_all(&WAL_ZEROS)
+                        .map_err(|e| StorageError::io("preallocate WAL", e))?;
+                }
+                io.flush()
+                    .map_err(|e| StorageError::io("preallocate WAL", e))?;
+                io.seek(SeekFrom::Start(pos))
+                    .map_err(|e| StorageError::io("seek WAL end", e))?;
+                self.alloc_end.store(start + WAL_PREALLOC_CHUNK, Ordering::Relaxed);
+            }
+            self.logical_end.store(pos, Ordering::Release);
+            let t = std::time::Instant::now();
             io.get_ref()
                 .sync_data()
                 .map_err(|e| StorageError::io("fsync WAL file", e))?;
+            let took = t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            let avg = self.fsync_ns.load(Ordering::Relaxed);
+            let next = if avg == 0 { took } else { avg - avg / 8 + took / 8 };
+            self.fsync_ns.store(next, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    /// How long the next group-commit leader waits for concurrent writers.
+    fn group_commit_linger(&self) -> std::time::Duration {
+        let ns = self.fsync_ns.load(Ordering::Relaxed) / GROUP_COMMIT_LINGER_DIVISOR;
+        std::time::Duration::from_nanos(ns).min(GROUP_COMMIT_LINGER_MAX)
     }
 
     /// Forces every frame appended so far to stable storage (`write` + `fsync`), whatever the
@@ -578,8 +750,8 @@ impl GroupCommitWal {
     pub fn sync_to_disk(&self) -> Result<()> {
         let res = {
             let mut io = self.lock_io();
-            io.flush()
-                .map_err(|e| StorageError::io("flush WAL buffer", e))
+            self.drain_staged(&mut io)
+                .and_then(|()| io.flush().map_err(|e| StorageError::io("flush WAL buffer", e)))
                 .and_then(|()| {
                     io.get_ref()
                         .sync_data()
@@ -602,11 +774,18 @@ impl GroupCommitWal {
         }
         let res = {
             let mut io = self.lock_io();
-            if io.buffer().is_empty() {
-                return Ok(());
-            }
-            io.flush()
-                .map_err(|e| StorageError::io("flush buffered WAL frames", e))
+            self.drain_staged(&mut io).and_then(|()| {
+                if io.buffer().is_empty() {
+                    return Ok(());
+                }
+                io.flush()
+                    .map_err(|e| StorageError::io("flush buffered WAL frames", e))?;
+                let pos = io
+                    .stream_position()
+                    .map_err(|e| StorageError::io("locate WAL end", e))?;
+                self.logical_end.store(pos, Ordering::Release);
+                Ok(())
+            })
         };
         if let Err(ref e) = res {
             let mut guard = self.lock_state();
@@ -624,7 +803,9 @@ impl GroupCommitWal {
             Ok(()) => {
                 guard.completed_seq = guard.completed_seq.max(batch_seq);
                 self.total_batches.fetch_add(1, Ordering::Relaxed);
-                self.cv.notify_all();
+                if guard.waiters > 0 {
+                    self.cv.notify_all();
+                }
                 Ok(())
             }
             Err(e) => {
@@ -701,10 +882,12 @@ impl GroupCommitWal {
     ) -> Result<R> {
         let mut guard = self.lock_state();
         while guard.flushing {
+            guard.waiters += 1;
             guard = self
                 .cv
                 .wait(guard)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.waiters -= 1;
         }
         if let Some(ref msg) = guard.broken {
             return Err(Self::broken_error(msg));
@@ -716,7 +899,11 @@ impl GroupCommitWal {
         let mut poison = false;
         let res = {
             let mut io = self.lock_io();
-            f(&mut io, &mut poison)
+            // Staged frames come first: `f` must see every frame appended before it.
+            match self.drain_staged(&mut io) {
+                Ok(()) => f(&mut io, &mut poison),
+                Err(e) => Err(e),
+            }
         };
 
         let mut guard = self.lock_state();
@@ -724,7 +911,9 @@ impl GroupCommitWal {
         if let (Err(ref e), true) = (&res, poison) {
             guard.broken = Some(e.to_string());
         }
-        self.cv.notify_all();
+        if guard.waiters > 0 || guard.broken.is_some() {
+            self.cv.notify_all();
+        }
         res
     }
 
@@ -755,12 +944,12 @@ impl GroupCommitWal {
     ) -> Result<()> {
         let _one = self.truncating.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // Phase 1: how far the WAL reaches now. Only appends can follow until phase 2.
+        // The log's end, not the file's: the file may extend past it with preallocated zeros.
         let head_len = self.with_exclusive_io(|io, _| {
             io.flush()
                 .map_err(|e| StorageError::io("flush WAL before checkpoint truncate", e))?;
-            io.get_ref()
-                .len()
-                .map_err(|e| StorageError::io("stat WAL before checkpoint truncate", e))
+            io.stream_position()
+                .map_err(|e| StorageError::io("locate WAL end before checkpoint truncate", e))
         })?;
         let mut next_path = self.path.as_os_str().to_os_string();
         next_path.push(".next");
@@ -845,7 +1034,8 @@ impl GroupCommitWal {
         // bytes can be copied as they are (a frame cut in two is finished by the next copy).
         let mut copied = head_len;
         for _ in 0..TRUNCATE_CATCH_UP_ROUNDS {
-            let len = self.vfs.open(&self.path, OpenOpts::read()).and_then(|f| f.len()).map_err(|e| StorageError::io("stat WAL tail", e))?;
+            // Frames known to be in the file (a lower bound; the locked copy takes the rest).
+            let len = self.logical_end.load(Ordering::Acquire);
             if len.saturating_sub(copied) < TRUNCATE_LOCKED_TAIL_BYTES {
                 break;
             }
@@ -859,7 +1049,10 @@ impl GroupCommitWal {
         self.with_exclusive_io(|io, poison| {
             io.flush()
                 .map_err(|e| StorageError::io("flush WAL before checkpoint swap", e))?;
-            self.copy_wal_bytes(copied, None, &mut next)?;
+            let end = io
+                .stream_position()
+                .map_err(|e| StorageError::io("locate WAL end before checkpoint swap", e))?;
+            self.copy_wal_bytes(copied, Some(end), &mut next)?;
             next.sync_all()
                 .map_err(|e| StorageError::io("fsync replacement WAL file", e))?;
 
@@ -884,9 +1077,13 @@ impl GroupCommitWal {
                 *poison = true;
                 return Err(e);
             }
-            io.get_mut()
+            let end = io
+                .get_mut()
                 .seek(SeekFrom::End(0))
                 .map_err(|e| StorageError::io("seek replacement WAL end", e))?;
+            // The replacement holds no preallocated zeros yet.
+            self.logical_end.store(end, Ordering::Release);
+            self.alloc_end.store(end, Ordering::Relaxed);
             Ok(old_file)
         })
         .map(drop)
@@ -1014,6 +1211,8 @@ impl GroupCommitWal {
 impl Drop for GroupCommitWal {
     fn drop(&mut self) {
         let mut io = self.io.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let staged = std::mem::take(&mut *self.staged.lock().unwrap_or_else(|p| p.into_inner()));
+        let _ = io.write_all(&staged);
         let _ = io.flush();
         if self.policy.syncs() {
             let _ = io.get_ref().sync_data();
@@ -1045,9 +1244,59 @@ fn compute_wal_checksum(
     meta[32..56].copy_from_slice(&record_id.to_raw_bytes());
     meta[56..60].copy_from_slice(&(body.len() as u32).to_le_bytes());
     meta[60..64].copy_from_slice(&uncompressed_len.to_le_bytes());
-    let h1 = checksum_payload(&meta);
-    let h2 = checksum_payload(body);
-    h1 ^ h2.rotate_left(29)
+    wal_checksum_from(&meta, checksum_payload(body))
+}
+
+/// The frame checksum from the 64-byte metadata block and the body's own hash (computed apart
+/// so it can be taken before the WAL's lock; the result is identical).
+#[inline]
+fn wal_checksum_from(meta: &[u8; 64], body_hash: u64) -> u64 {
+    checksum_payload(meta) ^ body_hash.rotate_left(29)
+}
+
+/// A frame body ready to be appended: compressed if worth it, hashed. Built outside the WAL's
+/// lock; only the LSN-dependent header is computed under it.
+struct PreparedBody<'a> {
+    flags: u8,
+    bytes: std::borrow::Cow<'a, [u8]>,
+    uncompressed_len: u32,
+    hash: u64,
+}
+
+impl<'a> PreparedBody<'a> {
+    fn new(frame_bytes: &'a [u8]) -> Self {
+        if frame_bytes.len() >= WAL_LZ4_THRESHOLD {
+            let compressed = compress_lz4(frame_bytes);
+            if compressed.len() < frame_bytes.len() {
+                let hash = checksum_payload(&compressed);
+                return Self { flags: WAL_FLAG_LZ4, bytes: compressed.into(), uncompressed_len: frame_bytes.len() as u32, hash };
+            }
+        }
+        Self { flags: 0, bytes: frame_bytes.into(), uncompressed_len: 0, hash: checksum_payload(frame_bytes) }
+    }
+
+    /// Appends the frame (header for `lsn`, then the body) to `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn write(&self, out: &mut Vec<u8>, lsn: u64, txn_id: u64, collection_id: u16, kind: WalOpKind, record_id: InlineId, version: Version) {
+        let mut hdr = [0u8; WAL_FRAME_HEADER_LEN];
+        hdr[0..4].copy_from_slice(&WAL_MAGIC.to_le_bytes());
+        hdr[4..6].copy_from_slice(&collection_id.to_le_bytes());
+        hdr[6] = kind as u8;
+        hdr[7] = self.flags;
+        hdr[8..16].copy_from_slice(&lsn.to_le_bytes());
+        hdr[16..24].copy_from_slice(&txn_id.to_le_bytes());
+        hdr[24..32].copy_from_slice(&version.0.to_le_bytes());
+        hdr[32..56].copy_from_slice(&record_id.to_raw_bytes());
+        hdr[56..60].copy_from_slice(&(self.bytes.len() as u32).to_le_bytes());
+        hdr[60..64].copy_from_slice(&self.uncompressed_len.to_le_bytes());
+        // The checksum's metadata block is these first 64 header bytes.
+        let mut meta = [0u8; 64];
+        meta.copy_from_slice(&hdr[0..64]);
+        let sum = wal_checksum_from(&meta, self.hash);
+        hdr[64..72].copy_from_slice(&sum.to_le_bytes());
+        out.extend_from_slice(&hdr);
+        out.extend_from_slice(&self.bytes);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1305,7 +1554,7 @@ mod tests {
             .unwrap();
         }
 
-        let wal_disk_bytes = fs::metadata(&wal_path).unwrap().len();
+        let wal_disk_bytes = log_bytes(&wal_path);
         assert!(
             wal_disk_bytes < 2048,
             "expected LZ4-compressed WAL (<2KB), got {wal_disk_bytes} bytes"
@@ -1333,6 +1582,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Bytes of valid frames at the start of the WAL file: the log itself, without the zeros
+    /// preallocated after it.
+    fn log_bytes(path: &Path) -> u64 {
+        parse_frames(&fs::read(path).unwrap()).1 as u64
+    }
+
     #[test]
     fn test_incomplete_txn_never_merges_with_new_txn_after_restart() {
         let dir = temp_dir("storage_wal_txn_restart");
@@ -1345,7 +1600,7 @@ mod tests {
                 .unwrap();
         }
         // Chop off the commit barrier: the transaction's single op remains, uncommitted.
-        let len = fs::metadata(&wal_path).unwrap().len();
+        let len = log_bytes(&wal_path);
         let f = OpenOptions::new().write(true).open(&wal_path).unwrap();
         f.set_len(len - WAL_FRAME_HEADER_LEN as u64).unwrap();
         drop(f);
@@ -1494,6 +1749,42 @@ mod tests {
         let extra: Vec<u64> = got.iter().copied().filter(|l| expected.binary_search(l).is_err()).collect();
         assert!(extra.iter().all(|&l| l <= last_cutoff) && extra.len() <= 4, "frames the truncation should have removed: {extra:?}");
         drop(wal);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Preallocated zeros never cost a frame (`TASK-151`): the file extends past the log, and a
+    /// checkpoint truncation, a restart and later appends must all work from the log's end, not
+    /// the file's. Were any of them to start at the file's end, frames written after the zeros
+    /// would be unreachable at recovery, which stops at the first zero header.
+    #[test]
+    fn test_preallocated_wal_keeps_every_frame_through_truncation_and_restart() {
+        let dir = temp_dir("storage_wal_prealloc");
+        let wal_path = dir.join("engine.wal");
+        let id = InlineId::new("k").unwrap();
+        let cutoff;
+        {
+            let wal = GroupCommitWal::open(&wal_path, SyncPolicy::Immediate).unwrap();
+            for v in 1..=50 {
+                wal.append_single(1, WalOpKind::Upsert, id, Version(v), &[v as u8; 100]).unwrap();
+            }
+            assert!(fs::metadata(&wal_path).unwrap().len() > log_bytes(&wal_path), "zeros were written ahead of the log");
+            cutoff = wal.current_lsn() - 10;
+            wal.checkpoint_truncate_before(cutoff, &|_| false, None).unwrap();
+            for v in 51..=60 {
+                wal.append_single(1, WalOpKind::Upsert, id, Version(v), &[v as u8; 100]).unwrap();
+            }
+            assert!(fs::metadata(&wal_path).unwrap().len() > log_bytes(&wal_path), "the replacement is preallocated too");
+        }
+        {
+            let wal = GroupCommitWal::open(&wal_path, SyncPolicy::Immediate).unwrap();
+            for v in 61..=70 {
+                wal.append_single(1, WalOpKind::Upsert, id, Version(v), &[v as u8; 100]).unwrap();
+            }
+            wal.checkpoint_truncate_before(cutoff, &|_| false, None).unwrap();
+            wal.append_single(1, WalOpKind::Upsert, id, Version(71), &[71; 100]).unwrap();
+        }
+        let got: Vec<u64> = GroupCommitWal::recover_committed(&wal_path).unwrap().iter().map(|e| e.version.0).collect();
+        assert_eq!(got, (41..=71).collect::<Vec<u64>>(), "every frame above the cutoff, in order");
         let _ = fs::remove_dir_all(&dir);
     }
 }

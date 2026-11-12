@@ -227,3 +227,9 @@ Yes:
 - **Fixed**: one unmovable record no longer aborts compaction and adds a segment at every checkpoint. There is a regression test. Whether `readprobe7` hit this is not confirmed.
 - **Verified**: local tests (197), the Modal workspace suite, and 40 of 40 chaos runs (20 on Modal, then 20 on an AWS spot `c7g.xlarge` for about $0.03 once the Modal spend limit was reached: $52.54 this month for the workspace, $47.11 for storine).
 
+
+### Write path speed (`TASK-153`) — 2026-11-12
+
+- Frame pool, batched arena flushes, staged memory-first WAL, adaptive group-commit linger, WAL preallocation, one lookup per `put`.
+- On AWS `c7i.xlarge`, Storine leads LMDB and RocksDB in every throughput row and every p99 row (`BENCHMARK_REPORT.md` section 8). Still behind: the 4-thread overwrite p99.9; level on the 4-thread durable p99.9.
+- **Verified**: workspace suite and 40 of 40 chaos runs on AWS (about $0.27).

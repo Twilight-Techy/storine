@@ -23,11 +23,78 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use storage_codec::{ArchiveBuilder, ArchivedBytes, RecordView, ZeroCopyRecord};
 use storage_core::{AgentObjectRecord, EngineConfig, StorageEngine, StorageLayoutMode};
-use storage_types::{InlineId, RecordFlags, Version};
+use storage_types::{InlineId, RecordFlags, Result as SResult, Version};
 use storage_wal::SyncPolicy;
 
 const VALUE_BODY: usize = 100;
+/// `KvRecord` value bytes: sized so its frame matches `AgentObjectRecord`'s (288 bytes).
+const KV_VALUE: usize = 180;
+
+/// A plain key-value record: what LMDB and RocksDB store (no secondary indexes, no embedding).
+#[derive(Clone, Debug)]
+pub struct KvRecord {
+    id: InlineId,
+    field: u64,
+    value: Vec<u8>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ArchivedKvRecord {
+    id: InlineId,
+    field: u64,
+    value: ArchivedBytes,
+}
+
+storage_codec::impl_archive_pod!(ArchivedKvRecord { id: InlineId, field: u64, value: ArchivedBytes });
+
+impl ZeroCopyRecord for KvRecord {
+    type Archived = ArchivedKvRecord;
+    fn archive(&self, b: &mut ArchiveBuilder<'_>) -> ArchivedKvRecord {
+        let value = b.write_bytes(&self.value);
+        ArchivedKvRecord { id: self.id, field: self.field, value }
+    }
+    fn validate_archived(root: &ArchivedKvRecord, payload: &[u8]) -> SResult<()> {
+        InlineId::from_raw_bytes(root.id.to_raw_bytes())?;
+        root.value.validate(payload)
+    }
+    fn unarchive(root: &ArchivedKvRecord, payload: &[u8]) -> SResult<Self> {
+        Ok(Self { id: root.id, field: root.field, value: root.value.as_slice(payload).to_vec() })
+    }
+}
+
+impl storage_index::Indexable for KvRecord {
+    const INDEXED: bool = false;
+    fn extract_archived_snapshot(_root: &ArchivedKvRecord, _payload: &[u8]) -> Option<storage_index::IndexSnapshot> {
+        Some(storage_index::IndexSnapshot::new())
+    }
+}
+
+/// A record type the Storine side of the benchmark can build and read one field from.
+trait BenchRecord: ZeroCopyRecord + storage_index::Indexable + Clone + Send + Sync + 'static {
+    fn make(i: usize, salt: i64) -> Self;
+    fn read(view: RecordView<'_, Self>) -> u64;
+}
+
+impl BenchRecord for KvRecord {
+    fn make(i: usize, salt: i64) -> Self {
+        Self { id: InlineId::new(&key_str(i)).expect("key"), field: (i as i64 + salt) as u64, value: vec![(i % 251) as u8; KV_VALUE] }
+    }
+    fn read(view: RecordView<'_, Self>) -> u64 {
+        view.field
+    }
+}
+
+impl BenchRecord for AgentObjectRecord {
+    fn make(i: usize, salt: i64) -> Self {
+        record(i, salt)
+    }
+    fn read(view: RecordView<'_, Self>) -> u64 {
+        view.score as u64
+    }
+}
 
 fn key_str(i: usize) -> String {
     format!("k{i:015}")
@@ -63,26 +130,28 @@ trait Kv: Sync {
 
 // ---------- Storine ----------
 
-struct Storine {
-    engine: StorageEngine<AgentObjectRecord>,
+struct Storine<T: BenchRecord> {
+    engine: StorageEngine<T>,
     ids: Vec<InlineId>,
-    records: Vec<AgentObjectRecord>,
+    records: Vec<T>,
     label: &'static str,
 }
 
-impl Storine {
+impl<T: BenchRecord> Storine<T> {
     fn open(dir: &Path, n: usize, policy: SyncPolicy, label: &'static str) -> Self {
         let cfg = EngineConfig {
             layout_mode: StorageLayoutMode::AdaptiveArena { arena_threshold_bytes: 64 * 1024, segment_capacity: 64 * 1024 * 1024 },
             wal_sync_policy: policy,
+            // `KV_HOT_DIRTY_MB`: the unflushed-data cap (experiments only; default 64 MiB).
+            max_hot_dirty_bytes: std::env::var("KV_HOT_DIRTY_MB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(64 << 20, |m| m << 20),
             ..EngineConfig::default()
         };
         let engine = StorageEngine::open(dir, cfg).expect("open storine");
-        Self { engine, ids: (0..n).map(|i| InlineId::new(&key_str(i)).unwrap()).collect(), records: (0..n).map(|i| record(i, 0)).collect(), label }
+        Self { engine, ids: (0..n).map(|i| InlineId::new(&key_str(i)).unwrap()).collect(), records: (0..n).map(|i| T::make(i, 0)).collect(), label }
     }
 }
 
-impl Kv for Storine {
+impl<T: BenchRecord> Kv for Storine<T> {
     fn name(&self) -> String {
         self.label.into()
     }
@@ -90,11 +159,11 @@ impl Kv for Storine {
         if salt == 0 {
             self.engine.put(self.ids[i], &self.records[i]).expect("put");
         } else {
-            self.engine.put(self.ids[i], &record(i, salt)).expect("put");
+            self.engine.put(self.ids[i], &T::make(i, salt)).expect("put");
         }
     }
     fn get(&self, i: usize) -> u64 {
-        self.engine.with_ref(self.ids[i], |v| v.score as u64).expect("get")
+        self.engine.with_ref(self.ids[i], T::read).expect("get")
     }
     fn settle(&self) {
         self.engine.flush_all().expect("flush");
@@ -113,15 +182,18 @@ impl Values {
         let keys = (0..n).map(|i| key_str(i).as_bytes().try_into().unwrap()).collect();
         let vals = (0..n)
             .map(|i| {
-                storage_codec::RecordCodec::encode_aligned(&record(i, 0), Version(1), 0, RecordFlags::NONE, 0).as_slice().to_vec()
+                storage_codec::RecordCodec::encode_aligned(&KvRecord::make(i, 0), Version(1), 0, RecordFlags::NONE, 0).as_slice().to_vec()
             })
             .collect();
         Self { keys, vals }
     }
 }
 
+/// `KvRecord::field` inside the frame: 64-byte header, then the 24-byte id.
+const FIELD_AT: usize = 64 + 24;
+
 fn field(v: &[u8]) -> u64 {
-    u64::from_le_bytes(v[64..72].try_into().unwrap())
+    u64::from_le_bytes(v[FIELD_AT..FIELD_AT + 8].try_into().unwrap())
 }
 
 // ---------- LMDB ----------
@@ -175,7 +247,7 @@ impl Kv for Lmdb {
             self.db.put(&mut w, &self.v.keys[i], &self.v.vals[i]).unwrap();
         } else {
             let mut val = self.v.vals[i].clone();
-            val[64..72].copy_from_slice(&((i as i64 + salt) as u64).to_le_bytes());
+            val[FIELD_AT..FIELD_AT + 8].copy_from_slice(&((i as i64 + salt) as u64).to_le_bytes());
             self.db.put(&mut w, &self.v.keys[i], &val).unwrap();
         }
         w.commit().unwrap();
@@ -203,8 +275,17 @@ struct Rocks {
 #[cfg(feature = "rocks")]
 impl Rocks {
     fn open(dir: &Path, v: Arc<Values>, wal: bool, sync: bool, label: &'static str) -> Self {
+        Self::open_with(dir, v, wal, sync, false, label)
+    }
+
+    /// `recycle`: reuse old WAL files in place (`recycle_log_file_num`), RocksDB's own way to
+    /// keep `fdatasync` from committing file growth, comparable to Storine's preallocation.
+    fn open_with(dir: &Path, v: Arc<Values>, wal: bool, sync: bool, recycle: bool, label: &'static str) -> Self {
         let mut o = rocksdb::Options::default();
         o.create_if_missing(true);
+        if recycle {
+            o.set_recycle_log_file_num(4);
+        }
         o.set_compression_type(rocksdb::DBCompressionType::None);
         o.increase_parallelism(std::thread::available_parallelism().map_or(4, |n| n.get() as i32));
         let mut b = rocksdb::BlockBasedOptions::default();
@@ -231,7 +312,7 @@ impl Kv for Rocks {
             self.db.put_opt(self.v.keys[i], &self.v.vals[i], &self.wo).unwrap();
         } else {
             let mut val = self.v.vals[i].clone();
-            val[64..72].copy_from_slice(&((i as i64 + salt) as u64).to_le_bytes());
+            val[FIELD_AT..FIELD_AT + 8].copy_from_slice(&((i as i64 + salt) as u64).to_le_bytes());
             self.db.put_opt(self.v.keys[i], &val, &self.wo).unwrap();
         }
     }
@@ -309,14 +390,17 @@ fn bench_fast(kv: &dyn Kv, n: usize, threads: usize, out: &mut Vec<String>) {
     kv.settle();
     out.push(format!("{:<22} {name:<24} {:>12.3} s", "settle (flush)", t.elapsed().as_secs_f64()));
 
-    let r = run(1, 2 * n, &|_, rng| {
-        std::hint::black_box(kv.get((rng.next() % n as u64) as usize));
-    });
-    out.push(r.line(&name, "readrandom 1 thread"));
-    let r = run(threads, 2 * n / threads.max(1), &|_, rng| {
-        std::hint::black_box(kv.get((rng.next() % n as u64) as usize));
-    });
-    out.push(r.line(&name, &format!("readrandom {threads} threads")));
+    // `KV_WRITES_ONLY=1` skips the reads (for profiling the write path).
+    if std::env::var_os("KV_WRITES_ONLY").is_none() {
+        let r = run(1, 2 * n, &|_, rng| {
+            std::hint::black_box(kv.get((rng.next() % n as u64) as usize));
+        });
+        out.push(r.line(&name, "readrandom 1 thread"));
+        let r = run(threads, 2 * n / threads.max(1), &|_, rng| {
+            std::hint::black_box(kv.get((rng.next() % n as u64) as usize));
+        });
+        out.push(r.line(&name, &format!("readrandom {threads} threads")));
+    }
     let r = run(1, n / 2, &|_, rng| {
         kv.put((rng.next() % n as u64) as usize, 7);
     });
@@ -356,7 +440,13 @@ fn main() {
 
     // No-fsync tier.
     if want("storine") {
-        let s = Storine::open(&fresh(&root, "storine-mem"), n, SyncPolicy::AsyncMemoryFirst, "storine memory-first");
+        let s = Storine::<KvRecord>::open(&fresh(&root, "storine-mem"), n, SyncPolicy::AsyncMemoryFirst, "storine memory-first");
+        bench_fast(&s, n, threads, &mut out);
+    }
+    // The same with a record type that keeps two secondary indexes (timestamp range, tags),
+    // work the others never do: shown apart, not compared.
+    if want("indexed") {
+        let s = Storine::<AgentObjectRecord>::open(&fresh(&root, "storine-indexed"), n, SyncPolicy::AsyncMemoryFirst, "storine indexed");
         bench_fast(&s, n, threads, &mut out);
     }
     #[cfg(feature = "rocks")]
@@ -386,8 +476,8 @@ fn main() {
     };
     if want("storine") {
         let d = fresh(&root, "storine-durable");
-        load(&Storine::open(&d, n, SyncPolicy::AsyncMemoryFirst, "load"));
-        let s = Storine::open(&d, n, SyncPolicy::GroupCommit { max_batch_entries: 64 }, "storine group commit");
+        load(&Storine::<KvRecord>::open(&d, n, SyncPolicy::AsyncMemoryFirst, "load"));
+        let s = Storine::<KvRecord>::open(&d, n, SyncPolicy::GroupCommit { max_batch_entries: 64 }, "storine group commit");
         bench_durable(&s, n, threads, durable_ops, &mut out);
     }
     #[cfg(feature = "rocks")]
@@ -395,6 +485,11 @@ fn main() {
         let d = fresh(&root, "rocks-sync");
         load(&Rocks::open(&d, Arc::clone(&values), true, false, "load"));
         let r = Rocks::open(&d, Arc::clone(&values), true, true, "rocksdb sync");
+        bench_durable(&r, n, threads, durable_ops, &mut out);
+        drop(r);
+        let d = fresh(&root, "rocks-sync-recycle");
+        load(&Rocks::open_with(&d, Arc::clone(&values), true, false, true, "load"));
+        let r = Rocks::open_with(&d, Arc::clone(&values), true, true, true, "rocksdb sync recycle");
         bench_durable(&r, n, threads, durable_ops, &mut out);
     }
     if want("lmdb") {

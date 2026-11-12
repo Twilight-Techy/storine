@@ -351,6 +351,7 @@ dependencies = [
  "rocksdb",
  "storage-codec",
  "storage-core",
+ "storage-index",
  "storage-types",
  "storage-wal",
 ]

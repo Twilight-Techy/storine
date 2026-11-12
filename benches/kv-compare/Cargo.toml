@@ -15,6 +15,7 @@ publish = false
 storage-core = { path = "../../crates/storage-core" }
 storage-codec = { path = "../../crates/storage-codec" }
 storage-types = { path = "../../crates/storage-types" }
+storage-index = { path = "../../crates/storage-index" }
 storage-wal = { path = "../../crates/storage-wal" }
 heed = "=0.20.5"
 rocksdb = { version = "0.22", default-features = false, optional = true }

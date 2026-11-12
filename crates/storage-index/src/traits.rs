@@ -287,6 +287,13 @@ pub trait Indexable: storage_codec::ZeroCopyRecord {
         None
     }
 
+    /// `false` if every record of this type has an empty [`IndexSnapshot`]: no indexed fields
+    /// and no embedding (plain key-value records). Writes then skip reading the previous
+    /// version's snapshot and the index diff, which cost most of an overwrite otherwise. A type
+    /// that sets it `false` must keep [`Self::extract_index_snapshot`] and
+    /// [`Self::extract_archived_snapshot`] empty.
+    const INDEXED: bool = true;
+
     /// `true` if records carry *named* vector embeddings (`TASK-122`): the engine then keeps one
     /// HNSW graph per name, maintained on every write path (local writes, WAL replay, Raft
     /// apply, snapshot install) and rebuilt at open.

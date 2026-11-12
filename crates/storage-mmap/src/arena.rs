@@ -408,6 +408,88 @@ impl ArenaSegment {
         })
     }
 
+    /// Appends as many of `frames` as fit before the rollover ceiling with **one** positional
+    /// write (each frame 64B-aligned, gaps zeroed), returning their locations in order. Never
+    /// reuses dead slots: batches are contiguous, and dead space is left to compaction. Returns
+    /// fewer locations than frames (possibly none) when the segment fills up.
+    pub fn append_frames(&self, frames: &[&[u8]], sync_data: bool) -> Result<Vec<ArenaLocation>> {
+        let mut w = self
+            .writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let start = w.write_head;
+        let mut end = start;
+        let mut count = 0;
+        for f in frames {
+            let aligned = f.len().next_multiple_of(HEADER_SIZE);
+            match end.checked_add(aligned) {
+                Some(next) if next <= w.max_capacity => {
+                    end = next;
+                    count += 1;
+                }
+                _ => break,
+            }
+        }
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut grew_capacity = false;
+        if end > w.capacity {
+            let new_cap = end
+                .max(w.capacity.saturating_mul(2))
+                .next_multiple_of(INITIAL_SEGMENT_BYTES);
+            w.file
+                .set_len(new_cap as u64)
+                .map_err(|e| StorageError::io("grow arena segment file", e))?;
+            w.capacity = new_cap;
+            w.max_capacity = w.max_capacity.max(new_cap);
+            let new_region = Arc::new(MmapRegion::map_read_only(w.file.file(), w.capacity)?);
+            let old_region = core::mem::replace(
+                &mut *self
+                    .region
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                new_region,
+            );
+            w.retired_regions.push(Arc::downgrade(&old_region));
+            drop(old_region);
+            grew_capacity = true;
+        }
+
+        let mut staging = Vec::new();
+        staging
+            .try_reserve_exact(end - start)
+            .map_err(|_| StorageError::resource_exhausted("heap memory (arena batch)"))?;
+        let mut locs = Vec::with_capacity(count);
+        for f in &frames[..count] {
+            locs.push(ArenaLocation {
+                segment_id: self.segment_id,
+                offset: (start + staging.len()) as u32,
+                len: f.len() as u32,
+            });
+            staging.extend_from_slice(f);
+            staging.resize(staging.len().next_multiple_of(HEADER_SIZE), 0);
+        }
+        write_all_at(w.file.file(), &staging, start as u64)
+            .map_err(|e| StorageError::io("write frame batch to arena segment", e))?;
+
+        w.write_head = end;
+        w.unsynced_appends = w.unsynced_appends.saturating_add(count as u32);
+        if grew_capacity || sync_data || w.unsynced_appends >= SUPERBLOCK_SYNC_INTERVAL {
+            write_all_at(w.file.file(), &(end as u64).to_le_bytes(), 12)
+                .map_err(|e| StorageError::io("update arena superblock head", e))?;
+            w.persisted_head = end;
+            w.unsynced_appends = 0;
+        }
+        if sync_data {
+            w.file
+                .sync_data()
+                .map_err(|e| StorageError::io("fsync arena segment", e))?;
+        }
+        Ok(locs)
+    }
+
     /// Writes the current `write_head` into the superblock and `fsync`s the segment file.
     pub fn sync(&self) -> Result<()> {
         let mut w = self
@@ -589,6 +671,51 @@ impl ArenaManager {
         }
         segs[idx] = Some(Arc::new(new_seg));
         Ok(loc)
+    }
+
+    /// Writes `frames` contiguously into the active segment (rolling over as segments fill),
+    /// one positional write per segment touched, and returns their locations in order. For
+    /// batched background flushes; [`Self::write_record`] remains the single-frame path.
+    pub fn write_records(&self, frames: &[&[u8]], sync_data: bool) -> Result<Vec<ArenaLocation>> {
+        let mut out = Vec::with_capacity(frames.len());
+        let mut active_id = self
+            .active_segment_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while out.len() < frames.len() {
+            let rest = &frames[out.len()..];
+            let seg_arc = {
+                let segs = self
+                    .segments
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                segs.get(*active_id as usize).and_then(|opt| opt.clone())
+            };
+            if let Some(seg) = seg_arc {
+                let locs = seg.append_frames(rest, sync_data)?;
+                if !locs.is_empty() {
+                    out.extend(locs);
+                    continue;
+                }
+            }
+            // The active segment cannot take the next frame: roll over.
+            let first = rest[0].len().next_multiple_of(HEADER_SIZE);
+            *active_id += 1;
+            let new_id = *active_id;
+            let path = self.seg_dir.join(format!("seg_{new_id:05}.dat"));
+            let new_seg =
+                ArenaSegment::open_or_create(new_id, path, self.segment_capacity.max(first * 2))?;
+            let mut segs = self
+                .segments
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let idx = new_id as usize;
+            if segs.len() <= idx {
+                segs.resize_with(idx + 1, || None);
+            }
+            segs[idx] = Some(Arc::new(new_seg));
+        }
+        Ok(out)
     }
 
     /// Reads a zero-copy `MmapRegion` for `segment_id` via $O(1)$ slice indexing.

@@ -890,3 +890,16 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - AWS: the other 20 chaos runs ran on one spot `c7g.xlarge` (arm64, us-east-1d) and all passed. That makes 40 of 40. The instance ran about 24 minutes, roughly $0.03 at $0.077/h, and was terminated right after.
 - **Modal**: $7.06 today and $47.11 this month for storine ($52.54 for the whole workspace), by the billing report at commit time.
 
+
+## 2026-11-12: write path faster than LMDB and RocksDB in every throughput row (`TASK-153`)
+
+- **Goal**: faster than LMDB and RocksDB in every case at the same durability (`BENCHMARK_REPORT.md` section 8).
+- **Changes**:
+  - `storage-codec`: `AlignedBytes` is one refcounted block from a frame pool (thread-local caches, a shared store per size class, 16 MiB cap per class). Cross-thread frees had contended on glibc's arena lock.
+  - `storage-core`: the flusher takes the whole dirty queue and writes up to 512 frames at once (`ArenaManager::write_records`). Each record completes under its stripe lock through `PrimaryIndex::complete_flush_at`, only if its version and location are unchanged; otherwise the new slot is marked dead. `put` looks a record up once. Records whose type declares `Indexable::INDEXED = false` skip index diffs.
+  - `storage-wal`: memory-first appends checksum and compress before the lock, then copy into a staging buffer, written out at 256 KiB and before every flush, sync, truncation and drop. Group commit lingers one twelfth of the measured fsync time (at most 250 µs) after a batch with more than one writer, and notifies only when someone waits. Syncing WALs preallocate 1 MiB of zeros ahead of the write position; truncation uses the logical end.
+  - `benches/kv-compare`: a record type without indexes, an indexed one, RocksDB with WAL recycling, and a per-component breakdown binary.
+- **Measured** (AWS `c7i.xlarge`, three rounds): fill 645–669 k/s, overwrite 0.80 M (1 thread) and 1.19 M (4 threads), reads 1.05 M and 3.8 M, durable puts 1.9 k and 2.6 k per second. That is 1.4–2.5× the fastest other engine without fsync and 3.2–4× with it.
+- **Not won**: the 4-thread overwrite p99.9 (261–288 µs against RocksDB's 67–240 µs) and the 4-thread durable p99.9 (level with RocksDB). The indexed record path was not measured.
+- **Trade-off**: batched flushes append instead of rewriting slots in place, so arena files can hold about twice the live data until compaction.
+- **Verified**: clippy `-D warnings` locally; on AWS, the release workspace suite (all pass) and 40 of 40 chaos runs. One on-demand `c7i.xlarge` for about 1 h 30 min, about $0.27, terminated after. An earlier spot attempt was reclaimed before reporting.

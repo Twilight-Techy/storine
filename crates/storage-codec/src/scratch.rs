@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Cache-line alignment (64 bytes) required for zero-copy `RecordHeader` and SIMD payloads.
 pub const BUFFER_ALIGNMENT: usize = 64;
@@ -43,23 +43,66 @@ fn alloc_failed(requested: usize) -> ! {
 /// An immutable, reference-counted byte buffer guaranteed to be 64-byte aligned in memory.
 /// Used by `HotDirtyArc` so concurrent readers can dereference `&RecordHeader` and `&T::Archived`
 /// directly from in-flight memory before background disk flush completes.
-#[derive(Clone)]
+///
+/// One allocation holds both the reference count and the bytes: a 64-byte [`BlockHeader`]
+/// followed by the data (so the data stays 64-byte aligned). Every write allocates one of these,
+/// so a separate `Arc` allocation would double the allocator work on the write path.
 pub struct AlignedBytes {
-    inner: Arc<AlignedStorage>,
+    block: NonNull<BlockHeader>,
 }
 
-struct AlignedStorage {
-    ptr: NonNull<u8>,
+/// Start of an [`AlignedBytes`] block; the data begins [`BUFFER_ALIGNMENT`] bytes after it.
+#[repr(C, align(64))]
+struct BlockHeader {
+    refs: AtomicUsize,
     len: usize,
+    /// Data capacity (a multiple of 64); the block is `BUFFER_ALIGNMENT + cap` bytes.
     cap: usize,
 }
 
-// SAFETY: `AlignedStorage` owns an immutable heap allocation and never mutates it after construction.
-unsafe impl Send for AlignedStorage {}
-// SAFETY: Shared references to `AlignedStorage` only expose immutable `&[u8]` slices.
-unsafe impl Sync for AlignedStorage {}
+const _: () = assert!(core::mem::size_of::<BlockHeader>() == BUFFER_ALIGNMENT);
+
+// SAFETY: the data is immutable once built and the reference count is atomic, exactly as for
+// `Arc<[u8]>`; nothing is ever mutated through a shared `AlignedBytes`.
+unsafe impl Send for AlignedBytes {}
+// SAFETY: shared references only expose `&[u8]`.
+unsafe impl Sync for AlignedBytes {}
 
 impl AlignedBytes {
+    /// Allocates an uninitialized block for `cap` data bytes, with one reference: from the
+    /// frame pool when its size class has one, otherwise from the allocator.
+    #[inline]
+    fn allocate(len: usize, cap: usize) -> Option<NonNull<BlockHeader>> {
+        let total = cap.checked_add(BUFFER_ALIGNMENT)?;
+        if total > MAX_CAP {
+            return None;
+        }
+        let block = match frame_pool::take(cap) {
+            Some(block) => block,
+            None => {
+                // SAFETY: `layout_for(total)` has a non-zero size (`total >= 128`).
+                let raw = unsafe { alloc(layout_for(total)) }.cast::<BlockHeader>();
+                NonNull::new(raw)?
+            }
+        };
+        // SAFETY: `block` is valid for writes of a `BlockHeader` and suitably aligned (64); a
+        // pooled block is owned by nobody else once taken.
+        unsafe { block.as_ptr().write(BlockHeader { refs: AtomicUsize::new(1), len, cap }) };
+        Some(block)
+    }
+
+    #[inline]
+    fn data_ptr(block: NonNull<BlockHeader>) -> *mut u8 {
+        // SAFETY: the data starts `BUFFER_ALIGNMENT` bytes into a block at least that long.
+        unsafe { block.as_ptr().cast::<u8>().add(BUFFER_ALIGNMENT) }
+    }
+
+    #[inline]
+    fn header(&self) -> &BlockHeader {
+        // SAFETY: `block` points to a live, initialized header while any reference exists.
+        unsafe { self.block.as_ref() }
+    }
+
     /// Copies `src` into a newly allocated 64-byte-aligned immutable buffer.
     ///
     /// For engine-encoded (trusted) data. Out of memory aborts like the standard collections;
@@ -78,23 +121,16 @@ impl AlignedBytes {
     pub fn try_copy_from_slice(src: &[u8]) -> storage_types::Result<Self> {
         let oom = || storage_types::StorageError::resource_exhausted("heap memory (aligned buffer)");
         let cap = aligned_cap(src.len()).ok_or_else(oom)?;
-        // SAFETY: `layout_for(cap)` has a non-zero size (`cap >= 64`).
-        let raw = unsafe { alloc(layout_for(cap)) };
-        let ptr = NonNull::new(raw).ok_or_else(oom)?;
-        // SAFETY: `ptr` has at least `src.len()` valid writable bytes and does not overlap `src`.
+        let block = Self::allocate(src.len(), cap).ok_or_else(oom)?;
+        let data = Self::data_ptr(block);
+        // SAFETY: `data` has `cap >= src.len()` writable bytes and does not overlap `src`.
         unsafe {
-            core::ptr::copy_nonoverlapping(src.as_ptr(), ptr.as_ptr(), src.len());
+            core::ptr::copy_nonoverlapping(src.as_ptr(), data, src.len());
             if cap > src.len() {
-                core::ptr::write_bytes(ptr.as_ptr().add(src.len()), 0, cap - src.len());
+                core::ptr::write_bytes(data.add(src.len()), 0, cap - src.len());
             }
         }
-        Ok(Self {
-            inner: Arc::new(AlignedStorage {
-                ptr,
-                len: src.len(),
-                cap,
-            }),
-        })
+        Ok(Self { block })
     }
 
     /// Allocates a zero-filled aligned buffer of `len` bytes, lets `fill` write it, then freezes
@@ -106,41 +142,184 @@ impl AlignedBytes {
     ) -> storage_types::Result<Self> {
         let oom = || storage_types::StorageError::resource_exhausted("heap memory (aligned buffer)");
         let cap = aligned_cap(len).ok_or_else(oom)?;
-        // SAFETY: `layout_for(cap)` has a non-zero size (`cap >= 64`).
-        let raw = unsafe { alloc(layout_for(cap)) };
-        let ptr = NonNull::new(raw).ok_or_else(oom)?;
-        // SAFETY: `ptr` is valid for `cap` writable bytes; zeroing makes all of them initialized.
-        unsafe { core::ptr::write_bytes(ptr.as_ptr(), 0, cap) };
-        // Owns the allocation from here on, so an error in `fill` frees it (via `Drop`).
-        let storage = AlignedStorage { ptr, len, cap };
-        // SAFETY: `ptr` is valid for `len <= cap` initialized bytes and uniquely owned by `storage`;
-        // the mutable slice ends before `storage` is moved into the `Arc`.
-        fill(unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), len) })?;
-        Ok(Self { inner: Arc::new(storage) })
+        let block = Self::allocate(len, cap).ok_or_else(oom)?;
+        let data = Self::data_ptr(block);
+        // SAFETY: `data` is valid for `cap` writable bytes; zeroing makes all of them initialized.
+        unsafe { core::ptr::write_bytes(data, 0, cap) };
+        // Owns the block from here on, so an error in `fill` frees it (via `Drop`).
+        let bytes = Self { block };
+        // SAFETY: `data` is valid for `len <= cap` initialized bytes and `bytes` is the only
+        // reference; the mutable slice ends before `bytes` is returned or shared.
+        fill(unsafe { core::slice::from_raw_parts_mut(data, len) })?;
+        Ok(bytes)
     }
 
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: `inner.ptr` is valid for `inner.len` initialized bytes for the lifetime of `self`.
-        unsafe { core::slice::from_raw_parts(self.inner.ptr.as_ptr(), self.inner.len) }
+        // SAFETY: the data is valid for `len` initialized bytes for the lifetime of `self`.
+        unsafe { core::slice::from_raw_parts(Self::data_ptr(self.block), self.header().len) }
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.inner.len
+        self.header().len
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.inner.len == 0
+        self.header().len == 0
     }
 }
 
-impl Drop for AlignedStorage {
+impl Clone for AlignedBytes {
+    #[inline]
+    fn clone(&self) -> Self {
+        // Relaxed, as `Arc::clone`: a new reference can only come from an existing one.
+        let old = self.header().refs.fetch_add(1, Ordering::Relaxed);
+        if old > isize::MAX as usize {
+            std::process::abort();
+        }
+        Self { block: self.block }
+    }
+}
+
+impl Drop for AlignedBytes {
+    #[inline]
     fn drop(&mut self) {
-        // SAFETY: `self.ptr` was allocated with `layout_for(self.cap)` in `try_copy_from_slice`.
-        unsafe {
-            dealloc(self.ptr.as_ptr(), layout_for(self.cap));
+        if self.header().refs.fetch_sub(1, Ordering::Release) != 1 {
+            return;
+        }
+        // Synchronizes with every earlier release, as `Arc::drop`, before the memory is reused.
+        std::sync::atomic::fence(Ordering::Acquire);
+        let cap = self.header().cap;
+        // SAFETY: this was the last reference, so the block is no longer reachable.
+        unsafe { frame_pool::give(self.block, cap) };
+    }
+}
+
+/// Recycles [`AlignedBytes`] blocks of up to [`frame_pool::MAX_POOLED_CAP`] bytes.
+///
+/// Every write allocates a frame on the writing thread, and the background flusher frees it.
+/// Through the allocator that is a cross-thread free into the writer's arena, and the two
+/// threads then serialize on that arena's lock. Here each thread keeps a small cache per size
+/// class, and caches trade blocks in groups through one shared store per class, so a lock is
+/// taken once per [`frame_pool::GROUP`] blocks. The shared store is bounded
+/// ([`frame_pool::MAX_SHARED_BYTES`] per class); blocks beyond it go back to the allocator.
+mod frame_pool {
+    use super::{dealloc, layout_for, BlockHeader, BUFFER_ALIGNMENT};
+    use std::cell::RefCell;
+    use std::ptr::NonNull;
+    use std::sync::Mutex;
+
+    /// Largest pooled data capacity (one class per 64 bytes up to this).
+    pub(super) const MAX_POOLED_CAP: usize = 4096;
+    const CLASSES: usize = MAX_POOLED_CAP / BUFFER_ALIGNMENT;
+    /// Blocks moved between a thread cache and the shared store at a time.
+    pub(super) const GROUP: usize = 64;
+    /// A thread cache holds at most this many blocks per class before giving a group back.
+    const LOCAL_MAX: usize = 2 * GROUP;
+    /// Bytes the shared store keeps per class; the rest is freed.
+    pub(super) const MAX_SHARED_BYTES: usize = 16 << 20;
+
+    /// A free block (raw, uninitialized). Only ever owned by one cache or store at a time.
+    struct FreeBlock(NonNull<BlockHeader>);
+    // SAFETY: a free block is plain memory owned by whichever cache or store holds it.
+    unsafe impl Send for FreeBlock {}
+
+    static SHARED: [Mutex<Vec<FreeBlock>>; CLASSES] = [const { Mutex::new(Vec::new()) }; CLASSES];
+
+    struct Local {
+        classes: [Vec<FreeBlock>; CLASSES],
+    }
+
+    impl Drop for Local {
+        fn drop(&mut self) {
+            for (class, blocks) in self.classes.iter_mut().enumerate() {
+                for b in blocks.drain(..) {
+                    // SAFETY: pooled blocks of `class` hold `(class + 1) * 64` data bytes and
+                    // were allocated with `layout_for(cap + BUFFER_ALIGNMENT)`.
+                    unsafe { free_block(b.0, cap_of(class)) };
+                }
+            }
+        }
+    }
+
+    thread_local! {
+        static LOCAL: RefCell<Local> = const { RefCell::new(Local { classes: [const { Vec::new() }; CLASSES] }) };
+    }
+
+    #[inline]
+    fn class_of(cap: usize) -> Option<usize> {
+        ((BUFFER_ALIGNMENT..=MAX_POOLED_CAP).contains(&cap) && cap % BUFFER_ALIGNMENT == 0).then(|| cap / BUFFER_ALIGNMENT - 1)
+    }
+
+    #[inline]
+    fn cap_of(class: usize) -> usize {
+        (class + 1) * BUFFER_ALIGNMENT
+    }
+
+    /// # Safety
+    /// `block` must be unreachable and allocated with `layout_for(cap + BUFFER_ALIGNMENT)`.
+    unsafe fn free_block(block: NonNull<BlockHeader>, cap: usize) {
+        // SAFETY: guaranteed by the caller.
+        unsafe { dealloc(block.as_ptr().cast::<u8>(), layout_for(cap + BUFFER_ALIGNMENT)) };
+    }
+
+    /// A free block for data capacity `cap`, if the pool has one.
+    #[inline]
+    pub(super) fn take(cap: usize) -> Option<NonNull<BlockHeader>> {
+        let class = class_of(cap)?;
+        LOCAL
+            .try_with(|l| {
+                let mut l = l.try_borrow_mut().ok()?;
+                let local = &mut l.classes[class];
+                if local.is_empty() {
+                    let mut shared = SHARED[class].lock().unwrap_or_else(|p| p.into_inner());
+                    let n = shared.len().min(GROUP);
+                    let from = shared.len() - n;
+                    local.extend(shared.drain(from..));
+                }
+                local.pop().map(|b| b.0)
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// Returns an unreachable block to the pool (or frees it).
+    ///
+    /// # Safety
+    /// `block` must be unreachable and allocated with `layout_for(cap + BUFFER_ALIGNMENT)`.
+    #[inline]
+    pub(super) unsafe fn give(block: NonNull<BlockHeader>, cap: usize) {
+        let Some(class) = class_of(cap) else {
+            // SAFETY: guaranteed by the caller.
+            unsafe { free_block(block, cap) };
+            return;
+        };
+        let kept = LOCAL
+            .try_with(|l| {
+                let Ok(mut l) = l.try_borrow_mut() else { return false };
+                let local = &mut l.classes[class];
+                local.push(FreeBlock(block));
+                if local.len() > LOCAL_MAX {
+                    let group: Vec<FreeBlock> = local.drain(local.len() - GROUP..).collect();
+                    let mut shared = SHARED[class].lock().unwrap_or_else(|p| p.into_inner());
+                    let room = (MAX_SHARED_BYTES / (cap + BUFFER_ALIGNMENT)).saturating_sub(shared.len());
+                    let mut group = group.into_iter();
+                    shared.extend(group.by_ref().take(room));
+                    drop(shared);
+                    for b in group {
+                        // SAFETY: each pooled block of this class was allocated for `cap`.
+                        unsafe { free_block(b.0, cap) };
+                    }
+                }
+                true
+            })
+            .unwrap_or(false);
+        if !kept {
+            // Thread-local storage is gone (thread exiting) or busy: free it directly.
+            // SAFETY: guaranteed by the caller.
+            unsafe { free_block(block, cap) };
         }
     }
 }
