@@ -9,6 +9,7 @@ pub mod error;
 pub mod header;
 pub mod id;
 pub mod padded;
+pub mod spin;
 pub mod vfs;
 #[doc(hidden)]
 pub mod testing;
@@ -21,6 +22,7 @@ pub use header::{
 };
 pub use id::{InlineId, MAX_INLINE_ID_LEN};
 pub use padded::{CachePadded, StripedCounter};
+pub use spin::lock_spinning;
 
 /// Dense 32-bit internal ordinal assigned to each record for compact secondary
 /// index storage (B+Tree leaves and compressed Roaring-style bitmaps).

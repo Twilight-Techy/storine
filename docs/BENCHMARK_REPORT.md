@@ -263,3 +263,52 @@ One difference from 7.2: the record type here declares no secondary indexes (`In
 **Trade-off.** A batched flush appends records to the arena instead of rewriting their old slots in place, so arena files can hold about twice the live data until compaction reclaims the dead slots. The auto-compaction threshold is unchanged.
 
 **Verified on the same instance:** the release workspace suite (all pass) and 40 of 40 process chaos runs. The instance ran about 1 h 30 min on demand at $0.1785/h, about $0.27, and was terminated when the job finished.
+
+### 8.1 The 4-writer tail (2026-11-12)
+
+**Found** with scheduler and syscall traces (`perf`, frame-pointer build) on the same instance type:
+- Writers slept on the WAL state lock and the flush-queue lock: about 46,000 sleeps a second. `std::sync::Mutex` spins briefly, then parks. With four writers and the flusher on four vCPUs, a woken writer waited a scheduler slice. With three writers, p99.9 was 17–20 µs.
+- A lower flusher priority (nice 5–19) changed nothing: the flusher was not what writers waited for.
+- After that, a writer that filled the 256 KiB WAL staging buffer wrote it out inside its `put`. That happened in about one put in 2,000.
+
+**Changed**:
+- Hot short locks (WAL state and staging, flush queue) spin for up to 4 µs before parking (`storage_types::lock_spinning`, safe code over `Mutex::try_lock`).
+- The staging buffer and the flush queue keep their capacity across swaps, so they are not regrown under their locks.
+- Appenders write the staging buffer themselves only past 4 MiB. The flusher writes it before every batch, so under load it is written every few hundred records.
+- With `background_flush` off, each `put` pushes the staged WAL frames to the OS, since no flusher does.
+
+**Harness fix**: an overwrite now clones Storine's prebuilt record and sets one field, as the LMDB and RocksDB puts clone their prebuilt value. Before, Storine built a new record and formatted its key inside every timed put. Cloning a random record costs cache misses, so Storine's one-thread overwrite reads lower than in the table above (774–796 k against 799–800 k), but now for the same work as the others.
+
+**Effect, writes only, four rounds each, same harness**:
+
+| overwrite, 4 threads | before | spinning locks | and the 4 MiB threshold |
+| :--- | ---: | ---: | ---: |
+| ops/s | 1.21–1.26 M | 1.28–1.43 M | 1.33–1.34 M |
+| p99 | 14–19 µs | 4.8–5.4 µs | 5.1–5.5 µs |
+| p99.9 | 252–272 µs | 89–99 µs | 25–30 µs |
+
+**Full comparison**: three rounds, ranges from lowest to highest:
+
+| | Storine | RocksDB no WAL | RocksDB WAL | LMDB |
+| :--- | ---: | ---: | ---: | ---: |
+| fill, ops/s | **682–728 k** | 504–523 k | 339–355 k | 177–179 k |
+| fill p99.9 | 9.7–13.4 µs | 11.9–12.1 µs | 13.7–14.1 µs | 18.2–18.5 µs |
+| read, 1 thread | **1.13–1.21 M** | 312–323 k | 318–325 k | 778–806 k |
+| read, 4 threads | **3.79–4.31 M** | 905–922 k | 921–932 k | 2.94–3.07 M |
+| overwrite, 1 thread | **774–796 k** | 516–541 k | 338–360 k | 174–176 k |
+| overwrite, 4 threads | **1.30–1.37 M** | 492–532 k | 285–295 k | 126–128 k |
+| overwrite p99, 4 threads | **5.4–6.2 µs** | 22.0–23.9 µs | 37.8–39.9 µs | 20.1–20.6 µs |
+| overwrite p99.9, 4 threads | 54–103 µs | 140–236 µs | 59–63 µs | 7.3–7.9 ms |
+| durable put, 1 thread | **1,387–1,577** | 347–367 (recycle 343–358) | | 477–502 |
+| durable put, 4 threads | **2,552–2,705** | 798–812 (recycle 831–902) | | 413–414 |
+| durable p99.9, 1 thread | 1.4–4.7 ms | 4.0–5.0 ms | | 2.7–3.4 ms |
+| durable p99.9, 4 threads | **5.9–7.6 ms** | 9.2–9.7 ms | | 75–94 ms |
+
+Durable throughput is lower on this instance than in the table above (1.39–1.58 k against 1.88–1.91 k on one thread). The committed engine measured the same 1.5–1.7 k here, so the difference is the instance's volume, not the change.
+
+**Where Storine stands.** It leads every throughput row and every p99 row. In p99.9 it leads reads, the one-thread overwrite and the four-thread durable put. Three p99.9 rows are not won consistently:
+- The 4-thread overwrite is 54–103 µs against RocksDB with its WAL at 59–63 µs: ahead in one round, behind in two. In writes-only runs it was 25–30 µs. In the full run the reads come first, and what makes it slower after them is not yet explained.
+- The fill is level with RocksDB without its WAL.
+- The one-thread durable put swings between 1.4 and 4.7 ms on this volume, against LMDB's 2.7–3.4 ms.
+
+**Verified on the same instance:** the release workspace suite (all pass), 40 of 40 process chaos runs, and the new test `test_memory_first_staging_swaps_keep_every_frame_in_order`. One on-demand `c7i.xlarge` ran 3 h 25 min for the experiments and this verification, about $0.61, and was terminated when it finished.

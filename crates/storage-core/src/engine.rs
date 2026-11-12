@@ -150,6 +150,9 @@ pub struct ResealReport {
     pub unchanged: usize,
 }
 
+/// A flush queue taken with at most this many ids is kept for reuse (about 2 MiB at most).
+const SPARE_FLUSH_QUEUE_IDS: usize = 32 * 1024;
+
 /// Configuration for `StorageEngine<T>`.
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -804,9 +807,12 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         let flusher_handle = if config.background_flush {
             let bg_inner = Arc::clone(&inner);
             let interval = Duration::from_millis(config.flush_interval_ms.max(1));
-            Some(thread::spawn(move || {
-                bg_inner.background_flush_loop(interval);
-            }))
+            Some(
+                thread::Builder::new()
+                    .name("storine-flush".into())
+                    .spawn(move || bg_inner.background_flush_loop(interval))
+                    .map_err(|e| StorageError::io("spawn background flusher", e))?,
+            )
         } else {
             None
         };
@@ -3066,6 +3072,10 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         if flush_now {
             if self.config.background_flush {
                 self.flush_cv.notify_one();
+            } else if let Some(ref wal) = self.wal {
+                // No flusher pushes memory-first WAL frames to the OS, so this write does, as
+                // the flusher would before flushing it (errors are retried on the next write).
+                let _ = wal.flush_buffered();
             }
             if let Err(e) = self.flush_single_record_to_disk_locked(id, self.data_sync()) {
                 // The write is already durable in the WAL and visible in memory: keep it dirty
@@ -3092,10 +3102,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
 
     /// Adds `id` to the coalescing flush queue and wakes the background flusher when useful.
     fn enqueue_flush(&self, id: InlineId) {
-        let mut q = self
-            .flush_queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut q = storage_types::lock_spinning(&self.flush_queue);
         let was_empty = q.is_empty();
         if !q.enqueue(id) {
             // `id` was already in the flush queue! This update coalesced in memory (`F-CONC-04`)!
@@ -3591,8 +3598,11 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
     }
 
     fn background_flush_loop(&self, interval: Duration) {
+        // The queue last taken, emptied with its capacity kept, swapped in on the next take:
+        // writers then never regrow and rehash it under the queue lock.
+        let mut spare = CoalescingQueue::default();
         while !self.shutdown.load(Ordering::Relaxed) {
-            let queued = {
+            let mut queued = {
                 let mut q = self
                     .flush_queue
                     .lock()
@@ -3618,10 +3628,9 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                 // Take the whole queue in O(1): writers wait on this lock for no longer than a
                 // swap, not for hundreds of removals. Ids written again meanwhile are queued
                 // anew; a flush that finds a record clean skips it.
-                std::mem::take(&mut *q)
+                std::mem::replace(&mut *q, std::mem::take(&mut spare))
             };
-            let ids: Vec<InlineId> = queued.order.into();
-            drop(queued.in_queue);
+            let ids = queued.order.make_contiguous();
             for (n, batch) in ids.chunks(FLUSH_BATCH).enumerate() {
                 if !self.flush_ids(batch, interval) {
                     for &id in ids.iter().skip((n + 1) * FLUSH_BATCH) {
@@ -3629,6 +3638,11 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                     }
                     break;
                 }
+            }
+            if queued.order.capacity() <= SPARE_FLUSH_QUEUE_IDS {
+                queued.order.clear();
+                queued.in_queue.clear();
+                spare = queued;
             }
         }
     }

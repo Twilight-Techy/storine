@@ -38,8 +38,19 @@ const WAL_PREALLOC_CHUNK: u64 = 1 << 20;
 const WAL_PREALLOC_LOW_WATER: u64 = 256 << 10;
 static WAL_ZEROS: [u8; 64 << 10] = [0; 64 << 10];
 
-/// Staged (`AsyncMemoryFirst`) bytes past which the appender pushes them to the OS itself.
-const STAGED_FLUSH_BYTES: usize = 256 * 1024;
+/// Staged (`AsyncMemoryFirst`) bytes past which an appender pushes them to the OS itself.
+///
+/// The engine's flusher drains the buffer before every batch it flushes, so under load it is
+/// written every few hundred records and stays far below this. The limit is only the bound
+/// for when the flusher falls behind: an appender that hits it makes a multi-megabyte `write`
+/// in the middle of its `put`. At 256 KiB appenders hit it about once in 2,000 puts, which was
+/// the 4-writer p99.9 (90–105 µs against 25–30 µs at 4 MiB on a `c7i.xlarge`).
+const STAGED_FLUSH_BYTES: usize = 4 << 20;
+/// Capacity of a fresh staging buffer: above what the flusher's cadence lets accumulate, so a
+/// buffer rarely regrows under `staged`'s lock, and small next to `STAGED_FLUSH_BYTES`.
+const STAGED_INITIAL_BYTES: usize = 320 << 10;
+/// A staging buffer that grew past this is freed after its drain instead of kept as the spare.
+const STAGED_SPARE_MAX_BYTES: usize = 1 << 20;
 
 /// Unlocked catch-up copies a checkpoint truncation makes before its locked final copy.
 const TRUNCATE_CATCH_UP_ROUNDS: usize = 16;
@@ -184,6 +195,10 @@ pub struct GroupCommitWal {
     /// copy into it under this short lock; [`Self::flush_buffered`] swaps it out and writes it
     /// holding only `io`, so an append never waits for a `write` syscall.
     staged: Mutex<Vec<u8>>,
+    /// The buffer `staged` last swapped out, emptied, kept so the next one starts at full
+    /// capacity: regrowing from empty copies the staged frames again under `staged`'s lock
+    /// while every other appender waits. Touched only under `io`.
+    staged_spare: Mutex<Vec<u8>>,
     vfs: VfsRef,
     total_batches: CachePadded<AtomicU64>,
     total_frames: CachePadded<AtomicU64>,
@@ -404,6 +419,7 @@ impl GroupCommitWal {
             cv: Condvar::new(),
             io: Mutex::new(BufWriter::with_capacity(256 * 1024, file)),
             staged: Mutex::new(Vec::new()),
+            staged_spare: Mutex::new(Vec::new()),
             vfs,
             total_batches: CachePadded::new(AtomicU64::new(0)),
             total_frames: CachePadded::new(AtomicU64::new(0)),
@@ -442,7 +458,7 @@ impl GroupCommitWal {
             let lsn = guard.last_lsn;
             self.current_lsn.store(lsn, Ordering::Release);
             let full = {
-                let mut staged = self.staged.lock().unwrap_or_else(|p| p.into_inner());
+                let mut staged = storage_types::lock_spinning(&self.staged);
                 prepared.write(&mut staged, lsn, 0, collection_id, kind, record_id, version);
                 staged.len() >= STAGED_FLUSH_BYTES
             };
@@ -561,7 +577,7 @@ impl GroupCommitWal {
 
     #[inline]
     fn lock_state(&self) -> std::sync::MutexGuard<'_, GroupCommitState> {
-        self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        storage_types::lock_spinning(&self.state)
     }
 
     #[inline]
@@ -569,7 +585,7 @@ impl GroupCommitWal {
     /// pushes them to the OS itself, as a full `BufWriter` would.
     fn stage(&self, write: impl FnOnce(&mut Vec<u8>) -> Result<()>) -> Result<()> {
         let full = {
-            let mut staged = self.staged.lock().unwrap_or_else(|p| p.into_inner());
+            let mut staged = storage_types::lock_spinning(&self.staged);
             write(&mut staged)?;
             staged.len() >= STAGED_FLUSH_BYTES
         };
@@ -582,20 +598,26 @@ impl GroupCommitWal {
 
     /// Moves the staged frames into `io` (whose lock the caller holds, which orders drains).
     fn drain_staged(&self, io: &mut BufWriter<VfsHandle>) -> Result<()> {
+        // Syncing policies never stage, so they never allocate a spare. Only appenders add to
+        // `staged` and drains are ordered by `io`, so it stays non-empty once seen so.
+        if storage_types::lock_spinning(&self.staged).is_empty() {
+            return Ok(());
+        }
+        let mut spare = std::mem::take(&mut *self.staged_spare.lock().unwrap_or_else(|p| p.into_inner()));
+        if spare.capacity() < STAGED_INITIAL_BYTES {
+            // Allocated here, outside `staged`'s lock.
+            spare = Vec::with_capacity(STAGED_INITIAL_BYTES);
+        }
         let mut taken = {
-            let mut staged = self.staged.lock().unwrap_or_else(|p| p.into_inner());
-            if staged.is_empty() {
-                return Ok(());
-            }
-            std::mem::take(&mut *staged)
+            let mut staged = storage_types::lock_spinning(&self.staged);
+            std::mem::replace(&mut *staged, spare)
         };
         io.write_all(&taken)
             .map_err(|e| StorageError::io("write staged WAL frames", e))?;
-        // Give the allocation back for the next frames if nothing was staged meanwhile.
-        taken.clear();
-        let mut staged = self.staged.lock().unwrap_or_else(|p| p.into_inner());
-        if staged.is_empty() && staged.capacity() < taken.capacity() {
-            *staged = taken;
+        // Keep the allocation for the next swap, unless one huge frame grew it.
+        if taken.capacity() <= STAGED_SPARE_MAX_BYTES {
+            taken.clear();
+            *self.staged_spare.lock().unwrap_or_else(|p| p.into_inner()) = taken;
         }
         Ok(())
     }
@@ -1211,7 +1233,7 @@ impl GroupCommitWal {
 impl Drop for GroupCommitWal {
     fn drop(&mut self) {
         let mut io = self.io.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let staged = std::mem::take(&mut *self.staged.lock().unwrap_or_else(|p| p.into_inner()));
+        let staged = std::mem::take(&mut *storage_types::lock_spinning(&self.staged));
         let _ = io.write_all(&staged);
         let _ = io.flush();
         if self.policy.syncs() {
@@ -1673,6 +1695,56 @@ mod tests {
         wal.append_single(1, WalOpKind::Delete, id, Version(2), &[]).unwrap();
         assert_eq!(GroupCommitWal::recover_committed(&wal_path).unwrap().len(), 2);
         drop(wal);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Memory-first frames from concurrent writers survive many staging-buffer swaps (the spare
+    /// buffer, the appenders' own drains past `STAGED_FLUSH_BYTES`, and a flusher draining
+    /// meanwhile), each exactly once and in LSN order.
+    #[test]
+    fn test_memory_first_staging_swaps_keep_every_frame_in_order() {
+        let dir = temp_dir("storage_wal_staging_swaps");
+        let wal_path = dir.join("engine.wal");
+        let wal = Arc::new(GroupCommitWal::open(&wal_path, SyncPolicy::AsyncMemoryFirst).unwrap());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flusher = {
+            let (w, stop) = (Arc::clone(&wal), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    w.flush_buffered().unwrap();
+                    std::thread::yield_now();
+                }
+            })
+        };
+        // 4 writers × 6,000 frames of about 900 bytes: over 20 MiB, past the threshold several
+        // times; some frames over 1 KiB are LZ4-compressed.
+        let writers: Vec<_> = (0..4u64)
+            .map(|t| {
+                let w = Arc::clone(&wal);
+                std::thread::spawn(move || {
+                    let id = InlineId::new(&format!("w{t}")).unwrap();
+                    for v in 0..6_000u64 {
+                        let len = 700 + (v as usize * 37) % 500;
+                        w.append_single(1, WalOpKind::Upsert, id, Version(v), &vec![(v % 251) as u8; len])
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in writers {
+            h.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        flusher.join().unwrap();
+        drop(wal);
+        let entries = GroupCommitWal::recover_committed(&wal_path).unwrap();
+        assert_eq!(entries.len(), 24_000);
+        assert!(entries.windows(2).all(|w| w[0].lsn < w[1].lsn), "file order must equal LSN order");
+        for t in 0..4u64 {
+            let id = InlineId::new(&format!("w{t}")).unwrap();
+            let versions: Vec<u64> = entries.iter().filter(|e| e.record_id == id).map(|e| e.version.0).collect();
+            assert_eq!(versions, (0..6_000).collect::<Vec<_>>(), "writer {t}");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

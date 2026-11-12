@@ -1388,4 +1388,5 @@ This document defines the strict chronological execution order for building the 
 
 - [ ] **TASK-153: Faster Than LMDB and RocksDB in Every Case** — every throughput and latency row of `benches/kv-compare` at equal durability, without weakening recovery or adding runtime crates.
   - **Done (2026-11-12)**: pooled frames, batched arena flushes, a staging buffer for the memory-first WAL, adaptive group-commit linger, WAL preallocation, one lookup per `put`. Storine now leads every throughput row and every p99 row (`BENCHMARK_REPORT.md` section 8).
-  - **Open**: the 4-thread overwrite p99.9 (261–288 µs against RocksDB's 67–240 µs); the 4-thread durable p99.9 (level with RocksDB); the path for record types with secondary indexes, which was not measured.
+  - **Done (2026-11-12, tail)**: spinning hot locks, capacity kept across staging and flush-queue swaps, appenders write the WAL staging buffer only past 4 MiB. The 4-thread overwrite p99.9 fell from 252–288 µs to 54–103 µs, and the p99 from 14–20 µs to 5–6 µs (section 8.1).
+  - **Open**: three p99.9 rows are not won consistently: the 4-thread overwrite against RocksDB with its WAL (59–63 µs), with an unexplained slowdown after the read phases (25–30 µs writes-only); the fill, level with RocksDB; the one-thread durable put on a noisy volume. The path for record types with secondary indexes was not measured.

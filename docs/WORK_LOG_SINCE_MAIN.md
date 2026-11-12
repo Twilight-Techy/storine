@@ -233,3 +233,9 @@ Yes:
 - Frame pool, batched arena flushes, staged memory-first WAL, adaptive group-commit linger, WAL preallocation, one lookup per `put`.
 - On AWS `c7i.xlarge`, Storine leads LMDB and RocksDB in every throughput row and every p99 row (`BENCHMARK_REPORT.md` section 8). Still behind: the 4-thread overwrite p99.9; level on the 4-thread durable p99.9.
 - **Verified**: workspace suite and 40 of 40 chaos runs on AWS (about $0.27).
+
+### The 4-writer tail (`TASK-153`) — 2026-11-12
+
+- Spinning hot locks, staging and flush-queue capacity kept across swaps, a 4 MiB appender threshold for the WAL staging buffer, and a fairer overwrite in the harness.
+- 4-thread overwrite p99.9 from 252–288 µs to 54–103 µs; p99 from 14–20 µs to 5–6 µs. Still behind RocksDB with its WAL in that p99.9 in two of three rounds.
+- **Verified**: workspace suite and 40 of 40 chaos runs on AWS (about $0.61).

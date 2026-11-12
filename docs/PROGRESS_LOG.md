@@ -903,3 +903,16 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Not won**: the 4-thread overwrite p99.9 (261–288 µs against RocksDB's 67–240 µs) and the 4-thread durable p99.9 (level with RocksDB). The indexed record path was not measured.
 - **Trade-off**: batched flushes append instead of rewriting slots in place, so arena files can hold about twice the live data until compaction.
 - **Verified**: clippy `-D warnings` locally; on AWS, the release workspace suite (all pass) and 40 of 40 chaos runs. One on-demand `c7i.xlarge` for about 1 h 30 min, about $0.27, terminated after. An earlier spot attempt was reclaimed before reporting.
+
+## 2026-11-12: the 4-writer tail (`TASK-153`)
+
+- **Found** with `perf` scheduler and syscall traces on AWS: writers parked on the WAL state lock and the flush-queue lock (about 46,000 times a second) and woke behind a full run queue. A lower flusher priority changed nothing. After that, a writer that filled the 256 KiB WAL staging buffer wrote it out itself, in about one put in 2,000.
+- **Changed**:
+  - `storage_types::lock_spinning`: spins up to 4 µs on `try_lock` before parking; safe code. Used for the WAL state and staging locks and the flush queue.
+  - The WAL keeps a spare staging buffer of 320 KiB; a buffer grown past 1 MiB is freed. The flusher reuses the queue it took, up to 32 Ki ids.
+  - Appenders write the staging buffer only past 4 MiB, since the flusher writes it before every batch. With `background_flush` off, each `put` pushes it to the OS.
+  - The flusher thread is named `storine-flush`.
+  - Harness: Storine overwrites clone a prebuilt record, as LMDB and RocksDB clone a prebuilt value. Before, Storine formatted a key and built a record inside each timed put.
+- **Measured**: the 4-thread overwrite p99.9 fell from 252–288 µs to 54–103 µs (25–30 µs writes-only), and the p99 from 14–20 µs to 5–6 µs. Throughput is the same or higher. Storine still leads every throughput and p99 row (`BENCHMARK_REPORT.md` section 8.1).
+- **Not won**: the 4-thread overwrite p99.9 against RocksDB with its WAL (59–63 µs) in two of three rounds; the fill p99.9, level; the one-thread durable p99.9, noisy.
+- **Verified**: clippy `-D warnings`, and new tests for `lock_spinning` and for staging swaps under concurrent writers and a flusher. On AWS: the release workspace suite and 40 of 40 chaos runs. One on-demand `c7i.xlarge` for 3 h 25 min, about $0.61, terminated after.

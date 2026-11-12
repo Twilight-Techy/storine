@@ -75,12 +75,20 @@ impl storage_index::Indexable for KvRecord {
 /// A record type the Storine side of the benchmark can build and read one field from.
 trait BenchRecord: ZeroCopyRecord + storage_index::Indexable + Clone + Send + Sync + 'static {
     fn make(i: usize, salt: i64) -> Self;
+    /// `self` (record `i` as loaded) with its field set from `salt`: a clone and one store,
+    /// the same work the LMDB and RocksDB puts do on their prebuilt value.
+    fn salted(&self, i: usize, salt: i64) -> Self;
     fn read(view: RecordView<'_, Self>) -> u64;
 }
 
 impl BenchRecord for KvRecord {
     fn make(i: usize, salt: i64) -> Self {
         Self { id: InlineId::new(&key_str(i)).expect("key"), field: (i as i64 + salt) as u64, value: vec![(i % 251) as u8; KV_VALUE] }
+    }
+    fn salted(&self, i: usize, salt: i64) -> Self {
+        let mut r = self.clone();
+        r.field = (i as i64 + salt) as u64;
+        r
     }
     fn read(view: RecordView<'_, Self>) -> u64 {
         view.field
@@ -90,6 +98,11 @@ impl BenchRecord for KvRecord {
 impl BenchRecord for AgentObjectRecord {
     fn make(i: usize, salt: i64) -> Self {
         record(i, salt)
+    }
+    fn salted(&self, i: usize, salt: i64) -> Self {
+        let mut r = self.clone();
+        r.score = i as i64 + salt;
+        r
     }
     fn read(view: RecordView<'_, Self>) -> u64 {
         view.score as u64
@@ -159,7 +172,7 @@ impl<T: BenchRecord> Kv for Storine<T> {
         if salt == 0 {
             self.engine.put(self.ids[i], &self.records[i]).expect("put");
         } else {
-            self.engine.put(self.ids[i], &T::make(i, salt)).expect("put");
+            self.engine.put(self.ids[i], &self.records[i].salted(i, salt)).expect("put");
         }
     }
     fn get(&self, i: usize) -> u64 {
