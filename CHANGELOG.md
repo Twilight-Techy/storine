@@ -2,7 +2,7 @@
 
 Versions follow [Semantic Versioning](https://semver.org). Before 1.0, a minor version (0.x) may change on-disk or wire formats; [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) says what each kind of release may change and how to upgrade.
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-11-13)
 
 The first release. Everything below is new.
 
