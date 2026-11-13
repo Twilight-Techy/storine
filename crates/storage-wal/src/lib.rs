@@ -2107,14 +2107,20 @@ mod tests {
         let wal_path = dir.join("engine.wal");
         let wal = Arc::new(GroupCommitWal::open(&wal_path, SyncPolicy::AsyncMemoryFirst).unwrap());
         let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // Writers run until truncations have overlapped them, however slow the disk (a slow CI
+        // runner once finished all writes during the first truncation).
+        let truncations_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut handles = Vec::new();
         for t in 0..4u64 {
-            let (w, done) = (Arc::clone(&wal), Arc::clone(&done));
+            let (w, done, truncs) = (Arc::clone(&wal), Arc::clone(&done), Arc::clone(&truncations_done));
             handles.push(std::thread::spawn(move || {
                 let id = InlineId::new(&format!("t{t}")).unwrap();
-                let lsns: Vec<u64> = (0..4_000u64)
-                    .map(|v| w.append_single(1, WalOpKind::Upsert, id, Version(v), &[t as u8; 3 * 1024]).unwrap())
-                    .collect();
+                let mut lsns = Vec::new();
+                let mut v = 0u64;
+                while v < 4_000 || (truncs.load(Ordering::Relaxed) < 3 && v < 200_000) {
+                    lsns.push(w.append_single(1, WalOpKind::Upsert, id, Version(v), &[t as u8; 3 * 1024]).unwrap());
+                    v += 1;
+                }
                 done.fetch_add(1, Ordering::Relaxed);
                 lsns
             }));
@@ -2124,6 +2130,7 @@ mod tests {
             last_cutoff = wal.current_lsn();
             wal.checkpoint_truncate_before(last_cutoff, &|_| false, None).unwrap();
             truncations += 1;
+            truncations_done.store(truncations, Ordering::Relaxed);
         }
         assert!(truncations >= 2, "the writers finished before truncations overlapped them");
         let mut expected: Vec<u64> = handles.into_iter().flat_map(|h| h.join().unwrap()).filter(|&l| l > last_cutoff).collect();

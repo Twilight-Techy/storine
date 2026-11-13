@@ -499,9 +499,20 @@ fn crash_child_writer() {
             engine.flush_all().unwrap();
         }
         if i == abort_after {
-            std::process::abort();
+            crash();
         }
     }
+}
+
+/// Ends the process at once, as a crash would: no destructor runs, so nothing the engine holds
+/// is flushed. `abort()` everywhere but macOS, whose crash reporter collects every `SIGABRT`
+/// before the process is reaped and has stalled CI runs; there, `exit` with abort's status ends
+/// the process just as abruptly for this test (it runs no Rust destructors).
+fn crash() -> ! {
+    if cfg!(target_os = "macos") {
+        std::process::exit(134)
+    }
+    std::process::abort()
 }
 
 /// Crash-test variants: the three storage layouts with in-memory indexes, the adaptive arena
