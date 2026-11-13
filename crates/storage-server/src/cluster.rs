@@ -19,7 +19,22 @@ use storage_core::NodeId;
 use storage_index::Indexable;
 use storage_types::{Result, StorageError};
 
-use crate::{StorageClient, STATUS_OK};
+use crate::{ClientTls, StorageClient, STATUS_OK};
+
+/// How a node reaches its peers when their ports require TLS: what it trusts, and the name each
+/// peer's certificate must carry (default: the peer's IP address).
+#[derive(Clone, Debug)]
+pub struct PeerTls {
+    pub config: Arc<storage_tls::ClientConfig>,
+    pub names: HashMap<NodeId, String>,
+}
+
+impl PeerTls {
+    /// The client side of a connection to `peer`.
+    pub fn for_peer(&self, peer: NodeId) -> ClientTls {
+        ClientTls { config: Arc::clone(&self.config), server_name: self.names.get(&peer).cloned() }
+    }
+}
 
 /// A peer's cached connection (`None` until first used or after a failure).
 type PeerConn = Arc<Mutex<Option<StorageClient>>>;
@@ -32,6 +47,8 @@ pub struct TcpRaftTransport {
     peers: Mutex<HashMap<NodeId, (SocketAddr, PeerConn)>>,
     token: Option<String>,
     timeout: Duration,
+    /// Peers are reached over TLS (their ports require it).
+    tls: Option<PeerTls>,
 }
 
 impl core::fmt::Debug for TcpRaftTransport {
@@ -48,7 +65,13 @@ impl TcpRaftTransport {
             .into_iter()
             .map(|(id, addr)| (id, (addr, Arc::new(Mutex::new(None)))))
             .collect();
-        Self { peers: Mutex::new(peers), token, timeout }
+        Self { peers: Mutex::new(peers), token, timeout, tls: None }
+    }
+
+    /// Reaches peers over TLS.
+    pub fn with_tls(mut self, tls: PeerTls) -> Self {
+        self.tls = Some(tls);
+        self
     }
 
     fn call(&self, peer: NodeId, f: impl Fn(&mut StorageClient) -> Result<(u8, u64, Vec<u8>)>) -> Result<Vec<u8>> {
@@ -62,7 +85,8 @@ impl TcpRaftTransport {
         let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
         for attempt in 0..2 {
             if guard.is_none() {
-                let mut c = StorageClient::connect_timeout(addr, self.timeout)?;
+                let tls = self.tls.as_ref().map(|t| t.for_peer(peer));
+                let mut c = StorageClient::connect_timeout_with(addr, self.timeout, tls.as_ref())?;
                 if let Some(ref t) = self.token {
                     c.authenticate(t)?;
                 }

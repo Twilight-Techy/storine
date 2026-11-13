@@ -38,11 +38,13 @@ pub struct RuntimeConfig {
     pub tick: Duration,
     /// Most KV requests queued at a node before it answers "overloaded" (backpressure).
     pub max_queued: usize,
+    /// How often a written engine is checkpointed: records flushed, the WAL cut, arenas compacted.
+    pub checkpoint_interval: Duration,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
-        Self { tick: Duration::from_millis(10), max_queued: 65_536 }
+        Self { tick: Duration::from_millis(10), max_queued: 65_536, checkpoint_interval: Duration::from_secs(5) }
     }
 }
 
@@ -71,6 +73,9 @@ pub struct RangeNode {
     gauges: Arc<[AtomicU64; GAUGES.len()]>,
     max_queued: usize,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Checkpoints the engine off the event loop ([`checkpoint_loop`]).
+    checkpointer: Mutex<Option<JoinHandle<()>>>,
+    stop_checkpoints: Arc<AtomicBool>,
     stopped: AtomicBool,
 }
 
@@ -103,11 +108,19 @@ impl RangeNode {
         let tick = cfg.tick;
         let gauges: Arc<[AtomicU64; GAUGES.len()]> = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
         let g = Arc::clone(&gauges);
+        let engine = Arc::clone(server.driver.engine());
         let thread = std::thread::Builder::new()
             .name(format!("range-node-{id}"))
             .spawn(move || event_loop(server, rx, transport, tick, q, b, g))
             .ok();
-        Arc::new(Self { id, tx, queued, batch_bytes, gauges, max_queued: cfg.max_queued, thread: Mutex::new(thread), stopped: AtomicBool::new(false) })
+        let stop_checkpoints = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&stop_checkpoints);
+        let interval = cfg.checkpoint_interval;
+        let checkpointer = std::thread::Builder::new()
+            .name(format!("range-checkpoint-{id}"))
+            .spawn(move || checkpoint_loop(&engine, &stop, interval))
+            .ok();
+        Arc::new(Self { id, tx, queued, batch_bytes, gauges, max_queued: cfg.max_queued, thread: Mutex::new(thread), checkpointer: Mutex::new(checkpointer), stop_checkpoints, stopped: AtomicBool::new(false) })
     }
 
     pub fn id(&self) -> NodeId {
@@ -167,6 +180,10 @@ impl RangeNode {
             if let Some(t) = self.thread.lock().unwrap_or_else(|p| p.into_inner()).take() {
                 let _ = t.join();
             }
+            self.stop_checkpoints.store(true, Ordering::Release);
+            if let Some(t) = self.checkpointer.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                let _ = t.join();
+            }
         }
     }
 }
@@ -174,6 +191,28 @@ impl RangeNode {
 impl Drop for RangeNode {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// Checkpoints the engine every `interval` while it is written: dirty records flushed and
+/// synced, the WAL cut, and arena segments compacted once half dead. The driver's own
+/// checkpoint only syncs the WAL (it must be quick, on the event loop), so without this the
+/// WAL and the arena would grow until the next restart. A failure is retried next interval;
+/// the WAL keeps everything until one succeeds.
+fn checkpoint_loop(engine: &crate::StorageEngine<crate::DocumentRecord>, stop: &AtomicBool, interval: Duration) {
+    let step = Duration::from_millis(100).min(interval);
+    let mut last = std::time::Instant::now();
+    let mut done = engine.stats().total_writes;
+    while !stop.load(Ordering::Acquire) {
+        std::thread::sleep(step);
+        if last.elapsed() < interval {
+            continue;
+        }
+        last = std::time::Instant::now();
+        let writes = engine.stats().total_writes;
+        if writes != done && engine.checkpoint().is_ok() {
+            done = writes;
+        }
     }
 }
 

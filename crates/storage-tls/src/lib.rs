@@ -24,7 +24,14 @@ use storage_codec::crypto::{open_in_place, seal_in_place};
 use storage_codec::curve25519::{x25519, x25519_public, Ed25519Key};
 use storage_codec::rand::{os_random, os_random_array};
 
-use crate::hash::{base64_decode, base64_encode, ct_eq, hmac_sha256, sha256};
+use storage_codec::sha256::{base64_decode, base64_encode, ct_eq, hmac_sha256, sha256};
+
+mod client;
+mod session;
+mod x509;
+
+pub use client::{connect, ClientConfig, Trust};
+pub use session::Session;
 
 const TLS13: u16 = 0x0304;
 const CHACHA20_POLY1305_SHA256: u16 = 0x1303;
@@ -56,6 +63,7 @@ const ALERT_UNEXPECTED_MESSAGE: u8 = 10;
 const ALERT_BAD_RECORD_MAC: u8 = 20;
 const ALERT_RECORD_OVERFLOW: u8 = 22;
 const ALERT_HANDSHAKE_FAILURE: u8 = 40;
+const ALERT_BAD_CERTIFICATE: u8 = 42;
 const ALERT_ILLEGAL_PARAMETER: u8 = 47;
 const ALERT_DECODE_ERROR: u8 = 50;
 const ALERT_DECRYPT_ERROR: u8 = 51;
@@ -233,7 +241,7 @@ fn der_seq(parts: &[Vec<u8>]) -> Vec<u8> {
 fn der_time(unix: i64) -> Vec<u8> {
     let days = unix.div_euclid(86_400);
     let secs = unix.rem_euclid(86_400);
-    let (y, m, d) = crate::datum::civil_from_days(days as i32);
+    let (y, m, d) = civil_from_days(days as i32);
     let hms = format!("{:02}{:02}{:02}", secs / 3600, secs / 60 % 60, secs % 60);
     if (1950..2050).contains(&y) {
         der(0x17, format!("{:02}{m:02}{d:02}{hms}Z", y % 100).as_bytes())
@@ -242,18 +250,34 @@ fn der_time(unix: i64) -> Vec<u8> {
     }
 }
 
+/// A distinguished name holding just a common name.
+fn common_name(cn: &str) -> Vec<u8> {
+    der_seq(&[der(0x31, &der_seq(&[der(0x06, &[0x55, 0x04, 0x03]), der(0x0c, cn.as_bytes())]))])
+}
+
 fn self_signed_cert(key: &Ed25519Key, names: &[&str]) -> io::Result<Vec<u8>> {
+    let name = common_name("storine-sql");
+    build_cert(key, &name, &name, &key.public_key(), names, true)
+}
+
+/// A certificate for `subject_public` with `names` (DNS names and IP addresses), signed by
+/// `signer` as `issuer`. `ca` marks it as able to sign others (a root, or a self-signed server
+/// certificate a client may trust directly).
+fn build_cert(
+    signer: &Ed25519Key,
+    issuer: &[u8],
+    subject: &[u8],
+    subject_public: &[u8; 32],
+    names: &[&str],
+    ca: bool,
+) -> io::Result<Vec<u8>> {
     let ed25519_alg = der_seq(&[der(0x06, &[0x2b, 0x65, 0x70])]);
-    let name = der_seq(&[der(
-        0x31,
-        &der_seq(&[der(0x06, &[0x55, 0x04, 0x03]), der(0x0c, b"storine-sql")]),
-    )]);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     let validity = der_seq(&[der_time(now - 86_400), der_time(now + 3650 * 86_400)]);
     let mut pk = vec![0u8];
-    pk.extend_from_slice(&key.public_key());
+    pk.extend_from_slice(subject_public);
     let spki = der_seq(&[ed25519_alg.clone(), der(0x03, &pk)]);
     let mut serial: [u8; 16] = os_random_array()?;
     serial[0] &= 0x7f; // positive
@@ -275,30 +299,103 @@ fn self_signed_cert(key: &Ed25519Key, names: &[&str]) -> io::Result<Vec<u8>> {
         parts.push(der(0x04, &value));
         der_seq(&parts)
     };
-    let extensions = der(
-        0xa3,
-        &der_seq(&[
+    let mut exts = if ca {
+        vec![
             // basicConstraints: CA (so the certificate can be its own trust anchor), critical.
             ext(&[0x55, 0x1d, 0x13], true, der_seq(&[der(0x01, &[0xff])])),
             // keyUsage: digitalSignature, keyCertSign, critical.
             ext(&[0x55, 0x1d, 0x0f], true, der(0x03, &[0x02, 0x84])),
-            ext(&[0x55, 0x1d, 0x11], false, der(0x30, &alt)),
-        ]),
-    );
+        ]
+    } else {
+        vec![
+            // basicConstraints: not a CA, critical.
+            ext(&[0x55, 0x1d, 0x13], true, der_seq(&[])),
+            // keyUsage: digitalSignature, critical.
+            ext(&[0x55, 0x1d, 0x0f], true, der(0x03, &[0x07, 0x80])),
+        ]
+    };
+    if !alt.is_empty() {
+        exts.push(ext(&[0x55, 0x1d, 0x11], false, der(0x30, &alt)));
+    }
+    let extensions = der(0xa3, &der_seq(&exts));
     let tbs = der_seq(&[
         der(0xa0, &der(0x02, &[0x02])), // version v3
         der(0x02, &serial),
         ed25519_alg.clone(),
-        name.clone(),
+        issuer.to_vec(),
         validity,
-        name,
+        subject.to_vec(),
         spki,
         extensions,
     ]);
-    let sig = key.sign(&tbs);
+    let sig = signer.sign(&tbs);
     let mut sig_bits = vec![0u8];
     sig_bits.extend_from_slice(&sig);
     Ok(der_seq(&[tbs, ed25519_alg, der(0x03, &sig_bits)]))
+}
+
+/// A certificate and its private key, as PEM: what [`new_ca`] and [`issue`] create, to be
+/// written to files and loaded with [`TlsConfig::from_pem`] / [`ClientConfig::with_roots_pem`].
+#[derive(Clone)]
+pub struct IssuedCert {
+    pub cert_pem: String,
+    pub key_pem: String,
+}
+
+impl std::fmt::Debug for IssuedCert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedCert").field("cert_pem", &self.cert_pem).finish_non_exhaustive()
+    }
+}
+
+impl IssuedCert {
+    /// Writes the certificate to `cert` and the key to `key` (readable by the owner only on
+    /// Unix; the key file must not exist yet).
+    pub fn write_files(&self, cert: &Path, key: &Path) -> io::Result<()> {
+        write_private(key, &self.key_pem)?;
+        std::fs::write(cert, &self.cert_pem)
+    }
+}
+
+fn key_pem_of(seed: &[u8; 32]) -> String {
+    let mut pkcs8 = ED25519_PKCS8_PREFIX.to_vec();
+    pkcs8.extend_from_slice(seed);
+    pem("PRIVATE KEY", &pkcs8)
+}
+
+/// A new certificate authority named `name` (valid ten years), for a cluster's own
+/// certificates: nodes and clients trust it, and it signs each node's certificate ([`issue`]).
+pub fn new_ca(name: &str) -> io::Result<IssuedCert> {
+    let seed: [u8; 32] = os_random_array()?;
+    let key = Ed25519Key::from_seed(&seed);
+    let dn = common_name(name);
+    let cert = build_cert(&key, &dn, &dn, &key.public_key(), &[], true)?;
+    Ok(IssuedCert { cert_pem: pem("CERTIFICATE", &cert), key_pem: key_pem_of(&seed) })
+}
+
+/// A certificate for `names` (the DNS names and IP addresses clients use to reach the node),
+/// signed by `ca`. It cannot sign others.
+pub fn issue(ca: &IssuedCert, names: &[&str]) -> io::Result<IssuedCert> {
+    let ca_cert = pem_blocks(&ca.cert_pem, "CERTIFICATE")
+        .into_iter()
+        .next()
+        .ok_or_else(|| tls_err("the CA file holds no PEM CERTIFICATE block"))?;
+    let ca_key_der = pem_blocks(&ca.key_pem, "PRIVATE KEY")
+        .into_iter()
+        .next()
+        .ok_or_else(|| tls_err("the CA key file holds no PEM PRIVATE KEY block"))?;
+    let ca_seed = ed25519_pkcs8_seed(&ca_key_der).ok_or_else(|| tls_err("the CA key is not Ed25519"))?;
+    let ca_key = Ed25519Key::from_seed(&ca_seed);
+    let parsed = x509::Certificate::parse(&ca_cert)?;
+    if parsed.public_key != ca_key.public_key() {
+        return Err(tls_err("the CA key does not match the CA certificate"));
+    }
+    let issuer = der(0x30, parsed.subject);
+    let seed: [u8; 32] = os_random_array()?;
+    let key = Ed25519Key::from_seed(&seed);
+    let subject = common_name(names.first().copied().unwrap_or("storine"));
+    let cert = build_cert(&ca_key, &issuer, &subject, &key.public_key(), names, false)?;
+    Ok(IssuedCert { cert_pem: pem("CERTIFICATE", &cert), key_pem: key_pem_of(&seed) })
 }
 
 // ── key schedule (SHA-256) ──
@@ -394,6 +491,57 @@ impl Keys {
             *b ^= s;
         }
         n
+    }
+
+    /// One encrypted record carrying `content` of type `ct`, appended to `out` with no other
+    /// allocation (the reactor's sessions are TLS 1.3; TLS 1.2 keys take the copying path).
+    fn seal_into(&mut self, ct: u8, content: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+        if self.tls12 {
+            let rec = self.seal(ct, content)?;
+            out.extend_from_slice(&rec);
+            return Ok(());
+        }
+        if self.seq == u64::MAX {
+            return Err(tls_err("record sequence number exhausted"));
+        }
+        let start = out.len();
+        out.reserve(5 + content.len() + 1 + 16);
+        out.extend_from_slice(&[CT_APPLICATION_DATA, 0x03, 0x03, 0, 0]);
+        out.extend_from_slice(content);
+        out.push(ct);
+        let len = (content.len() + 1 + 16) as u16;
+        out[start + 3..start + 5].copy_from_slice(&len.to_be_bytes());
+        let (header, body) = out[start..].split_at_mut(5);
+        let tag = seal_in_place(&self.key, &self.nonce(), header, body);
+        out.extend_from_slice(&tag);
+        self.seq += 1;
+        Ok(())
+    }
+
+    /// One application-data record carrying the concatenation of `parts` (at most
+    /// `MAX_FRAGMENT` bytes in all), appended to `out` (TLS 1.3 keys).
+    fn seal_parts_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> io::Result<()> {
+        if self.tls12 {
+            return self.seal_into(CT_APPLICATION_DATA, &parts.concat(), out);
+        }
+        if self.seq == u64::MAX {
+            return Err(tls_err("record sequence number exhausted"));
+        }
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let start = out.len();
+        out.reserve(5 + total + 1 + 16);
+        out.extend_from_slice(&[CT_APPLICATION_DATA, 0x03, 0x03, 0, 0]);
+        for p in parts {
+            out.extend_from_slice(p);
+        }
+        out.push(CT_APPLICATION_DATA);
+        let len = (total + 1 + 16) as u16;
+        out[start + 3..start + 5].copy_from_slice(&len.to_be_bytes());
+        let (header, body) = out[start..].split_at_mut(5);
+        let tag = seal_in_place(&self.key, &self.nonce(), header, body);
+        out.extend_from_slice(&tag);
+        self.seq += 1;
+        Ok(())
     }
 
     /// One encrypted record carrying `content` of type `ct`.
@@ -801,6 +949,28 @@ pub fn accept<R: Read, W: Write>(
     alpn: &str,
 ) -> io::Result<(TlsReader<R>, TlsWriter<W>)> {
     accept_inner(r, w, cfg, alpn, false)
+}
+
+/// Runs a server handshake like [`accept`] and returns the connection's keys as a [`Session`],
+/// for a caller that moves the bytes itself (the native server's reactor). `r` must not read
+/// ahead of what it is asked for (a raw socket, not a `BufReader`).
+pub fn accept_session<R: Read, W: Write>(mut r: R, mut w: W, cfg: &TlsConfig, alpn: &str) -> io::Result<Session> {
+    match handshake(&mut r, &mut w, cfg, alpn, false) {
+        Ok((read_keys, write_keys, plain)) => {
+            if !plain.is_empty() {
+                return Err(tls_err("application data inside the handshake"));
+            }
+            Ok(Session::new(read_keys, write_keys))
+        }
+        Err(e) => {
+            let code = alert_code(&e).unwrap_or(ALERT_INTERNAL_ERROR);
+            if e.kind() == io::ErrorKind::InvalidData {
+                let _ = w.write_all(&plain_record(CT_ALERT, &[2, code]));
+                let _ = w.flush();
+            }
+            Err(e)
+        }
+    }
 }
 
 /// [`accept`] for the TLS handshake that TDS 7.x carries in PRELOGIN packets. Some clients
@@ -1451,6 +1621,25 @@ pub fn random(buf: &mut [u8]) -> io::Result<()> {
     os_random(buf)
 }
 
+/// Year, month and day of a day count since 1970-01-01 (Howard Hinnant's `civil_from_days`).
+fn civil_from_days(z: i32) -> (i32, u32, u32) {
+    let z = i64::from(z) + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (i64::from(yoe) + era * 400) as i32;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1461,12 +1650,12 @@ mod tests {
         let zeros = [0u8; 32];
         let early = hkdf_extract(&zeros, &zeros);
         assert_eq!(
-            crate::hash::hex(&early),
+            hex(&early),
             "33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a"
         );
         let derived = derive_secret(&early, "derived", &sha256(&[]));
         assert_eq!(
-            crate::hash::hex(&derived),
+            hex(&derived),
             "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba"
         );
     }
@@ -1631,6 +1820,90 @@ mod fuzz_tests {
                 let _ = r.post_handshake(&input);
                 let _ = read_record(&mut &input[..]);
             });
+        }
+    }
+}
+
+/// Shared pieces of the fuzz sweeps over the record and handshake parsers (`TASK-135`).
+#[cfg(test)]
+pub(crate) mod fuzz_support {
+    pub(crate) use storage_types::testing::SweepRng;
+
+    #[global_allocator]
+    static ALLOCATOR: storage_codec::peak_alloc::PeakAlloc = storage_codec::peak_alloc::PeakAlloc;
+
+    /// Largest single allocation a parser may make for hostile input of a few KiB.
+    pub(crate) const ALLOC_LIMIT: usize = 16 << 20;
+
+    /// Runs `f`, failing if it allocated more than `ALLOC_LIMIT` bytes at once.
+    pub(crate) fn bounded<T>(what: &dyn std::fmt::Debug, f: impl FnOnce() -> T) -> T {
+        let (out, largest) = storage_codec::peak_alloc::measure(f);
+        assert!(largest <= ALLOC_LIMIT, "allocated {largest} bytes at once for {what:?}");
+        out
+    }
+
+    /// `base` iterations scaled by `STORINE_FUZZ_ITERS`.
+    pub(crate) fn iters(base: usize) -> usize {
+        let scale = std::env::var("STORINE_FUZZ_ITERS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(1.0);
+        ((base as f64 * scale) as usize).max(1)
+    }
+
+    /// The generator of one sweep: fixed, or varied by `STORINE_FUZZ_SEED`.
+    pub(crate) fn rng(tag: u64) -> SweepRng {
+        let seed = std::env::var("STORINE_FUZZ_SEED").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        SweepRng::new(tag ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+    }
+
+    /// `len` random bytes.
+    pub(crate) fn junk(rng: &mut SweepRng, len: usize) -> Vec<u8> {
+        (0..len).map(|_| rng.next_u64() as u8).collect()
+    }
+
+    /// Overwrites a 2- or 4-byte length-like field at a random offset of `buf` with an edge value.
+    pub(crate) fn poke_len(rng: &mut SweepRng, buf: &mut [u8]) {
+        if buf.len() < 2 {
+            return;
+        }
+        let at = rng.below(buf.len() - 1);
+        let wide = buf.len() - at >= 4 && rng.below(2) == 0;
+        let big = rng.below(2) == 0;
+        if wide {
+            let field: [u8; 4] = [buf[at], buf[at + 1], buf[at + 2], buf[at + 3]];
+            let real = if big { u32::from_be_bytes(field) } else { u32::from_le_bytes(field) };
+            let v = rng.edge_u32(real);
+            buf[at..at + 4].copy_from_slice(&if big { v.to_be_bytes() } else { v.to_le_bytes() });
+        } else {
+            let field = [buf[at], buf[at + 1]];
+            let real = if big { u16::from_be_bytes(field) } else { u16::from_le_bytes(field) };
+            let v = rng.edge_u32(u32::from(real)) as u16;
+            buf[at..at + 2].copy_from_slice(&if big { v.to_be_bytes() } else { v.to_le_bytes() });
+        }
+    }
+
+    /// A hostile variant of a valid input.
+    pub(crate) fn variant(rng: &mut SweepRng, base: &[u8]) -> Vec<u8> {
+        match rng.below(8) {
+            0 => {
+                let n = rng.below(64);
+                junk(rng, n)
+            }
+            1 | 2 => {
+                let mut v = base.to_vec();
+                for _ in 0..=rng.below(3) {
+                    poke_len(rng, &mut v);
+                }
+                v
+            }
+            3 => {
+                let mut v = base.to_vec();
+                v.truncate(rng.below(v.len() + 1));
+                v
+            }
+            _ => rng.hostile_copy(base),
         }
     }
 }

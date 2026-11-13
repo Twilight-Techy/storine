@@ -9,11 +9,18 @@ All integers are **little-endian**. `str` = `u32` byte length + UTF-8 bytes. Siz
 
 ## 1. Connection
 
-- Plain TCP (put TLS in front with a proxy or sidecar if the network is untrusted). Default port `7878`.
+- TCP, default port `7878`. A server started with a certificate (`STORAGE_TLS_CERT` /
+  `STORAGE_TLS_KEY`) requires TLS 1.3 on that port from every client, and its peers reach it over
+  TLS too; the framing below then runs inside the TLS stream. The server offers
+  `TLS_CHACHA20_POLY1305_SHA256`, `x25519` and an Ed25519 certificate: clients must accept
+  Ed25519 (every SDK's platform does, except .NET on Windows, whose TLS stack has no Ed25519).
 - One request at a time per connection: send a request, read its response, repeat. Use one
   connection per thread / task, or a pool.
 - Connection strings: `storine://[token@]host:port[,host:port...][?timeout_ms=5000&follower_reads=1]`.
-  Several hosts form the seed list of a cluster.
+  Several hosts form the seed list of a cluster. `storines://` connects over TLS; `tls_ca` (a PEM
+  file of the certificates to trust; giving it also turns TLS on) and `tls_server_name` (the name
+  the server's certificate must carry; default: the host connected to) may be given as options or
+  query parameters.
 
 ## 2. Framing
 
@@ -306,4 +313,4 @@ documented in `crates/storage-server/src/lib.rs`. SDKs do not need them.
 
 ## 8. Not yet in the protocol (TODO)
 
-TLS termination inside the server, streaming change feeds.
+Streaming change feeds.

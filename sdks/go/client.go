@@ -3,6 +3,8 @@ package storine
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	mrand "math/rand"
 	"net"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +44,13 @@ type Options struct {
 	FollowerReads bool
 	// PoolSize is the number of idle connections kept to the current server (default 16).
 	PoolSize int
+	// TLS connects over TLS with this configuration (an empty ServerName means the host
+	// connected to). Also turned on by storines:// or TLSCAFile.
+	TLS *tls.Config
+	// TLSCAFile is a PEM file of the certificates to trust (default: the system's roots).
+	TLSCAFile string
+	// TLSServerName is the name the server's certificate must carry.
+	TLSServerName string
 }
 
 type conn struct {
@@ -74,8 +84,8 @@ func Connect(rawURL string, options ...Options) (*Client, error) {
 		rawURL = "storine://" + rawURL
 	}
 	scheme, rest, _ := strings.Cut(rawURL, "://")
-	if scheme != "storine" {
-		return nil, invalidf("connection strings start with storine://")
+	if scheme != "storine" && scheme != "storines" {
+		return nil, invalidf("connection strings start with storine:// or storines://")
 	}
 	hosts, query, _ := strings.Cut(rest, "?")
 	if at := strings.LastIndex(hosts, "@"); at >= 0 {
@@ -102,6 +112,27 @@ func Connect(rawURL string, options ...Options) (*Client, error) {
 	}
 	if v := q.Get("follower_reads"); v != "" {
 		o.FollowerReads = v == "1" || v == "true" || v == "yes"
+	}
+	if v := q.Get("tls_ca"); v != "" && o.TLSCAFile == "" {
+		o.TLSCAFile = v
+	}
+	if v := q.Get("tls_server_name"); v != "" && o.TLSServerName == "" {
+		o.TLSServerName = v
+	}
+	if o.TLS == nil && (scheme == "storines" || o.TLSCAFile != "") {
+		cfg := &tls.Config{MinVersion: tls.VersionTLS13, ServerName: o.TLSServerName}
+		if o.TLSCAFile != "" {
+			pem, err := os.ReadFile(o.TLSCAFile)
+			if err != nil {
+				return nil, invalidf("reading tls_ca: %v", err)
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(pem) {
+				return nil, invalidf("tls_ca holds no PEM certificate")
+			}
+			cfg.RootCAs = pool
+		}
+		o.TLS = cfg
 	}
 	if o.Timeout <= 0 {
 		o.Timeout = 5 * time.Second
@@ -144,7 +175,17 @@ func (c *Client) Close() error {
 
 func (c *Client) dial(ctx context.Context, address string) (*conn, error) {
 	d := net.Dialer{Timeout: c.opts.Timeout}
-	nc, err := d.DialContext(ctx, "tcp", address)
+	var nc net.Conn
+	var err error
+	if c.opts.TLS != nil {
+		cfg := c.opts.TLS.Clone()
+		if cfg.ServerName == "" {
+			cfg.ServerName, _, _ = net.SplitHostPort(address)
+		}
+		nc, err = (&tls.Dialer{NetDialer: &d, Config: cfg}).DialContext(ctx, "tcp", address)
+	} else {
+		nc, err = d.DialContext(ctx, "tcp", address)
+	}
 	if err != nil {
 		return nil, err
 	}

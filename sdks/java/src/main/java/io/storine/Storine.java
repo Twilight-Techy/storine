@@ -3,8 +3,19 @@ package io.storine;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.FileInputStream;
+import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.security.GeneralSecurityException;
+import java.security.KeyStore;
+import java.security.cert.Certificate;
+import java.security.cert.CertificateFactory;
+import javax.net.ssl.SNIHostName;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.TrustManagerFactory;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
@@ -37,6 +48,8 @@ public final class Storine implements AutoCloseable {
 
     private final List<String> seeds;
     private final Options options;
+    /** Non-null when connections use TLS. */
+    private final SSLContext tls;
     private final ArrayDeque<Conn> pool = new ArrayDeque<>();
     private String target;
 
@@ -44,6 +57,33 @@ public final class Storine implements AutoCloseable {
         this.seeds = List.copyOf(seeds);
         this.options = options;
         this.target = seeds.get(0);
+        this.tls = options.tls() || options.tlsCa() != null ? tlsContext(options.tlsCa()) : null;
+    }
+
+    /** TLS 1.3 trusting the certificates in {@code caFile} (PEM), or the JVM's roots when null. */
+    private static SSLContext tlsContext(String caFile) {
+        try {
+            SSLContext ctx = SSLContext.getInstance("TLSv1.3");
+            if (caFile == null) {
+                ctx.init(null, null, null);
+                return ctx;
+            }
+            KeyStore roots = KeyStore.getInstance(KeyStore.getDefaultType());
+            roots.load(null, null);
+            try (InputStream in = new FileInputStream(caFile)) {
+                int i = 0;
+                for (Certificate c : CertificateFactory.getInstance("X.509").generateCertificates(in)) {
+                    roots.setCertificateEntry("storine-ca-" + i++, c);
+                }
+                if (i == 0) throw new InvalidException("tls_ca holds no certificate");
+            }
+            TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+            tmf.init(roots);
+            ctx.init(null, tmf.getTrustManagers(), null);
+            return ctx;
+        } catch (IOException | GeneralSecurityException e) {
+            throw new InvalidException("cannot set up TLS: " + e.getMessage());
+        }
     }
 
     /** {@link #connect(String, Options)} with default options. */
@@ -52,13 +92,18 @@ public final class Storine implements AutoCloseable {
     }
 
     /**
-     * Connects to {@code storine://[token@]host:port[,host:port...]} (or just {@code host:port}). Query parameters
-     * {@code timeout_ms=5000} and {@code follower_reads=1} are accepted too. Connections open lazily.
+     * Connects to {@code storine://[token@]host:port[,host:port...]} (or just {@code host:port});
+     * {@code storines://} connects over TLS. Query parameters {@code timeout_ms=5000}, {@code follower_reads=1},
+     * {@code tls_ca=/path/ca.crt} and {@code tls_server_name=db1} are accepted too. Connections open lazily.
      */
     public static Storine connect(String url, Options options) {
         if (!url.contains("://")) url = "storine://" + url;
-        if (!url.startsWith("storine://")) throw new InvalidException("connection strings start with storine://");
-        String rest = url.substring("storine://".length());
+        boolean secure = url.startsWith("storines://");
+        if (!url.startsWith("storine://") && !secure) {
+            throw new InvalidException("connection strings start with storine:// or storines://");
+        }
+        if (secure) options = options.tls(true);
+        String rest = url.substring(secure ? "storines://".length() : "storine://".length());
         String query = "";
         int qm = rest.indexOf('?');
         if (qm >= 0) {
@@ -82,6 +127,10 @@ public final class Storine implements AutoCloseable {
                 }
             } else if (p[0].equals("follower_reads")) {
                 options = options.followerReads(v.equals("1") || v.equals("true") || v.equals("yes"));
+            } else if (p[0].equals("tls_ca") && options.tlsCa() == null) {
+                options = options.tlsCa(URLDecoder.decode(v, StandardCharsets.UTF_8));
+            } else if (p[0].equals("tls_server_name") && options.tlsServerName() == null) {
+                options = options.tlsServerName(URLDecoder.decode(v, StandardCharsets.UTF_8));
             }
         }
         List<String> seeds = new ArrayList<>();
@@ -157,20 +206,36 @@ public final class Storine implements AutoCloseable {
         final DataInputStream in;
         final OutputStream out;
 
-        Conn(String address, int timeoutMs) throws IOException {
+        Conn(String address, int timeoutMs, SSLContext tls, String serverName) throws IOException {
             this.address = address;
             int colon = address.lastIndexOf(':');
             String host = address.substring(0, colon).replace("[", "").replace("]", "");
             int port = Integer.parseInt(address.substring(colon + 1));
-            socket = new Socket();
+            Socket plain = new Socket();
+            Socket s = plain;
             try {
-                socket.connect(new InetSocketAddress(host, port), timeoutMs);
-                socket.setTcpNoDelay(true);
-                socket.setSoTimeout(timeoutMs);
-                in = new DataInputStream(socket.getInputStream());
-                out = socket.getOutputStream();
+                plain.connect(new InetSocketAddress(host, port), timeoutMs);
+                plain.setTcpNoDelay(true);
+                plain.setSoTimeout(timeoutMs);
+                if (tls != null) {
+                    String name = serverName != null ? serverName : host;
+                    SSLSocket ssl = (SSLSocket) tls.getSocketFactory().createSocket(plain, name, port, true);
+                    s = ssl;
+                    SSLParameters params = ssl.getSSLParameters();
+                    params.setProtocols(new String[] {"TLSv1.3"});
+                    // Checks the certificate names the host (DNS name or IP address).
+                    params.setEndpointIdentificationAlgorithm("HTTPS");
+                    if (!name.isEmpty() && !Character.isDigit(name.charAt(0)) && !name.contains(":")) {
+                        params.setServerNames(List.of(new SNIHostName(name)));
+                    }
+                    ssl.setSSLParameters(params);
+                    ssl.startHandshake();
+                }
+                socket = s;
+                in = new DataInputStream(s.getInputStream());
+                out = s.getOutputStream();
             } catch (IOException e) {
-                socket.close();
+                s.close();
                 throw e;
             }
         }
@@ -226,7 +291,7 @@ public final class Storine implements AutoCloseable {
         int timeoutMs = (int) Math.min(Integer.MAX_VALUE, options.timeout().toMillis());
         Conn c;
         try {
-            c = new Conn(t, timeoutMs);
+            c = new Conn(t, timeoutMs, tls, options.tlsServerName());
         } catch (IOException e) {
             throw new DialFailure(t, e);
         }

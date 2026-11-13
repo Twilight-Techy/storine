@@ -958,3 +958,37 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - New tests: ARM CRC equals the portable CRC for lengths 0–299 and the golden values; `update_matches_separate_calls`; `tag_update_matches_separate_calls`.
   - On AWS: the release workspace suite and 40 of 40 chaos runs. One on-demand `c7i.xlarge`, about $0.25, terminated.
   - A stale-binary mistake (a copied build directory newer than the copied sources) made one run measure old code. It was caught by binary timestamps and rerun.
+
+## 2026-11-13: release candidate (`TASK-154`)
+
+- **Added**:
+  - TLS 1.3 on the native port and between cluster nodes (`storage-tls`, no third-party crates). It has a client with chain, name and validity checks, a sans-IO session driven by the reactors, and a handshake pool with a 10 s deadline. `gen-ca` / `gen-cert` issue Ed25519 certificates.
+  - `storines://` and a CA option in all eight SDKs, each with a TLS test.
+  - Streaming WAL recovery; a 64 MiB cap on the frame pool's shared store.
+  - `docs/RELEASE.md` (the checklist), CI on x86_64 and arm64, `CHANGELOG.md`, `docs/COMPATIBILITY.md`.
+- **Found and fixed**: range nodes that never came back after a kill (the range soak's and `soak17`'s final-read failure). They stored one file per record, and recovery synced one file per logged write: minutes for an 83 MB log. Killed again before finishing, a node started over each time. Range nodes now use arenas, and replay writes each record once per batch, syncing record files in parallel. That node's data reopens in 2.3 s.
+- **Measured** (`BENCHMARK_REPORT.md` section 8.5):
+  - TCP `GET` is 8.6–9.0 µs plaintext, unchanged by TLS support, and 11.5–11.7 µs over TLS.
+  - Storine still leads LMDB and RocksDB in every throughput and p99 row.
+- **Verified**:
+  - Sanitizers: Miri (frame pool, checksums) and AddressSanitizer (codec, mmap, WAL), clean.
+  - SDK suites: all eight pass against the release server, TLS included.
+  - Before the range fix: the workspace suite on x86_64 and arm64, 32 of 32 completed chaos runs on x86_64, and the 2-hour single-group soak (balances conserved, RSS 222–267 MiB, at most 47 descriptors).
+
+## 2026-11-13: range checkpoints and durable WAL cuts (`TASK-154`)
+
+- **Found** on the range soak, rerun with the recovery fix: each node's WAL reached 374 MB and its arena 3.2 GB in 25 minutes. Range nodes only synced their WAL and never checkpointed the engine.
+- **Changed**:
+  - `RangeNode` checkpoints its engine on its own thread every 5 s while written.
+  - Cutting a WAL now always syncs what it covered (arena and record files), under every sync policy. Raft nodes sync the WAL and then drop log entries, so `AsyncMemoryFirst` truncation without a sync could have lost applied writes on power loss.
+- **Verified locally**:
+  - New test `range_nodes_checkpoint_and_cut_their_logs`, failing without the thread.
+  - The storage-core suite, the range documents tests, clippy.
+  - A 15-minute range soak on 2 vCPUs: balances conserved, WAL 1–3 MB, segments under 105 MB, disk 149 MiB at the end.
+- **Verified on AWS, on the tree with the recovery fix but not this one**: the workspace suite and 40 of 40 chaos runs on x86_64 and on arm64.
+- **Verified on AWS, on the release candidate** (checks 2–5 of `docs/RELEASE.md`):
+  - The release workspace suite passed on x86_64 (`c7i.xlarge`) and arm64 (`c7g.xlarge`). Process chaos passed 40 of 40 on each.
+  - The 2-hour single-group soak passed: balances conserved, every key linearizable. RSS was 261–334 MiB, disk 85–110 MiB, at most 47 descriptors.
+  - The 2-hour range soak passed: balances conserved, every key linearizable, 318,345 writes. The largest node's RSS was 804 MiB to 1.12 GiB per window: it rose in the first hour and then levelled off. Disk was 138–433 MiB and descriptors at most 85. Before the checkpoint fix, a node alone had 3.2 GB on disk after 25 minutes.
+  - Four on-demand instances, about $2.40 in all, terminated.
+

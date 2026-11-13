@@ -788,13 +788,33 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         // later by the catalog, and any recovered frame means a crash.
         let mut paged_indexes_current = paged_stamp_matches && !shared_wal_mode;
         if !shared_wal_mode {
-            let recovered = GroupCommitWal::recover_committed(&wal_path)?;
-            if !recovered.is_empty() {
-                paged_indexes_current = false;
-                if inner.range_index.as_paged().is_some() {
-                    inner.reset_paged_indexes()?;
+            // Streamed: one frame in memory at a time, however long the log is.
+            // Streamed in batches: a bounded number of frames in memory at a time, however long
+            // the log is, and each batch's records flushed together (`flush_replayed`).
+            const REPLAY_BATCH_ENTRIES: usize = 4096;
+            const REPLAY_BATCH_BYTES: usize = 32 << 20;
+            let mut any = false;
+            let mut batch: Vec<WalEntry> = Vec::new();
+            let mut batch_bytes = 0usize;
+            GroupCommitWal::for_each_committed(&storage_types::vfs::at(&wal_path), &wal_path, |entry| {
+                if !any {
+                    any = true;
+                    if inner.range_index.as_paged().is_some() {
+                        inner.reset_paged_indexes()?;
+                    }
                 }
-                inner.replay_wal_entries(&recovered, false)?;
+                batch_bytes += entry.frame_bytes.len();
+                batch.push(entry);
+                if batch.len() >= REPLAY_BATCH_ENTRIES || batch_bytes >= REPLAY_BATCH_BYTES {
+                    inner.replay_wal_entries(&batch, false)?;
+                    batch.clear();
+                    batch_bytes = 0;
+                }
+                Ok(())
+            })?;
+            inner.replay_wal_entries(&batch, false)?;
+            if any {
+                paged_indexes_current = false;
                 if let Some(ref arena) = inner.arena {
                     arena.sync_all()?;
                 }
@@ -2548,6 +2568,10 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
     /// When `maintain_indexes` is set, secondary indexes are diffed per entry (used when the
     /// engine is already live); at open they are rebuilt from scratch afterwards instead.
     fn replay_wal_entries(&self, entries: &[WalEntry], maintain_indexes: bool) -> Result<()> {
+        // Records written by this batch, flushed once each when it is applied: a record logged
+        // many times is written once, and the record files of the one-file-per-record layout are
+        // synced in parallel rather than one disk flush per logged write (`flush_replayed`).
+        let mut touched: Vec<InlineId> = Vec::new();
         for entry in entries {
             if entry.collection_id != T::COLLECTION_ID && entry.collection_id != 0 {
                 continue;
@@ -2618,7 +2642,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                         });
                     }
                     self.set_ttl_ordinal(ord, hdr.ttl_expires_at_ns > 0);
-                    self.flush_single_record_impl(entry.record_id, true, true, false)?;
+                    touched.push(entry.record_id);
                     if maintain_indexes {
                         let new_snap = self
                             .extract_snapshot_from_frame(aligned.as_slice(), false)
@@ -2657,7 +2681,47 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                 _ => {}
             }
         }
-        Ok(())
+        self.flush_replayed(touched)
+    }
+
+    /// Flushes the records a replayed batch left dirty, each once. Arena appends are not synced
+    /// here: every caller syncs the arena once after replay, before anything relies on it. Record
+    /// files are synced, from several threads when there are many: each sync waits for a journal
+    /// commit, and concurrent syncs share one, where a restart flushing them one by one waited
+    /// minutes for a long log (`soak_range_cluster`).
+    fn flush_replayed(&self, mut ids: Vec<InlineId>) -> Result<()> {
+        ids.sort_unstable();
+        ids.dedup();
+        const PER_THREAD: usize = 64;
+        let threads = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .clamp(2, 16)
+            .min(ids.len().div_ceil(PER_THREAD));
+        if threads <= 1 {
+            for id in ids {
+                self.flush_single_record_impl(id, true, false, true)?;
+            }
+            return Ok(());
+        }
+        let chunk = ids.len().div_ceil(threads);
+        std::thread::scope(|s| {
+            let workers: Vec<_> = ids
+                .chunks(chunk)
+                .map(|part| {
+                    s.spawn(move || -> Result<()> {
+                        for &id in part {
+                            self.flush_single_record_impl(id, true, false, true)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            workers.into_iter().try_for_each(|w| {
+                w.join().unwrap_or_else(|_| {
+                    Err(StorageError::resource_exhausted("a replay flush thread panicked"))
+                })
+            })
+        })
     }
 
     fn decode_or_migrate_frame(&self, frame: &[u8]) -> Result<(Version, T)> {
@@ -3428,8 +3492,12 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
     /// `fsync`s data files, saves the primary checkpoint and truncates WAL frames `<= cutoff`.
     /// Caller guarantees every operation with `lsn <= cutoff` is applied and flushed.
     fn checkpoint_and_truncate(&self, cutoff: u64) -> Result<()> {
+        // The arena is synced before the WAL is cut, under every sync policy: a caller that
+        // syncs the WAL itself (`sync_wal`, as Raft nodes do before they compact their logs)
+        // relies on what the log held staying durable once the log drops it.
+        let truncates = !self.shared_wal_mode && self.wal.is_some();
         if let Some(ref arena) = self.arena {
-            if self.data_sync() {
+            if self.data_sync() || truncates {
                 arena.sync_all()?;
             }
         }
@@ -3609,7 +3677,9 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
 
     /// Flushes every dirty record. `already_locked` is set when the caller holds all stripes.
     fn drain_and_flush_all(&self, already_locked: bool) -> Result<usize> {
-        let sync = self.data_sync();
+        // Every caller truncates the WAL afterwards: what it flushes must then survive a power
+        // loss on its own, whatever the sync policy (the log no longer holds it).
+        let sync = self.data_sync() || self.wal.is_some();
         let mut total = 0usize;
         loop {
             let batch = {

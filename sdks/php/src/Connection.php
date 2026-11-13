@@ -12,12 +12,31 @@ final class Connection
     /** @var resource */
     private $sock;
 
-    /** @param array{0: string, 1: int} $address */
-    public function __construct(public readonly array $address, private readonly float $timeout, ?string $token, bool $followerReads)
+    /**
+     * @param array{0: string, 1: int} $address
+     * @param array{ca: ?string, name: ?string}|null $tls TLS 1.3, trusting `ca` (PEM file; system roots when null)
+     *        and expecting `name` in the server's certificate (default: the host)
+     */
+    public function __construct(public readonly array $address, private readonly float $timeout, ?string $token, bool $followerReads,
+                                ?array $tls = null)
     {
         [$host, $port] = $address;
-        $target = 'tcp://' . (str_contains($host, ':') ? "[$host]" : $host) . ":$port";
-        $ctx = stream_context_create(['socket' => ['tcp_nodelay' => true]]);
+        $options = ['socket' => ['tcp_nodelay' => true]];
+        if ($tls !== null) {
+            $options['ssl'] = [
+                'verify_peer' => true,
+                'verify_peer_name' => true,
+                'peer_name' => $tls['name'] ?? $host,
+                'crypto_method' => STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT,
+                'SNI_enabled' => filter_var($tls['name'] ?? $host, FILTER_VALIDATE_IP) === false,
+            ];
+            if ($tls['ca'] !== null) {
+                $options['ssl']['cafile'] = $tls['ca'];
+            }
+        }
+        $scheme = $tls !== null ? 'tls' : 'tcp';
+        $target = "$scheme://" . (str_contains($host, ':') ? "[$host]" : $host) . ":$port";
+        $ctx = stream_context_create($options);
         $sock = @stream_socket_client($target, $errno, $errstr, $timeout, STREAM_CLIENT_CONNECT, $ctx);
         if ($sock === false) {
             throw new TransportException("cannot connect to $host:$port: $errstr");

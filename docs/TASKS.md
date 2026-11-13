@@ -1401,4 +1401,27 @@ This document defines the strict chronological execution order for building the 
     - 4-writer overwrite p99.99: 2.3–3.0 ms against 0.46–1.32 ms; not traced.
     - Durable p99.9 and p99.99 against LMDB: four writers 6.0–6.4 ms against 2.9–3.2 ms (LMDB starves three writers for over 4 s); one writer p99.99 6.3–11.5 ms against 3.4–4.4 ms.
     - Indexed records: the remaining cost is the ordered index (`BTreeMap`) itself.
-    - Not investigated in this task: `soak17`'s final-read failure and `readprobe7`'s arena growth (from `TASK-151`), the arena's space amplification of up to 2× until compaction, and whether 64 MiB is the right default dirty budget.
+    - Not investigated in this task (`soak17`'s final-read failure: found and fixed in `TASK-154`): `soak17`'s final-read failure and `readprobe7`'s arena growth (from `TASK-151`), the arena's space amplification of up to 2× until compaction, and whether 64 MiB is the right default dirty budget.
+
+## Stage 33: Production Release (`TASK-154`)
+
+- [ ] **TASK-154: Ready for Production and Release** — what a 0.1.0 release needs: encrypted client and cluster traffic with no cost when off, recovery in bounded memory, a release checklist run on the release commit, release notes and a compatibility policy.
+  - **Done (2026-11-12)**:
+    - TLS 1.3 on the native port and between cluster nodes, in a new zero-dependency crate `storage-tls`. It has a client with name, validity and chain checks, a sans-IO session the reactors drive, and a handshake pool with a deadline. `gen-ca` and `gen-cert` issue Ed25519 certificates. All eight SDKs take `storines://` URLs and have a TLS test.
+    - WAL recovery streams the log in bounded batches instead of reading it whole (`GroupCommitWal::for_each_committed`).
+    - The frame pool's shared store is capped at 64 MiB in total.
+    - Release checklist (`docs/RELEASE.md`), CI on x86_64 and arm64 (`.github/workflows/ci.yml`), `CHANGELOG.md`, `docs/COMPATIBILITY.md`.
+    - Build output that had been committed by mistake (`target-fp/`) is no longer tracked, and `target*/` is ignored.
+  - **Found and fixed (2026-11-12), the range soak's final-read failure (also `soak17`'s)**:
+    - A range node killed during the soak never came back, so it refused connections. It was stuck single-threaded in recovery for minutes, one `fdatasync` + rename + directory `fsync` per logged write.
+    - Range nodes opened their engine with `EngineConfig::default()`, whose layout is one file per record, where `DocumentStore` uses arenas. One node held 20,155 record files and an 83 MB log.
+    - Killed again about every 3 minutes, before recovery finished, it started over each time.
+    - Fix: range nodes use `DOCUMENT_LAYOUT`. Replay applies the log in batches of up to 4,096 frames or 32 MiB and writes each record once per batch, syncing record files from up to 16 threads.
+    - That node's data, copied from the soak machine, reopens in 2.3 s.
+  - **Found and fixed (2026-11-13), two more from the range soak on the fixed tree**:
+    - Range nodes never checkpointed their engine. `NodeDriver::checkpoint` only syncs the WAL, so the WAL and the arena grew until the next restart: 374 MB of WAL and 3.2 GB of segments per node after 25 minutes. Before the layout fix, frequent restarts and in-place record files had hidden this. `RangeNode` now runs a checkpoint thread (`RuntimeConfig::checkpoint_interval`, 5 s) that flushes, cuts the WAL and compacts while the engine is written. In a local 15-minute range soak, WALs stayed at 1–3 MB, segments at 41–104 MB and RSS under 300 MB per node. New test: `range_nodes_checkpoint_and_cut_their_logs` (logs reach 974 KB without the thread).
+    - Under `AsyncMemoryFirst`, `flush_all` truncated the WAL without syncing what it had flushed. Raft nodes (single group and ranges) sync the WAL, checkpoint, then compact their Raft logs, so a power loss could have lost applied writes. Now, whenever a WAL is cut, record files are synced as they are flushed and the arena is synced before the cut.
+  - **Verified (2026-11-13), on the release candidate**: the release workspace suite on x86_64 and arm64, 40 of 40 process-chaos runs on each, and both 2-hour soaks. In each soak balances were conserved and every key linearizable. The single-group RSS peak was 334 MiB; the range RSS peak was 1.12 GiB, level after the first hour; disk stayed under 450 MiB. Checks 6–8 ran on the tree before the two checkpoint fixes, which don't touch the paths they cover.
+  - **Open**:
+    - Binary size: `storage-server` 3.87 MB, `storage-cli` 1.25 MB, `storine-sql` 5.58 MB (Linux x86_64, stripped). That is above `RULE-MEM-03`'s `< 1 MiB`. They were already 3.74, 1.19 and 5.51 MB before this task; TLS added 66–132 KB. Raising the budget or splitting optional subsystems into Cargo features (`TASK-091`'s options) is the user's call.
+

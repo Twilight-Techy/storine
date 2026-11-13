@@ -5,3 +5,5 @@
 *.tmp
 /.claude/worktrees/
 node_modules/
+# Build output (any target directory: target, target-fp, target-asan ...).
+target*/

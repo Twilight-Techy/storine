@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import random
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -48,11 +49,18 @@ class ByteRange(NamedTuple):
 
 
 class _Connection:
-    def __init__(self, address: Tuple[str, int], timeout: float, token: Optional[str], follower_reads: bool) -> None:
+    def __init__(self, address: Tuple[str, int], timeout: float, token: Optional[str], follower_reads: bool,
+                 tls: Optional[ssl.SSLContext] = None, tls_server_name: Optional[str] = None) -> None:
         self.address = address
         self.sock = socket.create_connection(address, timeout=timeout)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.sock.settimeout(timeout)
+        if tls is not None:
+            try:
+                self.sock = tls.wrap_socket(self.sock, server_hostname=tls_server_name or address[0])
+            except BaseException:
+                self.sock.close()
+                raise
         if token:
             status, _v, body = self.call(w.OP_AUTH, token.encode("utf-8"))
             if status != w.ST_OK:
@@ -101,9 +109,22 @@ class Client:
     """
 
     def __init__(self, seeds: Sequence[Tuple[str, int]], token: Optional[str] = None, timeout: float = 5.0,
-                 follower_reads: bool = False, retries: int = 8) -> None:
+                 follower_reads: bool = False, retries: int = 8, tls: bool = False,
+                 tls_ca: Optional[str] = None, tls_server_name: Optional[str] = None) -> None:
         if not seeds:
             raise InvalidError("no server address given")
+        # TLS 1.3 with the server's certificate checked against `tls_ca` (PEM file) or, without
+        # one, the system's trusted roots.
+        self._tls: Optional[ssl.SSLContext] = None
+        if tls or tls_ca:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            if tls_ca:
+                ctx.load_verify_locations(cafile=tls_ca)
+            else:
+                ctx.load_default_certs()
+            self._tls = ctx
+        self._tls_server_name = tls_server_name
         self._seeds = list(seeds)
         self._token = token
         self._timeout = timeout
@@ -123,7 +144,7 @@ class Client:
                 if c.address == target:
                     return c
                 c.close()
-        return _Connection(target, self._timeout, self._token, self._follower_reads)
+        return _Connection(target, self._timeout, self._token, self._follower_reads, self._tls, self._tls_server_name)
 
     def _release(self, c: _Connection) -> None:
         with self._lock:
@@ -291,17 +312,20 @@ class Client:
 
 
 def connect(url: str = "storine://127.0.0.1:7878", *, token: Optional[str] = None, timeout: float = 5.0,
-            follower_reads: bool = False) -> Client:
+            follower_reads: bool = False, tls_ca: Optional[str] = None,
+            tls_server_name: Optional[str] = None) -> Client:
     """Connects to a Storine server or cluster.
 
-    `url` is `storine://[token@]host:port[,host:port...]` (or just `host:port`). Options may also
-    be given as query parameters: `?timeout_ms=5000&follower_reads=1`.
+    `url` is `storine://[token@]host:port[,host:port...]` (or just `host:port`); `storines://`
+    connects over TLS. Options may also be given as query parameters:
+    `?timeout_ms=5000&follower_reads=1&tls_ca=/path/ca.crt&tls_server_name=db1`. Giving `tls_ca`
+    (the PEM certificates to trust) also turns TLS on.
     """
     if "://" not in url:
         url = "storine://" + url
     u = urlparse(url)
-    if u.scheme != "storine":
-        raise InvalidError("connection strings start with storine://")
+    if u.scheme not in ("storine", "storines"):
+        raise InvalidError("connection strings start with storine:// or storines://")
     netloc = u.netloc
     if "@" in netloc:
         cred, netloc = netloc.rsplit("@", 1)
@@ -312,7 +336,12 @@ def connect(url: str = "storine://127.0.0.1:7878", *, token: Optional[str] = Non
         timeout = int(q["timeout_ms"][0]) / 1000
     if "follower_reads" in q:
         follower_reads = q["follower_reads"][0] in ("1", "true", "yes")
-    return Client(seeds, token=token, timeout=timeout, follower_reads=follower_reads)
+    if "tls_ca" in q:
+        tls_ca = tls_ca or q["tls_ca"][0]
+    if "tls_server_name" in q:
+        tls_server_name = tls_server_name or q["tls_server_name"][0]
+    return Client(seeds, token=token, timeout=timeout, follower_reads=follower_reads,
+                  tls=u.scheme == "storines", tls_ca=tls_ca, tls_server_name=tls_server_name)
 
 
 def _ops(changes: Sequence[Any]) -> List[w.FieldOp]:

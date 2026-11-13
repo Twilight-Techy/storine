@@ -9,7 +9,8 @@ use storage_core::{
     FIELD_TIMESTAMP,
 };
 use storage_index::cosine_similarity_f32;
-use storage_server::{StorageClient, StorageServer};
+use storage_server::{SecurityConfig, StorageClient, StorageServer};
+use storage_types::StorageError;
 use storage_types::{InlineId, RecordFlags, Version};
 use storage_wal::SyncPolicy;
 
@@ -268,6 +269,27 @@ fn main() -> storage_types::Result<()> {
     let mut client = StorageClient::connect(srv.local_addr())?;
     results.push(run_latency_bench(
         "StorageServer TCP Binary GET Frame RPC",
+        1_000,
+        |i| {
+            let k = keys[i % 100];
+            let frame = client.get_frame(k).unwrap();
+            core::hint::black_box(frame.len());
+        },
+    ));
+    srv.stop();
+
+    // The same over TLS 1.3 (ChaCha20-Poly1305): what encryption adds to a round trip.
+    let ca = storage_tls::new_ca("bench").map_err(|e| StorageError::io("bench CA", e))?;
+    let node = storage_tls::issue(&ca, &["127.0.0.1"]).map_err(|e| StorageError::io("bench certificate", e))?;
+    let tls_cfg = storage_tls::TlsConfig::from_pem(&node.cert_pem, &node.key_pem).map_err(|e| StorageError::io("bench TLS", e))?;
+    let mut srv = StorageServer::start_with_config("127.0.0.1:0", Arc::clone(&engine), 64, SecurityConfig::default().with_tls(tls_cfg))?;
+    let client_tls = storage_server::ClientTls {
+        config: Arc::new(storage_tls::ClientConfig::with_roots_pem(&ca.cert_pem).map_err(|e| StorageError::io("bench roots", e))?),
+        server_name: None,
+    };
+    let mut client = StorageClient::connect_tls(srv.local_addr(), &client_tls)?;
+    results.push(run_latency_bench(
+        "StorageServer TCP Binary GET Frame RPC (TLS)",
         1_000,
         |i| {
             let k = keys[i % 100];

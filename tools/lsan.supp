@@ -1,0 +1,4 @@
+# LeakSanitizer suppressions for the sanitizer check of docs/RELEASE.md.
+# This test simulates a crash by `mem::forget`-ting an open arena segment (its Drop would write
+# the superblock a crash never writes), so the segment's allocations are leaked on purpose.
+leak:test_arena_positional_write_fast_forward_recovery_and_slot_reuse

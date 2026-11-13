@@ -86,9 +86,9 @@ SDK_SUITES = {
     "go": ("sdks/go", "go test ."),
     "java": ("sdks/java", "mvn -q -B test"),
     "csharp": ("sdks/csharp/tests/Storine.Tests", "dotnet test --nologo"),
-    "rust": ("sdks/rust", "cargo test --release"),
+    "rust": ("sdks/rust", "cargo test --release && cargo test --release --features tls --test tls"),
     "php": ("sdks/php", "php tests/harness.php"),
-    "ruby": ("sdks/ruby", "ruby -Ilib test/test_vectors.rb && ruby -Ilib test/test_e2e.rb"),
+    "ruby": ("sdks/ruby", "ruby -Ilib test/test_vectors.rb && ruby -Ilib test/test_tls.rb"),
 }
 
 EXCLUDE = (

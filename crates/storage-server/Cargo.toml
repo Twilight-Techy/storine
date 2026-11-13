@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 storage-types = { path = "../storage-types" }
 storage-codec = { path = "../storage-codec" }
+storage-tls = { path = "../storage-tls" }
 storage-mmap = { path = "../storage-mmap" }
 storage-wal = { path = "../storage-wal" }
 storage-index = { path = "../storage-index" }

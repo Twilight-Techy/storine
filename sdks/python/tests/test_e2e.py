@@ -334,3 +334,39 @@ class Cluster(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(os.path.exists(SERVER), "storage-server binary not built")
+class Tls(unittest.TestCase):
+    """TLS on the native port: certificates from `storage-server gen-ca` / `gen-cert`."""
+
+    def test_tls_round_trip_and_untrusted_server(self):
+        d = tempfile.mkdtemp(prefix="storine_py_tls_")
+        try:
+            subprocess.run([SERVER, "gen-ca", f"{d}/ca"], check=True, stdout=subprocess.DEVNULL)
+            subprocess.run([SERVER, "gen-cert", f"{d}/ca", f"{d}/node", "127.0.0.1,localhost"], check=True,
+                           stdout=subprocess.DEVNULL)
+            port = free_port()
+            env = {**os.environ, "STORAGE_TLS_CERT": f"{d}/node/node.crt", "STORAGE_TLS_KEY": f"{d}/node/node.key"}
+            p = subprocess.Popen([SERVER, f"{d}/data", f"127.0.0.1:{port}"], env=env,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                wait_port(port)
+                db = storine.connect(f"storines://127.0.0.1:{port}", tls_ca=f"{d}/ca/ca.crt")
+                db.collection("t").put("k", {"v": "x" * 100_000})
+                self.assertEqual(db.collection("t").get("k")["v"], "x" * 100_000)
+                db.close()
+                named = storine.connect(f"storines://127.0.0.1:{port}?tls_ca={d}/ca/ca.crt&tls_server_name=localhost")
+                self.assertIsNotNone(named.collection("t").get("k"))
+                named.close()
+                # Another CA's client refuses this server.
+                subprocess.run([SERVER, "gen-ca", f"{d}/other"], check=True, stdout=subprocess.DEVNULL)
+                other = storine.connect(f"storines://127.0.0.1:{port}", tls_ca=f"{d}/other/ca.crt", timeout=2)
+                with self.assertRaises(Exception):
+                    other.collection("t").get("k")
+                other.close()
+            finally:
+                p.terminate()
+                p.wait(10)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)

@@ -22,7 +22,8 @@ pub mod pg;
 pub mod rsa;
 pub mod store;
 pub mod tds;
-pub mod tls;
+/// The TLS layer, shared with the native server (`storage-tls`).
+pub use storage_tls as tls;
 pub mod vector;
 
 pub use error::{SqlError, SqlResult};

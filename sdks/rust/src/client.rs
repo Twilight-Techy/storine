@@ -30,11 +30,25 @@ pub struct Options {
     pub follower_reads: bool,
     /// Idle connections kept to the current server.
     pub pool_size: usize,
+    /// Connect over TLS 1.3 (also `storines://` or `tls_ca`). Needs the `tls` feature.
+    pub tls: bool,
+    /// PEM file of the certificates to trust (required for TLS: this client has no system roots).
+    pub tls_ca: Option<String>,
+    /// Name the server's certificate must carry (default: the host connected to).
+    pub tls_server_name: Option<String>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { token: None, timeout: Duration::from_secs(5), follower_reads: false, pool_size: 16 }
+        Options {
+            token: None,
+            timeout: Duration::from_secs(5),
+            follower_reads: false,
+            pool_size: 16,
+            tls: false,
+            tls_ca: None,
+            tls_server_name: None,
+        }
     }
 }
 
@@ -43,12 +57,17 @@ pub fn connect(url: &str) -> Result<Client> {
     connect_with(url, Options::default())
 }
 
-/// A client for `storine://[token@]host:port[,host:port...]` (or just `host:port`). Query parameters
-/// `timeout_ms=5000` and `follower_reads=1` are accepted too. Connections open lazily.
+/// A client for `storine://[token@]host:port[,host:port...]` (or just `host:port`); `storines://` connects over
+/// TLS. Query parameters `timeout_ms=5000`, `follower_reads=1`, `tls_ca=/path/ca.crt` and `tls_server_name=db1`
+/// are accepted too. Connections open lazily.
 pub fn connect_with(url: &str, mut options: Options) -> Result<Client> {
     let rest = match url.split_once("://") {
         Some(("storine", rest)) => rest,
-        Some(_) => return Err(invalid("connection strings start with storine://")),
+        Some(("storines", rest)) => {
+            options.tls = true;
+            rest
+        }
+        Some(_) => return Err(invalid("connection strings start with storine:// or storines://")),
         None => url,
     };
     let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
@@ -73,9 +92,14 @@ pub fn connect_with(url: &str, mut options: Options) -> Result<Client> {
                 options.timeout = Duration::from_millis(ms);
             }
             "follower_reads" => options.follower_reads = matches!(v, "1" | "true" | "yes"),
+            "tls_ca" if options.tls_ca.is_none() => options.tls_ca = Some(percent_decode(v)?),
+            "tls_server_name" if options.tls_server_name.is_none() => {
+                options.tls_server_name = Some(percent_decode(v)?)
+            }
             _ => {}
         }
     }
+    let tls = tls_config(&mut options)?;
     if options.timeout.is_zero() {
         return Err(invalid("timeout must be positive"));
     }
@@ -85,7 +109,32 @@ pub fn connect_with(url: &str, mut options: Options) -> Result<Client> {
         return Err(invalid("no server address given"));
     }
     let target = seeds[0].clone();
-    Ok(Client { seeds, options: options.clone(), state: Mutex::new(State { target, pool: Vec::new() }) })
+    Ok(Client { seeds, options: options.clone(), tls, state: Mutex::new(State { target, pool: Vec::new() }) })
+}
+
+#[cfg(feature = "tls")]
+type TlsConfig = std::sync::Arc<storage_tls::ClientConfig>;
+#[cfg(not(feature = "tls"))]
+type TlsConfig = std::convert::Infallible;
+
+/// The TLS settings `options` ask for, loaded once.
+fn tls_config(options: &mut Options) -> Result<Option<TlsConfig>> {
+    if !options.tls && options.tls_ca.is_none() {
+        return Ok(None);
+    }
+    options.tls = true;
+    #[cfg(feature = "tls")]
+    {
+        let ca =
+            options.tls_ca.as_deref().ok_or_else(|| invalid("TLS needs tls_ca (the PEM certificates to trust)"))?;
+        let pem = std::fs::read_to_string(ca).map_err(|e| invalid(format!("reading tls_ca: {e}")))?;
+        let cfg = storage_tls::ClientConfig::with_roots_pem(&pem).map_err(|e| invalid(format!("tls_ca: {e}")))?;
+        Ok(Some(std::sync::Arc::new(cfg)))
+    }
+    #[cfg(not(feature = "tls"))]
+    {
+        Err(invalid("TLS needs the storine crate's `tls` feature"))
+    }
 }
 
 fn percent_decode(s: &str) -> Result<String> {
@@ -140,11 +189,39 @@ fn random_index(len: usize) -> usize {
 
 struct Conn {
     address: String,
-    stream: TcpStream,
+    stream: Stream,
+}
+
+/// A connection's transport: plain TCP, or TLS over it.
+enum Stream {
+    Plain(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(Box<(storage_tls::TlsReader<TcpStream>, storage_tls::TlsWriter<TcpStream>)>),
+}
+
+impl Stream {
+    fn write_all(&mut self, data: &[u8]) -> io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.write_all(data),
+            #[cfg(feature = "tls")]
+            Stream::Tls(t) => {
+                t.1.write_all(data)?;
+                t.1.flush()
+            }
+        }
+    }
+
+    fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
+        match self {
+            Stream::Plain(s) => s.read_exact(buf),
+            #[cfg(feature = "tls")]
+            Stream::Tls(t) => t.0.read_exact(buf),
+        }
+    }
 }
 
 impl Conn {
-    fn open(address: &str, timeout: Duration) -> io::Result<Conn> {
+    fn open(address: &str, timeout: Duration, tls: Option<&TlsConfig>, server_name: Option<&str>) -> io::Result<Conn> {
         let mut last = io::Error::new(io::ErrorKind::NotFound, format!("cannot resolve {address}"));
         for addr in address.to_socket_addrs()? {
             match TcpStream::connect_timeout(&addr, timeout) {
@@ -152,6 +229,20 @@ impl Conn {
                     stream.set_nodelay(true)?;
                     stream.set_read_timeout(Some(timeout))?;
                     stream.set_write_timeout(Some(timeout))?;
+                    let stream = match tls {
+                        None => Stream::Plain(stream),
+                        #[cfg(feature = "tls")]
+                        Some(cfg) => {
+                            // The host as written (a DNS name stays a name), not the address it resolved to.
+                            let written = address.rsplit_once(':').map_or(address, |(h, _)| h);
+                            let host = server_name.unwrap_or(written).trim_start_matches('[').trim_end_matches(']');
+                            let (r, w) = storage_tls::connect(stream.try_clone()?, stream, cfg, host)?;
+                            Stream::Tls(Box::new((r, w)))
+                        }
+                        #[cfg(not(feature = "tls"))]
+                        Some(never) => match *never {},
+                    };
+                    let _ = server_name;
                     return Ok(Conn { address: address.to_owned(), stream });
                 }
                 Err(e) => last = e,
@@ -198,6 +289,8 @@ enum Acquire {
 pub struct Client {
     seeds: Vec<String>,
     options: Options,
+    /// Set when connections use TLS.
+    tls: Option<TlsConfig>,
     state: Mutex<State>,
 }
 
@@ -286,7 +379,9 @@ impl Client {
             }
             st.target.clone()
         };
-        let mut c = Conn::open(&target, self.options.timeout).map_err(|e| Acquire::Dial(target.clone(), e))?;
+        let mut c =
+            Conn::open(&target, self.options.timeout, self.tls.as_ref(), self.options.tls_server_name.as_deref())
+                .map_err(|e| Acquire::Dial(target.clone(), e))?;
         if let Some(token) = &self.options.token {
             let (status, _, body) =
                 c.call(wire::OP_AUTH, token.as_bytes()).map_err(|e| Acquire::Dial(target.clone(), e))?;

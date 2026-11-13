@@ -34,11 +34,14 @@ module Storine
 
     attr_reader :address
 
-    def initialize(address, timeout, token, follower_reads)
+    # `tls`: nil, or { ca: PEM file to trust (system roots when nil), name: name the server's
+    # certificate must carry (default: the host) } for TLS 1.3.
+    def initialize(address, timeout, token, follower_reads, tls = nil)
       @address = address
       @sock = Socket.tcp(address[0], address[1], connect_timeout: timeout)
       @sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
       @sock.timeout = timeout
+      @sock = start_tls(@sock, tls, address[0]) if tls
       if token
         status, _v, body = call(Wire::OP_AUTH, token.b)
         unless status == Wire::ST_OK
@@ -65,6 +68,27 @@ module Storine
 
     private
 
+    def start_tls(sock, tls, host)
+      require "openssl"
+      ctx = OpenSSL::SSL::SSLContext.new
+      ctx.min_version = OpenSSL::SSL::TLS1_3_VERSION
+      ctx.verify_mode = OpenSSL::SSL::VERIFY_PEER
+      ctx.verify_hostname = true
+      if tls[:ca]
+        ctx.ca_file = tls[:ca]
+      else
+        ctx.cert_store = OpenSSL::X509::Store.new.tap(&:set_default_paths)
+      end
+      ssl = OpenSSL::SSL::SSLSocket.new(sock, ctx)
+      ssl.sync_close = true
+      ssl.hostname = tls[:name] || host
+      ssl.connect
+      ssl
+    rescue StandardError
+      sock.close
+      raise
+    end
+
     def read(n)
       out = String.new(capacity: n, encoding: Encoding::BINARY)
       while out.bytesize < n
@@ -83,9 +107,11 @@ module Storine
   class Client
     TRANSIENT = [IOError, SystemCallError, IO::TimeoutError, SocketError].freeze
 
-    def initialize(seeds, token: nil, timeout: 5.0, follower_reads: false, retries: 8)
+    def initialize(seeds, token: nil, timeout: 5.0, follower_reads: false, retries: 8, tls: false, tls_ca: nil,
+                   tls_server_name: nil)
       raise InvalidError, "no server address given" if seeds.empty?
 
+      @tls = tls || tls_ca ? { ca: tls_ca, name: tls_server_name } : nil
       @seeds = seeds
       @token = token
       @timeout = timeout
@@ -258,7 +284,7 @@ module Storine
           c.close
         end
       end
-      Connection.new(target, @timeout, @token, @follower_reads)
+      Connection.new(target, @timeout, @token, @follower_reads, @tls)
     end
 
     def release(conn)
@@ -286,12 +312,17 @@ module Storine
   end
 
   # Connects to a Storine server or cluster.
-  # `url` is `storine://[token@]host:port[,host:port...]` (or just `host:port`); options may
-  # also be query parameters: `?timeout_ms=5000&follower_reads=1`.
-  def self.connect(url = "storine://127.0.0.1:7878", token: nil, timeout: 5.0, follower_reads: false)
+  # `url` is `storine://[token@]host:port[,host:port...]` (or just `host:port`); `storines://`
+  # connects over TLS. Options may also be query parameters:
+  # `?timeout_ms=5000&follower_reads=1&tls_ca=/path/ca.crt&tls_server_name=db1`. Giving `tls_ca`
+  # (the PEM certificates to trust) also turns TLS on.
+  def self.connect(url = "storine://127.0.0.1:7878", token: nil, timeout: 5.0, follower_reads: false, tls_ca: nil,
+                   tls_server_name: nil)
     url = "storine://#{url}" unless url.include?("://")
     scheme, rest = url.split("://", 2)
-    raise InvalidError, "connection strings start with storine://" unless scheme == "storine"
+    unless %w[storine storines].include?(scheme)
+      raise InvalidError, "connection strings start with storine:// or storines://"
+    end
 
     netloc, query = rest.split("?", 2)
     netloc = netloc.chomp("/")
@@ -303,8 +334,11 @@ module Storine
     URI.decode_www_form(query.to_s).each do |k, v|
       timeout = Integer(v) / 1000.0 if k == "timeout_ms"
       follower_reads = %w[1 true yes].include?(v) if k == "follower_reads"
+      tls_ca ||= v if k == "tls_ca"
+      tls_server_name ||= v if k == "tls_server_name"
     end
-    Client.new(seeds, token: token, timeout: timeout, follower_reads: follower_reads)
+    Client.new(seeds, token: token, timeout: timeout, follower_reads: follower_reads, tls: scheme == "storines",
+                      tls_ca: tls_ca, tls_server_name: tls_server_name)
   end
 
   # Shared write builders of Collection and Transaction.

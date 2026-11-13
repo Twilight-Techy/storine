@@ -58,6 +58,10 @@ pub struct SecurityConfig {
     pub rate_limit_burst: u32,
     /// Directory under which `OP_ADMIN_BACKUP` may create backups (`None` = admin backups disabled).
     pub backup_root: Option<PathBuf>,
+    /// TLS for the native port: every connection must complete a TLS 1.3 handshake before its
+    /// first request (`None` = plain TCP). Nodes of a cluster reach each other on this port
+    /// too, so this also encrypts their traffic.
+    pub tls: Option<std::sync::Arc<storage_tls::TlsConfig>>,
     tokens: HashMap<String, RbacRole>,
 }
 
@@ -68,6 +72,12 @@ impl SecurityConfig {
             require_auth,
             ..Self::default()
         }
+    }
+
+    /// Requires TLS on the native port, with `cfg`'s certificate.
+    pub fn with_tls(mut self, cfg: storage_tls::TlsConfig) -> Self {
+        self.tls = Some(std::sync::Arc::new(cfg));
+        self
     }
 
     /// Registers a bearer/API token mapped to `role`.

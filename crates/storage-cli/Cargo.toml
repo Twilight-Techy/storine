@@ -20,6 +20,7 @@ storage-index = { path = "../storage-index" }
 storage-graph = { path = "../storage-graph" }
 storage-core = { path = "../storage-core" }
 storage-server = { path = "../storage-server" }
+storage-tls = { path = "../storage-tls" }
 
 [lints]
 workspace = true

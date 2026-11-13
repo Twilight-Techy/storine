@@ -4,7 +4,10 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -27,6 +30,15 @@ public sealed record StorineOptions
 
     /// <summary>Idle connections kept to the current server (default 16).</summary>
     public int PoolSize { get; init; } = 16;
+
+    /// <summary>Connect over TLS 1.3 (also <c>storines://</c> or giving <see cref="TlsCa"/>).</summary>
+    public bool Tls { get; init; }
+
+    /// <summary>PEM file of the certificates to trust (default: the system's roots). Turns TLS on.</summary>
+    public string? TlsCa { get; init; }
+
+    /// <summary>Name the server's certificate must carry (default: the host connected to).</summary>
+    public string? TlsServerName { get; init; }
 }
 
 /// <summary>
@@ -57,15 +69,19 @@ public sealed class StorineClient : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// A client for <c>storine://[token@]host:port[,host:port...]</c> (or just <c>host:port</c>). Query parameters
-    /// <c>timeout_ms=5000</c> and <c>follower_reads=1</c> are accepted too. Connections open lazily.
+    /// A client for <c>storine://[token@]host:port[,host:port...]</c> (or just <c>host:port</c>);
+    /// <c>storines://</c> connects over TLS. Query parameters <c>timeout_ms=5000</c>, <c>follower_reads=1</c>,
+    /// <c>tls_ca=/path/ca.crt</c> and <c>tls_server_name=db1</c> are accepted too. Connections open lazily.
     /// </summary>
     public static StorineClient Connect(string url, StorineOptions? options = null)
     {
         var o = options ?? new StorineOptions();
         if (!url.Contains("://")) url = "storine://" + url;
-        if (!url.StartsWith("storine://", StringComparison.Ordinal)) throw new InvalidException("connection strings start with storine://");
-        string rest = url["storine://".Length..];
+        bool secure = url.StartsWith("storines://", StringComparison.Ordinal);
+        if (!url.StartsWith("storine://", StringComparison.Ordinal) && !secure)
+            throw new InvalidException("connection strings start with storine:// or storines://");
+        if (secure) o = o with { Tls = true };
+        string rest = url[(secure ? "storines://".Length : "storine://".Length)..];
         string query = "";
         int qm = rest.IndexOf('?');
         if (qm >= 0)
@@ -91,6 +107,14 @@ public sealed class StorineClient : IDisposable, IAsyncDisposable
             else if (p[0] == "follower_reads")
             {
                 o = o with { FollowerReads = v is "1" or "true" or "yes" };
+            }
+            else if (p[0] == "tls_ca" && o.TlsCa is null)
+            {
+                o = o with { TlsCa = Uri.UnescapeDataString(v) };
+            }
+            else if (p[0] == "tls_server_name" && o.TlsServerName is null)
+            {
+                o = o with { TlsServerName = Uri.UnescapeDataString(v) };
             }
         }
         if (o.Timeout <= TimeSpan.Zero) throw new InvalidException("Timeout must be positive");
@@ -171,16 +195,16 @@ public sealed class StorineClient : IDisposable, IAsyncDisposable
     {
         public readonly string Address;
         private readonly TcpClient tcp;
-        private readonly NetworkStream stream;
+        private readonly Stream stream;
 
-        private Conn(string address, TcpClient tcp)
+        private Conn(string address, TcpClient tcp, Stream stream)
         {
             Address = address;
             this.tcp = tcp;
-            stream = tcp.GetStream();
+            this.stream = stream;
         }
 
-        public static async Task<Conn> OpenAsync(string address, CancellationToken ct)
+        public static async Task<Conn> OpenAsync(string address, StorineOptions o, CancellationToken ct)
         {
             int colon = address.LastIndexOf(':');
             string host = address[..colon].Trim('[', ']');
@@ -189,13 +213,46 @@ public sealed class StorineClient : IDisposable, IAsyncDisposable
             try
             {
                 await tcp.ConnectAsync(host, port, ct).ConfigureAwait(false);
+                if (!o.Tls && o.TlsCa is null) return new Conn(address, tcp, tcp.GetStream());
+                var roots = o.TlsCa is null ? null : LoadRoots(o.TlsCa);
+                var ssl = new SslStream(tcp.GetStream(), false);
+                await ssl.AuthenticateAsClientAsync(new SslClientAuthenticationOptions
+                {
+                    TargetHost = o.TlsServerName ?? host,
+                    EnabledSslProtocols = SslProtocols.Tls13,
+                    RemoteCertificateValidationCallback = (_, cert, _, errors) => Accept(cert, errors, roots),
+                }, ct).ConfigureAwait(false);
+                return new Conn(address, tcp, ssl);
             }
             catch
             {
                 tcp.Dispose();
                 throw;
             }
-            return new Conn(address, tcp);
+        }
+
+        private static X509Certificate2Collection LoadRoots(string path)
+        {
+            var roots = new X509Certificate2Collection();
+            roots.ImportFromPemFile(path);
+            if (roots.Count == 0) throw new InvalidException("tls_ca holds no certificate");
+            return roots;
+        }
+
+        /// <summary>
+        /// The server's certificate must name the host; with <paramref name="roots"/> it must chain to one of them
+        /// (not to the system's roots), otherwise the system's verdict stands.
+        /// </summary>
+        private static bool Accept(X509Certificate? cert, SslPolicyErrors errors, X509Certificate2Collection? roots)
+        {
+            if (cert is null || errors.HasFlag(SslPolicyErrors.RemoteCertificateNameMismatch)
+                || errors.HasFlag(SslPolicyErrors.RemoteCertificateNotAvailable)) return false;
+            if (roots is null) return errors == SslPolicyErrors.None;
+            using var chain = new X509Chain();
+            chain.ChainPolicy.TrustMode = X509ChainTrustMode.CustomRootTrust;
+            chain.ChainPolicy.CustomTrustStore.AddRange(roots);
+            chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
+            return chain.Build(new X509Certificate2(cert));
         }
 
         public async Task<Reply> CallAsync(byte op, byte[] body, CancellationToken ct)
@@ -240,7 +297,7 @@ public sealed class StorineClient : IDisposable, IAsyncDisposable
         Conn conn;
         try
         {
-            conn = await Conn.OpenAsync(t, ct).ConfigureAwait(false);
+            conn = await Conn.OpenAsync(t, options, ct).ConfigureAwait(false);
         }
         catch (Exception e) when (e is SocketException or IOException or OperationCanceledException && !ct.IsCancellationRequested)
         {

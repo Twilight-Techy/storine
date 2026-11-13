@@ -204,11 +204,13 @@ impl Drop for AlignedBytes {
 /// threads then serialize on that arena's lock. Here each thread keeps a small cache per size
 /// class, and caches trade blocks in groups through one shared store per class, so a lock is
 /// taken once per [`frame_pool::GROUP`] blocks. The shared store is bounded
-/// ([`frame_pool::MAX_SHARED_BYTES`] per class); blocks beyond it go back to the allocator.
+/// ([`frame_pool::MAX_SHARED_BYTES`] per class and [`frame_pool::MAX_SHARED_TOTAL`] in all);
+/// blocks beyond it go back to the allocator.
 mod frame_pool {
     use super::{dealloc, layout_for, BlockHeader, BUFFER_ALIGNMENT};
     use std::cell::RefCell;
     use std::ptr::NonNull;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     /// Largest pooled data capacity (one class per 64 bytes up to this).
@@ -220,6 +222,18 @@ mod frame_pool {
     const LOCAL_MAX: usize = 2 * GROUP;
     /// Bytes the shared store keeps per class; the rest is freed.
     pub(super) const MAX_SHARED_BYTES: usize = 16 << 20;
+    /// Bytes the shared store keeps over all classes. Without it, a burst of writes over many
+    /// record sizes could leave 64 classes × 16 MiB parked here for good.
+    pub(super) const MAX_SHARED_TOTAL: usize = 64 << 20;
+
+    /// Bytes of blocks in the shared store, all classes (kept under each class's lock).
+    static SHARED_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+    /// Bytes currently held by the shared store.
+    #[cfg(test)]
+    pub(super) fn shared_bytes() -> usize {
+        SHARED_TOTAL.load(Ordering::Relaxed)
+    }
 
     /// A free block (raw, uninitialized). Only ever owned by one cache or store at a time.
     struct FreeBlock(NonNull<BlockHeader>);
@@ -278,6 +292,7 @@ mod frame_pool {
                     let n = shared.len().min(GROUP);
                     let from = shared.len() - n;
                     local.extend(shared.drain(from..));
+                    SHARED_TOTAL.fetch_sub(n * (cap_of(class) + BUFFER_ALIGNMENT), Ordering::Relaxed);
                 }
                 local.pop().map(|b| b.0)
             })
@@ -304,9 +319,14 @@ mod frame_pool {
                 if local.len() > LOCAL_MAX {
                     let group: Vec<FreeBlock> = local.drain(local.len() - GROUP..).collect();
                     let mut shared = SHARED[class].lock().unwrap_or_else(|p| p.into_inner());
-                    let room = (MAX_SHARED_BYTES / (cap + BUFFER_ALIGNMENT)).saturating_sub(shared.len());
+                    let block_bytes = cap + BUFFER_ALIGNMENT;
+                    let class_room = (MAX_SHARED_BYTES / block_bytes).saturating_sub(shared.len());
+                    let total_room = MAX_SHARED_TOTAL.saturating_sub(SHARED_TOTAL.load(Ordering::Relaxed)) / block_bytes;
+                    let room = class_room.min(total_room);
                     let mut group = group.into_iter();
+                    let before = shared.len();
                     shared.extend(group.by_ref().take(room));
+                    SHARED_TOTAL.fetch_add((shared.len() - before) * block_bytes, Ordering::Relaxed);
                     drop(shared);
                     for b in group {
                         // SAFETY: each pooled block of this class was allocated for `cap`.
@@ -511,4 +531,72 @@ pub fn with_thread_scratch<R>(f: impl FnOnce(&mut AlignedScratchBuf) -> R) -> R 
             f(&mut fallback)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Frames built on several threads, cloned and dropped on others, keep their bytes; blocks
+    /// go through the pool many times over (as the engine's writers and flusher use them).
+    #[test]
+    fn frames_survive_cross_thread_clones_and_reuse() {
+        let rounds = if cfg!(miri) { 40 } else { 20_000 };
+        let (tx, rx) = mpsc::channel::<(AlignedBytes, u8, usize)>();
+        let consumer = std::thread::spawn(move || {
+            let mut seen = 0usize;
+            for (frame, fill, len) in rx {
+                let copy = frame.clone();
+                drop(frame);
+                assert_eq!(copy.len(), len);
+                assert!(copy.iter().all(|&b| b == fill), "frame bytes changed");
+                assert_eq!(copy.as_ptr() as usize % BUFFER_ALIGNMENT, 0);
+                seen += 1;
+            }
+            seen
+        });
+        let producers: Vec<_> = (0..3u8)
+            .map(|t| {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    for i in 0..rounds {
+                        let len = 1 + (i * 37 + usize::from(t) * 11) % 5000;
+                        let fill = (i as u8).wrapping_add(t);
+                        let frame = AlignedBytes::try_build(len, |b| {
+                            b.fill(fill);
+                            Ok(())
+                        })
+                        .unwrap();
+                        // A copy stays here briefly, so blocks are freed on both threads.
+                        let keep = frame.clone();
+                        tx.send((frame, fill, len)).unwrap();
+                        assert!(keep.iter().all(|&b| b == fill));
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
+        for p in producers {
+            p.join().unwrap();
+        }
+        assert_eq!(consumer.join().unwrap(), 3 * rounds);
+    }
+
+    /// A burst of frames over every pooled size, freed on another thread, leaves at most
+    /// `MAX_SHARED_TOTAL` bytes parked in the shared store.
+    #[test]
+    fn shared_store_stays_bounded() {
+        let per_class = if cfg!(miri) { 3 } else { 3_000 };
+        let frames: Vec<AlignedBytes> = (1..=frame_pool::MAX_POOLED_CAP / BUFFER_ALIGNMENT)
+            .flat_map(|c| (0..per_class).map(move |_| c * BUFFER_ALIGNMENT))
+            .map(|len| AlignedBytes::try_copy_from_slice(&vec![7u8; len]).unwrap())
+            .collect();
+        std::thread::spawn(move || drop(frames)).join().unwrap();
+        assert!(
+            frame_pool::shared_bytes() <= frame_pool::MAX_SHARED_TOTAL,
+            "shared store holds {} bytes",
+            frame_pool::shared_bytes()
+        );
+    }
 }

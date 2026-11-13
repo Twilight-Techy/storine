@@ -254,7 +254,7 @@ struct ReactorShard {
     read_latency: LatencyHistogram,
     /// Request latency of write RPCs served by this shard's worker.
     write_latency: LatencyHistogram,
-    incoming: Mutex<Vec<TcpStream>>,
+    incoming: Mutex<Vec<(TcpStream, Option<Box<storage_tls::Session>>)>>,
     has_incoming: AtomicBool,
     wake_cv: Condvar,
     /// `None` only if a loopback socket pair could not be created; the worker then falls back to
@@ -275,12 +275,12 @@ impl ReactorShard {
     }
 
     #[inline]
-    fn push_stream(&self, stream: TcpStream) {
+    fn push_stream(&self, stream: TcpStream, tls: Option<Box<storage_tls::Session>>) {
         let mut guard = self
             .incoming
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.push(stream);
+        guard.push((stream, tls));
         self.has_incoming.store(true, Ordering::Release);
         self.wake_cv.notify_one();
         drop(guard);
@@ -331,7 +331,21 @@ struct NonBlockingConn {
     deferred: Option<Box<DeferredRequest>>,
     /// The client accepts possibly stale reads from a follower (`OP_SET_OPTIONS`).
     follower_reads: bool,
+    /// TLS state when the port requires TLS; boxed, so a plain connection stays small.
+    tls: Option<Box<TlsConn>>,
 }
+
+/// A TLS connection's buffers in the reactor: ciphertext not yet decrypted (an incomplete
+/// record), and decrypted bytes not yet read.
+struct TlsConn {
+    session: Box<storage_tls::Session>,
+    raw_in: Vec<u8>,
+    plain_in: Vec<u8>,
+    plain_pos: usize,
+}
+
+/// Bytes a TLS connection reads from its socket at a time (one full record and then some).
+const TLS_READ_CHUNK: usize = 17 * 1024;
 
 /// `(opcode, key, body)` of a request postponed behind a read barrier.
 type DeferredRequest = (u8, [u8; 24], Vec<u8>);
@@ -341,7 +355,7 @@ const STATUS_BARRIER_PASSED: u8 = 0xFE;
 
 impl NonBlockingConn {
     #[inline]
-    fn new(stream: TcpStream, sec: &SecurityConfig) -> Self {
+    fn new(stream: TcpStream, sec: &SecurityConfig, tls: Option<Box<storage_tls::Session>>) -> Self {
         Self {
             stream,
             req_hdr: [0u8; 29],
@@ -355,12 +369,59 @@ impl NonBlockingConn {
             pending_job: None,
             deferred: None,
             follower_reads: false,
+            tls: tls.map(|session| Box::new(TlsConn { session, raw_in: Vec::new(), plain_in: Vec::new(), plain_pos: 0 })),
         }
     }
 
     #[inline]
     fn wants_write(&self) -> bool {
         self.out_pos < self.out_buf.len()
+    }
+
+    /// Decrypted request bytes are waiting in memory: the socket will not report them, so the
+    /// reactor must come back to this connection without waiting for readiness.
+    #[inline]
+    fn has_buffered_input(&self) -> bool {
+        self.tls.as_ref().is_some_and(|t| t.plain_pos < t.plain_in.len())
+    }
+
+    /// Reads request bytes: from the socket, or through TLS. `Ok(0)` is end of stream (or the
+    /// peer's `close_notify`); `WouldBlock` means nothing complete has arrived.
+    #[inline]
+    fn read_plain(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let Some(tls) = self.tls.as_deref_mut() else {
+            return self.stream.read(buf);
+        };
+        loop {
+            if tls.plain_pos < tls.plain_in.len() {
+                let n = buf.len().min(tls.plain_in.len() - tls.plain_pos);
+                buf[..n].copy_from_slice(&tls.plain_in[tls.plain_pos..tls.plain_pos + n]);
+                tls.plain_pos += n;
+                if tls.plain_pos == tls.plain_in.len() {
+                    tls.plain_in.clear();
+                    tls.plain_pos = 0;
+                }
+                return Ok(n);
+            }
+            if tls.session.closed() {
+                return Ok(0);
+            }
+            let start = tls.raw_in.len();
+            tls.raw_in.resize(start + TLS_READ_CHUNK, 0);
+            let read = self.stream.read(&mut tls.raw_in[start..]);
+            match read {
+                Ok(0) => {
+                    tls.raw_in.truncate(start);
+                    return Ok(0);
+                }
+                Ok(n) => tls.raw_in.truncate(start + n),
+                Err(e) => {
+                    tls.raw_in.truncate(start);
+                    return Err(e);
+                }
+            }
+            tls.session.decrypt(&mut tls.raw_in, &mut tls.plain_in)?;
+        }
     }
 
     /// Writes `[13B ResponseHeader | body]` directly to the non-blocking socket with **zero heap
@@ -373,6 +434,30 @@ impl NonBlockingConn {
         hdr[1..9].copy_from_slice(&version.to_le_bytes());
         hdr[9..13].copy_from_slice(&(body.len() as u32).to_le_bytes());
 
+        if let Some(tls) = self.tls.as_deref_mut() {
+            // One record for header and body, queued, then pushed like any queued tail.
+            if self.out_pos >= self.out_buf.len() {
+                self.out_buf.clear();
+                self.out_pos = 0;
+            }
+            tls.session.encrypt_parts(&[&hdr, body], &mut self.out_buf)?;
+            match self.stream.write(&self.out_buf[self.out_pos..]) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "socket closed")),
+                Ok(n) => self.out_pos += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e),
+            }
+            if self.out_pos >= self.out_buf.len() {
+                // Keep a small buffer for the next response; free a large one.
+                if self.out_buf.capacity() > 64 * 1024 {
+                    self.out_buf = Vec::new();
+                } else {
+                    self.out_buf.clear();
+                }
+                self.out_pos = 0;
+            }
+            return Ok(());
+        }
         let total = 13 + body.len();
         let written = if body.is_empty() {
             match self.stream.write(&hdr) {
@@ -452,6 +537,96 @@ impl StorageServer<DocumentRecord> {
         let engine = Arc::clone(store.engine());
         let raft = Some(Arc::clone(options.runtime.node()));
         Self::start_inner(bind_addr, engine, max_connections, security, raft, Some(store), Some(options), None)
+    }
+}
+
+/// Runs TLS handshakes off the reactors and the accept thread: a slow or hostile client can
+/// hold one of these threads for at most [`TLS_HANDSHAKE_TIMEOUT`], never an event loop.
+/// Connections that arrive while every thread is busy and the queue is full are refused.
+struct HandshakePool {
+    queue: std::sync::mpsc::SyncSender<(TcpStream, Arc<ReactorShard>)>,
+}
+
+/// Handshake threads (each runs one handshake at a time).
+const TLS_HANDSHAKE_THREADS: usize = 4;
+/// Connections waiting for a handshake thread before new ones are refused.
+const TLS_HANDSHAKE_QUEUE: usize = 1024;
+/// Longest a client may take to complete its handshake.
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+impl HandshakePool {
+    fn start(cfg: Arc<storage_tls::TlsConfig>, active: Arc<AtomicUsize>) -> HandshakePool {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(TcpStream, Arc<ReactorShard>)>(TLS_HANDSHAKE_QUEUE);
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..TLS_HANDSHAKE_THREADS {
+            let (rx, cfg, active) = (Arc::clone(&rx), Arc::clone(&cfg), Arc::clone(&active));
+            let _ = thread::Builder::new().name(format!("storine-tls-{i}")).spawn(move || loop {
+                // Ends when the accept thread drops the sender (server stopped).
+                let next = rx.lock().unwrap_or_else(|p| p.into_inner()).recv();
+                let Ok((stream, shard)) = next else { return };
+                match Self::handshake(&stream, &cfg) {
+                    Ok(session) => shard.push_stream(stream, Some(Box::new(session))),
+                    Err(_) => {
+                        active.fetch_sub(1, Ordering::Release);
+                    }
+                }
+            });
+        }
+        HandshakePool { queue: tx }
+    }
+
+    fn handshake(stream: &TcpStream, cfg: &storage_tls::TlsConfig) -> io::Result<storage_tls::Session> {
+        stream.set_nonblocking(false)?;
+        // One deadline for the whole handshake: a per-read timeout alone would let a client
+        // trickling one byte at a time hold this thread indefinitely.
+        let io = Deadline { stream, until: Instant::now() + TLS_HANDSHAKE_TIMEOUT };
+        let session = storage_tls::accept_session(&io, &io, cfg, "storine")?;
+        stream.set_read_timeout(None)?;
+        stream.set_write_timeout(None)?;
+        stream.set_nonblocking(true)?;
+        Ok(session)
+    }
+
+    /// Queues `stream` for a handshake, then hands it to `shard`; `false` if the queue is full.
+    fn submit(&self, stream: TcpStream, shard: Arc<ReactorShard>) -> bool {
+        self.queue.try_send((stream, shard)).is_ok()
+    }
+}
+
+/// A blocking socket whose every read and write must finish before `until`.
+struct Deadline<'a> {
+    stream: &'a TcpStream,
+    until: Instant,
+}
+
+impl Deadline<'_> {
+    fn remaining(&self) -> io::Result<Duration> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            Err(io::Error::new(io::ErrorKind::TimedOut, "TLS handshake took too long"))
+        } else {
+            Ok(left)
+        }
+    }
+}
+
+impl Read for &Deadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        let mut s = self.stream;
+        s.read(buf)
+    }
+}
+
+impl Write for &Deadline<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        let mut s = self.stream;
+        s.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -667,6 +842,11 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
         let conn_count_accept = Arc::clone(&active_connections);
         let rejected_accept = Arc::clone(&rejected_connections);
         let max_conns_accept = Arc::clone(&max_conns);
+        let handshakes = shared
+            .security
+            .tls
+            .as_ref()
+            .map(|cfg| HandshakePool::start(Arc::clone(cfg), Arc::clone(&active_connections)));
 
         let accept_thread = thread::spawn(move || {
             let mut rr = 0usize;
@@ -703,7 +883,15 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
                         }
                         let target = &shards_accept[rr % shards_accept.len()];
                         rr = rr.wrapping_add(1);
-                        target.push_stream(stream);
+                        match &handshakes {
+                            None => target.push_stream(stream, None),
+                            Some(pool) => {
+                                if !pool.submit(stream, Arc::clone(target)) {
+                                    conn_count_accept.fetch_sub(1, Ordering::Release);
+                                    rejected_accept.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
                     }
                     Err(_) => {
                         // Transient descriptor exhaustion (`EMFILE` / `ENFILE`) or similar:
@@ -849,8 +1037,8 @@ fn reactor_worker_loop<T: ZeroCopyRecord + Indexable>(
                     .wait(inc)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
-            for stream in inc.drain(..) {
-                conns.push(NonBlockingConn::new(stream, &shared.security));
+            for (stream, tls) in inc.drain(..) {
+                conns.push(NonBlockingConn::new(stream, &shared.security, tls));
             }
             shard.has_incoming.store(false, Ordering::Release);
         }
@@ -864,7 +1052,7 @@ fn reactor_worker_loop<T: ZeroCopyRecord + Indexable>(
         // than an untimed wait under request/response traffic. Once idle for ~128 ms, block
         // indefinitely (`0%` CPU, zero timer wake-ups): new connections, finished admin jobs and
         // shutdown all write to the waker. Without a waker, back off to 25 ms polls.
-        let jobs_pending = conns.iter().any(|c| c.pending_job.is_some());
+        let jobs_pending = conns.iter().any(|c| c.pending_job.is_some() || c.has_buffered_input());
         poller.clear();
         let base = match shard.waker {
             Some(ref waker) => {
@@ -912,7 +1100,8 @@ fn reactor_worker_loop<T: ZeroCopyRecord + Indexable>(
         let mut idx = conns.len();
         while idx > 0 {
             idx -= 1;
-            let conn_ready = poller.is_ready(base + idx) || conns[idx].pending_job.is_some();
+            let conn_ready =
+                poller.is_ready(base + idx) || conns[idx].pending_job.is_some() || conns[idx].has_buffered_input();
             if !conn_ready {
                 continue;
             }
@@ -974,9 +1163,9 @@ fn reactor_worker_loop_epoll<T: ZeroCopyRecord + Indexable, P: storage_mmap::Rea
                     .wait(inc)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
-            for stream in inc.drain(..) {
+            for (stream, tls) in inc.drain(..) {
                 let token = storage_mmap::socket_token(&stream);
-                let conn = NonBlockingConn::new(stream, &shared.security);
+                let conn = NonBlockingConn::new(stream, &shared.security, tls);
                 if ep.add(&conn.stream, token, false).is_err() {
                     // Not watchable: close it rather than leave it unserved.
                     active_connections.fetch_sub(1, Ordering::Relaxed);
@@ -1053,7 +1242,7 @@ fn reactor_worker_loop_epoll<T: ZeroCopyRecord + Indexable, P: storage_mmap::Rea
                 ConnStep::WouldBlock => {}
             }
             let conn = &conns[idx];
-            if conn.pending_job.is_some() {
+            if conn.pending_job.is_some() || conn.has_buffered_input() {
                 pending_jobs.push(token);
             }
             let want_write = conn.wants_write();
@@ -1147,7 +1336,13 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
     // 2. Read 29-byte request header and admit the request BEFORE reserving body memory
     let hdr_pos = conn.hdr_read as usize;
     if hdr_pos < 29 {
-        match conn.stream.read(&mut conn.req_hdr[hdr_pos..]) {
+        let hdr_end = 29;
+        let mut hdr = [0u8; 29];
+        let got = conn.read_plain(&mut hdr[hdr_pos..hdr_end]);
+        if let Ok(n) = got {
+            conn.req_hdr[hdr_pos..hdr_pos + n].copy_from_slice(&hdr[hdr_pos..hdr_pos + n]);
+        }
+        match got {
             Ok(0) => return ConnStep::Closed,
             Ok(n) => {
                 let new_pos = hdr_pos + n;
@@ -1202,7 +1397,10 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
 
     // 3. Read request body (if any)
     if conn.body_read < conn.body_buf.len() {
-        match conn.stream.read(&mut conn.body_buf[conn.body_read..]) {
+        let mut body = core::mem::take(&mut conn.body_buf);
+        let got = conn.read_plain(&mut body[conn.body_read..]);
+        conn.body_buf = body;
+        match got {
             Ok(0) => return ConnStep::Closed,
             Ok(n) => {
                 conn.body_read += n;
@@ -2257,8 +2455,58 @@ fn run_admin_job<T: ZeroCopyRecord + Indexable>(
 /// High-speed TCP Client for `StorageServer<T>` supporting Wire Protocol v2 (`TASK-029`, `TASK-043`, `TASK-044`).
 #[derive(Debug)]
 pub struct StorageClient {
-    reader: BufReader<TcpStream>,
-    writer: BufWriter<TcpStream>,
+    reader: BufReader<ClientIn>,
+    writer: BufWriter<ClientOut>,
+}
+
+/// A client connection's receiving side: plain, or decrypting TLS.
+#[derive(Debug)]
+enum ClientIn {
+    Plain(TcpStream),
+    Tls(storage_tls::TlsReader<TcpStream>),
+}
+
+/// A client connection's sending side.
+#[derive(Debug)]
+enum ClientOut {
+    Plain(TcpStream),
+    Tls(storage_tls::TlsWriter<TcpStream>),
+}
+
+impl Read for ClientIn {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            ClientIn::Plain(s) => s.read(buf),
+            ClientIn::Tls(t) => t.read(buf),
+        }
+    }
+}
+
+impl Write for ClientOut {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            ClientOut::Plain(s) => s.write(buf),
+            ClientOut::Tls(t) => t.write(buf),
+        }
+    }
+
+    #[inline]
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            ClientOut::Plain(s) => s.flush(),
+            ClientOut::Tls(t) => t.flush(),
+        }
+    }
+}
+
+/// How a client reaches a server whose native port requires TLS: what it trusts, and the name
+/// it expects the server's certificate to carry (`None`: the address it connects to).
+#[derive(Clone, Debug)]
+pub struct ClientTls {
+    pub config: Arc<storage_tls::ClientConfig>,
+    pub server_name: Option<String>,
 }
 
 impl StorageClient {
@@ -2266,25 +2514,46 @@ impl StorageClient {
         let stream =
             TcpStream::connect(addr).map_err(|e| StorageError::io("connect StorageClient", e))?;
         let _ = stream.set_nodelay(true);
-        let reader_stream = stream
-            .try_clone()
-            .map_err(|e| StorageError::io("clone client TcpStream", e))?;
-        Ok(Self {
-            reader: BufReader::with_capacity(64 * 1024, reader_stream),
-            writer: BufWriter::with_capacity(64 * 1024, stream),
-        })
+        Self::over(stream, addr, None)
     }
 
     /// Connects with a connect timeout and per-call read / write timeouts of `timeout`, so a
     /// dead or partitioned server can never block the caller forever.
     pub fn connect_timeout(addr: SocketAddr, timeout: Duration) -> Result<Self> {
         let stream = cluster::connect_with_timeout(addr, timeout)?;
+        Self::over(stream, addr, None)
+    }
+
+    /// [`Self::connect`] to a server whose port requires TLS.
+    pub fn connect_tls(addr: SocketAddr, tls: &ClientTls) -> Result<Self> {
+        let stream =
+            TcpStream::connect(addr).map_err(|e| StorageError::io("connect StorageClient", e))?;
+        let _ = stream.set_nodelay(true);
+        Self::over(stream, addr, Some(tls))
+    }
+
+    /// [`Self::connect_timeout`], over TLS when `tls` is given.
+    pub fn connect_timeout_with(addr: SocketAddr, timeout: Duration, tls: Option<&ClientTls>) -> Result<Self> {
+        let stream = cluster::connect_with_timeout(addr, timeout)?;
+        Self::over(stream, addr, tls)
+    }
+
+    fn over(stream: TcpStream, addr: SocketAddr, tls: Option<&ClientTls>) -> Result<Self> {
         let reader_stream = stream
             .try_clone()
             .map_err(|e| StorageError::io("clone client TcpStream", e))?;
+        let (input, output) = match tls {
+            None => (ClientIn::Plain(reader_stream), ClientOut::Plain(stream)),
+            Some(t) => {
+                let host = t.server_name.clone().unwrap_or_else(|| addr.ip().to_string());
+                let (r, w) = storage_tls::connect(reader_stream, stream, &t.config, &host)
+                    .map_err(|e| StorageError::io("TLS handshake", e))?;
+                (ClientIn::Tls(r), ClientOut::Tls(w))
+            }
+        };
         Ok(Self {
-            reader: BufReader::with_capacity(64 * 1024, reader_stream),
-            writer: BufWriter::with_capacity(64 * 1024, stream),
+            reader: BufReader::with_capacity(64 * 1024, input),
+            writer: BufWriter::with_capacity(64 * 1024, output),
         })
     }
 

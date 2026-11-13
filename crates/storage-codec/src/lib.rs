@@ -13,6 +13,7 @@ pub mod crypto;
 pub mod curve25519;
 pub mod peak_alloc;
 pub mod rand;
+pub mod sha256;
 pub mod sha512;
 pub mod field_ops;
 pub mod scratch;

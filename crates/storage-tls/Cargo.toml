@@ -1,0 +1,19 @@
+[package]
+name = "storage-tls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Zero-dependency TLS 1.3 / 1.2 for Storine's endpoints: server, client and a record layer for non-blocking sockets"
+
+[lib]
+name = "storage_tls"
+path = "src/lib.rs"
+
+[dependencies]
+storage-types = { path = "../storage-types" }
+storage-codec = { path = "../storage-codec" }
+
+[lints]
+workspace = true

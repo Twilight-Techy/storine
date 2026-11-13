@@ -29,6 +29,16 @@
 //!   (admin backups are disabled when unset).
 //! - `STORAGE_RATE_LIMIT`: per-connection `rps:burst` token-bucket limit.
 //! - `STORAGE_MAX_CONNECTIONS`: connection ceiling (overridden by `--max-connections`).
+//! - `STORAGE_TLS_CERT` / `STORAGE_TLS_KEY`: PEM certificate (chain) and PKCS#8 Ed25519 key.
+//!   When set, the native port requires TLS 1.3 from every client and every peer.
+//! - `STORAGE_TLS_CA`: PEM certificates nodes trust when they call each other (default: this
+//!   node's own certificate, enough when every node shares one, or for a self-signed one). Each
+//!   peer's certificate must name the host it is listed under in `--peers`.
+//!
+//! Certificates (Ed25519) can be made without OpenSSL:
+//! - `storage-server gen-ca <dir>`: a cluster CA (`ca.crt`, `ca.key`);
+//! - `storage-server gen-cert <ca-dir> <out-dir> <name>[,<name>...]`: a node certificate
+//!   (`node.crt`, `node.key`) for those DNS names / IP addresses, signed by the CA.
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations, rust_2018_idioms)]
@@ -73,6 +83,16 @@ fn security_from_env() -> Result<SecurityConfig> {
     if let Ok(root) = env::var("STORAGE_BACKUP_ROOT") {
         sec = sec.with_backup_root(root);
     }
+    if let Ok(cert) = env::var("STORAGE_TLS_CERT") {
+        let key = env::var("STORAGE_TLS_KEY")
+            .map_err(|_| StorageError::invalid_key("STORAGE_TLS_CERT needs STORAGE_TLS_KEY"))?;
+        let read = |p: &str| {
+            std::fs::read_to_string(p).map_err(|e| StorageError::io("read TLS certificate or key", e))
+        };
+        let cfg = storage_tls::TlsConfig::from_pem(&read(&cert)?, &read(&key)?)
+            .map_err(|e| StorageError::io("load TLS certificate", e))?;
+        sec = sec.with_tls(cfg);
+    }
     if let Ok(limit) = env::var("STORAGE_RATE_LIMIT") {
         let (rps, burst) = limit
             .split_once(':')
@@ -83,8 +103,62 @@ fn security_from_env() -> Result<SecurityConfig> {
     Ok(sec)
 }
 
+/// How this node calls its peers: over TLS when its own port requires it, trusting
+/// `STORAGE_TLS_CA` (or its own certificate) and expecting each peer's listed host name.
+fn peer_tls(security: &SecurityConfig, members: &HashMap<NodeId, String>) -> Result<Option<cluster::PeerTls>> {
+    if security.tls.is_none() {
+        return Ok(None);
+    }
+    let roots_file = env::var("STORAGE_TLS_CA").or_else(|_| env::var("STORAGE_TLS_CERT")).map_err(|_| {
+        StorageError::invalid_key("TLS peers need STORAGE_TLS_CA (or STORAGE_TLS_CERT)")
+    })?;
+    let roots = std::fs::read_to_string(&roots_file).map_err(|e| StorageError::io("read STORAGE_TLS_CA", e))?;
+    let config = storage_tls::ClientConfig::with_roots_pem(&roots).map_err(|e| StorageError::io("load STORAGE_TLS_CA", e))?;
+    let names = members
+        .iter()
+        .map(|(&id, addr)| {
+            let host = addr.rsplit_once(':').map_or(addr.as_str(), |(h, _)| h);
+            (id, host.trim_start_matches('[').trim_end_matches(']').to_string())
+        })
+        .collect();
+    Ok(Some(cluster::PeerTls { config: Arc::new(config), names }))
+}
+
+/// `gen-ca <dir>` and `gen-cert <ca-dir> <out-dir> <names>`: certificates without OpenSSL.
+fn certificate_command(args: &[String]) -> Result<bool> {
+    let io = |what: &'static str| move |e: std::io::Error| StorageError::io(what, e);
+    match args.get(1).map(String::as_str) {
+        Some("gen-ca") => {
+            let dir = std::path::Path::new(args.get(2).ok_or_else(|| StorageError::invalid_key("usage: gen-ca <dir>"))?);
+            std::fs::create_dir_all(dir).map_err(io("create CA directory"))?;
+            let ca = storage_tls::new_ca("storine cluster CA").map_err(io("create CA"))?;
+            ca.write_files(&dir.join("ca.crt"), &dir.join("ca.key")).map_err(io("write CA files"))?;
+            println!("wrote {} and {}", dir.join("ca.crt").display(), dir.join("ca.key").display());
+            Ok(true)
+        }
+        Some("gen-cert") => {
+            let usage = || StorageError::invalid_key("usage: gen-cert <ca-dir> <out-dir> <name>[,<name>...]");
+            let (ca_dir, out, names) = (args.get(2).ok_or_else(usage)?, args.get(3).ok_or_else(usage)?, args.get(4).ok_or_else(usage)?);
+            let ca_dir = std::path::Path::new(ca_dir);
+            let read = |f: &str| std::fs::read_to_string(ca_dir.join(f)).map_err(io("read CA files"));
+            let ca = storage_tls::IssuedCert { cert_pem: read("ca.crt")?, key_pem: read("ca.key")? };
+            let names: Vec<&str> = names.split(',').map(str::trim).filter(|n| !n.is_empty()).collect();
+            let node = storage_tls::issue(&ca, &names).map_err(io("issue certificate"))?;
+            let out = std::path::Path::new(out);
+            std::fs::create_dir_all(out).map_err(io("create certificate directory"))?;
+            node.write_files(&out.join("node.crt"), &out.join("node.key")).map_err(io("write certificate files"))?;
+            println!("wrote {} and {} for {}", out.join("node.crt").display(), out.join("node.key").display(), names.join(", "));
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 fn run() -> Result<()> {
     let args: Vec<String> = env::args().collect();
+    if certificate_command(&args)? {
+        return Ok(());
+    }
     let positional: Vec<&String> = {
         let mut out = Vec::new();
         let mut skip_next = false;
@@ -172,7 +246,11 @@ fn run() -> Result<()> {
             }
         }
         let node = Arc::new(RaftNode::new(node_id, Arc::clone(store.engine()))?);
-        let transport = Arc::new(cluster::TcpRaftTransport::new(raft_peers, token, Duration::from_millis(500)));
+        let mut transport = cluster::TcpRaftTransport::new(raft_peers, token, Duration::from_millis(500));
+        if let Some(tls) = peer_tls(&security, &members)? {
+            transport = transport.with_tls(tls);
+        }
+        let transport = Arc::new(transport);
         // A joining node starts without a configuration (it never campaigns) and learns the
         // cluster's from the leader.
         let bootstrap = if join {
@@ -230,6 +308,7 @@ fn run_ranges(data_dir: &str, bind_addr: &str, max_connections: usize, security:
         addrs.insert(id, cluster::resolve(addr)?);
     }
     let n = addrs.len();
+    let peer_tls = peer_tls(&security, &members)?;
     let server = storage_server::ranges::start_range_server(storage_server::ranges::RangeServerConfig {
         data_dir: data_dir.into(),
         bind_addr: bind_addr.to_string(),
@@ -239,6 +318,7 @@ fn run_ranges(data_dir: &str, bind_addr: &str, max_connections: usize, security:
         security,
         max_connections,
         max_offset: Duration::from_millis(500),
+        peer_tls,
     })?;
     report((server.local_addr(), server.max_connections()), data_dir, server_auth(&server), &format!("documents, range node {node_id} of {n}"));
     park(server, once)

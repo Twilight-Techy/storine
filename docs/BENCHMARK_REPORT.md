@@ -451,3 +451,36 @@ Reads are 18 % behind the first commits, and `update` is 6 % behind `5d6b008`. T
 - Durable p99.9 and p99.99 against LMDB (section 8.3).
 
 **Verified:** the release workspace suite (all pass) and 40 of 40 process chaos runs on this code. Locally: clippy `-D warnings` across the workspace; new tests for the ARM checksum against the portable one and the golden values, and for batched index updates matching separate ones. One on-demand `c7i.xlarge` for about 1 h 25 min, about $0.25, terminated.
+
+### 8.5 Release candidate: TLS, recovery and a re-run against LMDB and RocksDB (`TASK-154`, 2026-11-13)
+
+On-demand `c7i.xlarge`, the release candidate's code before the fixes from the range soak. Those change recovery at open, range nodes, and the sync before a WAL is cut, none of which these benchmarks time (`kv-compare` flushes only between phases, after its own `sync`).
+
+**TCP `GET` round trip** (`bench-runner`, one client, loopback, five runs each):
+
+| | p50 | p99 | requests/s |
+| :--- | ---: | ---: | ---: |
+| plaintext, section 8.4 | 8.5–8.6 µs | – | 112–115 k |
+| **plaintext, now** | **8.6–9.0 µs** (one run 6.5 µs) | 13–14 µs | **110–114 k** (one run 150 k) |
+| **TLS 1.3, now** | **11.5–11.7 µs** (one run 9.4 µs) | 20–21 µs | **84–85 k** (one run 105 k) |
+
+- **TLS off costs nothing.** The plaintext path is where section 8.4 left it. A connection without TLS carries one `None` field, and the reactors check it once per read and write.
+- **TLS on** adds about 3 µs to a small request: one ChaCha20-Poly1305 seal and one open on each side, and the record framing. The handshake (x25519, an Ed25519 signature check) runs once per connection, on the handshake threads, so it is not in these numbers.
+
+**Hot paths** (five runs): `with_ref` 58 ns, `get_ref` 62–71 ns, `update` 853–865 ns, encrypted warm read 50 ns. All are unchanged from section 8.4.
+
+**Against LMDB and RocksDB** (`benches/kv-compare`, 1,000,000 keys, three rounds; ranges over rounds):
+
+| | Storine | RocksDB, best mode | LMDB |
+| :--- | ---: | ---: | ---: |
+| fill | **721–758 k/s**, p99 2.2 µs | 547–609 k/s, p99 3.2–3.9 µs | 186–191 k/s |
+| read, 1 thread | **1.22–1.35 M/s** | 0.34–0.38 M/s | 0.82–0.85 M/s |
+| read, 4 threads | **4.13–4.22 M/s** | 0.96–1.04 M/s | 2.86–3.18 M/s |
+| overwrite, 1 thread | **787–822 k/s** | 569–613 k/s | 180–184 k/s |
+| overwrite, 4 threads | **1.30–1.36 M/s**, p99 5.4–5.7 µs, p99.9 29–38 µs | 540–587 k/s, p99 15.5–24.9 µs, p99.9 53–60 µs (with WAL) | 133–135 k/s |
+| durable put, 1 thread | **1,112–1,119/s**, p99 1.15–1.18 ms | 311–319/s | 475–488/s, p99 2.3–2.4 ms |
+| durable put, 4 threads | **2,993–3,085/s**, p99 2.30–2.35 ms | 859–874/s | 468–482/s, p99 2.32–2.45 ms |
+
+Storine leads every throughput row and every p99 row, as in section 8.4. The tails listed there are where they were: fill p99.99 0.66–0.69 ms (RocksDB 15–17 µs), 4-writer overwrite p99.99 2.1–2.4 ms (RocksDB 0.83–1.27 ms), and durable p99.9/p99.99 against LMDB.
+
+**Recovery of a range node.** A node from the range soak held 20,155 record files and an 83 MB WAL. Before the fix, it had been recovering for over 4 minutes when it was killed again, with one `fdatasync`, rename and directory `fsync` per logged write. With the fix (arena layout for range nodes, batched replay), the same data directory opens and listens in **2.3 s**.

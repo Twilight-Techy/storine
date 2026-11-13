@@ -12,3 +12,9 @@ readme = "README.md"
 [workspace]
 
 [dependencies]
+# TLS 1.3 for `storines://` (off by default, so the default build has no dependencies). It is
+# the engine's own zero-dependency TLS (`crates/storage-tls`) and needs Rust 1.82.
+storage-tls = { path = "../../crates/storage-tls", optional = true }
+
+[features]
+tls = ["dep:storage-tls"]

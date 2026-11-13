@@ -24,6 +24,7 @@ storage-index = { path = "../crates/storage-index" }
 storage-graph = { path = "../crates/storage-graph" }
 storage-core = { path = "../crates/storage-core" }
 storage-server = { path = "../crates/storage-server" }
+storage-tls = { path = "../crates/storage-tls" }
 
 [lints]
 workspace = true

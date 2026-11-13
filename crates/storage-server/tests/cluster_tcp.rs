@@ -157,3 +157,73 @@ fn test_three_node_tcp_cluster_writes_redirects_and_failover() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The same cluster with TLS on every node's port: Raft traffic between nodes runs over TLS
+/// (each node checks its peers' CA-issued certificates), and clients reach it over TLS too.
+#[test]
+fn test_three_node_cluster_over_tls() {
+    use storage_server::cluster::PeerTls;
+    use storage_server::{ClientTls, RbacRole};
+    use storage_tls::{issue, new_ca, ClientConfig, TlsConfig};
+
+    let dir = std::env::temp_dir().join(format!("stge_cluster_tls_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let addrs: HashMap<NodeId, SocketAddr> = (1..=3).map(|i| (i, free_port())).collect();
+    let ca = new_ca("test cluster").unwrap();
+    let roots = Arc::new(ClientConfig::with_roots_pem(&ca.cert_pem).unwrap());
+    let token = "cluster-token-0123456789";
+    let mut nodes = Vec::new();
+    for id in 1..=3u16 {
+        let cert = issue(&ca, &["127.0.0.1"]).unwrap();
+        let security = SecurityConfig::new(true)
+            .with_token(token, RbacRole::Admin)
+            .with_tls(TlsConfig::from_pem(&cert.cert_pem, &cert.key_pem).unwrap());
+        let store = Arc::new(DocumentStore::open(dir.join(format!("n{id}")), EngineConfig::default()).unwrap());
+        let node = Arc::new(RaftNode::new(id, Arc::clone(store.engine())).unwrap());
+        let peers: HashMap<NodeId, SocketAddr> = addrs.iter().filter(|(&k, _)| k != id).map(|(&k, &v)| (k, v)).collect();
+        let tls = PeerTls { config: Arc::clone(&roots), names: HashMap::new() };
+        let transport =
+            Arc::new(TcpRaftTransport::new(peers, Some(token.into()), Duration::from_millis(300)).with_tls(tls));
+        let runtime = RaftRuntime::start(node, addrs.keys().copied().collect(), transport, config()).unwrap();
+        let client_addrs = addrs.iter().map(|(&k, v)| (k, v.to_string())).collect();
+        let server = StorageServer::start_documents_cluster(
+            &addrs[&id].to_string(),
+            Arc::clone(&store),
+            1000,
+            security,
+            ClusterOptions { runtime: Arc::clone(&runtime), client_addrs },
+        )
+        .unwrap();
+        nodes.push(Node { id, addr: addrs[&id], store, runtime, server });
+    }
+    let l = wait_leader(&nodes.iter().collect::<Vec<_>>());
+    let client_tls = ClientTls { config: Arc::clone(&roots), server_name: None };
+    let mut c = StorageClient::connect_tls(nodes[l].addr, &client_tls).unwrap();
+    c.authenticate(token).unwrap();
+    let mut f = BTreeMap::new();
+    f.insert("bal".to_string(), PropertyValue::Int64(100));
+    c.doc_write(&[DocWrite { collection: "acct".into(), key: "a".into(), op: DocOp::Put(f), precondition: Precondition::Absent }], None).unwrap();
+    for _ in 0..20 {
+        c.doc_write(&[deposit(1)], None).unwrap();
+    }
+    // Every write was committed by a quorum reached over TLS; a follower has it too.
+    let f_idx = (l + 1) % 3;
+    let mut fc = StorageClient::connect_tls(nodes[f_idx].addr, &client_tls).unwrap();
+    fc.authenticate(token).unwrap();
+    fc.doc_command(OP_SET_OPTIONS, &[1]).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(Some(d)) = fc.doc_get("acct", "a") {
+            if d.fields["bal"] == PropertyValue::Int64(120) {
+                break;
+            }
+        }
+        assert!(Instant::now() < deadline, "follower never caught up over TLS");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for n in &mut nodes {
+        n.server.stop();
+    }
+    drop(nodes);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -6,7 +6,7 @@
 
 **Storine** is an ultra-fast, zero-copy, memory-mapped embedded storage engine and sharded non-blocking TCP server written in pure Rust with **zero third-party runtime dependencies**.
 
-It is engineered for workloads requiring **sub-microsecond reads (`~200 ns` p50)**, **zero heap allocations on hot read paths**, **coalesced microsecond writes (`~5 µs` p50 with `SyncPolicy::AsyncMemoryFirst`)**, **hybrid secondary + SIMD vector search**, **bidirectional relational links (`1:1`, `1:N`, `M:N`)**, and **million-connection scalability (`~88 bytes` per idle TCP connection)**.
+It is engineered for workloads requiring **sub-microsecond reads (`~60 ns` p50)**, **zero heap allocations on hot read paths**, **coalesced sub-microsecond writes (`~0.9 µs` p50 with `SyncPolicy::AsyncMemoryFirst`)**, **hybrid secondary + SIMD vector search**, **bidirectional relational links (`1:1`, `1:N`, `M:N`)**, and **million-connection scalability (`~88 bytes` per idle TCP connection)**.
 
 ---
 
@@ -36,6 +36,7 @@ It is engineered for workloads requiring **sub-microsecond reads (`~200 ns` p50)
   - Per-record policy (`Indexable::protection`): encrypt confidential records, authenticate-only (plaintext + MAC, tamper-proof) the rest.
 - **Sharded Non-Blocking TCP Server (`StorageServer`)**:
   - Fixed pool of `ReactorShard` worker threads multiplexing non-blocking sockets (`NonBlockingConn`, `~88 bytes` per idle connection) with zero-allocation vectored `IoSlice` socket writes and dynamic `max_connections` admission control.
+  - Optional TLS 1.3 on the native port (`STORAGE_TLS_CERT` / `STORAGE_TLS_KEY`, zero-dependency `storage-tls`): handshakes run off the reactors with a deadline, so a slow client never stalls an event loop. Cluster nodes reach each other on the same port, so their Raft and range traffic is encrypted and their certificates checked too.
 - **Client SDKs** ([`sdks/`](sdks)):
   - Python, TypeScript, Go, Java, C#, Rust, PHP and Ruby clients with one shared API, no runtime dependencies, exact decimals, at-most-once retries and automatic leader failover, all checked against the same protocol vectors ([`protocol/PROTOCOL.md`](protocol/PROTOCOL.md)).
 - **SQL Gateway for Existing Apps (`storine-sql`)** ([`crates/storage-sql`](crates/storage-sql/README.md)):
@@ -96,7 +97,8 @@ flowchart TD
 | **`storage-index`** | [`crates/storage-index`](crates/storage-index) | 64-shard `PrimaryIndex`, compact `STGEIDX2` checkpointing, `BitmapTagIndex`, `NumericRangeIndex`, and SIMD cosine similarity kernel. |
 | **`storage-graph`** | [`crates/storage-graph`](crates/storage-graph) | Bidirectional `OneToOne`, `OneToMany`, and `ManyToMany` relational containers and referential integrity verifiers. |
 | **`storage-core`** | [`crates/storage-core`](crates/storage-core) | Unified `StorageEngine<T>`, `RecordRef<T>`, `WriteCoalescer`, `StripedLockTable`, hybrid query planner, and chaos crash-recovery tests. |
-| **`storage-server`** | [`crates/storage-server`](crates/storage-server) | Sharded non-blocking TCP event reactor (`StorageServer<T>`) and binary client (`StorageClient`) with runtime `max_connections` admission control. |
+| **`storage-tls`** | [`crates/storage-tls`](crates/storage-tls) | Zero-dependency TLS 1.3 / 1.2 (ChaCha20-Poly1305, x25519, Ed25519): server, client with certificate checks, a record layer for non-blocking sockets, and CA / certificate issuing. |
+| **`storage-server`** | [`crates/storage-server`](crates/storage-server) | Sharded non-blocking TCP event reactor (`StorageServer<T>`) with optional TLS and binary client (`StorageClient`) with runtime `max_connections` admission control. |
 | **`storage-cli`** | [`crates/storage-cli`](crates/storage-cli) | Command-line inspection, CRUD, hybrid search, compaction, and diagnostics utility. |
 | **`storage-sql`** | [`crates/storage-sql`](crates/storage-sql) | `storine-sql`: PostgreSQL / MySQL / SQL Server wire-compatible SQL gateway over Storine documents (see its [README](crates/storage-sql/README.md)). |
 | **`benches`** | [`benches`](benches) | Release benchmark harness with custom `TrackingAllocator` enforcing `0.00` heap allocations on hot read paths. |
@@ -210,6 +212,17 @@ Environment settings:
 - `STORAGE_BACKUP_ROOT`: directory under which remote `OP_ADMIN_BACKUP` may create backups (disabled when unset).
 - `STORAGE_RATE_LIMIT`: per-connection `rps:burst` token bucket.
 - `STORAGE_MAX_CONNECTIONS`: connection ceiling (overridden by `--max-connections`).
+- `STORAGE_TLS_CERT` / `STORAGE_TLS_KEY`: a PEM certificate and PKCS#8 Ed25519 key. With them the port requires TLS 1.3 from every client and peer.
+- `STORAGE_TLS_CA`: the PEM certificates nodes trust when they call each other (default: the node's own certificate). Each peer's certificate must name the host it is listed under in `--peers`.
+
+TLS certificates without OpenSSL:
+```bash
+storage-server gen-ca ./tls/ca                                   # ca.crt, ca.key (keep ca.key offline)
+storage-server gen-cert ./tls/ca ./tls/node1 10.0.0.1,db1.internal   # node.crt, node.key for one node
+STORAGE_TLS_CERT=./tls/node1/node.crt STORAGE_TLS_KEY=./tls/node1/node.key STORAGE_TLS_CA=./tls/ca/ca.crt \
+STORAGE_AUTH_TOKENS="change-me-admin-token:admin" storage-server ./server_data 0.0.0.0:7878
+```
+Clients connect with `storines://host:7878?tls_ca=/path/ca.crt` (every SDK), and the CLI with `STORAGE_TLS_CA`.
 
 ### Run the CLI Utility
 ```bash
@@ -238,24 +251,25 @@ Measured with `cargo run --release -p storage-benches` (`opt-level = 3`, `lto = 
 
 | Workload | `p50` Latency | Heap Allocs / Op |
 | :--- | ---: | ---: |
-| **`InlineId` (24B) Hash + Eq** | `1–3 ns` | **`0.00`** |
-| **Zero-Copy `RecordView` Read + `get_str` (`decode_unchecked`)** | `~8–15 ns` *(includes the per-call UTF-8 check that makes `as_str` sound)* | **`0.00`** |
-| **SIMD Cosine Similarity (`64-dim f32`, 8-way unrolled)** | `87 ns` | **`0.00`** |
-| **`StorageEngine::with_ref` (0-Alloc Hot Read)** | **`~200–300 ns`** | **`0.00`** |
-| **`StorageEngine::get_ref` (Mmap Arena Segment)** | **`~300–500 ns`** | **`0.00`** |
-| **Checksum (`XXH64-family + CRC32C`, 4 KB)** | `~1.6–1.9 µs` | **`0.00`** |
-| **`StorageEngine::update` (Coalesced Hot Write)** | **`~5–6 µs`** | `5.00` |
-| **Secondary Index (`Tag Bitmap + B+Tree Range`)** | **`~7–15 µs`** | `1.00` |
-| **`StorageServer` TCP Binary `GET` Frame RPC (loopback)** | **`~70–180 µs`** | `3.00` *(client side)* |
+| **`InlineId` (24B) Hash + Eq** | `< 1 ns` | **`0.00`** |
+| **Zero-Copy `RecordView` Read (`decode_unchecked`)** | `2 ns` | **`0.00`** |
+| **SIMD Cosine Similarity (`64-dim f32`, 8-way unrolled)** | `22 ns` | **`0.00`** |
+| **`StorageEngine::with_ref` (0-Alloc Hot Read)** | **`58 ns`** | **`0.00`** |
+| **`StorageEngine::get_ref` (Mmap Arena Segment)** | **`62–71 ns`** | **`0.00`** |
+| **Checksum (`XXH64-family + CRC32C`, 4 KB)** | `347 ns` | **`0.00`** |
+| **`StorageEngine::update` (Coalesced Hot Write)** | **`0.85–0.87 µs`** | `3.00` |
+| **Secondary Index (`Tag Bitmap + B+Tree Range`)** | **`2.1–2.2 µs`** | `1.00` |
+| **`StorageServer` TCP Binary `GET` Frame RPC (loopback)** | **`8.6–9.0 µs`** | `1.00` *(client side)* |
+| **The same over TLS 1.3** | **`11.5–11.7 µs`** | `3.00` *(client side)* |
 
-Ranges reflect run-to-run variance on the (shared) development machine; see the report for interleaved baseline-vs-candidate measurements.
+Five runs on an AWS `c7i.xlarge` (2026-11-13). Against LMDB and RocksDB at equal durability, Storine leads every throughput row and every p99 row of `benches/kv-compare`. For example, 4.1–4.2 M random reads per second on 4 threads (LMDB 2.9–3.2 M), and 1.30–1.36 M overwrites per second on 4 threads (RocksDB 0.54–0.59 M). The tails where it still trails are listed in the report (section 8.5) and in [`CHANGELOG.md`](CHANGELOG.md).
 
 ### Memory & Disk Efficiency Highlights
 - **Per-Connection Server Footprint**: `~88 bytes` per idle `NonBlockingConn` (`~88 MB` for 1,000,000 idle connections vs `~2.1 TB` for thread-per-connection servers).
 - **Primary Index Checkpoint (`primary.idx`)**: `~21 bytes / record` (`4.2x` smaller than the fixed-row v1 format via varint + compact `InlineId` encoding).
 - **Persisted Vector Graph (`hnsw.idx`)**: saved at checkpoints and reused at open (reconciled against the records), so restarts do not rebuild the HNSW graph.
 - **Zero Duplicate In-RAM Index/Vector Maps**: Secondary index snapshots and float embeddings are read zero-copy directly from the memory-mapped `&T::Archived` frame (`0 bytes/record` of duplicate heap maps).
-- **Release Binaries**: `storage-server` is a self-contained **`903 KiB`** binary and `storage-cli` **`830.5 KiB`** (Windows x86_64, fat LTO, stripped), within the `RULE-MEM-03` budget of `< 1 MiB`.
+- **Release Binaries**: self-contained, no shared libraries beyond libc: `storage-server` **3.9 MB**, `storage-cli` **1.3 MB**, `storine-sql` **5.6 MB** (Linux x86_64, fat LTO, stripped). These exceed the `< 1 MiB` budget in `docs/RULES.md` (`RULE-MEM-03`), which the binaries outgrew as clusters, analytics and the SQL gateway were added. TLS added 66–132 KB per binary.
 
 See [`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) for the complete latency and footprint verification report.
 

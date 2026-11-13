@@ -52,6 +52,8 @@ pub struct TcpRangeTransport {
     queued_bytes: Arc<AtomicU64>,
     dropped: AtomicU64,
     idle: Mutex<HashMap<NodeId, Vec<StorageClient>>>,
+    /// Peers are reached over TLS (their ports require it).
+    tls: Option<crate::cluster::PeerTls>,
     /// The local node: calls to ourselves skip the network.
     local: RwLock<Option<Arc<RangeNode>>>,
     /// This transport (its sender threads hold it weakly).
@@ -68,7 +70,18 @@ impl TcpRangeTransport {
     /// `peers`: node id -> address of every node (this one included); `token`: an Admin token
     /// every peer accepts.
     pub fn new(me: NodeId, peers: HashMap<NodeId, SocketAddr>, token: Option<String>, timeout: Duration) -> Arc<Self> {
-        Arc::new_cyclic(|weak| Self { me, peers, token, timeout, senders: Mutex::new(HashMap::new()), queued_bytes: Arc::new(AtomicU64::new(0)), dropped: AtomicU64::new(0), idle: Mutex::new(HashMap::new()), local: RwLock::new(None), weak: weak.clone() })
+        Self::new_with_tls(me, peers, token, timeout, None)
+    }
+
+    /// [`Self::new`], reaching peers over TLS when `tls` is given.
+    pub fn new_with_tls(
+        me: NodeId,
+        peers: HashMap<NodeId, SocketAddr>,
+        token: Option<String>,
+        timeout: Duration,
+        tls: Option<crate::cluster::PeerTls>,
+    ) -> Arc<Self> {
+        Arc::new_cyclic(|weak| Self { me, peers, token, timeout, senders: Mutex::new(HashMap::new()), queued_bytes: Arc::new(AtomicU64::new(0)), dropped: AtomicU64::new(0), idle: Mutex::new(HashMap::new()), tls, local: RwLock::new(None), weak: weak.clone() })
     }
 
     pub fn set_local(&self, node: Arc<RangeNode>) {
@@ -77,7 +90,8 @@ impl TcpRangeTransport {
 
     fn connect(&self, to: NodeId, timeout: Duration) -> Result<StorageClient> {
         let addr = *self.peers.get(&to).ok_or_else(|| StorageError::invalid_key("unknown range peer"))?;
-        let mut c = StorageClient::connect_timeout(addr, timeout)?;
+        let tls = self.tls.as_ref().map(|t| t.for_peer(to));
+        let mut c = StorageClient::connect_timeout_with(addr, timeout, tls.as_ref())?;
         if let Some(ref t) = self.token {
             c.authenticate(t)?;
         }
@@ -611,6 +625,8 @@ pub struct RangeServerConfig {
     pub security: crate::SecurityConfig,
     pub max_connections: usize,
     pub max_offset: Duration,
+    /// Peers are reached over TLS (needed when their ports require it).
+    pub peer_tls: Option<crate::cluster::PeerTls>,
 }
 
 /// Starts one node of a range cluster: on first start it holds one range over the whole key
@@ -627,7 +643,7 @@ pub fn start_range_server(cfg: RangeServerConfig) -> Result<crate::StorageServer
     }
     let mut ids: Vec<NodeId> = cfg.peers.keys().copied().collect();
     ids.sort_unstable();
-    let engine = Arc::new(StorageEngine::<DocumentRecord>::open(&cfg.data_dir, EngineConfig { collection_name: "ranges".into(), wal_sync_policy: storage_core::dist::range_wal_policy(), ..EngineConfig::default() })?);
+    let engine = Arc::new(StorageEngine::<DocumentRecord>::open(&cfg.data_dir, EngineConfig { collection_name: "ranges".into(), layout_mode: storage_core::document::DOCUMENT_LAYOUT, wal_sync_policy: storage_core::dist::range_wal_policy(), ..EngineConfig::default() })?);
     let incarnation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
     let node_cfg = NodeConfig {
         seed: u64::from(cfg.node_id),
@@ -642,7 +658,7 @@ pub fn start_range_server(cfg: RangeServerConfig) -> Result<crate::StorageServer
         driver.open_range(1, storage_core::raft::KeySpan::all(), &ids)?;
     }
     let hlc = Arc::new(Hlc::new(Arc::new(SystemClock), cfg.max_offset));
-    let transport = TcpRangeTransport::new(cfg.node_id, cfg.peers.clone(), cfg.token.clone(), Duration::from_secs(2));
+    let transport = TcpRangeTransport::new_with_tls(cfg.node_id, cfg.peers.clone(), cfg.token.clone(), Duration::from_secs(2), cfg.peer_tls.clone());
     let node = RangeNode::start(NodeServer::new(driver, Arc::clone(&hlc)), Arc::clone(&transport) as Arc<dyn Transport>, RuntimeConfig::default());
     transport.set_local(Arc::clone(&node));
     let gateway = GatewayConfig { nodes: ids, request_timeout: Duration::from_secs(10), call_timeout: Duration::from_secs(5) };

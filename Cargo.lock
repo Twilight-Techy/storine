@@ -12,6 +12,7 @@ dependencies = [
  "storage-index",
  "storage-mmap",
  "storage-server",
+ "storage-tls",
  "storage-types",
  "storage-wal",
 ]
@@ -26,6 +27,7 @@ dependencies = [
  "storage-index",
  "storage-mmap",
  "storage-server",
+ "storage-tls",
  "storage-types",
  "storage-wal",
 ]
@@ -94,6 +96,7 @@ dependencies = [
  "storage-graph",
  "storage-index",
  "storage-mmap",
+ "storage-tls",
  "storage-types",
  "storage-wal",
 ]
@@ -105,8 +108,17 @@ dependencies = [
  "storage-codec",
  "storage-core",
  "storage-server",
+ "storage-tls",
  "storage-types",
  "storine",
+]
+
+[[package]]
+name = "storage-tls"
+version = "0.1.0"
+dependencies = [
+ "storage-codec",
+ "storage-types",
 ]
 
 [[package]]

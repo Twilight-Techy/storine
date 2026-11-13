@@ -243,79 +243,35 @@ impl core::fmt::Debug for GroupCommitWal {
     }
 }
 
-/// A parsed frame.
-struct RawFrame {
-    entry: WalEntry,
-}
 
-/// Parses all valid frames from `raw`, stopping at the first torn/corrupt frame.
-/// Returns the frames and the byte offset just past the last valid frame.
-fn parse_frames(raw: &[u8]) -> (Vec<RawFrame>, usize) {
-    let mut out = Vec::new();
-    let mut pos = 0usize;
-    while pos + WAL_FRAME_HEADER_LEN <= raw.len() {
-        let Some(h) = decode_wal_frame_header(&raw[pos..pos + WAL_FRAME_HEADER_LEN]) else {
-            break;
-        };
-        if h.body_len > MAX_PAYLOAD_SIZE as usize || h.uncompressed_len > MAX_PAYLOAD_SIZE as usize {
-            break;
+
+
+
+/// Reads the next valid frame from `r` into `buf` (header and body, as on disk) and returns its
+/// header. Tells a clean end (end of file, a torn or corrupt frame: `Ok(None)`) from a failed
+/// read (`Err`). Recovery must never take an I/O
+/// error for the end of the log: opening would cut the file there.
+fn next_frame(r: &mut impl Read, buf: &mut Vec<u8>) -> Result<Option<DecodedHeader>> {
+    fn fill(r: &mut impl Read, buf: &mut [u8]) -> Result<bool> {
+        match r.read_exact(buf) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(e) => Err(StorageError::io("read WAL", e)),
         }
-        let frame_end = match (pos + WAL_FRAME_HEADER_LEN).checked_add(h.body_len) {
-            Some(end) if end <= raw.len() => end,
-            _ => break,
-        };
-        let body = &raw[pos + WAL_FRAME_HEADER_LEN..frame_end];
-        let actual_sum = compute_wal_checksum(
-            h.lsn,
-            h.txn_id,
-            h.collection_id,
-            h.kind,
-            h.flags,
-            h.record_id,
-            h.version,
-            body,
-            h.uncompressed_len as u32,
-        );
-        if actual_sum != h.checksum {
-            break;
-        }
-        let frame_bytes = if (h.flags & WAL_FLAG_LZ4) != 0 {
-            let Ok(decompressed) = decompress_lz4(body, h.uncompressed_len) else {
-                break;
-            };
-            decompressed
-        } else {
-            body.to_vec()
-        };
-        out.push(RawFrame {
-            entry: WalEntry {
-                lsn: h.lsn,
-                txn_id: h.txn_id,
-                collection_id: h.collection_id,
-                kind: h.kind,
-                record_id: h.record_id,
-                version: h.version,
-                frame_bytes,
-            },
-        });
-        pos = frame_end;
     }
-    (out, pos)
-}
-
-/// Reads the next valid frame from `r` into `buf` (header and body, as on disk) and returns
-/// its header; `None` at the end or at the first torn or corrupt frame. Unlike
-/// [`parse_frames`], nothing is decompressed and only one frame is held at a time.
-fn read_raw_frame(r: &mut impl Read, buf: &mut Vec<u8>) -> Option<DecodedHeader> {
     buf.clear();
     buf.resize(WAL_FRAME_HEADER_LEN, 0);
-    r.read_exact(buf).ok()?;
-    let h = decode_wal_frame_header(buf)?;
+    if !fill(r, buf)? {
+        return Ok(None);
+    }
+    let Some(h) = decode_wal_frame_header(buf) else { return Ok(None) };
     if h.body_len > MAX_PAYLOAD_SIZE as usize || h.uncompressed_len > MAX_PAYLOAD_SIZE as usize {
-        return None;
+        return Ok(None);
     }
     buf.resize(WAL_FRAME_HEADER_LEN + h.body_len, 0);
-    r.read_exact(&mut buf[WAL_FRAME_HEADER_LEN..]).ok()?;
+    if !fill(r, &mut buf[WAL_FRAME_HEADER_LEN..])? {
+        return Ok(None);
+    }
     let sum = compute_wal_checksum(
         h.lsn,
         h.txn_id,
@@ -327,38 +283,59 @@ fn read_raw_frame(r: &mut impl Read, buf: &mut Vec<u8>) -> Option<DecodedHeader>
         &buf[WAL_FRAME_HEADER_LEN..],
         h.uncompressed_len as u32,
     );
-    (sum == h.checksum).then_some(h)
+    Ok((sum == h.checksum).then_some(h))
 }
 
-/// Resolves committed entries from parsed frames (transactions only when their commit barrier
-/// is present with the matching operation count). `Checkpoint` markers are skipped.
-fn committed_from_frames(frames: Vec<RawFrame>) -> Vec<WalEntry> {
-    let mut committed = Vec::new();
-    let mut pending_txns: HashMap<u64, Vec<WalEntry>> = HashMap::new();
-    for f in frames {
-        let entry = f.entry;
-        match entry.kind {
-            WalOpKind::Checkpoint => {}
-            WalOpKind::TxnCommit => {
-                if let Some(ops) = pending_txns.remove(&entry.txn_id) {
-                    if ops.len() as u64 == entry.version.0 {
-                        committed.extend(ops);
-                    }
-                }
-            }
-            _ if entry.txn_id == 0 => committed.push(entry),
-            _ => pending_txns.entry(entry.txn_id).or_default().push(entry),
-        }
-    }
-    committed
-}
-
-fn read_file_if_exists(vfs: &VfsRef, path: &Path) -> Result<Vec<u8>> {
+/// Streams the valid frames of the WAL at `path`, one at a time, calling `f(header, body)` for
+/// each; stops at the first torn or corrupt frame, or where `f` returns `false` (that frame is
+/// not counted). Returns the offset just past the last valid frame. Memory stays at one frame
+/// however long the log is (reading it whole took a recovering node to 2–4× its data).
+fn scan_frames(
+    vfs: &VfsRef,
+    path: &Path,
+    f: impl FnMut(&DecodedHeader, &[u8]) -> Result<bool>,
+) -> Result<u64> {
     if !vfs.exists(path) {
-        return Ok(Vec::new());
+        return Ok(0);
     }
-    vfs.read(path).map_err(|e| StorageError::io("read WAL", e))
+    let file = vfs
+        .open(path, OpenOpts::read())
+        .map_err(|e| StorageError::io("open WAL for recovery", e))?;
+    scan_reader(BufReader::with_capacity(1 << 20, file), f)
 }
+
+/// [`scan_frames`] over any reader.
+fn scan_reader(mut r: impl Read, mut f: impl FnMut(&DecodedHeader, &[u8]) -> Result<bool>) -> Result<u64> {
+    let mut buf = Vec::new();
+    let mut end = 0u64;
+    while let Some(h) = next_frame(&mut r, &mut buf)? {
+        if !f(&h, &buf[WAL_FRAME_HEADER_LEN..])? {
+            break;
+        }
+        end += buf.len() as u64;
+    }
+    Ok(end)
+}
+
+/// The entry a frame holds, decompressed; `None` if its LZ4 body does not decompress (treated
+/// as the end of the log, as a torn frame is).
+fn entry_of(h: &DecodedHeader, body: &[u8]) -> Option<WalEntry> {
+    let frame_bytes = if (h.flags & WAL_FLAG_LZ4) != 0 {
+        decompress_lz4(body, h.uncompressed_len).ok()?
+    } else {
+        body.to_vec()
+    };
+    Some(WalEntry {
+        lsn: h.lsn,
+        txn_id: h.txn_id,
+        collection_id: h.collection_id,
+        kind: h.kind,
+        record_id: h.record_id,
+        version: h.version,
+        frame_bytes,
+    })
+}
+
 
 fn sync_parent_dir(vfs: &VfsRef, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -390,18 +367,22 @@ impl GroupCommitWal {
         }
 
         let existed = vfs.exists(&path);
-        let raw = read_file_if_exists(&vfs, &path)?;
-        let (frames, valid_len) = parse_frames(&raw);
+        // One frame at a time: only the counters and the valid length are needed here.
         let mut max_lsn = 0u64;
         let mut max_txn = 0u64;
-        for f in &frames {
-            max_lsn = max_lsn.max(f.entry.lsn);
-            max_txn = max_txn.max(f.entry.txn_id);
-            if f.entry.kind == WalOpKind::Checkpoint {
-                // Checkpoint markers carry `next_txn_id - 1` in `version`.
-                max_txn = max_txn.max(f.entry.version.0);
+        let valid_len = scan_frames(&vfs, &path, |h, body| {
+            if (h.flags & WAL_FLAG_LZ4) != 0 && decompress_lz4(body, h.uncompressed_len).is_err() {
+                // The log ends here, as at a torn frame.
+                return Ok(false);
             }
-        }
+            max_lsn = max_lsn.max(h.lsn);
+            max_txn = max_txn.max(h.txn_id);
+            if h.kind == WalOpKind::Checkpoint {
+                // Checkpoint markers carry `next_txn_id - 1` in `version`.
+                max_txn = max_txn.max(h.version.0);
+            }
+            Ok(true)
+        })?;
 
         let mut file = vfs
             .open(&path, OpenOpts::create())
@@ -412,8 +393,9 @@ impl GroupCommitWal {
                 .map_err(|e| StorageError::io("fsync new WAL file", e))?;
             sync_parent_dir(&vfs, &path)?;
         }
-        if valid_len < raw.len() {
-            file.set_len(valid_len as u64)
+        let file_len = file.len().map_err(|e| StorageError::io("size WAL file", e))?;
+        if valid_len < file_len {
+            file.set_len(valid_len)
                 .map_err(|e| StorageError::io("truncate torn WAL tail", e))?;
             file.sync_data()
                 .map_err(|e| StorageError::io("fsync truncated WAL tail", e))?;
@@ -1108,7 +1090,9 @@ impl GroupCommitWal {
             let mut kept_txns: HashSet<u64> = HashSet::new();
             let mut archive: Option<(PathBuf, BufWriter<VfsHandle>)> = None;
             let mut frame = Vec::new();
-            while let Some(h) = read_raw_frame(&mut src, &mut frame) {
+            // A read error aborts the truncation before the swap: ending the copy early would
+            // drop every frame after it.
+            while let Some(h) = next_frame(&mut src, &mut frame)? {
                 let keep = match h.kind {
                     WalOpKind::Checkpoint => continue,
                     WalOpKind::TxnCommit => h.lsn > cutoff_lsn || kept_txns.contains(&h.txn_id),
@@ -1251,11 +1235,55 @@ impl GroupCommitWal {
 
     /// [`Self::recover_committed`] on the given file system.
     pub fn recover_committed_with(vfs: &VfsRef, path: &Path) -> Result<Vec<WalEntry>> {
-        let raw = read_file_if_exists(vfs, path)?;
-        let (frames, _) = parse_frames(&raw);
-        Ok(committed_from_frames(frames))
+        let mut out = Vec::new();
+        Self::for_each_committed(vfs, path, |e| {
+            out.push(e);
+            Ok(())
+        })?;
+        Ok(out)
     }
 
+    /// Streams the committed operations of the WAL at `path` to `f`, in the order
+    /// [`Self::recover_committed`] returns them, holding one frame at a time (plus the
+    /// operations of transactions whose commit barrier has not been read yet). Recovery uses
+    /// this, so a node replaying a large log does not hold it all in memory.
+    pub fn for_each_committed(vfs: &VfsRef, path: &Path, f: impl FnMut(WalEntry) -> Result<()>) -> Result<()> {
+        if !vfs.exists(path) {
+            return Ok(());
+        }
+        let file = vfs
+            .open(path, OpenOpts::read())
+            .map_err(|e| StorageError::io("open WAL for recovery", e))?;
+        committed_from_reader(BufReader::with_capacity(1 << 20, file), f)
+    }
+}
+
+/// The committed operations of the frames `r` yields, streamed to `f` (see
+/// [`GroupCommitWal::for_each_committed`]).
+fn committed_from_reader(r: impl Read, mut f: impl FnMut(WalEntry) -> Result<()>) -> Result<()> {
+    let mut pending_txns: HashMap<u64, Vec<WalEntry>> = HashMap::new();
+    scan_reader(r, |h, body| {
+        let Some(entry) = entry_of(h, body) else { return Ok(false) };
+        match entry.kind {
+            WalOpKind::Checkpoint => {}
+            WalOpKind::TxnCommit => {
+                if let Some(ops) = pending_txns.remove(&entry.txn_id) {
+                    if ops.len() as u64 == entry.version.0 {
+                        for op in ops {
+                            f(op)?;
+                        }
+                    }
+                }
+            }
+            _ if entry.txn_id == 0 => f(entry)?,
+            _ => pending_txns.entry(entry.txn_id).or_default().push(entry),
+        }
+        Ok(true)
+    })?;
+    Ok(())
+}
+
+impl GroupCommitWal {
     /// Returns the LSN of the most recently appended frame.
     #[inline]
     pub fn current_lsn(&self) -> u64 {
@@ -1322,9 +1350,11 @@ impl GroupCommitWal {
         let mut pruned = 0usize;
         for seg in Self::list_archived_segments(wal_dir)? {
             let vfs = storage_types::vfs::at(&seg);
-            let raw = read_file_if_exists(&vfs, &seg)?;
-            let (frames, _) = parse_frames(&raw);
-            let max_lsn = frames.iter().map(|f| f.entry.lsn).max().unwrap_or(0);
+            let mut max_lsn = 0u64;
+            scan_frames(&vfs, &seg, |h, _| {
+                max_lsn = max_lsn.max(h.lsn);
+                Ok(true)
+            })?;
             if max_lsn < min_keep_lsn && vfs.remove_file(&seg).is_ok() {
                 pruned += 1;
             }
@@ -1765,8 +1795,7 @@ mod tests {
                 buf.extend_from_slice(&hdr);
                 buf.extend_from_slice(&body);
             }
-            let (frames, _) = parse_frames(&buf);
-            let _ = committed_from_frames(frames);
+            let _ = committed_from_reader(std::io::Cursor::new(&buf), |_| Ok(()));
         }
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1829,7 +1858,7 @@ mod tests {
     /// Bytes of valid frames at the start of the WAL file: the log itself, without the zeros
     /// preallocated after it.
     fn log_bytes(path: &Path) -> u64 {
-        parse_frames(&fs::read(path).unwrap()).1 as u64
+        scan_frames(&storage_types::vfs::at(path), path, |_, _| Ok(true)).unwrap()
     }
 
     #[test]
@@ -1942,6 +1971,47 @@ mod tests {
         let all: Vec<u8> = log.sealed.iter().chain(std::iter::once(&log.open)).flatten().copied().collect();
         assert_eq!(all.len(), log.len());
         assert!(all == expect, "staged bytes must be the frames in order");
+    }
+
+    /// Recovery tells a failed read from the end of the log: an I/O error part-way through a
+    /// frame is an error, never a torn tail (opening would truncate the WAL there), while a
+    /// genuinely short tail ends the log cleanly.
+    #[test]
+    fn test_recovery_reports_read_errors_instead_of_ending_the_log() {
+        let mut frames = Vec::new();
+        for v in 1..=3u64 {
+            GroupCommitWal::write_frame(&mut frames, v, 0, 1, WalOpKind::Upsert, InlineId::new("r").unwrap(), Version(v), &[v as u8; 40]).unwrap();
+        }
+        struct FailAfter<'a>(&'a [u8], usize);
+        impl Read for FailAfter<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.1 == 0 {
+                    return Err(std::io::Error::other("disk read failed"));
+                }
+                let n = buf.len().min(self.1).min(self.0.len());
+                buf[..n].copy_from_slice(&self.0[..n]);
+                self.0 = &self.0[n..];
+                self.1 -= n;
+                Ok(n)
+            }
+        }
+        // Fails in the middle of the second frame.
+        let cut = frames.len() / 3 + 10;
+        let mut seen = 0;
+        let r = committed_from_reader(FailAfter(&frames, cut), |_| {
+            seen += 1;
+            Ok(())
+        });
+        assert!(r.is_err(), "a read error must not end the log quietly");
+        assert_eq!(seen, 1);
+        // A short tail (a torn write) ends the log after the whole frames.
+        let mut seen = 0;
+        committed_from_reader(std::io::Cursor::new(&frames[..cut]), |_| {
+            seen += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, 1);
     }
 
     /// Memory-first frames from concurrent writers survive many staging-buffer swaps (the spare

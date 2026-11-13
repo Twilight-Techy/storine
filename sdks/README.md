@@ -12,6 +12,9 @@ Official clients of the Storine document API. Every SDK:
 - retries writes with the same request id (applied at most once), follows cluster leader redirects and fails over
   between seeds;
 - is tested end to end against a real `storage-server`, single node and a 3-node cluster with the leader killed.
+- connects over TLS 1.3 with `storines://` (or a `tls_ca` option: the PEM certificates to trust) and checks the
+  server's certificate and name. TLS uses the platform's own TLS library (Rust: the `tls` feature, which uses the
+  engine's own TLS crate; .NET on Windows cannot, as its TLS stack has no Ed25519).
 
 | Language | Directory | Money type | Tests |
 | --- | --- | --- | --- |

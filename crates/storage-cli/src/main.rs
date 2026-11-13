@@ -63,7 +63,9 @@ fn print_usage() {
          \x20 cluster <addr> promote <id>                       Promote a caught-up learner to voter (admin)\n\
          \x20 cluster <addr> remove <id>                        Remove a member, the leader included (admin)\n\
          \n\
-         Remote commands authenticate with the STORAGE_TOKEN environment variable when set.\n\
+         Remote commands authenticate with the STORAGE_TOKEN environment variable when set, and use\n\
+         TLS when STORAGE_TLS_CA names the PEM certificates to trust (STORAGE_TLS_SERVER_NAME: the\n\
+         name to expect in the server's certificate; default: its address).\n\
          cluster changes can be sent to any member: a follower's redirect to the leader is followed.\n\
          backup / archive-wal / restore-pitr enable WAL archiving (required for PITR)."
     );
@@ -534,9 +536,21 @@ fn cluster_command(args: &[String]) -> storage_types::Result<()> {
     Ok(())
 }
 
-/// Connects to a remote server, authenticating with `STORAGE_TOKEN` when it is set.
+/// Connects to a remote server, over TLS when `STORAGE_TLS_CA` is set, authenticating with
+/// `STORAGE_TOKEN` when it is set.
 fn connect_remote(addr: SocketAddr) -> storage_types::Result<StorageClient> {
-    let mut client = StorageClient::connect(addr)?;
+    let mut client = match env::var("STORAGE_TLS_CA") {
+        Ok(ca) => {
+            let pem = std::fs::read_to_string(&ca).map_err(|e| storage_types::StorageError::io("read STORAGE_TLS_CA", e))?;
+            let config = storage_tls::ClientConfig::with_roots_pem(&pem).map_err(|e| storage_types::StorageError::io("load STORAGE_TLS_CA", e))?;
+            let tls = storage_server::ClientTls {
+                config: std::sync::Arc::new(config),
+                server_name: env::var("STORAGE_TLS_SERVER_NAME").ok(),
+            };
+            StorageClient::connect_tls(addr, &tls)?
+        }
+        Err(_) => StorageClient::connect(addr)?,
+    };
     if let Ok(token) = env::var("STORAGE_TOKEN") {
         client.authenticate(&token)?;
     }

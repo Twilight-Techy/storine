@@ -1,7 +1,9 @@
 /** Storine client: connections, retries, redirects and the collection API. */
 
 import { randomBytes } from "crypto";
+import { readFileSync } from "fs";
 import * as net from "net";
+import * as tls from "tls";
 
 import {
   ConflictError, InvalidError, NotFoundError, OverloadedError, RateLimitedError, ServerError, StorineError,
@@ -33,6 +35,18 @@ export interface ConnectOptions {
   followerReads?: boolean;
   /** Connections kept open to the current server (default 8). */
   poolSize?: number;
+  /** Connect over TLS 1.3 (also `storines://` or giving `tlsCa`). */
+  tls?: boolean;
+  /** PEM file of the certificates to trust (default: Node's trusted roots). Turns TLS on. */
+  tlsCa?: string;
+  /** Name the server's certificate must carry (default: the host connected to). */
+  tlsServerName?: string;
+}
+
+/** What a TLS connection checks: trusted roots and the expected name. */
+interface TlsOptions {
+  ca?: Buffer;
+  serverName?: string;
 }
 
 type Reply = { status: number; version: bigint; body: Uint8Array };
@@ -44,9 +58,26 @@ class Connection {
   private closed = false;
   private chain: Promise<unknown> = Promise.resolve();
 
-  private constructor(readonly address: string, private timeoutMs: number) {
+  private readonly connectEvent: string;
+
+  private constructor(readonly address: string, private timeoutMs: number, secure?: TlsOptions) {
     const [host, port] = splitAddress(address);
-    this.socket = net.createConnection({ host, port });
+    if (secure) {
+      const name = secure.serverName ?? host;
+      this.socket = tls.connect({
+        host,
+        port,
+        ca: secure.ca,
+        minVersion: "TLSv1.3",
+        // SNI carries host names only, never IP addresses.
+        servername: net.isIP(name) ? undefined : name,
+        checkServerIdentity: (_host, cert) => tls.checkServerIdentity(name, cert),
+      });
+      this.connectEvent = "secureConnect";
+    } else {
+      this.socket = net.createConnection({ host, port });
+      this.connectEvent = "connect";
+    }
     this.socket.setNoDelay(true);
     this.socket.on("data", (chunk: Buffer) => this.onData(chunk));
     const fail = (e: Error) => {
@@ -59,11 +90,11 @@ class Connection {
     this.socket.on("close", () => fail(new Error("server closed the connection")));
   }
 
-  static async open(address: string, timeoutMs: number, token?: string, followerReads?: boolean): Promise<Connection> {
-    const c = new Connection(address, timeoutMs);
+  static async open(address: string, timeoutMs: number, token?: string, followerReads?: boolean, secure?: TlsOptions): Promise<Connection> {
+    const c = new Connection(address, timeoutMs, secure);
     await new Promise<void>((resolve, reject) => {
       const t = setTimeout(() => reject(new Error(`connect timeout to ${address}`)), timeoutMs);
-      c.socket.once("connect", () => {
+      c.socket.once(c.connectEvent, () => {
         clearTimeout(t);
         resolve();
       });
@@ -157,7 +188,12 @@ export class Client {
     this.target = seeds[0];
     this.timeoutMs = options.timeoutMs ?? 5000;
     this.poolSize = options.poolSize ?? 8;
+    if (options.tls || options.tlsCa) {
+      this.secure = { ca: options.tlsCa ? readFileSync(options.tlsCa) : undefined, serverName: options.tlsServerName };
+    }
   }
+
+  private readonly secure?: TlsOptions;
 
   /** A handle on the collection `name` (created on first write). */
   collection<T extends Fields = Fields>(name: string): Collection<T> {
@@ -212,7 +248,7 @@ export class Client {
       if (!c.isClosed && c.address === this.target) return c;
       c.close();
     }
-    return Connection.open(this.target, this.timeoutMs, this.options.token, this.options.followerReads);
+    return Connection.open(this.target, this.timeoutMs, this.options.token, this.options.followerReads, this.secure);
   }
 
   private release(c: Connection): void {
@@ -314,13 +350,14 @@ export class Client {
 }
 
 /**
- * Connects to a Storine server or cluster: `connect("storine://[token@]host:port[,host:port...]")`.
- * Connections are opened lazily; every method is async.
+ * Connects to a Storine server or cluster: `connect("storine://[token@]host:port[,host:port...]")`;
+ * `storines://` connects over TLS. Connections are opened lazily; every method is async.
  */
 export function connect(url = "storine://127.0.0.1:7878", options: ConnectOptions = {}): Client {
   let rest = url.includes("://") ? url : "storine://" + url;
-  if (!rest.startsWith("storine://")) throw new InvalidError("connection strings start with storine://");
-  rest = rest.slice("storine://".length);
+  const secure = rest.startsWith("storines://");
+  if (!rest.startsWith("storine://") && !secure) throw new InvalidError("connection strings start with storine:// or storines://");
+  rest = rest.slice(secure ? "storines://".length : "storine://".length);
   const [hostsPart, query = ""] = rest.split("?", 2);
   let hosts = hostsPart;
   const opts = { ...options };
@@ -333,7 +370,10 @@ export function connect(url = "storine://127.0.0.1:7878", options: ConnectOption
     const [k, v = ""] = pair.split("=");
     if (k === "timeout_ms") opts.timeoutMs = Number(v);
     if (k === "follower_reads") opts.followerReads = v === "1" || v === "true";
+    if (k === "tls_ca") opts.tlsCa = opts.tlsCa ?? decodeURIComponent(v);
+    if (k === "tls_server_name") opts.tlsServerName = opts.tlsServerName ?? decodeURIComponent(v);
   }
+  if (secure) opts.tls = true;
   return new Client(hosts.split(",").filter(Boolean), opts);
 }
 

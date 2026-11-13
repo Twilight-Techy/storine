@@ -24,9 +24,16 @@ final class Storine
     private array $pool = [];
 
     /** @param list<array{0: string, 1: int}> $seeds */
+    /** @var array{ca: ?string, name: ?string}|null */
+    private ?array $tls = null;
+
     public function __construct(array $seeds, private readonly ?string $token = null, private readonly float $timeout = 5.0,
-                                private readonly bool $followerReads = false, private readonly int $retries = 8)
+                                private readonly bool $followerReads = false, private readonly int $retries = 8,
+                                bool $tls = false, ?string $tlsCa = null, ?string $tlsServerName = null)
     {
+        if ($tls || $tlsCa !== null) {
+            $this->tls = ['ca' => $tlsCa, 'name' => $tlsServerName];
+        }
         if ($seeds === []) {
             throw new InvalidException('no server address given');
         }
@@ -36,18 +43,20 @@ final class Storine
 
     /**
      * Connects to a Storine server or cluster. `$url` is
-     * `storine://[token@]host:port[,host:port...]` (or just `host:port`); options may also be
-     * query parameters: `?timeout_ms=5000&follower_reads=1`.
+     * `storine://[token@]host:port[,host:port...]` (or just `host:port`); `storines://` connects
+     * over TLS. Options may also be query parameters:
+     * `?timeout_ms=5000&follower_reads=1&tls_ca=/path/ca.crt&tls_server_name=db1`. Giving
+     * `$tlsCa` (the PEM certificates to trust) also turns TLS on.
      */
     public static function connect(string $url = 'storine://127.0.0.1:7878', ?string $token = null, float $timeout = 5.0,
-                                   bool $followerReads = false): self
+                                   bool $followerReads = false, ?string $tlsCa = null, ?string $tlsServerName = null): self
     {
         if (!str_contains($url, '://')) {
             $url = 'storine://' . $url;
         }
         [$scheme, $rest] = explode('://', $url, 2);
-        if ($scheme !== 'storine') {
-            throw new InvalidException('connection strings start with storine://');
+        if ($scheme !== 'storine' && $scheme !== 'storines') {
+            throw new InvalidException('connection strings start with storine:// or storines://');
         }
         [$netloc, $query] = array_pad(explode('?', $rest, 2), 2, '');
         $netloc = rtrim($netloc, '/');
@@ -69,7 +78,13 @@ final class Storine
         if (isset($q['follower_reads'])) {
             $followerReads = in_array($q['follower_reads'], ['1', 'true', 'yes'], true);
         }
-        return new self($seeds, $token, $timeout, $followerReads);
+        if (isset($q['tls_ca']) && is_string($q['tls_ca'])) {
+            $tlsCa ??= $q['tls_ca'];
+        }
+        if (isset($q['tls_server_name']) && is_string($q['tls_server_name'])) {
+            $tlsServerName ??= $q['tls_server_name'];
+        }
+        return new self($seeds, $token, $timeout, $followerReads, 8, $scheme === 'storines', $tlsCa, $tlsServerName);
     }
 
     /** "host:port" (port 7878 when omitted; "[::1]:7878" for IPv6). @return array{0: string, 1: int} */
@@ -283,7 +298,7 @@ final class Storine
             }
             $c->close();
         }
-        return new Connection($this->target, $this->timeout, $this->token, $this->followerReads);
+        return new Connection($this->target, $this->timeout, $this->token, $this->followerReads, $this->tls);
     }
 
     private function release(Connection $c): void

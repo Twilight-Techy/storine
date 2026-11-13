@@ -256,3 +256,12 @@ Yes:
 
 - TCP `GET` 19.5 → 8.5 µs (reactor polls 50 µs after work); ARM hardware CRC32C (writes about 1.9× there); indexed index updates under one spinning lock (+32 % throughput on 4 writers, worse p99.9/p99.99).
 - **Verified**: workspace suite and 40 of 40 chaos runs on AWS (about $0.25).
+
+### Release candidate (`TASK-154`) — 2026-11-13
+
+- TLS 1.3 for clients and cluster traffic (`storage-tls`), TLS in all eight SDKs, streaming WAL recovery, release checklist, CI, changelog and compatibility policy.
+- Fixed: range nodes stuck in recovery after a kill (one file per record, one sync per logged write). Range nodes now use arenas; replay is batched. A stuck node's data reopens in 2.3 s.
+- TCP `GET` 8.6–9.0 µs plaintext (unchanged), 11.5–11.7 µs over TLS.
+- Fixed: range nodes never checkpointed (WAL and arena grew until restart), and `AsyncMemoryFirst` WAL cuts did not sync what they covered. Range nodes now checkpoint every 5 s; every WAL cut syncs first.
+- **Verified** on the release candidate: workspace suite and 40 of 40 chaos runs on x86_64 and arm64, and both 2-hour soaks (balances conserved; single group RSS at most 334 MiB, ranges at most 1.12 GiB and level after the first hour). About $2.40 on AWS.
+

@@ -35,6 +35,10 @@ fn hlc() -> Arc<Hlc> {
 }
 
 fn start(name: &str) -> Cluster {
+    start_with(name, RuntimeConfig::default())
+}
+
+fn start_with(name: &str, runtime: RuntimeConfig) -> Cluster {
     let root = std::env::temp_dir().join(format!("storine_range_docs_{name}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let transport = LocalTransport::new();
@@ -44,7 +48,7 @@ fn start(name: &str) -> Cluster {
         let cfg = NodeConfig { seed: u64::from(id), cluster: MEMBERS.to_vec(), max_offset_ns: 500_000_000, ..NodeConfig::default() };
         let mut d = NodeDriver::new(id, Arc::new(engine), cfg);
         d.open_range(1, KeySpan::all(), &MEMBERS).unwrap();
-        let node = RangeNode::start(NodeServer::new(d, hlc()), transport.clone(), RuntimeConfig::default());
+        let node = RangeNode::start(NodeServer::new(d, hlc()), transport.clone(), runtime.clone());
         transport.register(Arc::clone(&node));
         nodes.push(node);
     }
@@ -407,4 +411,26 @@ fn a_cut_off_leader_answers_nothing_stale_and_steps_down() {
     assert!(docs::get(&mut stale, "t", "seed").is_err());
     assert!(at.elapsed() < Duration::from_secs(2), "it should answer, not wait: {:?}", at.elapsed());
     cluster.transport.heal();
+}
+
+/// Nodes checkpoint their engines on their own: the WAL is cut once what it held is flushed and
+/// synced, instead of growing until the next restart (the range soak's 374 MB logs).
+#[test]
+fn range_nodes_checkpoint_and_cut_their_logs() {
+    let cluster = start_with("checkpoint", RuntimeConfig { checkpoint_interval: Duration::from_millis(200), ..RuntimeConfig::default() });
+    let mut g = cluster.gateway();
+    let text = PropertyValue::Text("x".repeat(400));
+    for batch in 0..20 {
+        let writes = (0..50).map(|i| put("c", &format!("k{batch}-{i}"), fields(&[("v", text.clone())]), Precondition::None)).collect();
+        docs::write(&mut g, writes, None).unwrap();
+    }
+    let wal_bytes = |id: u16| std::fs::metadata(cluster.root.join(format!("n{id}/wal/node.wal"))).map_or(0, |m| m.len());
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while MEMBERS.iter().any(|&id| wal_bytes(id) > 64 * 1024) {
+        assert!(std::time::Instant::now() < deadline, "logs not cut: {:?} bytes", MEMBERS.map(wal_bytes));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Everything is still there.
+    assert!(docs::get(&mut g, "c", "k19-49").unwrap().is_some());
+    assert!(docs::get(&mut g, "c", "k0-0").unwrap().is_some());
 }

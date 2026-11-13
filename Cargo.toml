@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/storage-types",
     "crates/storage-codec",
+    "crates/storage-tls",
     "crates/storage-mmap",
     "crates/storage-wal",
     "crates/storage-index",
