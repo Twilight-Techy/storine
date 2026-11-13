@@ -20,7 +20,7 @@
 - Order struct fields to eliminate alignment padding waste (`IndexSnapshot` uses Struct-of-Arrays packing; `ArchivedOneToOne` uses `InlineId::EMPTY` as the `None` niche).
 - Every core structure (`RecordHeader`, `InlineId`, `PrimaryEntry`, `MmapGuard`) MUST enforce compile-time size assertions.
 - On-disk checkpoints (`primary.idx`), paged B+Tree nodes, HNSW neighbor lists, and WAL frames MUST use compact varint, delta, bit-packed, or scalar-quantized (`SQ8`) encodings to keep disk footprint minimal.
-- Zero external runtime crates are used in production binaries, and every release binary stays `< 1 MiB` with `lto = "fat"` and `strip = "symbols"` (budget raised from `500 KiB` on 2026-10-27, `TASK-091`). The budget is a ceiling, not a target: keep minimizing code size wherever it costs no hot-path speed.
+- Zero external runtime crates are used in production binaries, and each release binary stays under its ceiling with `lto = "fat"` and `strip = "symbols"`, Linux x86_64: `storage-server` `< 4.5 MiB`, `storage-cli` `< 1.5 MiB`, `storine-sql` `< 6.5 MiB`. The budget was `500 KiB` until 2026-10-27, then `< 1 MiB` (`TASK-091`); it was raised to these ceilings on 2026-11-13 (`TASK-154`), after clusters, analytics, the SQL gateway and TLS grew the binaries. The budget is a ceiling, not a target: keep minimizing code size wherever it costs no hot-path speed.
 
 ### RULE-MEM-04: Strict Resource Ceilings & Anti-Memory-Bloat Reclamation
 - Enforce hard, runtime-configurable ceilings on:

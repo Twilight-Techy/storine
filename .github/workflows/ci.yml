@@ -38,3 +38,14 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --release --workspace --no-fail-fast
+      - name: Binary size (RULE-MEM-03)
+        run: |
+          cargo build --release --workspace --bins
+          fail=0
+          for spec in storage-server:4718592 storage-cli:1572864 storine-sql:6815744; do
+            bin=${spec%%:*}; max=${spec##*:}
+            size=$(stat -c %s "target/release/$bin")
+            echo "$bin: $size bytes (ceiling $max)"
+            [ "$size" -lt "$max" ] || { echo "::error::$bin is $size bytes, over its $max-byte ceiling"; fail=1; }
+          done
+          exit $fail

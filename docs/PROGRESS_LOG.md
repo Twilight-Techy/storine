@@ -991,4 +991,5 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - The 2-hour single-group soak passed: balances conserved, every key linearizable. RSS was 261–334 MiB, disk 85–110 MiB, at most 47 descriptors.
   - The 2-hour range soak passed: balances conserved, every key linearizable, 318,345 writes. The largest node's RSS was 804 MiB to 1.12 GiB per window: it rose in the first hour and then levelled off. Disk was 138–433 MiB and descriptors at most 85. Before the checkpoint fix, a node alone had 3.2 GB on disk after 25 minutes.
   - Four on-demand instances, about $2.40 in all, terminated.
+- **Decision (user, 2026-11-13)**: the `RULE-MEM-03` budget is raised to per-binary ceilings: `storage-server` `< 4.5 MiB`, `storage-cli` `< 1.5 MiB`, `storine-sql` `< 6.5 MiB`. The binaries are 3.69, 1.19 and 5.32 MiB. The release checklist gains a size check.
 

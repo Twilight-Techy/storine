@@ -269,7 +269,7 @@ Five runs on an AWS `c7i.xlarge` (2026-11-13). Against LMDB and RocksDB at equal
 - **Primary Index Checkpoint (`primary.idx`)**: `~21 bytes / record` (`4.2x` smaller than the fixed-row v1 format via varint + compact `InlineId` encoding).
 - **Persisted Vector Graph (`hnsw.idx`)**: saved at checkpoints and reused at open (reconciled against the records), so restarts do not rebuild the HNSW graph.
 - **Zero Duplicate In-RAM Index/Vector Maps**: Secondary index snapshots and float embeddings are read zero-copy directly from the memory-mapped `&T::Archived` frame (`0 bytes/record` of duplicate heap maps).
-- **Release Binaries**: self-contained, no shared libraries beyond libc: `storage-server` **3.9 MB**, `storage-cli` **1.3 MB**, `storine-sql` **5.6 MB** (Linux x86_64, fat LTO, stripped). These exceed the `< 1 MiB` budget in `docs/RULES.md` (`RULE-MEM-03`), which the binaries outgrew as clusters, analytics and the SQL gateway were added. TLS added 66–132 KB per binary.
+- **Release Binaries**: self-contained, no shared libraries beyond libc: `storage-server` **3.9 MB**, `storage-cli` **1.3 MB**, `storine-sql` **5.6 MB** (Linux x86_64, fat LTO, stripped). Each stays under its ceiling in `docs/RULES.md` (`RULE-MEM-03`): 4.5, 1.5 and 6.5 MiB.
 
 See [`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) for the complete latency and footprint verification report.
 

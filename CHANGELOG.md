@@ -36,6 +36,7 @@ Measured on AWS `c7i.xlarge` against LMDB and RocksDB at equal durability ([`doc
 
 - Storine leads in every throughput row and every p99 row.
 - Network: a TCP `GET` round trip takes 8.6–9.0 µs, or 11.5–11.7 µs over TLS.
+- Release binaries (Linux x86_64, stripped, no shared libraries beyond libc): `storage-server` 3.9 MB, `storage-cli` 1.3 MB, `storine-sql` 5.6 MB.
 
 ### Fixed before release
 
@@ -53,7 +54,6 @@ Measured on AWS `c7i.xlarge` against LMDB and RocksDB at equal durability ([`doc
 - Arena segments can hold up to twice the live data until compaction reclaims them.
 - TLS supports one suite: TLS 1.3 with `TLS_CHACHA20_POLY1305_SHA256`, x25519 and Ed25519 certificates. Certificates from other CAs must use Ed25519 keys. Clients are not asked for certificates; they authenticate with tokens.
 - Change feeds are not in the wire protocol yet.
-- Release binaries are larger than the project's 1 MiB budget (`docs/RULES.md`): `storage-server` 3.9 MB, `storage-cli` 1.3 MB, `storine-sql` 5.6 MB (Linux x86_64, stripped).
 - Soak testing ran for 2 hours per mode under constant kills, pauses and partitions; both modes passed with balances conserved and every key linearizable. No multi-day soak has been run.
 - A range-cluster node peaked at 1.12 GiB of resident memory in the soak, against 334 MiB for a single-group node.
 - Upgrading from one 0.x minor version to another needs a stop of the whole cluster or a backup and restore. Rolling upgrades are supported only between patch releases of the same minor version ([`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)).

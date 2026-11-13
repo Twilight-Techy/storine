@@ -264,4 +264,5 @@ Yes:
 - TCP `GET` 8.6–9.0 µs plaintext (unchanged), 11.5–11.7 µs over TLS.
 - Fixed: range nodes never checkpointed (WAL and arena grew until restart), and `AsyncMemoryFirst` WAL cuts did not sync what they covered. Range nodes now checkpoint every 5 s; every WAL cut syncs first.
 - **Verified** on the release candidate: workspace suite and 40 of 40 chaos runs on x86_64 and arm64, and both 2-hour soaks (balances conserved; single group RSS at most 334 MiB, ranges at most 1.12 GiB and level after the first hour). About $2.40 on AWS.
+- Binary-size budget raised by the user to 4.5 / 1.5 / 6.5 MiB (`storage-server` / `storage-cli` / `storine-sql`); added to the release checklist.
 

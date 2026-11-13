@@ -1,6 +1,6 @@
 # Release checklist
 
-What has to pass before a version is tagged, and how each check is run. CI (`.github/workflows/ci.yml`) covers the first two on every push, on x86_64 and arm64. The rest are run by hand on the release candidate's exact commit, and their results go in `docs/PROGRESS_LOG.md`.
+What has to pass before a version is tagged, and how each check is run. CI (`.github/workflows/ci.yml`) covers checks 1, 2 and 9 on every push, on x86_64 and arm64. The rest are run by hand on the release candidate's exact commit, and their results go in `docs/PROGRESS_LOG.md`.
 
 | # | Check | How | Pass |
 | :--- | :--- | :--- | :--- |
@@ -12,7 +12,8 @@ What has to pass before a version is tagged, and how each check is run. CI (`.gi
 | 6 | Undefined behaviour in `unsafe` code | Miri: `MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-disable-isolation" cargo +nightly miri test -p storage-codec --lib -- scratch checksum`. AddressSanitizer: `LSAN_OPTIONS=suppressions=tools/lsan.supp RUSTFLAGS=-Zsanitizer=address cargo +nightly test -Zbuild-std --target <host> --no-fail-fast -p storage-codec -p storage-mmap -p storage-wal --lib -- --skip freed_memory_can_be_released` | no report. The skipped test checks that glibc's `malloc_trim` returns memory, which it cannot under AddressSanitizer's allocator; the suppression covers a test that leaks a segment on purpose (it simulates a crash). |
 | 7 | Benchmarks | `cargo run --release -p storage-benches --bin bench-runner`, and `benches/kv-compare` against LMDB and RocksDB (`docs/BENCHMARK_REPORT.md` section 8) | no unexplained regression against the last release |
 | 8 | SDKs | each SDK's suite (commands in `tools/modal/sweep.py`, `SDK_SUITES`) against the release `storage-server` (`STORINE_SERVER`): conformance vectors, end to end on one node and a 3-node cluster, and TLS (`storines://`, certificates from `gen-ca` / `gen-cert`) | every suite passes |
-| 9 | Release notes | the version's entry in `CHANGELOG.md`: what changed, what it fixes, known limitations, and which formats and protocols changed (`docs/COMPATIBILITY.md`) | written, with numbers from checks 7 and 4–5 |
+| 9 | Binary size | `cargo build --release --workspace --bins` on Linux x86_64 (CI checks it on every push) | under the `RULE-MEM-03` ceilings: 4.5, 1.5 and 6.5 MiB |
+| 10 | Release notes | the version's entry in `CHANGELOG.md`: what changed, what it fixes, known limitations, and which formats and protocols changed (`docs/COMPATIBILITY.md`) | written, with numbers from checks 7, 4–5 and 9 |
 
 `unsafe` is allowed only in `storage-codec` and `storage-mmap` (`docs/RULES.md`), which is why check 6 covers those crates. It also covers `storage-wal`, whose tests drive the codec's frame pool from many threads.
 
