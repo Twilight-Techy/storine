@@ -169,10 +169,13 @@ fn snapshots_are_consistent_while_writers_and_merges_run() {
     s.create_columnar("acct").unwrap();
     s.columnar("acct").unwrap().unwrap().merge().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
+    // Transfers so far: the check below runs until enough happened, however slow the disk.
+    let done = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut writers = Vec::new();
     for t in 0..4u64 {
         let s = Arc::clone(&s);
         let stop = Arc::clone(&stop);
+        let done = Arc::clone(&done);
         writers.push(std::thread::spawn(move || {
             use storage_codec::field_ops::FieldOp;
             use storage_core::{DocOp, DocWrite, Precondition};
@@ -196,6 +199,7 @@ fn snapshots_are_consistent_while_writers_and_merges_run() {
                 let neg = P::Decimal(format!("-{amount}").parse::<Decimal>().unwrap());
                 s.write(vec![add(a, neg), add(b, dec(&amount))], None).unwrap();
                 n += 1;
+                done.fetch_add(1, Ordering::Relaxed);
             }
             n
         }));
@@ -217,7 +221,9 @@ fn snapshots_are_consistent_while_writers_and_merges_run() {
     let want: Decimal = "100000.00".parse().unwrap();
     let started = std::time::Instant::now();
     let mut checked = 0;
-    while started.elapsed() < std::time::Duration::from_secs(2) || checked < 150 {
+    while (started.elapsed() < std::time::Duration::from_secs(2) || checked < 150 || done.load(Ordering::Relaxed) <= 100)
+        && started.elapsed() < std::time::Duration::from_secs(120)
+    {
         checked += 1;
         let snap = c.snapshot().unwrap();
         let mut total: Decimal = "0".parse().unwrap();

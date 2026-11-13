@@ -202,11 +202,23 @@ fn test_three_node_cluster_over_tls() {
     c.authenticate(token).unwrap();
     let mut f = BTreeMap::new();
     f.insert("bal".to_string(), PropertyValue::Int64(100));
-    c.doc_write(&[DocWrite { collection: "acct".into(), key: "a".into(), op: DocOp::Put(f), precondition: Precondition::Absent }], None).unwrap();
-    for _ in 0..20 {
-        c.doc_write(&[deposit(1)], None).unwrap();
+    // A write whose commit could not be confirmed in time (`CommitUnknown`, e.g. on a slow CI
+    // disk) is retried with the same request id, as every client does: it applies once.
+    let write = |c: &mut StorageClient, w: DocWrite, id: u8| {
+        let rid = Some([id; 16]);
+        for attempt in 0.. {
+            match c.doc_write(std::slice::from_ref(&w), rid) {
+                Ok(_) => return,
+                Err(StorageError::CommitUnknown { .. }) if attempt < 10 => continue,
+                Err(e) => panic!("write {id}: {e:?} after {attempt} retries"),
+            }
+        }
+    };
+    write(&mut c, DocWrite { collection: "acct".into(), key: "a".into(), op: DocOp::Put(f), precondition: Precondition::Absent }, 0);
+    for i in 0..20 {
+        write(&mut c, deposit(1), i + 1);
     }
-    // Every write was committed by a quorum reached over TLS; a follower has it too.
+    // Every write was committed by a quorum reached over TLS, once; a follower has it too.
     let f_idx = (l + 1) % 3;
     let mut fc = StorageClient::connect_tls(nodes[f_idx].addr, &client_tls).unwrap();
     fc.authenticate(token).unwrap();
