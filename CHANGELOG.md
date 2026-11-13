@@ -24,6 +24,8 @@ Binaries for Linux, macOS and Windows, and a web console. On-disk formats, the c
 
 - **Windows: the write-ahead log could not be synced.** The WAL fsyncs through a second handle, which was opened read-only; Linux and macOS sync any descriptor, but Windows' `FlushFileBuffers` needs write access and refused, so every durable write failed. Append-mode files (Raft logs, index deltas) are now also opened for writing on Windows, with each write moved to the end. Windows had not been tested before 0.1.1; CI now runs the whole suite there.
 
+- Binary-size ceilings (`docs/RULES.md`) apply to the baseline build that ships, which is larger than a native build. Released sizes, Linux x86_64: `storage-server` 4.6 MB, `storage-cli` 1.4 MB, `storine-sql` 6.7 MB, `storine-console` 0.8 MB; macOS arm64: 3.6, 1.2, 5.2 and 0.7 MB. The ceilings are now 5.5, 1.75, 8 and 1 MiB.
+
 ### Documentation
 
 - The README is now a short introduction; [`docs/TECHNICAL.md`](docs/TECHNICAL.md) is a new technical reference written from the current code: every program, option, default and limit.

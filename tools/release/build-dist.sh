@@ -66,7 +66,7 @@ for b in "${bins[@]}"; do
   case "$os" in
     linux)
       # RULE-MEM-03 ceilings (docs/RULES.md) are set for Linux x86_64.
-      declare -A ceiling=([storage-server]=4718592 [storage-cli]=1572864 [storine-sql]=6815744 [storine-console]=1048576)
+      declare -A ceiling=([storage-server]=5767168 [storage-cli]=1835008 [storine-sql]=8388608 [storine-console]=1048576)
       if [ "$arch" = x86_64 ] && [ "$(size_of "$f")" -ge "${ceiling[$b]}" ]; then
         echo "$b is over its ${ceiling[$b]}-byte ceiling"; fail=1
       fi

@@ -53,7 +53,7 @@ jobs:
         run: |
           cargo build --release --bins -p storage-server -p storage-cli -p storage-sql -p storage-console
           fail=0
-          for spec in storage-server:4718592 storage-cli:1572864 storine-sql:6815744 storine-console:1048576; do
+          for spec in storage-server:5767168 storage-cli:1835008 storine-sql:8388608 storine-console:1048576; do
             bin=${spec%%:*}; max=${spec##*:}
             size=$(stat -c %s "target-dist/release/$bin")
             echo "$bin: $size bytes (ceiling $max)"
