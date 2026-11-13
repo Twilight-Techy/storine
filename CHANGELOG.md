@@ -22,6 +22,8 @@ Binaries for Linux, macOS and Windows, and a web console. On-disk formats, the c
 
 - A standalone server (no `--peers`) never cut its write-ahead log: nothing checkpointed its engine except an admin request, so the log grew with every write until a restart, which then replayed all of it. It now checkpoints every 10 s while it is written, as cluster nodes already did. New test: `a_standalone_server_cuts_its_wal`.
 
+- **Windows: the write-ahead log could not be synced.** The WAL fsyncs through a second handle, which was opened read-only; Linux and macOS sync any descriptor, but Windows' `FlushFileBuffers` needs write access and refused, so every durable write failed. Append-mode files (Raft logs, index deltas) are now also opened for writing on Windows, with each write moved to the end. Windows had not been tested before 0.1.1; CI now runs the whole suite there.
+
 ### Documentation
 
 - The README is now a short introduction; [`docs/TECHNICAL.md`](docs/TECHNICAL.md) is a new technical reference written from the current code: every program, option, default and limit.

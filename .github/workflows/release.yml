@@ -74,6 +74,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Changelog at the tag
+        uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          path: src
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -85,6 +92,9 @@ jobs:
           cd dist
           cat *.sha256 > SHA256SUMS
           cat SHA256SUMS
+          # Release notes: this version's section of CHANGELOG.md.
+          awk -v v="## ${TAG#v} " 'index($0, v) == 1 {f = 1; next} /^## / {f = 0} f' ../src/CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "See CHANGELOG.md." > notes.md
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
-            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Storine ${TAG#v}" --notes "See CHANGELOG.md."
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Storine ${TAG#v}" --notes-file notes.md
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber *.tar.gz *.zip SHA256SUMS

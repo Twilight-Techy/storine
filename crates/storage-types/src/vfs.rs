@@ -115,7 +115,11 @@ impl OpenOpts {
 
     fn std(self) -> OpenOptions {
         let mut o = OpenOptions::new();
-        o.read(self.read).write(self.write).append(self.append).create(self.create).truncate(self.truncate);
+        // Windows opens an append-only file without full write access, and then refuses to
+        // flush it (`FlushFileBuffers`: access denied). There it is opened for writing, and
+        // each write moves to the end first (`RealFile` / `SimFile`).
+        let (write, append) = if cfg!(windows) && self.append { (true, false) } else { (self.write, self.append) };
+        o.read(self.read).write(write).append(append).create(self.create).truncate(self.truncate);
         o
     }
 }
@@ -202,7 +206,19 @@ pub trait Vfs: Send + Sync + fmt::Debug {
 pub struct RealVfs;
 
 #[derive(Debug)]
-struct RealFile(File);
+struct RealFile(File, /** opened to append (written at the end on Windows) */ bool);
+
+impl RealFile {
+    /// On Windows an append-mode file is opened for writing (see [`OpenOpts::std`]): each
+    /// write starts at the end, as an `O_APPEND` write does elsewhere.
+    #[inline]
+    fn move_to_end_if_appending(&mut self) -> io::Result<()> {
+        if cfg!(windows) && self.1 {
+            self.0.seek(SeekFrom::End(0))?;
+        }
+        Ok(())
+    }
+}
 
 impl Read for RealFile {
     #[inline]
@@ -213,10 +229,12 @@ impl Read for RealFile {
 impl Write for RealFile {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.move_to_end_if_appending()?;
         self.0.write(buf)
     }
     #[inline]
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.move_to_end_if_appending()?;
         self.0.write_all(buf)
     }
     #[inline]
@@ -250,7 +268,7 @@ impl VfsFile for RealFile {
 
 impl Vfs for RealVfs {
     fn open(&self, path: &Path, opts: OpenOpts) -> io::Result<VfsHandle> {
-        Ok(Box::new(RealFile(opts.std().open(path)?)))
+        Ok(Box::new(RealFile(opts.std().open(path)?, opts.append)))
     }
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         fs::rename(from, to)
@@ -791,6 +809,10 @@ impl Write for SimFile {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.check()?;
         let at = if self.append { self.f.metadata()?.len() } else { self.f.stream_position()? };
+        if cfg!(windows) && self.append {
+            // Opened for writing rather than appending on Windows (see `OpenOpts::std`).
+            self.f.seek(SeekFrom::Start(at))?;
+        }
         self.mark(at);
         self.f.write(buf)
     }

@@ -245,8 +245,10 @@ fn range_cluster_under_kills_pauses_and_partitions() {
 
 /// A client that gives up on a request hangs up; the server must not keep that connection until the
 /// request answers. Clients that time out and reconnect while nothing can commit would otherwise
-/// pile up descriptors at the rate they retry (found by `TASK-151`).
+/// pile up descriptors at the rate they retry (found by `TASK-151`). It counts the server's
+/// descriptors in `/proc`, so it runs on Linux only.
 #[test]
+#[cfg_attr(not(target_os = "linux"), ignore = "counts descriptors through /proc")]
 fn abandoned_requests_do_not_hold_descriptors() {
     for (name, mode) in [("delay", Some(DELAY)), ("half-open", Some(BLACKHOLE)), ("paused followers", None)] {
         abandoned_requests(name, mode);

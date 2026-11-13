@@ -9,7 +9,10 @@ use storage_sql::exec::EngineConfig;
 
 /// Reads until the server closes; `false` if it has not within `limit`.
 fn closes_within(s: &mut TcpStream, limit: Duration) -> bool {
-    s.set_read_timeout(Some(limit)).unwrap();
+    // macOS refuses socket options on a connection the peer has already reset (EINVAL).
+    if s.set_read_timeout(Some(limit)).is_err() {
+        return true;
+    }
     let mut b = [0u8; 4096];
     let start = Instant::now();
     loop {

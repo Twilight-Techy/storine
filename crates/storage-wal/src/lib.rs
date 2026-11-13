@@ -402,8 +402,10 @@ impl GroupCommitWal {
         }
         let end = file.seek(SeekFrom::End(0))
             .map_err(|e| StorageError::io("seek WAL end", e))?;
+        // Read-write: Windows flushes only handles with write access (Linux and macOS sync
+        // any descriptor).
         let sync_file = vfs
-            .open(&path, OpenOpts::read())
+            .open(&path, OpenOpts::read_write())
             .map_err(|e| StorageError::io("open WAL sync handle", e))?;
 
         Ok(Self {
@@ -1186,7 +1188,7 @@ impl GroupCommitWal {
                 *poison = true;
                 return Err(e);
             }
-            match self.vfs.open(&self.path, OpenOpts::read()) {
+            match self.vfs.open(&self.path, OpenOpts::read_write()) {
                 Ok(h) => *self.sync_file.lock().unwrap_or_else(|p| p.into_inner()) = Arc::new(h),
                 Err(e) => {
                     // Batches would be `fsync`ed on the old file: stop accepting writes.
