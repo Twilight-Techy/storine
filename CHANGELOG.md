@@ -2,6 +2,31 @@
 
 Versions follow [Semantic Versioning](https://semver.org). Before 1.0, a minor version (0.x) may change on-disk or wire formats; [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) says what each kind of release may change and how to upgrade.
 
+## 0.1.1 (2026-11-13)
+
+Binaries for Linux, macOS and Windows, and a web console. On-disk formats, the client protocol and the node-to-node protocol are unchanged from 0.1.0: a rolling upgrade works, and 0.1.0 and 0.1.1 nodes can run in one cluster.
+
+### Added
+
+- **Release binaries** for Linux (x86_64, arm64; glibc 2.28 or newer), macOS (Apple silicon, Intel; macOS 11 or newer) and Windows (x86_64), with `SHA256SUMS`. GitHub Actions builds, checks and smoke-tests them for each tagged release (`.github/workflows/release.yml`).
+- **`storine-console`**: a web console in the browser. It shows the cluster and node health, browses, filters and edits documents with version checks, runs grouped aggregates and manages indexes. It listens on loopback, and only a browser opened with the link it prints (holding a per-run key) can use it.
+- **macOS server support**: a `kqueue` reactor, like `epoll` on Linux and AFD poll on Windows. CI now runs the full test suite on macOS and Windows too.
+- Rust SDK: `Collection::page` (one page of a query, with the total and the next page's key) and `Client::health`.
+
+### Changed
+
+- Release builds target each architecture's baseline CPU instead of the build machine's. Vector scoring (`dot_product_f32`, `cosine_similarity_f32`) moved to `storage-codec`, which picks an AVX2 + FMA copy at run time: a baseline build without it scored vectors 20 times slower. Other hot paths already picked hardware CRC32C, AES and AVX2 at run time. Measured against native builds on x86_64 and arm64: [`BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) section 8.6.
+- The bench runner's checksum benchmark measured a loop the compiler had partly hoisted on native builds. It now reads its input through `black_box`.
+
+### Fixed
+
+- A standalone server (no `--peers`) never cut its write-ahead log: nothing checkpointed its engine except an admin request, so the log grew with every write until a restart, which then replayed all of it. It now checkpoints every 10 s while it is written, as cluster nodes already did. New test: `a_standalone_server_cuts_its_wal`.
+
+### Documentation
+
+- The README is now a short introduction; [`docs/TECHNICAL.md`](docs/TECHNICAL.md) is a new technical reference written from the current code: every program, option, default and limit.
+- Corrected: the native port accepts TLS 1.2 as well as 1.3; range clusters have change feeds (`storage-cli changefeed`); request body limits differ by opcode; the SQL gateway supports functions, procedures, triggers, cursors, temporary tables, materialized views and `LISTEN` / `NOTIFY`.
+
 ## 0.1.0 (2026-11-13)
 
 The first release. Everything below is new.
@@ -52,8 +77,8 @@ Measured on AWS `c7i.xlarge` against LMDB and RocksDB at equal durability ([`doc
   - 4-writer overwrite p99.99 is 2.3–3.0 ms, against 0.46–1.32 ms.
   - Durable p99.9 and p99.99 trail LMDB.
 - Arena segments can hold up to twice the live data until compaction reclaims them.
-- TLS supports one suite: TLS 1.3 with `TLS_CHACHA20_POLY1305_SHA256`, x25519 and Ed25519 certificates. Certificates from other CAs must use Ed25519 keys. Clients are not asked for certificates; they authenticate with tokens.
-- Change feeds are not in the wire protocol yet.
+- TLS supports one suite per version: TLS 1.3 with `TLS_CHACHA20_POLY1305_SHA256`, and TLS 1.2 with `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` for clients without 1.3; x25519 and Ed25519 certificates. Certificates from other CAs must use Ed25519 keys. Clients are not asked for certificates; they authenticate with tokens.
+- Change feeds exist for range clusters only (`storage-cli changefeed`), and the SDKs do not expose them.
 - Soak testing ran for 2 hours per mode under constant kills, pauses and partitions; both modes passed with balances conserved and every key linearizable. No multi-day soak has been run.
 - A range-cluster node peaked at 1.12 GiB of resident memory in the soak, against 334 MiB for a single-group node.
 - Upgrading from one 0.x minor version to another needs a stop of the whole cluster or a backup and restore. Rolling upgrades are supported only between patch releases of the same minor version ([`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)).

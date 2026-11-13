@@ -266,3 +266,9 @@ Yes:
 - **Verified** on the release candidate: workspace suite and 40 of 40 chaos runs on x86_64 and arm64, and both 2-hour soaks (balances conserved; single group RSS at most 334 MiB, ranges at most 1.12 GiB and level after the first hour). About $2.40 on AWS.
 - Binary-size budget raised by the user to 4.5 / 1.5 / 6.5 MiB (`storage-server` / `storage-cli` / `storine-sql`); added to the release checklist.
 
+### Binaries and web console (`TASK-155`, 0.1.1) — 2026-11-13
+
+- Release binaries for Linux, macOS and Windows from GitHub Actions; portable CPU targets measured equal to native once vector scoring got an FMA copy chosen at run time.
+- `storine-console`: browse, edit, query, aggregate and index from a browser.
+- macOS `kqueue` reactor; CI on all three systems.
+

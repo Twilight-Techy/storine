@@ -1,5 +1,7 @@
 # Features Specification: Storine Full-Scale Production Storage Engine & Distributed Database
 
+> This is the original feature specification, kept for its feature ids (`F-…`), which tasks and code comments cite. Some rows describe plans or early designs that changed. For how Storine works today, read [`TECHNICAL.md`](TECHNICAL.md).
+
 ## 1. Core Storage & Zero-Copy Memory Engine (`v0.1 – v0.8` Completed)
 
 | Feature ID | Feature Name | Description | Target Tier |

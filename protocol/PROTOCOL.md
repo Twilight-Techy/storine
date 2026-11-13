@@ -10,9 +10,10 @@ All integers are **little-endian**. `str` = `u32` byte length + UTF-8 bytes. Siz
 ## 1. Connection
 
 - TCP, default port `7878`. A server started with a certificate (`STORAGE_TLS_CERT` /
-  `STORAGE_TLS_KEY`) requires TLS 1.3 on that port from every client, and its peers reach it over
-  TLS too; the framing below then runs inside the TLS stream. The server offers
-  `TLS_CHACHA20_POLY1305_SHA256`, `x25519` and an Ed25519 certificate: clients must accept
+  `STORAGE_TLS_KEY`) requires TLS on that port from every client, and its peers reach it over
+  TLS too; the framing below then runs inside the TLS stream. The server offers TLS 1.3 with
+  `TLS_CHACHA20_POLY1305_SHA256` (TLS 1.2 with `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` for
+  clients without 1.3), `x25519` and an Ed25519 certificate: clients must accept
   Ed25519 (every SDK's platform does, except .NET on Windows, whose TLS stack has no Ed25519).
 - One request at a time per connection: send a request, read its response, repeat. Use one
   connection per thread / task, or a pool.
@@ -42,7 +43,9 @@ All integers are **little-endian**. `str` = `u32` byte length + UTF-8 bytes. Siz
 | 9 | 4 | `body_len` (`u32`) |
 | 13 | `body_len` | body |
 
-Bodies are capped at 256 MiB. A request rejected before its body was read (unauthorized,
+Bodies are capped per opcode, checked from the header before the body is read: 256 MiB for writes,
+1 MiB for queries, aggregates, collection commands and scans, 128 KiB for `OP_DOC_GET`, 4 KiB for
+`OP_AUTH`, 16 bytes for `OP_SET_OPTIONS` and 512 bytes for `OP_CLUSTER_CHANGE`. A request rejected before its body was read (unauthorized,
 too large, rate limited) gets an error response **and the server closes the connection**: reconnect.
 
 ## 3. Status codes
@@ -311,6 +314,8 @@ reads go to the leader unless the user enabled follower reads (then send `OP_SET
 `0x01`–`0x0B`, `0x24 OP_TXN` and the admin opcodes operate on raw engine record frames and are
 documented in `crates/storage-server/src/lib.rs`. SDKs do not need them.
 
-## 8. Not yet in the protocol (TODO)
+## 8. Not yet in this specification
 
-Streaming change feeds.
+Range clusters answer `OP_CHANGEFEED` (`0x2E`, admin role): a poll-based feed of every change,
+used by `storage-cli changefeed`. Its body and those of the other range-cluster opcodes (`0x2B`–`0x2D`)
+are internal and may change between minor versions; SDKs do not use them.

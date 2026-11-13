@@ -20,6 +20,7 @@ pub mod scratch;
 pub mod sealed_file;
 pub mod simd;
 pub mod types;
+pub mod vector;
 pub mod value_wire;
 
 pub use archive::{

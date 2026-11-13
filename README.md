@@ -1,291 +1,140 @@
-# Storine
+<p align="center">
+  <img src="docs/images/logo.svg" alt="" width="72" height="72">
+</p>
 
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
-[![Rust Edition: 2021](https://img.shields.io/badge/rust-2021%20edition-orange.svg)](Cargo.toml)
-[![Zero External Dependencies](https://img.shields.io/badge/dependencies-zero%20external%20crates-brightgreen.svg)](Cargo.toml)
+<h1 align="center">Storine</h1>
 
-**Storine** is an ultra-fast, zero-copy, memory-mapped embedded storage engine and sharded non-blocking TCP server written in pure Rust with **zero third-party runtime dependencies**.
+<p align="center">
+  <strong>A fast document database you can embed, run as a server, or replicate across a cluster.</strong><br>
+  Written in Rust, with no third-party dependencies.
+</p>
 
-It is engineered for workloads requiring **sub-microsecond reads (`~60 ns` p50)**, **zero heap allocations on hot read paths**, **coalesced sub-microsecond writes (`~0.9 µs` p50 with `SyncPolicy::AsyncMemoryFirst`)**, **hybrid secondary + SIMD vector search**, **bidirectional relational links (`1:1`, `1:N`, `M:N`)**, and **million-connection scalability (`~88 bytes` per idle TCP connection)**.
+<p align="center">
+  <a href="https://github.com/Twilight-Techy/storine/releases/latest"><img src="https://img.shields.io/github/v/release/Twilight-Techy/storine?label=release" alt="Latest release"></a>
+  <a href="https://github.com/Twilight-Techy/storine/actions/workflows/ci.yml"><img src="https://github.com/Twilight-Techy/storine/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License: MIT or Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/dependencies-none-brightgreen.svg" alt="No dependencies">
+</p>
 
----
+<p align="center">
+  <a href="#get-started">Get started</a> ·
+  <a href="#clients">Clients</a> ·
+  <a href="#run-a-cluster">Clusters</a> ·
+  <a href="docs/TECHNICAL.md">Technical reference</a> ·
+  <a href="CHANGELOG.md">Changelog</a>
+</p>
 
-## Key Features
+<p align="center">
+  <img src="docs/images/console-documents.png" alt="The Storine console showing a collection of documents with a filter and a document open for editing" width="900">
+</p>
 
-- **Zero-Copy Memory-Mapped Reads (`0.00 Allocs/Op`)**:
-  - 64-byte cache-line-aligned record frames (`[RecordHeader (64B) | Relative-Offset Archive Payload]`) are memory-mapped directly from disk into virtual address space and read in place (`~200 ns` p50 via `StorageEngine::with_ref`) without deserializing or allocating heap memory. Bytes are validated once when first mapped; every later read is a safe O(1) bounds-checked decode, so corrupted or hostile bytes can never cause undefined behavior.
-- **Dual-Tier Storage & Write Coalescing**:
-  - Hot updates land immediately in a 64-way sharded in-RAM write buffer (`hot_dirty`, capped by `max_hot_dirty_bytes`) and are coalesced in the background into 4 KiB-growable, 64-byte-aligned arena segment files (`seg_XXXXX.dat`), eliminating up to **71.6% of redundant physical disk writes**.
-- **Group-Commit Write-Ahead Log (WAL) & Torn-Frame Recovery**:
-  - `SyncPolicy::Immediate` (`fsync` per write), `SyncPolicy::GroupCommit` (concurrent writers share one `fsync`), and `SyncPolicy::AsyncMemoryFirst` (buffered, written to the OS by the background flusher, never `fsync`ed: a crash can lose the last flush interval). Recovery ignores torn trailing frames and replays only committed transactions; the WAL fails stop on I/O errors instead of acknowledging writes of unknown durability.
-- **End-to-End Hardware Checksum Verification**:
-  - Every 64-byte `RecordHeader` and payload is protected by a 4-lane XXH64-family hash combined with a dual-lane `CRC32C` (SSE4.2 `_mm_crc32_u64` when available, a bit-identical portable table otherwise, so files are readable across builds and CPUs), catching single-bit flips on both disk and network paths.
-- **Hybrid Indexing & $O(N + K \log K)$ SIMD Vector Search**:
-  - **Primary Index**: 64-shard cache-line-padded hash index keyed by 24-byte stack-allocated `InlineId`s (`3 ns` hash + equality), persisted in a compact varint checkpoint (`primary.idx` at `~21 bytes/record`, ordinals included so persisted ordinal-keyed indexes survive restarts).
-  - **Tag Index**: Word-aligned `CompactBitmap` inverted index driving multi-tag `AND`/`OR` intersections from the smallest posting list via hardware `TZCNT`.
-  - **Numeric Range Index**: IEEE-754 order-preserving `BTreeMap` index supporting fast `[min, max]` range scans.
-  - **Index Tiers**: `IndexTier::Memory` (default; rebuilt at open) or `IndexTier::Paged` (memory-mapped 4 KiB B+Tree pages and 512 B bitmap blocks; RAM bounded by page directories plus the recent delta; persisted at checkpoints and reused after a clean shutdown).
-  - **Vector Similarity Search**: 8-way unrolled SIMD cosine similarity (`87 ns` per 64-dim vector) paired with Hoare/Floyd-Rivest Quickselect (`select_nth_unstable_by`) for linear $O(N)$ top-$K$ partitioning.
-- **Deadlock-Free Bidirectional Relational Graph (`1:1`, `1:N`, `M:N`)**:
-  - First-class `OneToOne`, `OneToMany`, and `ManyToMany` containers with canonical lock ordering (`StripedLockTable::lock_many`) that mathematically prevents AB-BA deadlocks during concurrent bidirectional link updates.
-- **Tiered Primary Index (optional)**:
-  - `EngineConfig::primary_tier = PrimaryTier::Cold` keeps the primary index and ordinal table as of the last checkpoint in an immutable on-disk generation; RAM holds only what changed since (plus a Bloom filter and page directory), and opening maps the tier instead of loading every entry.
-- **Encryption at Rest (optional)**:
-  - `EngineConfig::encryption` seals record frames on disk and in the WAL with ChaCha20-Poly1305, authenticated against their record id and metadata. Warm reads stay zero-allocation via a bounded decrypted-frame cache. Index files (`primary.idx`, `hnsw.idx`, paged secondary indexes) are sealed too; file names, sizes and WAL frame headers stay visible.
-  - Key ring with online enable / disable and key rotation (`set_encryption` + `reseal_all`, which also scrubs superseded copies).
-  - Per-record policy (`Indexable::protection`): encrypt confidential records, authenticate-only (plaintext + MAC, tamper-proof) the rest.
-- **Sharded Non-Blocking TCP Server (`StorageServer`)**:
-  - Fixed pool of `ReactorShard` worker threads multiplexing non-blocking sockets (`NonBlockingConn`, `~88 bytes` per idle connection) with zero-allocation vectored `IoSlice` socket writes and dynamic `max_connections` admission control.
-  - Optional TLS 1.3 on the native port (`STORAGE_TLS_CERT` / `STORAGE_TLS_KEY`, zero-dependency `storage-tls`): handshakes run off the reactors with a deadline, so a slow client never stalls an event loop. Cluster nodes reach each other on the same port, so their Raft and range traffic is encrypted and their certificates checked too.
-- **Client SDKs** ([`sdks/`](sdks)):
-  - Python, TypeScript, Go, Java, C#, Rust, PHP and Ruby clients with one shared API, no runtime dependencies, exact decimals, at-most-once retries and automatic leader failover, all checked against the same protocol vectors ([`protocol/PROTOCOL.md`](protocol/PROTOCOL.md)).
-- **SQL Gateway for Existing Apps (`storine-sql`)** ([`crates/storage-sql`](crates/storage-sql/README.md)):
-  - Speaks the PostgreSQL, MySQL and SQL Server wire protocols and their SQL dialects, so applications built on psycopg, node-postgres, JDBC, ADO.NET, Django, Rails, Laravel, Prisma, Hibernate, Entity Framework and others run on Storine by changing only the connection string. Writes are versioned (no lost updates), constraints are enforced atomically, and TLS 1.3 / 1.2 is built in.
+## Why Storine
 
----
+- **Fast where it counts.** Reads take about 60 nanoseconds in process and 9 microseconds over the network. Against LMDB and RocksDB at equal durability, Storine leads every throughput row and every p99 row ([benchmarks](docs/BENCHMARK_REPORT.md)).
+- **Documents, done properly.** Collections of JSON-like documents with secondary indexes, vector search, exact decimals and server-side aggregates. Changes are atomic: transfer money between two documents and it either all happens or none of it does.
+- **One engine, three ways to run it.** Link it into a Rust program, run `storage-server`, or start three servers and get a replicated cluster with automatic failover. Range-partitioned clusters spread data across more nodes and keep transactions across them.
+- **Speaks your stack.** Clients for eight languages, and a SQL gateway that speaks the PostgreSQL, MySQL and SQL Server protocols, so existing apps can switch by changing a connection string.
+- **Security built in.** A server refuses to listen beyond localhost until you give it tokens, each with a role. Two settings turn on TLS for clients and between cluster nodes, with certificates the server can issue itself. Embedded, the engine also encrypts data at rest, with key rotation.
+- **Small and self-contained.** Each tool is a single file of a few megabytes, with nothing else to install.
 
-## Architecture Overview
+| Against LMDB and RocksDB, 1,000,000 keys | Storine | RocksDB | LMDB |
+| :--- | ---: | ---: | ---: |
+| Random reads, 4 threads | **4.1–4.2 M/s** | 0.96–1.04 M/s | 2.9–3.2 M/s |
+| Overwrites, 4 threads | **1.30–1.36 M/s** | 0.54–0.59 M/s | 0.13 M/s |
+| Durable writes (fsync), 4 threads | **3,000/s** | 860/s | 470/s |
 
-```mermaid
-flowchart TD
-    Client["StorageClient / Local Caller"] -->|"TCP Binary Protocol or Direct Rust API"| Server["StorageServer (Sharded Non-Blocking Reactor)"]
-    Client --> Engine["StorageEngine&lt;T&gt;"]
-    Server --> Engine
+<sub>AWS `c7i.xlarge`, three rounds each; details and the cases where Storine trails in [section 8.5](docs/BENCHMARK_REPORT.md).</sub>
 
-    subgraph Concurrency ["Concurrency & Admission Layer"]
-        Locks["StripedLockTable (2,048 Cache-Line-Padded Stripes)"]
-        Coalescer["WriteCoalescer (Deduplicated Dirty Queue)"]
-    end
+## Get started
 
-    subgraph Indexes ["In-Memory Index Layer (Zero Duplicate Payload Maps)"]
-        Primary["PrimaryIndex (64-Shard InlineId -> StorageLocation + Ordinal)"]
-        Bitmap["BitmapTagIndex (Word-Aligned Bitmaps)"]
-        BTree["NumericRangeIndex (Order-Preserving f64 B-Tree)"]
-        Vector["Zero-Copy Mmap SIMD Vector Scorer (O(N + K log K))"]
-    end
+**1. Download** the archive for your system from the [latest release](https://github.com/Twilight-Techy/storine/releases/latest) and unpack it.
 
-    subgraph Storage ["Storage & Durability Layer"]
-        HotDirty["Sharded hot_dirty Buffer (Hard 64 MiB Cap)"]
-        WAL["GroupCommitWal (Batched fsync + Torn-Frame Recovery)"]
-        Arena["ArenaManager (4 KiB -> 64 MiB Segments + Live Compaction)"]
-        Pool["MmapPool (4-Shard Clock-PRO / Second-Chance Eviction)"]
-    end
+| System | Archive |
+| :--- | :--- |
+| Linux (x86_64, arm64) | `storine-<version>-x86_64-linux.tar.gz`, `storine-<version>-aarch64-linux.tar.gz` |
+| macOS (Apple silicon, Intel) | `storine-<version>-aarch64-macos.tar.gz`, `storine-<version>-x86_64-macos.tar.gz` |
+| Windows (x86_64) | `storine-<version>-x86_64-windows.zip` |
 
-    Engine --> Locks
-    Engine --> Primary
-    Engine --> Bitmap
-    Engine --> BTree
-    Engine --> Vector
-    Primary --> HotDirty
-    Primary --> Arena
-    Arena --> Pool
-    Engine --> WAL
-    Engine --> Coalescer
-    Coalescer -->|"Background Batch Flush"| Arena
+**2. Start a server:**
+
+```bash
+bin/storage-server ./data 127.0.0.1:7878
 ```
 
----
+**3. Open the console** in another terminal, and follow the link it prints:
 
-## Workspace Crates
+```bash
+bin/storine-console storine://127.0.0.1:7878
+```
 
-| Crate | Path | Description |
+**4. Use it from your code**, here in Python:
+
+```python
+from decimal import Decimal
+import storine
+from storine import add
+
+db = storine.connect("storine://127.0.0.1:7878")
+accounts = db.collection("accounts")
+accounts.insert("alice", {"owner": "Alice", "balance": Decimal("100.00")})
+
+# Exact and atomic on the server: no lost updates, no overdraft.
+accounts.update("alice", add("balance", Decimal("-25.00"), min=0))
+```
+
+Prefer building it yourself? `cargo build --release` with Rust 1.82 or newer.
+
+## The console
+
+`storine-console` is a web console for any Storine server or cluster. Browse and edit documents (edits check the version, so you never overwrite someone else's change), filter and sort, run grouped aggregates, manage indexes, and watch the cluster and each node's health. It runs on your machine and only a browser holding the link it prints can use it.
+
+| Analytics | Overview, dark mode |
+| :---: | :---: |
+| <img src="docs/images/console-analytics.png" alt="Grouped aggregates by city" width="440"> | <img src="docs/images/console-overview-dark.png" alt="Cluster and health overview in dark mode" width="440"> |
+
+## Clients
+
+| Language | Package | |
 | :--- | :--- | :--- |
-| **`storage-types`** | [`crates/storage-types`](crates/storage-types) | Core primitives: 24-byte `InlineId`, 64-byte `RecordHeader`, `RecordOrdinal`, `Version`, `CachePadded<T>`, and unified `StorageError`. |
-| **`storage-codec`** | [`crates/storage-codec`](crates/storage-codec) | Zero-copy relative-offset archive format (`ArchivedString`, `ArchivedSlice<T>`, `ArchivePod` + `impl_archive_pod!`), archived relationship types, `AlignedBytes`, LZ4-style compression, checksums, and RFC 8439 ChaCha20-Poly1305 primitives. |
-| **`storage-mmap`** | [`crates/storage-mmap`](crates/storage-mmap) | Cross-platform OS memory mapping (Win32 `CreateFileMappingW` / POSIX `mmap`), 4-shard Clock-PRO `MmapPool`, and `ArenaManager` with live compaction. |
-| **`storage-wal`** | [`crates/storage-wal`](crates/storage-wal) | `GroupCommitWal` batching concurrent durable writes, torn-frame-tolerant recovery, checkpoint truncation and optional WAL archiving for PITR. |
-| **`storage-index`** | [`crates/storage-index`](crates/storage-index) | 64-shard `PrimaryIndex`, compact `STGEIDX2` checkpointing, `BitmapTagIndex`, `NumericRangeIndex`, and SIMD cosine similarity kernel. |
-| **`storage-graph`** | [`crates/storage-graph`](crates/storage-graph) | Bidirectional `OneToOne`, `OneToMany`, and `ManyToMany` relational containers and referential integrity verifiers. |
-| **`storage-core`** | [`crates/storage-core`](crates/storage-core) | Unified `StorageEngine<T>`, `RecordRef<T>`, `WriteCoalescer`, `StripedLockTable`, hybrid query planner, and chaos crash-recovery tests. |
-| **`storage-tls`** | [`crates/storage-tls`](crates/storage-tls) | Zero-dependency TLS 1.3 / 1.2 (ChaCha20-Poly1305, x25519, Ed25519): server, client with certificate checks, a record layer for non-blocking sockets, and CA / certificate issuing. |
-| **`storage-server`** | [`crates/storage-server`](crates/storage-server) | Sharded non-blocking TCP event reactor (`StorageServer<T>`) with optional TLS and binary client (`StorageClient`) with runtime `max_connections` admission control. |
-| **`storage-cli`** | [`crates/storage-cli`](crates/storage-cli) | Command-line inspection, CRUD, hybrid search, compaction, and diagnostics utility. |
-| **`storage-sql`** | [`crates/storage-sql`](crates/storage-sql) | `storine-sql`: PostgreSQL / MySQL / SQL Server wire-compatible SQL gateway over Storine documents (see its [README](crates/storage-sql/README.md)). |
-| **`benches`** | [`benches`](benches) | Release benchmark harness with custom `TrackingAllocator` enforcing `0.00` heap allocations on hot read paths. |
+| Python 3.8+ | [`sdks/python`](sdks/python) | `decimal.Decimal` for money |
+| TypeScript / Node.js 18+ | [`sdks/typescript`](sdks/typescript) | exact `Decimal` |
+| Go 1.21+ | [`sdks/go`](sdks/go) | |
+| Java 17+ | [`sdks/java`](sdks/java) | `BigDecimal` |
+| C# / .NET 8+ | [`sdks/csharp`](sdks/csharp) | `decimal` |
+| Rust 1.70+ | [`sdks/rust`](sdks/rust) | |
+| PHP 8.1+ | [`sdks/php`](sdks/php) | |
+| Ruby 3.2+ | [`sdks/ruby`](sdks/ruby) | |
+| SQL | [`storine-sql`](crates/storage-sql/README.md) | PostgreSQL, MySQL and SQL Server protocols |
 
----
+Every client has the same API, needs nothing beyond its language's standard library (Ruby also uses the `bigdecimal` gem), retries without ever applying a write twice, and fails over to a cluster's new leader on its own. TLS in the Rust client needs Rust 1.82.
 
-## Quick Start
+## Run a cluster
 
-### 1. Embedded Engine Usage (Rust)
+Three servers that know each other form a replicated cluster: writes are acknowledged once a majority has them, and if the leader stops, another takes over on its own.
 
-```rust
-use storage_core::{AgentObjectRecord, EngineConfig, StorageEngine, FIELD_PRIMARY_TAG, FIELD_SCORE};
-use storage_types::InlineId;
-
-fn main() -> storage_types::Result<()> {
-    let engine = StorageEngine::<AgentObjectRecord>::open("./data", EngineConfig::default())?;
-
-    let id = InlineId::from_static("agent:atlas-01");
-    let mut record = AgentObjectRecord::new(id, "Atlas Memory Node", 1_700_000_000, 950);
-    record.tags = vec![InlineId::from_static("ai"), InlineId::from_static("memory")];
-    record.embedding = vec![0.25; 64];
-
-    // 1. Insert or overwrite (WAL-logged, then coalesced to disk in the background)
-    let version = engine.put(id, &record)?;
-    assert_eq!(version.0, 1);
-
-    // 2. Zero-allocation read straight from the in-memory frame or mmap
-    engine.with_ref(id, |view| {
-        println!("Title: {}, Score: {}", view.get_str(&view.title), view.score);
-    })?;
-
-    // 3. Hybrid query: tag bitmap AND numeric range, then top-K SIMD vector similarity
-    let ids = engine
-        .query()
-        .filter_tag(FIELD_PRIMARY_TAG, InlineId::from_static("ai"))
-        .filter_range(FIELD_SCORE, 900..=1000)
-        .execute_ids();
-    let hits = engine
-        .query()
-        .filter_tag(FIELD_PRIMARY_TAG, InlineId::from_static("ai"))
-        .top_k_similar(&[0.25; 64], 10);
-    println!("{} range matches, top hit: {:?}", ids.len(), hits.first().map(|(id, _)| *id));
-
-    // 4. Make everything durable on disk before exiting
-    engine.flush_all()?;
-    Ok(())
-}
-```
-
-### 2. Network Server & Client Usage
-
-```rust
-use std::sync::Arc;
-use storage_core::{AgentObjectRecord, EngineConfig, StorageEngine};
-use storage_server::{decode_agent_frame, StorageClient, StorageServer};
-use storage_types::InlineId;
-
-fn main() -> storage_types::Result<()> {
-    let engine = Arc::new(StorageEngine::<AgentObjectRecord>::open(
-        "./server_data",
-        EngineConfig::default(),
-    )?);
-
-    // Without authentication the server only accepts a loopback bind address.
-    let mut server = StorageServer::start_with_max_connections(
-        "127.0.0.1:7878",
-        Arc::clone(&engine),
-        250_000,
-    )?;
-
-    // Adjust the connection ceiling at runtime without restarting
-    server.set_max_connections(500_000);
-
-    let mut client = StorageClient::connect(server.local_addr())?;
-    let id = InlineId::from_static("net:item-01");
-    let rec = AgentObjectRecord::new(id, "Zero-Copy Network Record", 1_700_000_000, 42);
-
-    client.put(id, &rec)?;
-    let frame = client.get_frame(id)?;
-    let view = decode_agent_frame(&frame)?;
-    assert_eq!(view.get_str(&view.title), "Zero-Copy Network Record");
-
-    server.stop();
-    Ok(())
-}
-```
-
-For a network-reachable server, build a `SecurityConfig` with tokens (`SecurityConfig::new(true).with_token(token, RbacRole::ReadWrite)`) and start the server with it with `StorageServer::start_with_config(addr, engine, max_connections, security)`; clients call `client.authenticate(token)` first. The standalone binary reads the same settings from `STORAGE_AUTH_TOKENS` (below).
-
----
-
-## CLI & Standalone Server
-
-### Build All Binaries
 ```bash
-cargo build --release
+STORAGE_AUTH_TOKENS="cluster-admin-token-0001:admin" STORAGE_CLUSTER_TOKEN="node-to-node-secret-0001" \
+  storage-server ./n1 10.0.0.1:7878 --node-id 1 --peers 1=10.0.0.1:7878,2=10.0.0.2:7878,3=10.0.0.3:7878
+# the same on 10.0.0.2 (--node-id 2) and 10.0.0.3 (--node-id 3)
 ```
 
-### Run the TCP Server
-```bash
-# Default (./server_data on 127.0.0.1:7878, max_connections = 100,000, no authentication)
-cargo run --release -p storage-server
+Clients list the servers and find the leader themselves: `storine://token@10.0.0.1:7878,10.0.0.2:7878,10.0.0.3:7878`. Add `--ranges` to partition data across nodes, and certificates to encrypt everything between them: the [technical reference](docs/TECHNICAL.md#7-clusters) covers both.
 
-# Network-reachable server: authentication is mandatory for non-loopback addresses
-STORAGE_AUTH_TOKENS="change-me-admin-token:admin,change-me-app-token1:write" \
-STORAGE_BACKUP_ROOT=./backups \
-cargo run --release -p storage-server -- ./server_data 0.0.0.0:7878 --max-connections 500000
-```
-Environment settings:
-- `STORAGE_AUTH_TOKENS`: comma-separated `token:role` pairs (`read`, `write`, `admin`; tokens of at least 16 characters). Without it the server refuses any non-loopback bind address.
-- `STORAGE_BACKUP_ROOT`: directory under which remote `OP_ADMIN_BACKUP` may create backups (disabled when unset).
-- `STORAGE_RATE_LIMIT`: per-connection `rps:burst` token bucket.
-- `STORAGE_MAX_CONNECTIONS`: connection ceiling (overridden by `--max-connections`).
-- `STORAGE_TLS_CERT` / `STORAGE_TLS_KEY`: a PEM certificate and PKCS#8 Ed25519 key. With them the port requires TLS 1.3 from every client and peer.
-- `STORAGE_TLS_CA`: the PEM certificates nodes trust when they call each other (default: the node's own certificate). Each peer's certificate must name the host it is listed under in `--peers`.
+## Learn more
 
-TLS certificates without OpenSSL:
-```bash
-storage-server gen-ca ./tls/ca                                   # ca.crt, ca.key (keep ca.key offline)
-storage-server gen-cert ./tls/ca ./tls/node1 10.0.0.1,db1.internal   # node.crt, node.key for one node
-STORAGE_TLS_CERT=./tls/node1/node.crt STORAGE_TLS_KEY=./tls/node1/node.key STORAGE_TLS_CA=./tls/ca/ca.crt \
-STORAGE_AUTH_TOKENS="change-me-admin-token:admin" storage-server ./server_data 0.0.0.0:7878
-```
-Clients connect with `storines://host:7878?tls_ca=/path/ca.crt` (every SDK), and the CLI with `STORAGE_TLS_CA`.
+| | |
+| :--- | :--- |
+| [Technical reference](docs/TECHNICAL.md) | How it works, every option, operations, limits |
+| [Wire protocol](protocol/PROTOCOL.md) | For writing a client |
+| [Benchmarks](docs/BENCHMARK_REPORT.md) | Every measurement, with the method and the machine |
+| [Compatibility and upgrades](docs/COMPATIBILITY.md) | What each release may change, and how to upgrade |
+| [SQL gateway](crates/storage-sql/README.md) | Supported SQL and drivers |
+| [Changelog](CHANGELOG.md) | Every release, with known limitations |
 
-### Run the CLI Utility
-```bash
-cargo run --release -p storage-cli -- put ./data agent_01 "Primary Node" 100 "ai,core"
-cargo run --release -p storage-cli -- get ./data agent_01
-cargo run --release -p storage-cli -- stats ./data
-cargo run --release -p storage-cli -- compact ./data
-```
-Backups and point-in-time recovery: `backup <db_dir> <backup_dir>`, `archive-wal <db_dir> <backup_dir>`, `restore-pitr <backup_dir> <restore_dir> <ts_ns>` (these open the engine with WAL archiving enabled, which PITR requires). Remote admin commands (`remote-health`, `remote-backup`, ...) authenticate with `STORAGE_TOKEN`.
+## Status
 
-### Run the SQL Gateway
-```bash
-cargo build --release -p storage-sql
-# Embedded database; PostgreSQL on :5432, MySQL on :3306, SQL Server on :1433 (TLS on by default)
-target/release/storine-sql --data ./sql_data --user app:secret
-# Or in front of a running Storine server / cluster
-target/release/storine-sql --storine storine://h1:7878,h2:7878,h3:7878 --user app:secret
-```
-Then use `postgresql://app:secret@127.0.0.1:5432/shop`, `mysql://app:secret@127.0.0.1:3306/shop` or `Server=tcp:127.0.0.1,1433;Database=shop;User ID=app;Password=secret;TrustServerCertificate=true` in the application. A client that has not logged in after 30 s is closed, and `--max-connections N` (default 1024) caps open connections. `--oidc-*` and `--kerberos-keytab` need at least one `--user`. Details, supported SQL and limitations: [`crates/storage-sql/README.md`](crates/storage-sql/README.md).
-
----
-
-## Verified Benchmarks & Footprint
-
-Measured with `cargo run --release -p storage-benches` (`opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `-C target-cpu=native`) with allocation tracking enabled. The engine benchmarks use `SyncPolicy::AsyncMemoryFirst` (no `fsync` per write), so write latencies are memory-first numbers, not durable-commit numbers.
-
-| Workload | `p50` Latency | Heap Allocs / Op |
-| :--- | ---: | ---: |
-| **`InlineId` (24B) Hash + Eq** | `< 1 ns` | **`0.00`** |
-| **Zero-Copy `RecordView` Read (`decode_unchecked`)** | `2 ns` | **`0.00`** |
-| **SIMD Cosine Similarity (`64-dim f32`, 8-way unrolled)** | `22 ns` | **`0.00`** |
-| **`StorageEngine::with_ref` (0-Alloc Hot Read)** | **`58 ns`** | **`0.00`** |
-| **`StorageEngine::get_ref` (Mmap Arena Segment)** | **`62–71 ns`** | **`0.00`** |
-| **Checksum (`XXH64-family + CRC32C`, 4 KB)** | `347 ns` | **`0.00`** |
-| **`StorageEngine::update` (Coalesced Hot Write)** | **`0.85–0.87 µs`** | `3.00` |
-| **Secondary Index (`Tag Bitmap + B+Tree Range`)** | **`2.1–2.2 µs`** | `1.00` |
-| **`StorageServer` TCP Binary `GET` Frame RPC (loopback)** | **`8.6–9.0 µs`** | `1.00` *(client side)* |
-| **The same over TLS 1.3** | **`11.5–11.7 µs`** | `3.00` *(client side)* |
-
-Five runs on an AWS `c7i.xlarge` (2026-11-13). Against LMDB and RocksDB at equal durability, Storine leads every throughput row and every p99 row of `benches/kv-compare`. For example, 4.1–4.2 M random reads per second on 4 threads (LMDB 2.9–3.2 M), and 1.30–1.36 M overwrites per second on 4 threads (RocksDB 0.54–0.59 M). The tails where it still trails are listed in the report (section 8.5) and in [`CHANGELOG.md`](CHANGELOG.md).
-
-### Memory & Disk Efficiency Highlights
-- **Per-Connection Server Footprint**: `~88 bytes` per idle `NonBlockingConn` (`~88 MB` for 1,000,000 idle connections vs `~2.1 TB` for thread-per-connection servers).
-- **Primary Index Checkpoint (`primary.idx`)**: `~21 bytes / record` (`4.2x` smaller than the fixed-row v1 format via varint + compact `InlineId` encoding).
-- **Persisted Vector Graph (`hnsw.idx`)**: saved at checkpoints and reused at open (reconciled against the records), so restarts do not rebuild the HNSW graph.
-- **Zero Duplicate In-RAM Index/Vector Maps**: Secondary index snapshots and float embeddings are read zero-copy directly from the memory-mapped `&T::Archived` frame (`0 bytes/record` of duplicate heap maps).
-- **Release Binaries**: self-contained, no shared libraries beyond libc: `storage-server` **3.9 MB**, `storage-cli` **1.3 MB**, `storine-sql` **5.6 MB** (Linux x86_64, fat LTO, stripped). Each stays under its ceiling in `docs/RULES.md` (`RULE-MEM-03`): 4.5, 1.5 and 6.5 MiB.
-
-See [`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) for the complete latency and footprint verification report.
-
----
-
-## Contributing
-
-Contributions are welcome! Please read [`CONTRIBUTING.md`](CONTRIBUTING.md) for our architecture invariants, safety rules, and testing workflow before submitting a pull request.
-
----
+Storine 0.1 is the first release. Its test suite, crash tests and 2-hour soak tests under constant faults pass on every release, but it has not yet run in production for long. Read the [known limitations](CHANGELOG.md) before you rely on it, and back up.
 
 ## License
 
-Dual-licensed under either of:
-
-- **MIT License** ([`LICENSE`](LICENSE) or <https://opensource.org/licenses/MIT>)
-- **Apache License, Version 2.0** ([`LICENSE-APACHE`](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
-
-at your option.
+MIT or Apache-2.0, at your option.

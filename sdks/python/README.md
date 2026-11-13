@@ -44,7 +44,7 @@ for d in accounts.scan():               # every document, any collection size
 | `c.update(key, *changes, if_version=None)` | Atomic server-side changes: `set_`, `unset`, `add(path, amount, min=, max=)`, `append`, or a `{field: value}` dict. |
 | `c.delete(key, if_version=None)` | `True` if it existed. |
 | `c.find(where, order_by=, limit=, offset=)` / `c.first(...)` / `c.count(where)` / `c.scan(where)` | Queries. `where` is a filter (`eq`, `ne`, `lt`, `le`, `gt`, `ge`, `between`, `in_`, `prefix`, `contains`, `exists`, `missing`, `key_prefix`, combined with `&`, `|`, `~`) or `{field: value}`. `order_by="-price"` sorts descending. |
-| `c.create_index(field)` / `c.drop_index(field)` / `c.info()` / `c.drop()` | Indexes (up to 4 per collection) and collection management. |
+| `c.create_index(field)` / `c.drop_index(field)` / `c.info()` / `c.drop()` | Indexes (up to 16 per collection) and collection management. |
 | `c.aggregate(aggregates, where, group_by=, order_by=, limit=, memory_budget=0, spill_budget=0)` / `c.scan_columns(fields, where, page_size=1000)` / `c.enable_columnar()` / `c.disable_columnar()` | Analytics (see below). |
 | `db.transaction()` | Buffered writes committed atomically (`with` block or `.commit()`); `tx.require(...)` adds a version check. |
 

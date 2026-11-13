@@ -40,10 +40,16 @@ extern "system" {
     fn WSAPoll(fdArray: *mut PollEntry, fds: u32, timeout: i32) -> i32;
 }
 
+/// `nfds_t`: `unsigned long` on Linux, `unsigned int` on the BSDs and macOS.
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+type NfdsT = usize;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+type NfdsT = u32;
+
 #[cfg(unix)]
 extern "C" {
     #[link_name = "poll"]
-    fn libc_poll(fds: *mut PollEntry, nfds: usize, timeout: i32) -> i32;
+    fn libc_poll(fds: *mut PollEntry, nfds: NfdsT, timeout: i32) -> i32;
 }
 
 /// Reusable zero-allocation kernel socket readiness poller (`WSAPoll` / `poll`).
@@ -124,7 +130,7 @@ impl SocketPoller {
             let rc = unsafe {
                 libc_poll(
                     self.entries.as_mut_ptr(),
-                    self.entries.len(),
+                    self.entries.len() as NfdsT,
                     timeout_ms,
                 )
             };
@@ -281,10 +287,11 @@ impl Drop for EpollPoller {
     }
 }
 
-/// Readiness poller with persistent registration (`epoll` on Linux, AFD poll on Windows):
+/// Readiness poller with persistent registration (`epoll` on Linux, `kqueue` on macOS, AFD
+/// poll on Windows):
 /// sockets are registered once with a caller token and only ready ones are reported, so a
 /// reactor wake-up costs `O(ready)` (`F-NET-01`, `RULE-CPU-03`). Level-triggered semantics.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub trait ReadyPoller {
     /// Registers `stream` with `token` (write interest when `want_write`).
     fn add(&mut self, stream: &TcpStream, token: u64, want_write: bool) -> std::io::Result<()>;
@@ -309,6 +316,201 @@ impl ReadyPoller for EpollPoller {
     }
     fn wait(&mut self, timeout_ms: i32) -> &[u64] {
         EpollPoller::wait(self, timeout_ms)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// macOS: `kqueue`.
+// ---------------------------------------------------------------------------------------------
+
+/// Persistent-registration readiness poller on macOS (`kqueue`, level-triggered).
+///
+/// Each socket gets a read filter and a write filter; the write filter is registered disabled
+/// and enabled only while the connection has output queued, which matches the `epoll`
+/// interest masks. A socket ready both ways is reported once.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct KqueuePoller {
+    kq: i32,
+    events: Vec<Kevent>,
+    ready: Vec<u64>,
+}
+
+/// `struct kevent` (64-bit macOS).
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct Kevent {
+    ident: usize,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    data: isize,
+    udata: *mut core::ffi::c_void,
+}
+
+#[cfg(target_os = "macos")]
+impl Default for Kevent {
+    fn default() -> Self {
+        Self { ident: 0, filter: 0, flags: 0, fflags: 0, data: 0, udata: core::ptr::null_mut() }
+    }
+}
+
+// SAFETY: `udata` only carries the caller's token as an integer; it is never dereferenced.
+#[cfg(target_os = "macos")]
+unsafe impl Send for KqueuePoller {}
+
+/// `struct timespec`.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct Timespec {
+    tv_sec: isize,
+    tv_nsec: isize,
+}
+
+#[cfg(target_os = "macos")]
+const EVFILT_READ: i16 = -1;
+#[cfg(target_os = "macos")]
+const EVFILT_WRITE: i16 = -2;
+#[cfg(target_os = "macos")]
+const EV_ADD: u16 = 0x0001;
+#[cfg(target_os = "macos")]
+const EV_DELETE: u16 = 0x0002;
+#[cfg(target_os = "macos")]
+const EV_ENABLE: u16 = 0x0004;
+#[cfg(target_os = "macos")]
+const EV_DISABLE: u16 = 0x0008;
+#[cfg(target_os = "macos")]
+const EV_RECEIPT: u16 = 0x0040;
+#[cfg(target_os = "macos")]
+const EV_ERROR: u16 = 0x4000;
+#[cfg(target_os = "macos")]
+const ENOENT: isize = 2;
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn kqueue() -> i32;
+    fn kevent(
+        kq: i32,
+        changelist: *const Kevent,
+        nchanges: i32,
+        eventlist: *mut Kevent,
+        nevents: i32,
+        timeout: *const Timespec,
+    ) -> i32;
+    #[link_name = "close"]
+    fn kq_close(fd: i32) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+impl KqueuePoller {
+    /// Creates a `kqueue` reporting up to `max_events` ready filters per wait.
+    pub fn new(max_events: usize) -> std::io::Result<Self> {
+        // SAFETY: plain syscall without arguments; the descriptor is owned by `Self`. A kqueue
+        // is not inherited across `fork`, so it needs no close-on-exec flag.
+        let kq = unsafe { kqueue() };
+        if kq < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let max = max_events.clamp(1, 4096);
+        Ok(Self { kq, events: vec![Kevent::default(); max], ready: Vec::with_capacity(max) })
+    }
+
+    /// Applies `changes` and reports the first failure. `EV_RECEIPT` makes the kernel answer
+    /// each change with an `EV_ERROR` entry (data 0 on success) instead of polling.
+    fn apply(&self, changes: &mut [Kevent; 2], ignore_missing: bool) -> std::io::Result<()> {
+        for c in changes.iter_mut() {
+            c.flags |= EV_RECEIPT;
+        }
+        let mut out = [Kevent::default(); 2];
+        let zero = Timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: both arrays are valid for 2 entries for the duration of the call; a zero
+        // timeout makes the call return at once.
+        let rc = unsafe { kevent(self.kq, changes.as_ptr(), 2, out.as_mut_ptr(), 2, &zero) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        for e in out.iter().take(rc as usize) {
+            if e.flags & EV_ERROR != 0 && e.data != 0 && !(ignore_missing && e.data == ENOENT) {
+                return Err(std::io::Error::from_raw_os_error(e.data as i32));
+            }
+        }
+        Ok(())
+    }
+
+    fn change(fd: i32, filter: i16, flags: u16, token: u64) -> Kevent {
+        Kevent { ident: fd as usize, filter, flags, fflags: 0, data: 0, udata: token as usize as *mut core::ffi::c_void }
+    }
+
+    fn register(&self, fd: i32, token: u64, want_write: bool) -> std::io::Result<()> {
+        let write = if want_write { EV_ADD | EV_ENABLE } else { EV_ADD | EV_DISABLE };
+        let mut changes = [Self::change(fd, EVFILT_READ, EV_ADD | EV_ENABLE, token), Self::change(fd, EVFILT_WRITE, write, token)];
+        self.apply(&mut changes, false)
+    }
+
+    /// Registers `stream` with `token` (write interest when `want_write`).
+    pub fn add(&self, stream: &TcpStream, token: u64, want_write: bool) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        self.register(stream.as_raw_fd(), token, want_write)
+    }
+
+    /// Changes the write interest of a registered `stream`.
+    pub fn modify(&self, stream: &TcpStream, token: u64, want_write: bool) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        self.register(stream.as_raw_fd(), token, want_write)
+    }
+
+    /// Unregisters `stream` (call before closing it).
+    pub fn delete(&self, stream: &TcpStream) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+        let mut changes = [Self::change(fd, EVFILT_READ, EV_DELETE, 0), Self::change(fd, EVFILT_WRITE, EV_DELETE, 0)];
+        self.apply(&mut changes, true)
+    }
+
+    /// Waits up to `timeout_ms` (`-1` = indefinitely) and returns the tokens of the ready
+    /// sockets, each once. `EINTR` counts as "nothing ready".
+    pub fn wait(&mut self, timeout_ms: i32) -> &[u64] {
+        self.ready.clear();
+        let ts = Timespec { tv_sec: (timeout_ms.max(0) / 1000) as isize, tv_nsec: ((timeout_ms.max(0) % 1000) as isize) * 1_000_000 };
+        let tsp: *const Timespec = if timeout_ms < 0 { core::ptr::null() } else { &ts };
+        // SAFETY: `self.events` is a valid buffer of `self.events.len()` (<= 4096) entries and
+        // `tsp` is null or points at `ts`, alive for the call.
+        let rc = unsafe { kevent(self.kq, core::ptr::null(), 0, self.events.as_mut_ptr(), self.events.len() as i32, tsp) };
+        for ev in self.events.iter().take(rc.max(0) as usize) {
+            self.ready.push(ev.udata as usize as u64);
+        }
+        if self.ready.len() > 1 {
+            self.ready.sort_unstable();
+            self.ready.dedup();
+        }
+        &self.ready
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for KqueuePoller {
+    fn drop(&mut self) {
+        // SAFETY: `self.kq` is a descriptor this poller owns, closed exactly once.
+        unsafe {
+            kq_close(self.kq);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ReadyPoller for KqueuePoller {
+    fn add(&mut self, stream: &TcpStream, token: u64, want_write: bool) -> std::io::Result<()> {
+        KqueuePoller::add(self, stream, token, want_write)
+    }
+    fn modify(&mut self, stream: &TcpStream, token: u64, want_write: bool) -> std::io::Result<()> {
+        KqueuePoller::modify(self, stream, token, want_write)
+    }
+    fn delete(&mut self, stream: &TcpStream) -> std::io::Result<()> {
+        KqueuePoller::delete(self, stream)
+    }
+    fn wait(&mut self, timeout_ms: i32) -> &[u64] {
+        KqueuePoller::wait(self, timeout_ms)
     }
 }
 
@@ -928,11 +1130,16 @@ mod afd_tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod epoll_tests {
     use super::*;
     use std::io::Write;
     use std::net::TcpListener;
+
+    #[cfg(target_os = "linux")]
+    type Poller = EpollPoller;
+    #[cfg(target_os = "macos")]
+    type Poller = KqueuePoller;
 
     #[test]
     fn test_epoll_reports_only_ready_sockets_and_tracks_interest() {
@@ -944,7 +1151,7 @@ mod epoll_tests {
             clients.push(TcpStream::connect(addr).unwrap());
             servers.push(listener.accept().unwrap().0);
         }
-        let mut ep = EpollPoller::new(64).unwrap();
+        let mut ep = Poller::new(64).unwrap();
         for (i, s) in servers.iter().enumerate() {
             s.set_nonblocking(true).unwrap();
             ep.add(s, i as u64, false).unwrap();
@@ -973,5 +1180,28 @@ mod epoll_tests {
         let mut ready: Vec<u64> = ep.wait(100).to_vec();
         ready.sort_unstable();
         assert_eq!(ready, vec![6], "deleted socket no longer reported; level-triggered keeps 6");
+    }
+
+    #[test]
+    fn a_closed_peer_is_reported_once_with_write_interest() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let server = listener.accept().unwrap().0;
+        server.set_nonblocking(true).unwrap();
+        let mut ep = Poller::new(8).unwrap();
+        ep.add(&server, 9, true).unwrap();
+        // Writable and, once the peer closes, readable (EOF): one token, not two.
+        drop(client);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut buf = [0u8; 1];
+        loop {
+            assert_eq!(ep.wait(1000), &[9]);
+            if std::io::Read::read(&mut &server, &mut buf).is_ok_and(|n| n == 0) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "EOF never seen");
+        }
+        ep.delete(&server).unwrap();
+        assert!(ep.wait(0).is_empty());
     }
 }

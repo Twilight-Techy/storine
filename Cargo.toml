@@ -13,13 +13,14 @@ members = [
     "crates/storage-cli",
     "crates/storage-server",
     "crates/storage-sql",
+    "crates/storage-console",
     "benches",
 ]
 # Client SDKs are standalone projects (the Rust one has its own workspace).
 exclude = ["sdks", "benches/kv-compare"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.82"
 authors = ["Ibrahim Makanjuola"]

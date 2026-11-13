@@ -1,5 +1,6 @@
-# Lint and test on every push and pull request, on x86_64 and arm64 (the checksum and SIMD
-# paths differ by architecture). The long soaks (`process_chaos soak_*`, ignored by default)
+# Lint and test on every push and pull request: Linux on x86_64 and arm64 (the checksum and
+# SIMD paths differ by architecture), macOS on arm64 (kqueue reactor) and Windows on x86_64
+# (AFD-poll reactor, Win32 file mapping). The long soaks (`process_chaos soak_*`, ignored by default)
 # are run by hand: see docs/RELEASE.md.
 name: ci
 
@@ -23,13 +24,16 @@ jobs:
   test:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2025]
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Toolchain
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy
@@ -38,13 +42,20 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --release --workspace --no-fail-fast
+      # The ceilings apply to what ships: the release build for the baseline CPU
+      # (tools/release/build-dist.sh), not this runner's `native` build, which AVX-512
+      # makes about 25% larger.
       - name: Binary size (RULE-MEM-03)
+        if: matrix.os == 'ubuntu-24.04'
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64"
+          CARGO_TARGET_DIR: target-dist
         run: |
-          cargo build --release --workspace --bins
+          cargo build --release --bins -p storage-server -p storage-cli -p storage-sql -p storage-console
           fail=0
-          for spec in storage-server:4718592 storage-cli:1572864 storine-sql:6815744; do
+          for spec in storage-server:4718592 storage-cli:1572864 storine-sql:6815744 storine-console:1048576; do
             bin=${spec%%:*}; max=${spec##*:}
-            size=$(stat -c %s "target/release/$bin")
+            size=$(stat -c %s "target-dist/release/$bin")
             echo "$bin: $size bytes (ceiling $max)"
             [ "$size" -lt "$max" ] || { echo "::error::$bin is $size bytes, over its $max-byte ceiling"; fail=1; }
           done

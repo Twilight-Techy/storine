@@ -365,6 +365,11 @@ impl Client {
         wire::decode_cluster_info(&self.call(wire::OP_CLUSTER_INFO, &[])?.body)
     }
 
+    /// The server's health report (JSON text).
+    pub fn health(&self) -> Result<String> {
+        Ok(text(&self.call(wire::OP_HEALTH, &[])?.body))
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -678,6 +683,13 @@ impl Collection<'_> {
 
     fn query(&self, q: &Query, after: Option<&str>) -> Result<wire::Page> {
         wire::decode_page(&self.client.call(wire::OP_DOC_QUERY, &wire::encode_query(&self.name, q, after, None)?)?.body)
+    }
+
+    /// One page of the documents matching `query`, with the total count: the page after the key
+    /// `after` (`None`: the first page). Keyset pages need a query without sort keys; with sort keys
+    /// use [`Query::offset`] instead.
+    pub fn page(&self, query: impl Into<Query>, after: Option<&str>) -> Result<wire::Page> {
+        self.query(&query.into(), after)
     }
 
     /// Documents matching `query` (a [`Query`] or a [`Filter`]).

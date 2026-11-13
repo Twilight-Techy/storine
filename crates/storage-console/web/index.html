@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Storine Console</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <button class="icon-btn menu-btn" id="menu" type="button" aria-label="Collections" aria-expanded="false" hidden>
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </button>
+    <a class="brand" href="#/" aria-label="Storine Console home">
+      <img src="/icon.svg" alt="" width="22" height="22">
+      <span class="wordmark">Storine</span><span class="product">Console</span>
+    </a>
+    <div class="conn" id="conn" hidden>
+      <span class="dot" id="conn-dot"></span>
+      <span class="conn-url" id="conn-url"></span>
+      <span class="badge" id="conn-role"></span>
+    </div>
+    <div class="topbar-actions">
+      <button class="icon-btn" id="theme" type="button" title="Switch light / dark" aria-label="Switch light or dark theme">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></svg>
+      </button>
+      <button class="btn ghost small" id="disconnect" type="button" hidden>Disconnect</button>
+    </div>
+  </header>
+  <div class="layout">
+    <nav class="sidebar" id="sidebar" hidden aria-label="Collections">
+      <a class="nav-item" id="nav-overview" href="#/">
+        <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M4 13h6V4H4v9zm0 7h6v-5H4v5zm10 0h6v-9h-6v9zm0-16v5h6V4h-6z"/></svg>
+        Overview
+      </a>
+      <div class="nav-section">
+        <span>Collections</span>
+        <button class="icon-btn small" id="new-collection" type="button" title="New collection" aria-label="New collection">+</button>
+      </div>
+      <input class="nav-filter" id="nav-filter" type="search" placeholder="Filter collections" aria-label="Filter collections">
+      <div class="nav-list" id="nav-list"></div>
+    </nav>
+    <main class="main" id="main" tabindex="-1"></main>
+  </div>
+  <aside class="drawer" id="drawer" hidden aria-label="Document"></aside>
+  <div class="toast-host" id="toasts" aria-live="polite"></div>
+  <noscript><p class="noscript">The Storine console needs JavaScript.</p></noscript>
+</body>
+</html>

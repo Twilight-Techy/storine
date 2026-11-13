@@ -1,0 +1,23 @@
+[package]
+name = "storage-console"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Web console for Storine: browse and edit documents, run queries and aggregates, manage indexes, watch the cluster"
+
+[[bin]]
+name = "storine-console"
+path = "src/main.rs"
+
+[dependencies]
+storine = { path = "../../sdks/rust", features = ["tls"] }
+storage-codec = { path = "../storage-codec" }
+
+[dev-dependencies]
+storage-server = { path = "../storage-server" }
+storage-core = { path = "../storage-core" }
+
+[lints]
+workspace = true

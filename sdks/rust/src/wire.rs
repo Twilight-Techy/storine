@@ -13,6 +13,7 @@ pub(crate) const OP_DOC_ADMIN: u8 = 0x23;
 pub(crate) const OP_DOC_INFO: u8 = 0x25;
 pub(crate) const OP_SET_OPTIONS: u8 = 0x26;
 pub(crate) const OP_CLUSTER_INFO: u8 = 0x27;
+pub(crate) const OP_HEALTH: u8 = 0x13;
 pub(crate) const ST_OK: u8 = 0;
 pub(crate) const ST_NOT_FOUND: u8 = 1;
 pub(crate) const ST_OVERLOADED: u8 = 3;
@@ -534,8 +535,12 @@ impl Document {
     }
 }
 
-pub(crate) struct Page {
+/// One page of a query: [`Collection::page`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Page {
+    /// Documents matching the query in all (not only on this page).
     pub total: u32,
+    /// Pass back as `after` for the next page; `None` on the last page.
     pub next_key: Option<String>,
     pub docs: Vec<Document>,
 }

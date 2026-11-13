@@ -16,8 +16,10 @@ pub mod raw;
 pub use arena::{ArenaLocation, ArenaManager, ArenaSegment, DEFAULT_SEGMENT_CAPACITY};
 pub use heap::release_free_heap;
 pub use net_poll::{socket_token, SocketPoller};
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub use net_poll::ReadyPoller;
+#[cfg(target_os = "macos")]
+pub use net_poll::KqueuePoller;
 #[cfg(windows)]
 pub use net_poll::AfdPoller;
 #[cfg(target_os = "linux")]

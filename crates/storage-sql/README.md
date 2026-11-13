@@ -15,6 +15,9 @@ storine-sql --storine storine://h1,h2,h3     # or in front of a running Storine 
             [--user name:password]...        # without --user every client is trusted (keep it on localhost)
             [--database shop]                # name of the default database (default: storine)
             [--tls-cert chain.pem --tls-key key.pem | --no-tls] [--require-tls]
+            [--max-connections 1024]         # open client connections; a client silent for 30 s before logging in is closed
+            [--oidc-issuer URL --oidc-audience AUD --oidc-jwks keys.json]   # SQL Server access-token logins (below)
+            [--kerberos-keytab FILE]         # SQL Server Kerberos logins (below)
 ```
 
 Then point the application at it, exactly as you would at the database it was written for:
@@ -294,9 +297,10 @@ what Django's and Rails' test databases and Prisma's shadow databases rely on.
 - **SQL Server**: logins by password, OpenID Connect access token or Kerberos; NTLM and the
   driver-driven sign-in workflows (`Authentication=ActiveDirectoryPassword` and similar) are
   refused with an explanation. One schema
-  (`dbo`), no MARS (one active result per connection, as with `MultipleActiveResultSets=false`),
-  no stored procedures of your own, cursors or temporary `#tables`; a statement error leaves the
-  transaction open (`XACT_ABORT OFF`), as SQL Server does.
+  (`dbo`), no MARS (one active result per connection, as with `MultipleActiveResultSets=false`).
+  Functions, procedures and triggers are written in PostgreSQL syntax on every endpoint (below), so
+  T-SQL procedure bodies are not accepted. A statement error leaves the transaction open
+  (`XACT_ABORT OFF`), as SQL Server does.
 - **DDL is applied immediately**, even inside a transaction (MySQL behavior). On the
   PostgreSQL endpoint, a `ROLLBACK` undoes the transaction's data changes but not its `CREATE
   / ALTER / DROP`. A migration that fails halfway leaves the steps it already ran.
@@ -308,14 +312,17 @@ what Django's and Rails' test databases and Prisma's shadow databases rely on.
 - **`COPY ... FROM STDIN` outside a transaction commits every 5,000 rows** (inside `BEGIN` ...
   `COMMIT` it is all-or-nothing, up to the store's 256 MiB per-transaction limit). `COPY` to or
   from server-side files is not available; stream through `STDIN` / `STDOUT`.
-- **Views** are read-only and evaluated when queried (no `INSERT` into a view, no materialized
-  views).
-- **Not supported**: stored procedures, functions and triggers, PostgreSQL extensions other
-  than pgvector's SQL,
-  `NOTIFY` (`LISTEN` is accepted but no notification is ever delivered). Unsupported
-  statements fail with SQLSTATE `0A000` and a message naming the feature; nothing else is
-  silently ignored except session settings that do not apply (e.g. `SET search_path`, `SET
-  NAMES`).
+- **Views** are read-only (no `INSERT` into a view). Materialized views hold their rows until
+  `REFRESH MATERIALIZED VIEW`.
+- **Functions, procedures and triggers** take `LANGUAGE sql` or a PL/pgSQL subset. They run with
+  the caller's rights (`SECURITY DEFINER` is refused); a function called inside a larger query may
+  only read; foreign-key cascades do not fire triggers.
+- **`LISTEN` / `NOTIFY`** deliver at once within one gateway. Between gateways in front of the same
+  cluster, delivery is polled every 100 ms and best effort: a gateway that was down misses what was
+  sent meanwhile, as a disconnected PostgreSQL client does.
+- **Not supported**: PostgreSQL extensions other than pgvector's SQL. Unsupported statements fail
+  with SQLSTATE `0A000` and a message naming the feature; nothing else is silently ignored except
+  session settings that do not apply (e.g. `SET search_path`, `SET NAMES`).
 - An **SQLite** endpoint is not available (SQLite is an in-process library, not a server).
 
 ## Development

@@ -670,7 +670,8 @@ pub struct StorageServer<T: ZeroCopyRecord + Indexable> {
     shards: Vec<Arc<ReactorShard>>,
     accept_thread: Option<JoinHandle<()>>,
     worker_threads: Vec<JoinHandle<()>>,
-    /// Gives freed heap back to the OS every [`HEAP_TRIM_INTERVAL`] (see `storage_mmap::heap`).
+    /// Gives freed heap back to the OS every [`HEAP_TRIM_INTERVAL`] (see `storage_mmap::heap`)
+    /// and, on a standalone server, checkpoints every [`STANDALONE_CHECKPOINT_INTERVAL`].
     trim_thread: Option<JoinHandle<()>>,
     shared: Arc<ServerShared<T>>,
 }
@@ -678,6 +679,11 @@ pub struct StorageServer<T: ZeroCopyRecord + Indexable> {
 /// How often a server returns the heap it freed to the operating system. Process-wide: an
 /// application embedding a server has its own freed memory returned too.
 const HEAP_TRIM_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How often a standalone server checkpoints its engine when it has been written: flushes the
+/// records, syncs them and cuts the WAL, so the log (and the time to replay it at the next
+/// start) stays bounded. Raft and range nodes checkpoint on their own schedules.
+const STANDALONE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
 
 impl<T: ZeroCopyRecord + Indexable> core::fmt::Debug for StorageServer<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -772,6 +778,9 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
         cluster_opts: Option<cluster::ClusterOptions<T>>,
         range_opts: Option<ranges::RangeOptions>,
     ) -> Result<Self> {
+        // Raft and range nodes checkpoint their engines themselves; a standalone server's
+        // engine is checkpointed by the maintenance thread below.
+        let standalone_engine = (raft.is_none() && range_opts.is_none()).then(|| Arc::clone(&engine));
         if security.require_auth && security.token_count() == 0 {
             return Err(StorageError::invalid_key(
                 "require_auth is set but no authentication token is registered",
@@ -905,15 +914,35 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
 
         let shutdown_trim = Arc::clone(&shutdown);
         let trim_thread = thread::Builder::new()
-            .name("storine-heap-trim".into())
+            .name("storine-maintenance".into())
             .spawn(move || {
                 let mut last = Instant::now();
+                let mut last_checkpoint = Instant::now();
+                let mut checkpointed_writes = standalone_engine.as_ref().map_or(0, |e| e.stats().total_writes);
+                let mut reported = false;
                 while !shutdown_trim.load(Ordering::Relaxed) {
                     // Short sleeps, so `stop` is not held up for the interval.
                     thread::sleep(Duration::from_millis(100));
                     if last.elapsed() >= HEAP_TRIM_INTERVAL {
                         last = Instant::now();
                         storage_mmap::release_free_heap();
+                    }
+                    if let Some(engine) = standalone_engine.as_ref().filter(|_| last_checkpoint.elapsed() >= STANDALONE_CHECKPOINT_INTERVAL) {
+                        last_checkpoint = Instant::now();
+                        let writes = engine.stats().total_writes;
+                        if writes != checkpointed_writes {
+                            match engine.checkpoint() {
+                                Ok(_) => {
+                                    checkpointed_writes = writes;
+                                    reported = false;
+                                }
+                                Err(e) if !reported => {
+                                    eprintln!("storage-server: checkpoint failed (retrying every {}s): {e}", STANDALONE_CHECKPOINT_INTERVAL.as_secs());
+                                    reported = true;
+                                }
+                                Err(_) => {}
+                            }
+                        }
                     }
                 }
             })
@@ -1018,6 +1047,13 @@ fn reactor_worker_loop<T: ZeroCopyRecord + Indexable>(
             return reactor_worker_loop_epoll(shard, shared, shutdown, active_connections, ep);
         }
     }
+    // macOS: `kqueue`.
+    #[cfg(target_os = "macos")]
+    if std::env::var("STORINE_REACTOR").map_or(true, |v| v != "poll") {
+        if let Ok(kq) = storage_mmap::KqueuePoller::new(1024) {
+            return reactor_worker_loop_epoll(shard, shared, shutdown, active_connections, kq);
+        }
+    }
     let mut conns: Vec<NonBlockingConn> = Vec::with_capacity(64);
     let mut poller = SocketPoller::with_capacity(64);
     let mut idle_polls: u32 = 0;
@@ -1117,12 +1153,6 @@ fn reactor_worker_loop<T: ZeroCopyRecord + Indexable>(
     }
 }
 
-/// Readiness reactor (`TASK-090` Linux `epoll`, `TASK-102` Windows AFD poll): sockets are
-/// registered once (token = descriptor / socket handle) and each wake-up drives only the ready
-/// connections plus those awaiting a job, so its cost is `O(active)` rather than
-/// `O(connections)`. Same timeout policy as the `poll` reactor; set `STORINE_REACTOR=poll` to use
-/// that one instead.
-#[cfg(any(target_os = "linux", windows))]
 /// How long a reactor keeps polling without sleeping after it last had work. A request that
 /// arrives meanwhile is picked up at once instead of waking a sleeping thread, which on a
 /// `c7i.xlarge` took a loopback `GET` from 19.5 µs to 8.6 µs (back to the thread-per-connection
@@ -1130,6 +1160,12 @@ fn reactor_worker_loop<T: ZeroCopyRecord + Indexable>(
 /// polls anyway.
 const REACTOR_SPIN_AFTER_WORK: Duration = Duration::from_micros(50);
 
+/// Readiness reactor (`TASK-090` Linux `epoll`, `TASK-102` Windows AFD poll, macOS `kqueue`):
+/// sockets are registered once (token = descriptor / socket handle) and each wake-up drives only the ready
+/// connections plus those awaiting a job, so its cost is `O(active)` rather than
+/// `O(connections)`. Same timeout policy as the `poll` reactor; set `STORINE_REACTOR=poll` to use
+/// that one instead.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 fn reactor_worker_loop_epoll<T: ZeroCopyRecord + Indexable, P: storage_mmap::ReadyPoller>(
     shard: Arc<ReactorShard>,
     shared: Arc<ServerShared<T>>,

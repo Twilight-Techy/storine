@@ -52,7 +52,7 @@ fn main() -> storage_types::Result<()> {
         "SIMD Checksum (XXH3 + CRC32C, 4KB)",
         20_000,
         |_| {
-            core::hint::black_box(checksum_payload(&payload_4k));
+            core::hint::black_box(checksum_payload(core::hint::black_box(&payload_4k)));
         },
     ));
 

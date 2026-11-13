@@ -164,3 +164,46 @@ fn test_document_api_over_tcp() {
     drop(store);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A standalone server checkpoints its engine on its own, so its WAL does not grow without
+/// bound between restarts (and a restart does not replay everything written since start).
+#[test]
+fn a_standalone_server_cuts_its_wal() {
+    let dir = std::env::temp_dir().join(format!("stge_doc_wal_cut_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(DocumentStore::open(&dir, EngineConfig::default()).unwrap());
+    let mut server =
+        StorageServer::start_documents("127.0.0.1:0", Arc::clone(&store), 1000, SecurityConfig::default(), None).unwrap();
+    let mut c = StorageClient::connect(server.local_addr()).unwrap();
+    for i in 0..400 {
+        let mut f = BTreeMap::new();
+        f.insert("body".to_string(), PropertyValue::Text("x".repeat(2000)));
+        c.doc_write(&[put("logs", &format!("k{i}"), f, Precondition::None)], None).unwrap();
+    }
+    let wal_size = || {
+        std::fs::read_dir(dir.join("wal"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "wal"))
+            .map(|e| e.metadata().map_or(0, |m| m.len()))
+            .sum::<u64>()
+    };
+    let written = wal_size();
+    assert!(written > 400 * 2000, "the writes are logged first ({written} bytes)");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while wal_size() > 256 * 1024 {
+        assert!(std::time::Instant::now() < deadline, "the WAL was never cut: {} bytes", wal_size());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    // Every document is still there, from the records rather than the log.
+    assert!(c.doc_get("logs", "k399").unwrap().is_some());
+    server.stop();
+    drop(c);
+    drop(server);
+    drop(store);
+    let reopened = DocumentStore::open(&dir, EngineConfig::default()).unwrap();
+    assert!(reopened.get("logs", "k0").unwrap().is_some());
+    assert!(reopened.get("logs", "k399").unwrap().is_some());
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&dir);
+}

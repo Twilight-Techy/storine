@@ -484,3 +484,31 @@ On-demand `c7i.xlarge`, the release candidate's code before the fixes from the r
 Storine leads every throughput row and every p99 row, as in section 8.4. The tails listed there are where they were: fill p99.99 0.66–0.69 ms (RocksDB 15–17 µs), 4-writer overwrite p99.99 2.1–2.4 ms (RocksDB 0.83–1.27 ms), and durable p99.9/p99.99 against LMDB.
 
 **Recovery of a range node.** A node from the range soak held 20,155 record files and an 83 MB WAL. Before the fix, it had been recovering for over 4 minutes when it was killed again, with one `fdatasync`, rename and directory `fsync` per logged write. With the fix (arena layout for range nodes, batched replay), the same data directory opens and listens in **2.3 s**.
+
+### 8.6 Portable release builds against native builds (`TASK-155`, 2026-11-13)
+
+Release binaries are built for each architecture's baseline CPU (`-C target-cpu=x86-64`, generic ARMv8), not for the build machine (`native`), so they run on any CPU of the architecture. These runs measure what that costs. `tools/release/compare-cpu-targets.sh` builds `bench-runner` and `kv-compare` (Storine only, 500,000 keys, 4 threads) once per target, then runs them in five alternating rounds; the tables give medians (`summarize-cpu-targets.py`). Throughput change is against native; positive means the portable build is faster.
+
+**x86_64**: on-demand `c7i.xlarge` (Xeon Platinum 8488C, which has AVX-512), the final 0.1.1 code:
+
+| Benchmark | native | `x86-64` |
+| :--- | ---: | ---: |
+| `with_ref` (hot read) | 62 ns | 62 ns (+1.6 %) |
+| `get_ref` (arena) | 68 ns | 67 ns (+10 %) |
+| `update` (coalesced write) | 908 ns | 857 ns (+5.0 %) |
+| Checksum, 4 KiB | 1,033 ns | 739 ns (+40 %) |
+| Cosine similarity, 64 dims | 23 ns | **17 ns** (+37 %) |
+| Secondary index | 2,328 ns | 2,373 ns (−1.0 %) |
+| TCP `GET` | 8.7 µs | 9.0 µs (−1.9 %) |
+| TCP `GET`, TLS | 11.6 µs | 12.2 µs (−4.7 %) |
+| `kv-compare` fill | 732 k/s | 739 k/s (+1.0 %) |
+| `kv-compare` read, 4 threads | 4.15 M/s | 3.97 M/s (−4.3 %) |
+| `kv-compare` overwrite, 4 threads | 1.31 M/s | 1.32 M/s (+1.2 %) |
+| `kv-compare` indexed overwrite, 4 threads | 721 k/s | 747 k/s (+3.6 %) |
+
+**arm64**: on-demand `c7g.xlarge` (Graviton3), generic ARMv8 against native. Every row is within ±4 % except 4-thread indexed reads (−8.1 %): `with_ref` 83 → 81 ns, `update` 1,170 → 1,147 ns, checksum 630 → 629 ns, TCP `GET` 11.4 → 11.3 µs, `kv-compare` 4-thread reads 4.08 → 4.13 M/s.
+
+- **Found, and fixed before release.** On the first x86 run the baseline build scored vectors in 449 ns, not 22. Vector scoring used `f32::mul_add`, which without FMA in the build target compiles to a call to the C library's `fmaf`. The kernels moved to `storage_codec::vector`, which picks an AVX2 + FMA copy at run time; both copies compute the same fused operations, so scores are bit-identical. That copy measured faster than the native build (17 against 23 ns); the cause was not investigated.
+- The checksum is faster on the x86 baseline build too, in both x86 runs (700 against 973 ns, then 739 against 1,033 ns). CRC32C uses the hardware instruction in both builds (chosen at run time); why the native build's code for the rest is slower was not investigated.
+- **Found**: the bench runner's checksum benchmark did not pass its input through `black_box`, so native builds partly hoisted the work out of the loop. Earlier checksum figures in this report (347 ns at section 8.4, 310 ns on Graviton2) measured less than one full call; it now takes 0.7–1.0 µs per 4 KiB on x86_64 and 0.63 µs on Graviton3.
+- The TCP and TLS rows vary by a few per cent between rounds in both directions: section 8.5 measured 8.6–9.0 µs and 11.5–11.7 µs for native builds.

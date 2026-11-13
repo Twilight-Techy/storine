@@ -993,3 +993,20 @@ A line-by-line review of every crate against `RULES.md` found that several earli
   - Four on-demand instances, about $2.40 in all, terminated.
 - **Decision (user, 2026-11-13)**: the `RULE-MEM-03` budget is raised to per-binary ceilings: `storage-server` `< 4.5 MiB`, `storage-cli` `< 1.5 MiB`, `storine-sql` `< 6.5 MiB`. The binaries are 3.69, 1.19 and 5.32 MiB. The release checklist gains a size check.
 
+## 2026-11-13: binaries for every platform and a web console (`TASK-155`, 0.1.1)
+
+- **Added**:
+  - Release binaries for Linux (x86_64, arm64), macOS (arm64, x86_64) and Windows (x86_64), built, checked and smoke-tested by `.github/workflows/release.yml` on GitHub's runners.
+  - `storine-console`, a web console (`crates/storage-console`).
+  - A `kqueue` reactor for macOS, and CI on macOS and Windows.
+- **Measured**, portable baseline against native, five alternating rounds (`BENCHMARK_REPORT.md` section 8.6):
+  - Graviton3 (`c7g.xlarge`), generic ARMv8 against native: every row within noise.
+  - Sapphire Rapids (`c7i.xlarge`), `x86-64` against native: every row within noise except vector scoring, 22 → 449 ns, from `mul_add` without FMA. Fixed with run-time dispatch (`storage_codec::vector`).
+- **Found and fixed**: the bench runner's checksum benchmark was partly hoisted out of its loop on native builds.
+- **Verified locally**: the Linux container build on arm64 (glibc 2.28, libc only, smoke test); the console's end-to-end test against a real server; the console in headless Chromium (every view, light and dark, phone width, no errors).
+- **Found and fixed**:
+  - A standalone server never cut its WAL; it now checkpoints every 10 s while written.
+  - CI's binary-size check measured the runner's native build, not the baseline build that ships.
+- **Measured** (final code, `c7i.xlarge`): cosine similarity on the `x86-64` build 17 ns against 23 ns native (449 ns before the FMA dispatch); every other row within noise.
+- **Docs**: friendly `README.md`; new `docs/TECHNICAL.md` from a code inventory; stale statements corrected across the changelog, protocol, SQL and SDK docs.
+

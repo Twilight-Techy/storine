@@ -1,0 +1,90 @@
+# Builds the release binaries (Linux x86_64 and arm64, macOS arm64 and x86_64, Windows
+# x86_64) and attaches them to the GitHub release of a tag. Runs when a `v*` tag is pushed, or by hand for an existing tag. The
+# build script comes from this workflow's commit and the sources from the tag, so a tag cut
+# before the script existed can still get binaries built from its own sources.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  RUST_TOOLCHAIN: "1.99.1"
+
+jobs:
+  build:
+    name: build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, container: true }
+          - { os: ubuntu-24.04-arm, container: true }
+          - { os: macos-15 }
+          - { os: macos-15-intel }
+          - { os: windows-2025 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Sources at the tag
+        uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          path: src
+      - name: Release tools from this workflow's commit
+        uses: actions/checkout@v5
+        with:
+          path: tools-src
+          sparse-checkout: tools/release
+      - name: Build, check and package in rockylinux:8 (glibc 2.28)
+        if: matrix.container
+        run: |
+          docker run --rm -e RUST_TOOLCHAIN -v "$PWD/src:/src" -v "$PWD/tools-src/tools/release:/release:ro" -w /src \
+            rockylinux:8 bash /release/build-dist.sh "${TAG#v}" /src/dist
+      - name: Toolchain
+        if: ${{ !matrix.container }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Build, check and package
+        if: ${{ !matrix.container }}
+        working-directory: src
+        run: bash ../tools-src/tools/release/build-dist.sh "${TAG#v}" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: src/dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          cat *.sha256 > SHA256SUMS
+          cat SHA256SUMS
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Storine ${TAG#v}" --notes "See CHANGELOG.md."
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber *.tar.gz *.zip SHA256SUMS
