@@ -129,7 +129,7 @@ Rewritten and deleted records leave dead space in segments. Compaction copies a 
 - **MVCC snapshots**: `begin_read_snapshot` gives a consistent view while writes continue.
 - **TTL**: documents written with a time to live expire. Single-group Raft nodes sweep expired documents every 60 s; embedded engines call `sweep_expired`.
 - **Schema migrations**: a record type's `SCHEMA_VERSION` and registered migrations upgrade older records when they are read or replayed (`register_migration`, `register_step_upcaster`, `upgrade_legacy_schemas`).
-- **Encryption at rest** (embedded API): `EngineConfig::encryption` seals record frames, WAL entries and index files with ChaCha20-Poly1305, bound to each record's id and metadata. A key ring allows rotation online (`set_encryption`, then `reseal_all`, which also scrubs superseded copies). Each record type can choose to encrypt or only authenticate (`Indexable::protection`). Warm reads stay allocation-free through a cache of decrypted frames (`decrypted_cache_bytes`, 256 MiB). File names and sizes, and WAL frame headers (ids, versions), remain visible. The server binary does not expose encryption at rest yet.
+- **Encryption at rest** (embedded API): `EngineConfig::encryption` seals record frames, WAL entries and index files with ChaCha20-Poly1305, bound to each record's id and metadata. A key ring allows rotation online (`set_encryption`, then `reseal_all`, which also scrubs superseded copies). Each record type can choose to encrypt or only authenticate (`Indexable::protection`). Warm reads stay allocation-free through a cache of decrypted frames (`decrypted_cache_bytes`, 256 MiB). File names and sizes, and WAL frame headers (ids, versions), remain visible. Raft logs and snapshots of a replicated engine are sealed with the same keys. The server enables it with a key file (section 8).
 - **Cold tiers**: `primary_tier: Cold` keeps the primary index as of the last checkpoint on disk, holding only later changes in memory; `index_tier: Paged` does the same for secondary indexes with memory-mapped B+tree pages and bitmap blocks.
 - **Relationships**: typed engines link records one-to-one, one-to-many and many-to-many, locking keys in a fixed order so concurrent link updates cannot deadlock, and `verify_relationships` checks for dangling links.
 
@@ -201,10 +201,11 @@ storage-server gen-cert <ca-dir> <out-dir> <name>[,<name>...]
 | :--- | :--- | :--- |
 | `--max-connections N` | `STORAGE_MAX_CONNECTIONS`, else 100,000 | Connections beyond this are answered `Overloaded` and closed |
 | `--node-id N` | | This node's id (1–65,535) in a cluster |
-| `--peers 1=host:port,2=host:port,...` | | The cluster's founding members, this node included |
+| `--peers 1=host:port,2=host:port,...` | | The cluster's founding members, this node included. On a range cluster each may add its locality: `1=host:port@region/zone` |
 | `--join` | | Start without members and wait to be added (section 7) |
 | `--ranges` | | Run as a range-cluster node (needs `--node-id` and `--peers`) |
 | `--records agent` | | Serve the typed demo record engine instead of documents |
+| `--zones FILE` | | Placement rules of a range cluster (section 7), the same file on every node |
 | `--once` | | Start, print the banner and exit (for scripts and tests) |
 
 | Environment variable | Meaning |
@@ -216,6 +217,11 @@ storage-server gen-cert <ca-dir> <out-dir> <name>[,<name>...]
 | `STORAGE_RATE_LIMIT` | `rps:burst`: a token bucket per connection, one token per request |
 | `STORAGE_BACKUP_ROOT` | Directory under which admins may create and restore backups remotely. Unset: remote backups are off |
 | `STORAGE_MAX_CONNECTIONS` | As `--max-connections` |
+| `STORAGE_ENCRYPTION_KEYS` | Key file: turns encryption at rest on (section 8) |
+| `STORAGE_ENCRYPTION_ACTIVE_KEY` | Key id that seals new data (default: the highest id), or `none` to decrypt |
+| `STORAGE_ENCRYPTION_ALLOW_PLAINTEXT` | `1`: accept existing plaintext while it is encrypted (turning encryption on for a database with data) |
+| `STORAGE_WAL_ARCHIVE` | Directory where checkpoints archive the WAL for point-in-time recovery (section 13); not on range clusters |
+| `STORAGE_WAL_ARCHIVE_RETAIN` | How long archived WAL is kept: `7d` by default, or hours (`48h`) or minutes (`90m`) |
 | `STORINE_REACTOR=poll` | Use `poll` instead of `epoll` / `kqueue` / AFD poll |
 | `STORINE_THREADS` | Analytics parallelism |
 | `STORINE_SIMD=portable` | Use the portable column kernels |
@@ -270,7 +276,34 @@ With `--ranges`, data is split into key ranges, each replicated by its own Raft 
 | Log retained after a checkpoint | 8,192 entries; a replica further behind gets a snapshot (64 KiB chunks) |
 | Client request timeout | 10 s |
 
-Range clusters also offer **cluster backups** (`storage-cli remote-backup` / `remote-restore`) and **change feeds**: `storage-cli changefeed` streams every change as JSON lines, at least once, resuming from a cursor file. Membership, metrics, compaction and checkpoint requests are refused in range mode. Placement across regions exists in the library (`dist::zone`) but the server binary does not expose it yet.
+Range clusters also offer **cluster backups** (`storage-cli remote-backup` / `remote-restore`) and **change feeds**: `storage-cli changefeed` streams every change as JSON lines, at least once, resuming from a cursor file. Membership, metrics, compaction and checkpoint requests are refused in range mode.
+
+### Placement across regions
+
+Give every node its locality in `--peers` (`1=10.0.0.1:7878@us-east/a`: region `us-east`, zone `a`) and every node the same placement rules with `--zones <file>`. Each node's allocator applies the rules: it splits ranges at rule boundaries, moves replicas to where the rules allow, and moves leases (which serve writes and current reads) to preferred regions. One rule per line:
+
+```text
+default replicas=3 survival=zone                             # everything without a rule of its own
+collection accounts survival=region lease=us-east,eu-west    # survive losing a region; leases in us-east first
+collection eu_customers require=region:eu-west lease=eu-west # this collection's data stays in eu-west
+collection orders prefix=eu/ require=region:eu-west          # only the keys starting with eu/
+collection logs avoid=zone:c                                 # never in zone c
+collection rates global lead=1500ms                          # present-time reads from any replica
+collection profiles regional-by-row regions=us-east,eu-west  # each row in its home region
+```
+
+| Option | Meaning |
+| :--- | :--- |
+| `replicas=N` | Voters (1–15) |
+| `survival=zone` / `survival=region` | Losing any one zone (or region) keeps a majority: no zone (or region) may hold a majority of the voters, so this needs at least three |
+| `require=region:R`, `require=zone:Z` | Replicas only there; several of one kind are alternatives |
+| `avoid=region:R`, `avoid=zone:Z` | Never there |
+| `lease=R1,R2` | Preferred leaseholder regions, in order |
+| `follower-reads=3s` / `off` | How far behind followers may serve reads (default 3 s) |
+| `global lead=1500ms` | Writes are timestamped ahead and wait out the lead, so every replica serves present-time reads; the lead must exceed twice the maximum clock offset (500 ms) |
+| `regional-by-row regions=R1,R2` | Keys written as `<region>\u0001<key>` live in their region, with leases there |
+
+The server refuses rules the localities cannot satisfy, such as too few nodes in a required region, or region survival with fewer than three regions. Every node's health report lists the ranges it holds in `placement`: span, voters, and whether it leads each. Change rules or localities with a rolling restart, giving every node the new file.
 
 ### TLS between nodes
 
@@ -294,7 +327,11 @@ storage-server gen-cert ./tls/ca ./tls/n1 10.0.0.1,db1.internal   # node.crt, no
 - **Authentication** is by bearer token, sent once per connection and compared in constant time. With no `STORAGE_AUTH_TOKENS`, the server serves only on a loopback address and refuses to start on any other.
 - **TLS** on the native port: TLS 1.3 with `TLS_CHACHA20_POLY1305_SHA256`, or TLS 1.2 with `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256` and extended master secret for clients that offer nothing newer; `x25519`; Ed25519 certificates (from `gen-ca` / `gen-cert`, or any CA issuing Ed25519 keys). Full handshakes only; clients are not asked for certificates.
 - **Limits** protect memory before authentication: each opcode has a body limit, checked from the header (section 14); a connection that sends a request it may not make is closed.
-- **Encryption at rest** is available to embedded applications (section 3).
+- **Encryption at rest**: `storage-server gen-key <file>` creates a key file (readable by its owner only; the server refuses a file others can read), and `STORAGE_ENCRYPTION_KEYS=<file>` turns encryption on. Records, the WAL, index files, Raft logs and snapshots are sealed with ChaCha20-Poly1305 (section 3), and the server refuses plaintext and data sealed with a key it does not have. Every node of a cluster needs the same key file, since snapshots travel between nodes as stored. Keep a copy of the keys away from the data: data sealed with a lost key is lost.
+  - **Turning it on for existing data**: one restart with the key file and `STORAGE_ENCRYPTION_ALLOW_PLAINTEXT=1`. The server reseals everything in the background, then refuses plaintext again on its own; drop the setting before the next restart. The health report shows `"accept_plaintext": false` once done.
+  - **Rotating keys**: `gen-key` adds a key to the file, and the newest is used after a restart, which reseals everything with it. Once that restart's reseal has finished and a checkpoint has passed, the database no longer needs the old key, but backups and archived WAL made before the rotation still do: keep it in the file (or in a safe place) for as long as you might restore them.
+  - **Turning it off**: `STORAGE_ENCRYPTION_ACTIVE_KEY=none` and a restart decrypt everything; then remove the settings.
+  - Range nodes reseal before they start serving; standalone and single-group nodes reseal while they serve.
 
 ---
 
@@ -363,6 +400,7 @@ Remote commands take a `host:port` address (an IP address, not a name) and authe
 | `remote-compact <addr>` | Compact arenas now (admin) |
 | `remote-backup <addr> <name>` | Online backup into `STORAGE_BACKUP_ROOT/<name>` (admin); a cluster backup on a range cluster |
 | `remote-restore <addr> <name>` | Restore a cluster backup (admin, range clusters) |
+| `restore-pitr <backup> <restore-dir> <time> [--archive DIR]... [--wal FILE]...` | Point-in-time recovery of a backup (section 13); runs offline |
 | `changefeed <addr> <out.jsonl> <cursor-file> [--collection C] [--from wall.logical] [--once] [--interval-ms N]` | Stream changes (admin, range clusters) |
 | `cluster <addr> [members]` | Members, leader, term and commit index |
 | `cluster <addr> add <id> <host:port>` / `add-learner` / `promote <id>` / `remove <id>` | Change membership (admin) |
@@ -392,7 +430,7 @@ Cluster nodes also keep their Raft logs and snapshots in the data directory. Two
 
 ### Monitoring
 
-`storage-cli remote-health` (or `OP_HEALTH`) returns JSON. A standalone or single-group node reports `status`, `live_records`, `total_reads`, `total_writes`, `hot_dirty_bytes` (written but not yet flushed) and `arena` (`segments`, `used`, `dead`, `live`, `compactions`, `removed`, `errors`, `last_error`). A range node reports `mode: "ranges"`, `ranges`, `log_entries`, `log_bytes`, queue and batch sizes, and `dropped_batches`.
+`storage-cli remote-health` (or `OP_HEALTH`) returns JSON. A standalone or single-group node reports `status`, `live_records`, `total_reads`, `total_writes`, `hot_dirty_bytes` (written but not yet flushed) and `arena` (`segments`, `used`, `dead`, `live`, `compactions`, `removed`, `errors`, `last_error`). A range node reports `mode: "ranges"`, `ranges`, `log_entries`, `log_bytes`, queue and batch sizes, and `dropped_batches`. Every node also reports `encryption` (`"off"`, or the active key, the keys it holds and whether it still accepts plaintext), a standalone or single-group node `wal_archive` (the archive directory, when set), and a range node `placement` (the ranges it holds: span, voters, and whether it leads each).
 
 `storage-cli remote-metrics` returns Prometheus text: `storine_live_records`, `storine_total_reads`, `storine_total_writes`, `storine_coalesced_flushes`, `storine_hot_dirty_bytes`, `storine_arena_*`, read and write latency summaries (`storine_read_latency_ns`, `storine_write_latency_ns`) and `storine_slow_rpcs` (requests over 10 ms; the last 256 are kept).
 
@@ -404,7 +442,14 @@ In the 2-hour soaks under constant faults, a single-group node peaked at 334 MiB
 
 - **Online backup of a running server**: set `STORAGE_BACKUP_ROOT` on the server, then `storage-cli remote-backup <addr> <name>`. On a range cluster this is a cluster-wide backup, restored with `remote-restore`.
 - **Offline**: stop the server and copy the data directory.
-- **Point-in-time recovery** (embedded engines with `wal_archive: true`): `storage-cli backup`, then `archive-wal` regularly, and `restore-pitr <backup> <restore-dir> <timestamp_ns>`. The server binary does not enable WAL archiving, so point-in-time recovery of a server's data is not available yet.
+- **Point-in-time recovery** (standalone and single-group servers):
+  1. Start the server with `STORAGE_WAL_ARCHIVE=<dir>`, ideally on another disk than the data. Each checkpoint (every 10 s while written) appends the WAL it cuts to `<dir>/documents/`. Archived segments older than `STORAGE_WAL_ARCHIVE_RETAIN` (7 days by default) are deleted; keep it longer than the time between backups.
+  2. Take backups regularly: `storage-cli remote-backup <addr> <name>` (with `STORAGE_BACKUP_ROOT`).
+  3. To recover, with the server stopped: `storage-cli restore-pitr <backup> <restore-dir> 2026-11-13T08:00:00Z --archive <dir>/documents`, adding `--wal <data>/wal/documents.wal` to include the writes after the last checkpoint if the data directory survived. The time is RFC 3339 or nanoseconds since the epoch. The restored directory holds every write up to that moment and none after; start a server on it. With encryption at rest, run the restore with the same `STORAGE_ENCRYPTION_KEYS`.
+  4. A single-group node's restore is one node's data: start it as a standalone server, or found a new cluster from it.
+
+  Range clusters refuse `STORAGE_WAL_ARCHIVE`: each node's log holds only its own ranges' history. Use cluster backups there.
+- **Embedded engines** use the same pieces directly: `EngineConfig::wal_archive` or `wal_archive_dir`, `create_online_backup`, and `restore_point_in_time_with`.
 
 ### Upgrades
 
@@ -439,7 +484,7 @@ Patch releases can be rolled through a cluster one node at a time; minor release
 ## 15. Known limitations
 
 - **Tail latency** trails RocksDB and LMDB in some cases: fill p99.99 (about 0.7 ms against RocksDB's 16–20 µs), 4-writer overwrite p99.99 (2.1–3.0 ms against 0.5–1.3 ms), and durable p99.9 / p99.99 against LMDB ([`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) sections 8.4–8.5).
-- The **server binary** does not expose encryption at rest, point-in-time recovery, cold or paged index tiers, or multi-region placement; these are in the embedded API.
+- The **server binary** does not expose cold or paged index tiers; they are in the embedded API. Point-in-time recovery is not available on range clusters (they have cluster backups), and placement rules change only with a rolling restart.
 - **TLS** supports one suite per version and Ed25519 certificates only; no client certificates.
 - **Change feeds** exist for range clusters only (`storage-cli changefeed`); the SDKs do not expose them.
 - **Soak testing** ran for 2 hours per cluster mode under constant faults; no multi-day soak has run, and the standalone server's periodic checkpoint is new in 0.1.1.

@@ -54,7 +54,7 @@ fn sql_on_a_range_cluster() {
                 security: SecurityConfig::default(),
                 max_connections: 1024,
                 max_offset: Duration::from_millis(500),
-                peer_tls: None,
+                peer_tls: None, extras: Default::default(),
             })
             .unwrap()
         })

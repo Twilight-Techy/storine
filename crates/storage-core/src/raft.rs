@@ -36,7 +36,30 @@ use storage_types::vfs::OpenOpts;
 use storage_types::{FastHashMap, FastHashSet, InlineId, RecordFlags, Result, StorageError, Version};
 use storage_types::wire::{read_u16_le, read_u32_le, read_u64_le, read_array_24};
 
-use crate::engine::{Precondition, StorageEngine, WriteKind, WriteOp, WriteResult};
+use crate::engine::{file_seal, EncryptionConfig, Precondition, StorageEngine, WriteKind, WriteOp, WriteResult};
+
+/// Where a replica's Raft files get their encryption settings: the engine's, read at each use,
+/// so they follow key rotation (`TASK-156`). Log frames and snapshot records hold document
+/// contents, so they are sealed like the engine's own records.
+#[derive(Clone, Default)]
+struct SealSource(Option<Arc<dyn Fn() -> Option<Arc<EncryptionConfig>> + Send + Sync>>);
+
+impl core::fmt::Debug for SealSource {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(if self.0.is_some() { "SealSource(engine)" } else { "SealSource(none)" })
+    }
+}
+
+impl SealSource {
+    fn get(&self) -> Option<Arc<EncryptionConfig>> {
+        self.0.as_ref().and_then(|f| f())
+    }
+}
+
+/// Context bound into a sealed frame of `path`: frames cannot be moved to another file.
+fn seal_context(path: &Path) -> Vec<u8> {
+    path.file_name().map(|n| n.to_string_lossy().as_bytes().to_vec()).unwrap_or_default()
+}
 use crate::sharding::NodeId;
 
 const RAFT_META_MAGIC: u32 = 0x5241_4654; // "RAFT"
@@ -730,6 +753,11 @@ const SNAPSHOT_MAGIC_V2: &[u8; 8] = b"STGESNP2";
 const SNAPSHOT_MAGIC: &[u8; 8] = b"STGESNP3";
 const SNAPSHOT_HEADER_LEN: usize = 40;
 const SNAPSHOT_RECORD_HEADER: usize = 24 + 4 + 8;
+/// Bytes a sealed snapshot record adds (`TASK-156`): header and tag.
+const SNAPSHOT_SEAL_OVERHEAD: u32 = (storage_codec::sealed_file::SEALED_FILE_HEADER_LEN + 16) as u32;
+/// Context of sealed snapshot records; the record's number in the snapshot is its position, so
+/// records cannot be reordered or moved between snapshots of different sizes undetected.
+const SNAPSHOT_SEAL_CONTEXT: &[u8] = b"raft-snapshot";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SnapshotMeta {
@@ -872,8 +900,10 @@ type SnapshotContents = (SnapshotMeta, Option<(u64, Membership)>, Option<(KeySpa
 
 fn for_each_snapshot_record(
     path: &Path,
+    enc: Option<&EncryptionConfig>,
     mut f: impl FnMut(InlineId, &AlignedBytes) -> Result<()>,
 ) -> Result<SnapshotContents> {
+    let seal = file_seal(enc);
     let io = |e| StorageError::io("read raft snapshot", e);
     let mut r = BufReader::with_capacity(RAFT_SNAPSHOT_CHUNK, File::open(path).map_err(io)?);
     let mut hdr = [0u8; SNAPSHOT_HEADER_LEN];
@@ -882,12 +912,12 @@ fn for_each_snapshot_record(
     let config = if meta.version >= 2 { read_config_block(&mut r)? } else { None };
     let span = if meta.version >= 3 { Some(read_span_block(&mut r)?) } else { None };
     let mut frame = Vec::new();
-    for _ in 0..meta.count {
+    for record_no in 0..meta.count {
         let mut rh = [0u8; SNAPSHOT_RECORD_HEADER];
         r.read_exact(&mut rh).map_err(io)?;
         let id_raw = read_array_24(&rh, 0);
         let len = read_u32_le(&rh, 24);
-        if len > storage_types::MAX_PAYLOAD_SIZE + storage_types::HEADER_SIZE as u32 {
+        if len > storage_types::MAX_PAYLOAD_SIZE + storage_types::HEADER_SIZE as u32 + SNAPSHOT_SEAL_OVERHEAD {
             return Err(StorageError::corrupted_header("raft snapshot frame too large"));
         }
         frame.clear();
@@ -899,7 +929,8 @@ fn for_each_snapshot_record(
         if snapshot_record_check(&id_raw, &frame) != read_u64_le(&rh, 28) {
             return Err(StorageError::corrupted_header("raft snapshot record checksum mismatch"));
         }
-        f(InlineId::from_raw_bytes(id_raw)?, &AlignedBytes::try_copy_from_slice(&frame)?)?;
+        let plain = seal.open_in_place(SNAPSHOT_SEAL_CONTEXT, record_no, &mut frame)?;
+        f(InlineId::from_raw_bytes(id_raw)?, &AlignedBytes::try_copy_from_slice(&frame[plain])?)?;
     }
     if r.read(&mut [0u8; 1]).map_err(io)? != 0 {
         return Err(StorageError::corrupted_header("trailing bytes after raft snapshot records"));
@@ -1174,6 +1205,8 @@ struct RaftStorage {
     sync_data: bool,
     meta_file: Mutex<Option<File>>,
     log_file: Mutex<Option<File>>,
+    /// Encryption settings for log frames and snapshot records (the engine's).
+    seal: SealSource,
 }
 
 impl RaftStorage {
@@ -1196,6 +1229,7 @@ impl RaftStorage {
             sync_data: true,
             meta_file: Mutex::new(None),
             log_file: Mutex::new(None),
+            seal: SealSource::default(),
         }
     }
 
@@ -1332,12 +1366,18 @@ impl RaftStorage {
         atomic_write_replace(&self.meta_path, &full, self.sync_data)
     }
 
-    fn encode_log_frame(entry: &RaftLogEntry, out: &mut Vec<u8>) {
+    /// Appends one `[len | checksum | body]` frame; the body is sealed when encryption is on
+    /// (`TASK-156`). The checksum covers the stored body, sealed or not.
+    fn encode_log_frame(&self, enc: Option<&EncryptionConfig>, entry: &RaftLogEntry, out: &mut Vec<u8>) -> Result<()> {
+        let seal = file_seal(enc);
         let mut body = Vec::with_capacity(64);
+        body.resize(seal.header_len(), 0);
         encode_log_entry(entry, &mut body);
+        seal.seal_in_place(&seal_context(&self.log_path), 0, &mut body)?;
         out.extend_from_slice(&(body.len() as u32).to_le_bytes());
         out.extend_from_slice(&checksum_payload(&body).to_le_bytes());
         out.extend_from_slice(&body);
+        Ok(())
     }
 
     fn append_log(&self, entries: &[RaftLogEntry]) -> Result<()> {
@@ -1349,8 +1389,9 @@ impl RaftStorage {
             return Ok(());
         }
         let mut buf = Vec::new();
+        let enc = self.seal.get();
         for e in entries {
-            Self::encode_log_frame(e, &mut buf);
+            self.encode_log_frame(enc.as_deref(), e, &mut buf)?;
         }
         let vfs = storage_types::vfs::at(&self.log_path);
         if !self.sync_data && !vfs.is_simulated() {
@@ -1379,8 +1420,9 @@ impl RaftStorage {
     fn rewrite_log(&self, log: &[RaftLogEntry]) -> Result<()> {
         *self.log_file.lock().unwrap_or_else(|p| p.into_inner()) = None;
         let mut buf = Vec::new();
+        let enc = self.seal.get();
         for e in log {
-            Self::encode_log_frame(e, &mut buf);
+            self.encode_log_frame(enc.as_deref(), e, &mut buf)?;
         }
         atomic_write_replace(&self.log_path, &buf, self.sync_data)
     }
@@ -1427,6 +1469,7 @@ impl RaftStorage {
 
         if self.log_path.exists() {
             let raw = fs::read(&self.log_path).map_err(|e| StorageError::io("read raft log", e))?;
+            let (enc, context) = (self.seal.get(), seal_context(&self.log_path));
             let mut pos = 0usize;
             while pos + 12 <= raw.len() {
                 let len = read_u32_le(&raw, pos) as usize;
@@ -1438,7 +1481,9 @@ impl RaftStorage {
                 if checksum_payload(body) != sum {
                     break;
                 }
-                let (entry, _) = decode_log_entry(body, 0)?;
+                let mut opened = body.to_vec();
+                let plain = file_seal(enc.as_deref()).open_in_place(&context, 0, &mut opened)?;
+                let (entry, _) = decode_log_entry(&opened[plain], 0)?;
                 pos = end;
                 // Entries covered by the snapshot remain only if a crash hit between writing the
                 // new compaction point and rewriting the log: skip them.
@@ -1565,6 +1610,8 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         let dir = engine.base_dir().to_path_buf();
         let mut storage = RaftStorage::for_group(&dir, &stem, group);
         storage.sync_data = engine.data_sync() || storage_types::vfs::at(&dir).is_simulated();
+        let weak = Arc::downgrade(&engine);
+        storage.seal = SealSource(Some(Arc::new(move || weak.upgrade().and_then(|e| e.encryption()))));
         let (span, span_state) = match storage.load_span_state()? {
             Some(saved) => saved,
             None => {
@@ -2665,6 +2712,23 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
 
     /// Leader: chunk `[offset, offset + max_chunk)` of a snapshot covering at least the
     /// compaction point. The snapshot is (re)generated when none covers it.
+    /// Rewrites this replica's Raft log with the engine's current encryption settings and drops
+    /// a snapshot written under older ones; one is generated again when a follower needs it
+    /// (`TASK-156`). Run after turning encryption on or off, or rotating keys, alongside
+    /// [`StorageEngine::reseal_all`].
+    pub fn reseal_storage(&self) -> Result<()> {
+        {
+            let _gen = self.snapshot_lock.lock().unwrap_or_else(|p| p.into_inner());
+            match std::fs::remove_file(&self.storage.snapshot_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(StorageError::io("remove raft snapshot", e)),
+            }
+        }
+        let st = self.lock_state();
+        self.storage.rewrite_log(&st.log)
+    }
+
     pub fn build_install_snapshot(&self, offset: u64, max_chunk: usize) -> Result<InstallSnapshotReq> {
         self.build_install_snapshot_from(offset, max_chunk, 0)
     }
@@ -2738,19 +2802,31 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         w.write_all(&encode_config_block(config.as_ref())).map_err(io)?;
         w.write_all(&encode_span_block(&span.0, span.1)).map_err(io)?;
         let mut count = 0u64;
+        let enc = self.storage.seal.get();
+        let seal = file_seal(enc.as_deref());
+        let mut sealed = Vec::new();
         for id in ids {
             let Some((version, ttl, record)) = read.get_with_ttl(id)? else {
                 continue;
             };
             let flags = if ttl > 0 { RecordFlags::HAS_TTL } else { RecordFlags::NONE };
-            let frame = RecordCodec::encode_aligned(&record, version, 0, flags, ttl);
+            let plain = RecordCodec::encode_aligned(&record, version, 0, flags, ttl);
+            let frame: &[u8] = if seal.sealing() {
+                sealed.clear();
+                sealed.resize(seal.header_len(), 0);
+                sealed.extend_from_slice(plain.as_slice());
+                seal.seal_in_place(SNAPSHOT_SEAL_CONTEXT, count, &mut sealed)?;
+                &sealed
+            } else {
+                plain.as_slice()
+            };
             let id_raw = id.to_raw_bytes();
             let len = u32::try_from(frame.len())
                 .map_err(|_| StorageError::invalid_archive("snapshot frame exceeds u32"))?;
             w.write_all(&id_raw).map_err(io)?;
             w.write_all(&len.to_le_bytes()).map_err(io)?;
-            w.write_all(&snapshot_record_check(&id_raw, &frame).to_le_bytes()).map_err(io)?;
-            w.write_all(&frame).map_err(io)?;
+            w.write_all(&snapshot_record_check(&id_raw, frame).to_le_bytes()).map_err(io)?;
+            w.write_all(frame).map_err(io)?;
             count += 1;
         }
         drop(read);
@@ -2846,7 +2922,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
         let recv = &self.storage.recv_path;
         // 1. Verify everything before touching the engine.
         let mut ids = FastHashSet::default();
-        let (meta, config, snap_span) = for_each_snapshot_record(recv, |id, _| {
+        let (meta, config, snap_span) = for_each_snapshot_record(recv, self.storage.seal.get().as_deref(), |id, _| {
             ids.insert(id);
             Ok(())
         })?;
@@ -2868,7 +2944,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             self.set_span(sp, state)?;
         }
         let span = self.span();
-        for_each_snapshot_record(recv, |id, frame| {
+        for_each_snapshot_record(recv, self.storage.seal.get().as_deref(), |id, frame| {
             if !span.contains_id(id) {
                 return Ok(()); // another group's key: never ours to write
             }
@@ -3519,6 +3595,105 @@ mod tests {
                 assert!(decode_raft_ops::<AgentObjectRecord>(&bytes.as_slice()[..cut]).is_err());
             }
         }
+    }
+
+    /// Every file under `dir` (recursively), with its bytes.
+    fn files_under(dir: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if let Ok(b) = std::fs::read(&p) {
+                    out.push((p, b));
+                }
+            }
+        }
+        out
+    }
+
+    /// With encryption on, Raft logs and snapshots are sealed like the engine's records
+    /// (`TASK-156`): no document byte reaches disk in plaintext, a follower installs a sealed
+    /// snapshot, and a replica reopens from its sealed log. Turning encryption on for existing
+    /// data reseals the logs too, after which plaintext frames are refused.
+    #[test]
+    fn test_encrypted_raft_logs_and_snapshots_hold_no_plaintext() {
+        use crate::engine::EncryptionConfig;
+        use storage_codec::EncryptionKey;
+        const MARK: &str = "PLAINTEXT-MARK-7f3c";
+        let base = std::env::temp_dir().join(format!("stge_test_raft_sealed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let strict = || EncryptionConfig::strict(1, EncryptionKey::from_bytes([7; 32]));
+        let migrating = || EncryptionConfig { accept_unencrypted: true, ..strict() };
+        let open = |name: &str, enc: Option<EncryptionConfig>| {
+            Arc::new(
+                StorageEngine::<AgentObjectRecord>::open(
+                    base.join(name),
+                    EngineConfig { wal_sync_policy: storage_wal::SyncPolicy::AsyncMemoryFirst, encryption: enc, ..EngineConfig::default() },
+                )
+                .unwrap(),
+            )
+        };
+        let id = |i: u32| InlineId::new(&format!("sealed{i:04}")).unwrap();
+        let rec = |i: u32, v: i64| AgentObjectRecord::new(id(i), format!("{MARK}-{i}"), 1, v);
+
+        // Plaintext first, as an existing cluster would be.
+        let engines = [open("s1", None), open("s2", None), open("s3", None)];
+        let nodes: Vec<Arc<RaftNode<AgentObjectRecord>>> =
+            engines.iter().enumerate().map(|(i, e)| Arc::new(RaftNode::new(i as NodeId + 1, Arc::clone(e)).unwrap())).collect();
+        let group = RaftReplicationGroup::new(nodes.clone()).unwrap();
+        group.elect_leader(1).unwrap();
+        for i in 0..20 {
+            group.replicate_put(id(i), &rec(i, 1)).unwrap();
+        }
+        assert!(files_under(&base).iter().any(|(p, b)| p.to_string_lossy().ends_with("_raft.log") && b.windows(MARK.len()).any(|w| w == MARK.as_bytes())));
+
+        // Turn encryption on: engines accept plaintext while they reseal, then go strict.
+        for (e, n) in engines.iter().zip(&nodes) {
+            e.set_encryption(Some(migrating())).unwrap();
+            e.reseal_all().unwrap();
+            n.reseal_storage().unwrap();
+            e.set_encryption(Some(strict())).unwrap();
+        }
+        // Node 3 falls behind; the others compact past it and must ship a sealed snapshot.
+        group.set_node_isolated(3, true);
+        for i in 0..200 {
+            group.replicate_put(id(i % 100), &rec(i % 100, i64::from(i))).unwrap();
+        }
+        for n in &nodes[..2] {
+            let applied = n.last_applied();
+            n.compact_log_through(applied).unwrap();
+        }
+        group.set_node_isolated(3, false);
+        let last = group.replicate_put(id(500), &rec(500, 5)).unwrap();
+        assert_eq!(nodes[2].last_applied(), last, "sealed snapshot installed, then the tail");
+        for i in (0..100).chain([500]) {
+            assert_eq!(engines[2].get_owned(id(i)).unwrap().1, engines[0].get_owned(id(i)).unwrap().1, "record {i}");
+        }
+        for e in &engines {
+            e.flush_all().unwrap();
+        }
+        for (path, bytes) in files_under(&base) {
+            assert!(!bytes.windows(MARK.len()).any(|w| w == MARK.as_bytes()), "plaintext in {}", path.display());
+        }
+
+        // A replica reopens from its sealed log; a plaintext frame appended to it is refused.
+        drop(group);
+        drop(nodes);
+        let log = base.join("s1").join(format!("{}_raft.log", crate::engine::collection_file_stem(engines[0].collection_name()).unwrap()));
+        let reopened = RaftNode::new(1, Arc::clone(&engines[0])).unwrap();
+        assert_eq!(reopened.last_log_index(), last);
+        drop(reopened);
+        let mut forged = Vec::new();
+        let plain = RaftStorage::for_group(&base.join("s1"), "x", None);
+        let entry = RaftLogEntry::record(1, last + 1, id(9), None);
+        plain.encode_log_frame(None, &entry, &mut forged).unwrap();
+        std::fs::OpenOptions::new().append(true).open(&log).unwrap().write_all(&forged).unwrap();
+        assert!(RaftNode::new(1, Arc::clone(&engines[0])).is_err(), "plaintext frame accepted under strict encryption");
+        drop(engines);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

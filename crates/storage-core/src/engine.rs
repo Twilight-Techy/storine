@@ -172,6 +172,9 @@ pub struct EngineConfig {
     /// (`archive_wal_for_pitr`). Archived segments grow until pruned
     /// (`GroupCommitWal::prune_archived_segments_before_lsn`).
     pub wal_archive: bool,
+    /// Where archived WAL goes instead (`<dir>/<collection>/`), ideally another disk than the
+    /// data, so the history survives losing it (`TASK-156`). Setting it turns archiving on.
+    pub wal_archive_dir: Option<PathBuf>,
     /// Storage tier of the secondary indexes (default [`IndexTier::Memory`]).
     pub index_tier: IndexTier,
     /// Storage tier of the primary index (default [`PrimaryTier::Memory`]). Switching tiers is
@@ -206,6 +209,7 @@ impl Default for EngineConfig {
             flush_interval_ms: 10,
             max_hot_dirty_bytes: 64 * 1024 * 1024,
             wal_archive: false,
+            wal_archive_dir: None,
             index_tier: IndexTier::Memory,
             primary_tier: PrimaryTier::Memory,
             encryption: None,
@@ -732,9 +736,10 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
 
         let wal_dir = base_dir.join("wal");
         let wal_path = wal_dir.join(format!("{stem}.wal"));
-        let wal_archive_dir = config
-            .wal_archive
-            .then(|| wal_dir.join("archive").join(&stem));
+        let wal_archive_dir = match &config.wal_archive_dir {
+            Some(dir) => Some(dir.join(&stem)),
+            None => config.wal_archive.then(|| wal_dir.join("archive").join(&stem)),
+        };
 
         let inner = Arc::new(SharedEngineInner {
             _dir_lock: dir_lock,
@@ -943,6 +948,12 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = config.map(Arc::new);
         self.inner.crypto_on.store(on, Ordering::Release);
         Ok(())
+    }
+
+    /// The installed encryption settings (`None`: encryption is off). Raft logs and snapshots
+    /// of a replicated engine are sealed with them too (`TASK-156`).
+    pub fn encryption(&self) -> Option<Arc<EncryptionConfig>> {
+        self.inner.crypto()
     }
 
     /// Rewrites every on-disk record frame into the form the current settings require: sealed

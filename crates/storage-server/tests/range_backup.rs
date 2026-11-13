@@ -45,7 +45,7 @@ fn start(root: &Path, backups: &Path) -> Cluster {
                 security: SecurityConfig::default().with_backup_root(backups),
                 max_connections: 256,
                 max_offset: Duration::from_millis(100),
-                peer_tls: None,
+                peer_tls: None, extras: Default::default(),
             })
             .unwrap()
         })
@@ -274,7 +274,7 @@ fn a_range_cluster_authenticates() {
                 security: SecurityConfig::new(true).with_token("secret-token-for-the-cluster", RbacRole::Admin),
                 max_connections: 256,
                 max_offset: Duration::from_millis(100),
-                peer_tls: None,
+                peer_tls: None, extras: Default::default(),
             })
             .unwrap()
         })

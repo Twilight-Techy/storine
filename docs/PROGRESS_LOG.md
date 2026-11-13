@@ -1010,3 +1010,9 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Measured** (final code, `c7i.xlarge`): cosine similarity on the `x86-64` build 17 ns against 23 ns native (449 ns before the FMA dispatch); every other row within noise.
 - **Docs**: friendly `README.md`; new `docs/TECHNICAL.md` from a code inventory; stale statements corrected across the changelog, protocol, SQL and SDK docs.
 
+## 2026-11-13: encryption, point-in-time recovery and placement in the server (`TASK-156`)
+
+- **Added**: key-file encryption at rest with resealing at start; WAL archiving for point-in-time recovery and a `restore-pitr` for server data; placement rules and localities for range clusters, with placement in health reports.
+- **Found and fixed**: Raft logs and snapshots held document contents in plaintext under engine encryption; they are now sealed.
+- **Verified locally**: Raft sealing unit test; the binary turning encryption on, rotating, retiring a key and refusing the wrong one; a range cluster with no plaintext on disk; a point-in-time restore exact to the moment on encrypted data; placement converging in a six-node, two-region cluster (and failing without its rule).
+

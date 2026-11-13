@@ -105,6 +105,20 @@ pub fn restore_point_in_time<T: ZeroCopyRecord + Indexable>(
     config: EngineConfig,
     target_timestamp_ns: u64,
 ) -> Result<StorageEngine<T>> {
+    restore_point_in_time_with::<T>(backup_dir, &[], restore_dir, config, target_timestamp_ns)
+}
+
+/// [`restore_point_in_time`] that also replays the WAL history in `logs` (`TASK-156`): archive
+/// directories (a server's `STORAGE_WAL_ARCHIVE`, read straight from where it archives) and WAL
+/// files (the active WAL a stopped or crashed server left, for the writes after its last
+/// checkpoint). Entries found in several places are replayed once.
+pub fn restore_point_in_time_with<T: ZeroCopyRecord + Indexable>(
+    backup_dir: &Path,
+    logs: &[std::path::PathBuf],
+    restore_dir: &Path,
+    config: EngineConfig,
+    target_timestamp_ns: u64,
+) -> Result<StorageEngine<T>> {
     if !backup_dir.exists() {
         return Err(StorageError::invalid_key("backup_dir does not exist"));
     }
@@ -115,10 +129,23 @@ pub fn restore_point_in_time<T: ZeroCopyRecord + Indexable>(
     let engine = StorageEngine::<T>::open(restore_dir, config)?;
 
     let wal_pitr_dir = backup_dir.join("wal_pitr");
+    let mut segments = Vec::new();
     if wal_pitr_dir.exists() {
+        segments.extend(GroupCommitWal::list_archived_segments(&wal_pitr_dir)?);
+    }
+    for log in logs {
+        if log.is_dir() {
+            segments.extend(GroupCommitWal::list_archived_segments(log)?);
+        } else if log.exists() {
+            segments.push(log.clone());
+        } else {
+            return Err(StorageError::io("read WAL history for PITR", std::io::Error::new(std::io::ErrorKind::NotFound, format!("{} does not exist", log.display()))));
+        }
+    }
+    if !segments.is_empty() {
         let mut entries = Vec::new();
-        for seg in GroupCommitWal::list_archived_segments(&wal_pitr_dir)? {
-            entries.extend(GroupCommitWal::recover_committed(&seg)?);
+        for seg in &segments {
+            entries.extend(GroupCommitWal::recover_committed(seg)?);
         }
         entries.retain(|e| {
             e.lsn > manifest.base_lsn

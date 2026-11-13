@@ -57,7 +57,9 @@
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
+pub mod at_rest;
 pub mod cluster;
+pub mod placement;
 pub mod documents;
 pub mod ranges;
 pub mod security;
@@ -1969,10 +1971,11 @@ fn execute_local<T: ZeroCopyRecord + Indexable>(
                 .map(|c| if c == '"' || c == '\\' || c.is_control() { '\'' } else { c })
                 .collect();
             let health = format!(
-                "{{\"status\":\"ok\",\"live_records\":{},\"total_reads\":{},\"total_writes\":{},\"hot_dirty_bytes\":{},\"arena\":{{\"segments\":{},\"used\":{},\"dead\":{},\"live\":{},\"compactions\":{},\"removed\":{},\"errors\":{},\"last_error\":\"{}\"}}{}}}",
+                "{{\"status\":\"ok\",\"live_records\":{},\"total_reads\":{},\"total_writes\":{},\"hot_dirty_bytes\":{},\"arena\":{{\"segments\":{},\"used\":{},\"dead\":{},\"live\":{},\"compactions\":{},\"removed\":{},\"errors\":{},\"last_error\":\"{}\"}}{}{}}}",
                 st.live_records, st.total_reads, st.total_writes, st.hot_dirty_bytes,
                 st.arena_segments, st.arena_used_bytes, st.arena_dead_bytes, engine.arena_live_bytes(),
                 st.arena_compactions, st.arena_compacted_segments, st.arena_compaction_errors, last_error,
+                at_rest::health_field(engine.encryption()) + &engine.wal_archive_dir().map_or(String::new(), |d| format!(",\"wal_archive\":\"{}\"", d.display().to_string().replace('\\', "/").replace('"', "'"))),
                 heap_fields(),
             );
             conn.send_or_queue_response(STATUS_OK, st.live_records as u64, health.as_bytes())

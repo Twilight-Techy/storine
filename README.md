@@ -32,9 +32,9 @@
 
 - **Fast where it counts.** Reads take about 60 nanoseconds in process and 9 microseconds over the network. Against LMDB and RocksDB at equal durability, Storine leads every throughput row and every p99 row ([benchmarks](docs/BENCHMARK_REPORT.md)).
 - **Documents, done properly.** Collections of JSON-like documents with secondary indexes, vector search, exact decimals and server-side aggregates. Changes are atomic: transfer money between two documents and it either all happens or none of it does.
-- **One engine, three ways to run it.** Link it into a Rust program, run `storage-server`, or start three servers and get a replicated cluster with automatic failover. Range-partitioned clusters spread data across more nodes and keep transactions across them.
+- **One engine, three ways to run it.** Link it into a Rust program, run `storage-server`, or start three servers and get a replicated cluster with automatic failover. Range-partitioned clusters spread data across more nodes, keep transactions across them, and place data by region when you tell them where each node runs.
 - **Speaks your stack.** Clients for eight languages, and a SQL gateway that speaks the PostgreSQL, MySQL and SQL Server protocols, so existing apps can switch by changing a connection string.
-- **Security built in.** A server refuses to listen beyond localhost until you give it tokens, each with a role. Two settings turn on TLS for clients and between cluster nodes, with certificates the server can issue itself. Embedded, the engine also encrypts data at rest, with key rotation.
+- **Security built in.** A server refuses to listen beyond localhost until you give it tokens, each with a role. Two settings turn on TLS for clients and between cluster nodes, with certificates the server can issue itself. A key file encrypts everything on disk, logs and backups included, with key rotation. Archived logs let you restore the database as it was at any moment.
 - **Small and self-contained.** Each tool is a single file of a few megabytes, with nothing else to install.
 
 | Against LMDB and RocksDB, 1,000,000 keys | Storine | RocksDB | LMDB |

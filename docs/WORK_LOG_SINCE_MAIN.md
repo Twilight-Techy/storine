@@ -272,3 +272,7 @@ Yes:
 - `storine-console`: browse, edit, query, aggregate and index from a browser.
 - macOS `kqueue` reactor; CI on all three systems.
 
+### Encryption, PITR and placement in the server (`TASK-156`) — 2026-11-13
+
+- Key-file encryption at rest (Raft logs and snapshots now sealed too), WAL archiving and `restore-pitr` for server data, and region placement rules for range clusters.
+

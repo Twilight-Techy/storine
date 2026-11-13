@@ -35,7 +35,7 @@ pub mod telemetry;
 pub mod write_queue;
 
 pub use backup::{
-    archive_wal_for_pitr, create_online_backup, restore_point_in_time, BackupManifest,
+    archive_wal_for_pitr, create_online_backup, load_backup_manifest, restore_point_in_time, restore_point_in_time_with, BackupManifest,
 };
 pub use catalog::{CatalogTransaction, CollectionMeta, DatabaseCatalog, ErasedCollectionEngine};
 pub use document::{

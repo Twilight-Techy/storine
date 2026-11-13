@@ -35,6 +35,17 @@
 //!   node's own certificate, enough when every node shares one, or for a self-signed one). Each
 //!   peer's certificate must name the host it is listed under in `--peers`.
 //!
+//! - `STORAGE_ENCRYPTION_KEYS`: a key file (`storage-server gen-key <file>` makes one) turns on
+//!   encryption at rest; `STORAGE_ENCRYPTION_ACTIVE_KEY` picks the sealing key (default: the
+//!   newest; `none` decrypts) and `STORAGE_ENCRYPTION_ALLOW_PLAINTEXT=1` accepts existing
+//!   plaintext while it is converted. Every start reseals what does not match (`at_rest`).
+//! - `STORAGE_WAL_ARCHIVE`: a directory (preferably on another disk) where checkpoints archive
+//!   the WAL for point-in-time recovery (`storage-cli restore-pitr`), kept for
+//!   `STORAGE_WAL_ARCHIVE_RETAIN` (default `7d`). Not on range clusters.
+//!
+//! Placement (range clusters): `--peers 1=host:port@region/zone,...` gives every node's
+//! locality and `--zones <file>` the placement rules, the same on every node (`placement`).
+//!
 //! Certificates (Ed25519) can be made without OpenSSL:
 //! - `storage-server gen-ca <dir>`: a cluster CA (`ca.crt`, `ca.key`);
 //! - `storage-server gen-cert <ca-dir> <out-dir> <name>[,<name>...]`: a node certificate
@@ -150,8 +161,82 @@ fn certificate_command(args: &[String]) -> Result<bool> {
             println!("wrote {} and {} for {}", out.join("node.crt").display(), out.join("node.key").display(), names.join(", "));
             Ok(true)
         }
+        Some("gen-key") => {
+            let file = std::path::Path::new(args.get(2).ok_or_else(|| StorageError::invalid_key("usage: gen-key <key-file>"))?);
+            let id = storage_server::at_rest::add_key(file)?;
+            println!("added encryption key {id} to {} (readable by its owner only; keep a copy elsewhere)", file.display());
+            println!("the newest key seals new data: restart with STORAGE_ENCRYPTION_KEYS={} to use it", file.display());
+            Ok(true)
+        }
         _ => Ok(false),
     }
+}
+
+/// Reseals in the background once the server runs (standalone and single-group nodes; range
+/// nodes reseal before they start): records, WAL, index files and the Raft log are brought into
+/// the form the encryption settings require (`TASK-156`).
+fn spawn_reseal<T: storage_codec::ZeroCopyRecord + storage_index::Indexable + 'static>(
+    engine: Arc<StorageEngine<T>>,
+    raft: Option<Arc<RaftNode<T>>>,
+    at_rest: Option<storage_server::at_rest::AtRest>,
+) {
+    let Some(at_rest) = at_rest else { return };
+    let _ = thread::Builder::new().name("storine-reseal".into()).spawn(move || {
+        let raft_step = || raft.as_ref().map_or(Ok(()), |r| r.reseal_storage());
+        match storage_server::at_rest::reseal(&engine, raft_step, at_rest.after_reseal.as_ref()) {
+            Ok(r) if r.resealed > 0 || at_rest.after_reseal.is_some() => {
+                eprintln!("storage-server: encryption: resealed {} records ({} already in place)", r.resealed, r.unchanged);
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("storage-server: encryption: resealing failed (data written before stays in its old form until the next start): {e}"),
+        }
+    });
+}
+
+/// `STORAGE_WAL_ARCHIVE`: where checkpoints archive the WAL for point-in-time recovery
+/// (`TASK-156`), and `STORAGE_WAL_ARCHIVE_RETAIN` (`7d` by default; `h` and `m` units too):
+/// how long archived segments are kept.
+fn wal_archive_from_env() -> Result<Option<(std::path::PathBuf, Duration)>> {
+    let Some(dir) = env::var_os("STORAGE_WAL_ARCHIVE").filter(|d| !d.is_empty()) else {
+        if env::var_os("STORAGE_WAL_ARCHIVE_RETAIN").is_some() {
+            return Err(StorageError::config("STORAGE_WAL_ARCHIVE_RETAIN needs STORAGE_WAL_ARCHIVE (the archive directory)"));
+        }
+        return Ok(None);
+    };
+    let retain = env::var("STORAGE_WAL_ARCHIVE_RETAIN").unwrap_or_else(|_| "7d".into());
+    let t = retain.trim();
+    let (n, unit) = t.split_at(t.len().saturating_sub(1));
+    let secs = n.parse::<u64>().ok().filter(|&n| n > 0).and_then(|n| match unit {
+        "d" => n.checked_mul(86_400),
+        "h" => n.checked_mul(3_600),
+        "m" => n.checked_mul(60),
+        _ => None,
+    });
+    let secs = secs.ok_or_else(|| StorageError::config(format!("STORAGE_WAL_ARCHIVE_RETAIN {retain:?}: use a number of days, hours or minutes, like 7d, 48h or 90m")))?;
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).map_err(|e| StorageError::io("create the WAL archive directory", e))?;
+    Ok(Some((dir, Duration::from_secs(secs))))
+}
+
+/// Deletes archived WAL segments older than `retain`, every hour. Keep `retain` longer than the
+/// time between backups: a restore needs every segment since the backup it starts from.
+fn spawn_archive_pruner(dir: std::path::PathBuf, retain: Duration) {
+    let _ = thread::Builder::new().name("storine-archive-prune".into()).spawn(move || loop {
+        let now = std::time::SystemTime::now();
+        for stem in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            for seg in std::fs::read_dir(stem.path()).into_iter().flatten().flatten() {
+                let p = seg.path();
+                let is_segment = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("wal_") && n.ends_with(".log"));
+                let old = seg.metadata().and_then(|m| m.modified()).ok().and_then(|t| now.duration_since(t).ok()).is_some_and(|age| age > retain);
+                if is_segment && old {
+                    if let Err(e) = std::fs::remove_file(&p) {
+                        eprintln!("storage-server: could not prune archived WAL {}: {e}", p.display());
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_secs(3600));
+    });
 }
 
 fn run() -> Result<()> {
@@ -167,7 +252,7 @@ fn run() -> Result<()> {
                 skip_next = false;
                 continue;
             }
-            if a == "--max-connections" || a == "--records" || a == "--node-id" || a == "--peers" {
+            if a == "--max-connections" || a == "--records" || a == "--node-id" || a == "--peers" || a == "--zones" {
                 skip_next = true;
                 continue;
             }
@@ -202,7 +287,7 @@ fn run() -> Result<()> {
     if legacy_agent {
         let engine = Arc::new(StorageEngine::<AgentObjectRecord>::open(
             data_dir,
-            EngineConfig::default(),
+            EngineConfig { encryption: storage_server::at_rest::from_env()?.map(|a| a.startup), ..EngineConfig::default() },
         )?);
         let server = StorageServer::start_with_config(bind_addr, engine, max_connections, security)?;
         report((server.local_addr(), server.max_connections()), data_dir, auth_enabled, "agent records");
@@ -210,9 +295,27 @@ fn run() -> Result<()> {
     }
     let flag = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1));
     if args.iter().any(|a| a == "--ranges") {
-        return run_ranges(data_dir, bind_addr, max_connections, security, flag("--node-id").map(String::as_str), flag("--peers").map(String::as_str), once);
+        if env::var_os("STORAGE_WAL_ARCHIVE").is_some() {
+            return Err(StorageError::config(
+                "STORAGE_WAL_ARCHIVE (point-in-time recovery) is not available on range clusters: one node's log holds only its ranges' history. Use cluster backups (storage-cli remote-backup) instead",
+            ));
+        }
+        return run_ranges(data_dir, bind_addr, max_connections, security, flag("--node-id").map(String::as_str), flag("--peers").map(String::as_str), flag("--zones").map(String::as_str), once);
     }
-    let store = Arc::new(DocumentStore::open(data_dir, EngineConfig::default())?);
+    if flag("--zones").is_some() {
+        return Err(StorageError::config("--zones (placement rules) applies to range clusters: add --ranges"));
+    }
+    let at_rest = storage_server::at_rest::from_env()?;
+    let archive = wal_archive_from_env()?;
+    let engine_config = EngineConfig {
+        encryption: at_rest.as_ref().map(|a| a.startup.clone()),
+        wal_archive_dir: archive.as_ref().map(|(d, _)| d.clone()),
+        ..EngineConfig::default()
+    };
+    if let Some((dir, retain)) = archive {
+        spawn_archive_pruner(dir, retain);
+    }
+    let store = Arc::new(DocumentStore::open(data_dir, engine_config)?);
     let join = args.iter().any(|a| a == "--join");
     if let (Some(node_id), true) = (flag("--node-id"), flag("--peers").is_some() || join) {
         let node_id: NodeId = node_id
@@ -246,6 +349,7 @@ fn run() -> Result<()> {
             }
         }
         let node = Arc::new(RaftNode::new(node_id, Arc::clone(store.engine()))?);
+        spawn_reseal(Arc::clone(store.engine()), Some(Arc::clone(&node)), at_rest.clone());
         let mut transport = cluster::TcpRaftTransport::new(raft_peers, token, Duration::from_millis(500));
         if let Some(tls) = peer_tls(&security, &members)? {
             transport = transport.with_tls(tls);
@@ -276,18 +380,27 @@ fn run() -> Result<()> {
         report((server.local_addr(), server.max_connections()), data_dir, auth_enabled, &mode);
         return park(server, once);
     }
+    spawn_reseal(Arc::clone(store.engine()), None, at_rest);
     let server = StorageServer::start_documents(bind_addr, store, max_connections, security, None)?;
     report((server.local_addr(), server.max_connections()), data_dir, auth_enabled, "documents");
     park(server, once)
 }
 
 /// `--ranges`: one node of a range cluster (see the module docs).
-fn run_ranges(data_dir: &str, bind_addr: &str, max_connections: usize, security: SecurityConfig, node_id: Option<&str>, peers: Option<&str>, once: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn run_ranges(data_dir: &str, bind_addr: &str, max_connections: usize, security: SecurityConfig, node_id: Option<&str>, peers: Option<&str>, zones_file: Option<&str>, once: bool) -> Result<()> {
     let node_id: NodeId = node_id
         .ok_or_else(|| StorageError::invalid_key("--ranges needs --node-id"))?
         .parse()
         .map_err(|_| StorageError::invalid_key("--node-id must be a number (1-65535)"))?;
-    let members = parse_peers(peers.ok_or_else(|| StorageError::invalid_key("--ranges needs --peers (every node, this one included)"))?)?;
+    let peers = peers.ok_or_else(|| StorageError::invalid_key("--ranges needs --peers (every node, this one included)"))?;
+    let members = parse_peers(peers)?;
+    let localities = parse_localities(peers)?;
+    let zones = match zones_file {
+        Some(f) => storage_server::placement::parse(&std::fs::read_to_string(f).map_err(|e| StorageError::io("read --zones file", e))?)?,
+        None => storage_core::dist::zone::ZoneConfigs::default(),
+    };
+    storage_server::placement::check(&localities, members.len(), &zones)?;
     if !members.contains_key(&node_id) {
         return Err(StorageError::invalid_key("--peers must list this node's own --node-id"));
     }
@@ -319,6 +432,7 @@ fn run_ranges(data_dir: &str, bind_addr: &str, max_connections: usize, security:
         max_connections,
         max_offset: Duration::from_millis(500),
         peer_tls,
+        extras: storage_server::ranges::RangeExtras { encryption: storage_server::at_rest::from_env()?, localities, zones },
     })?;
     report((server.local_addr(), server.max_connections()), data_dir, server_auth(&server), &format!("documents, range node {node_id} of {n}"));
     park(server, once)
@@ -339,12 +453,25 @@ fn parse_peers(spec: &str) -> Result<HashMap<NodeId, String>> {
             .trim()
             .parse()
             .map_err(|_| StorageError::invalid_key("--peers ids must be numbers (1-65535)"))?;
-        if id == 0 || out.insert(id, addr.trim().to_owned()).is_some() {
+        let (addr, _) = storage_server::placement::split_locality(addr.trim())?;
+        if id == 0 || out.insert(id, addr.to_owned()).is_some() {
             return Err(StorageError::invalid_key("--peers ids must be unique and non-zero"));
         }
     }
     if out.is_empty() {
         return Err(StorageError::invalid_key("--peers is empty"));
+    }
+    Ok(out)
+}
+
+/// The localities in `--peers` (`id=host:port@region/zone`), by node.
+fn parse_localities(spec: &str) -> Result<std::collections::BTreeMap<NodeId, storage_core::dist::zone::Locality>> {
+    let mut out = std::collections::BTreeMap::new();
+    for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let Some((id, addr)) = item.split_once('=') else { continue };
+        if let (Ok(id), (_, Some(loc))) = (id.trim().parse::<NodeId>(), storage_server::placement::split_locality(addr.trim())?) {
+            out.insert(id, loc);
+        }
     }
     Ok(out)
 }

@@ -183,6 +183,7 @@ impl Transport for TcpRangeTransport {
 /// What a range-mode server holds.
 pub struct RangeContext {
     pub(crate) node: Arc<RangeNode>,
+    engine: Arc<storage_core::StorageEngine<storage_core::DocumentRecord>>,
     pub(crate) pool: Arc<WorkerPool>,
     /// `OP_KV` from other nodes' coordinators.
     pub(crate) kv_pool: Arc<WorkerPool>,
@@ -214,6 +215,8 @@ impl core::fmt::Debug for RangeContext {
 /// Everything a range-mode server needs (see [`crate::StorageServer::start_documents_ranges`]).
 pub struct RangeOptions {
     pub node: Arc<RangeNode>,
+    /// The node's engine (health reports its encryption settings).
+    pub engine: Arc<storage_core::StorageEngine<storage_core::DocumentRecord>>,
     pub transport: Arc<TcpRangeTransport>,
     pub gateway: GatewayConfig,
     pub hlc: Arc<Hlc>,
@@ -244,7 +247,7 @@ impl RangeContext {
     }
 
     pub(crate) fn new(o: RangeOptions, workers: usize) -> Self {
-        Self { node: o.node, pool: WorkerPool::new(workers, 16_384), kv_pool: WorkerPool::new(workers, 16_384), analytics: Arc::default(), transport: o.transport, gateway: o.gateway, hlc: o.hlc, cache: Arc::new(RwLock::new(RangeIndex::new())), plain: Arc::default(), backup_running: Arc::default() }
+        Self { node: o.node, engine: o.engine, pool: WorkerPool::new(workers, 16_384), kv_pool: WorkerPool::new(workers, 16_384), analytics: Arc::default(), transport: o.transport, gateway: o.gateway, hlc: o.hlc, cache: Arc::new(RwLock::new(RangeIndex::new())), plain: Arc::default(), backup_running: Arc::default() }
     }
 
     /// The node's backup slot, unless a backup or restore holds it (each occupies a worker for as
@@ -263,10 +266,11 @@ impl RangeContext {
     /// `OP_HEALTH` in range mode: what the node holds in memory, for operators and the soak.
     pub(crate) fn health(&self) -> Vec<u8> {
         format!(
-            "{{\"status\":\"ok\",\"mode\":\"ranges\",{},\"outbound_batch_bytes\":{},\"dropped_batches\":{}{}}}",
+            "{{\"status\":\"ok\",\"mode\":\"ranges\",{},\"outbound_batch_bytes\":{},\"dropped_batches\":{}{}{}}}",
             self.node.gauges(),
             self.transport.queued_bytes.load(Ordering::Relaxed),
             self.transport.dropped.load(Ordering::Relaxed),
+            crate::at_rest::health_field(self.engine.encryption()) + ",\"placement\":" + &self.node.placement(),
             crate::heap_fields()
         )
         .into_bytes()
@@ -627,6 +631,19 @@ pub struct RangeServerConfig {
     pub max_offset: Duration,
     /// Peers are reached over TLS (needed when their ports require it).
     pub peer_tls: Option<crate::cluster::PeerTls>,
+    /// Encryption at rest and placement (`TASK-156`).
+    pub extras: RangeExtras,
+}
+
+/// Optional settings of a range node (`TASK-156`).
+#[derive(Clone, Debug, Default)]
+pub struct RangeExtras {
+    /// Encryption at rest: records, WAL, Raft logs and snapshots (every node needs the keys).
+    pub encryption: Option<crate::at_rest::AtRest>,
+    /// Region and zone of every node, and placement rules by key span (every node needs the
+    /// same; see `crate::placement`).
+    pub localities: std::collections::BTreeMap<NodeId, storage_core::dist::zone::Locality>,
+    pub zones: storage_core::dist::zone::ZoneConfigs,
 }
 
 /// Starts one node of a range cluster: on first start it holds one range over the whole key
@@ -643,7 +660,8 @@ pub fn start_range_server(cfg: RangeServerConfig) -> Result<crate::StorageServer
     }
     let mut ids: Vec<NodeId> = cfg.peers.keys().copied().collect();
     ids.sort_unstable();
-    let engine = Arc::new(StorageEngine::<DocumentRecord>::open(&cfg.data_dir, EngineConfig { collection_name: "ranges".into(), layout_mode: storage_core::document::DOCUMENT_LAYOUT, wal_sync_policy: storage_core::dist::range_wal_policy(), ..EngineConfig::default() })?);
+    let encryption = cfg.extras.encryption.clone();
+    let engine = Arc::new(StorageEngine::<DocumentRecord>::open(&cfg.data_dir, EngineConfig { collection_name: "ranges".into(), layout_mode: storage_core::document::DOCUMENT_LAYOUT, wal_sync_policy: storage_core::dist::range_wal_policy(), encryption: encryption.as_ref().map(|e| e.startup.clone()), ..EngineConfig::default() })?);
     let incarnation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
     let node_cfg = NodeConfig {
         seed: u64::from(cfg.node_id),
@@ -651,16 +669,30 @@ pub fn start_range_server(cfg: RangeServerConfig) -> Result<crate::StorageServer
         cluster: ids.clone(),
         allocator: Some(storage_core::dist::alloc::AllocatorConfig::default()),
         max_offset_ns: cfg.max_offset.as_nanos() as u64,
+        localities: cfg.extras.localities.clone(),
         ..NodeConfig::default()
     };
     let mut driver = NodeDriver::new(cfg.node_id, Arc::clone(&engine), node_cfg);
+    if !cfg.extras.localities.is_empty() || cfg.extras.zones != storage_core::dist::zone::ZoneConfigs::default() {
+        driver.set_zones(cfg.extras.zones.clone()).map_err(|e| StorageError::config(format!("placement rules (--zones) do not fit the cluster's localities: {e}")))?;
+    }
     if driver.reopen_ranges()?.is_empty() {
         driver.open_range(1, storage_core::raft::KeySpan::all(), &ids)?;
+    }
+    // Encryption settings changed (turned on, rotated, turned off): bring the engine and every
+    // replica's Raft log into line before serving. Range nodes do it at start, while nothing
+    // else runs on the driver.
+    if let Some(at_rest) = encryption {
+        let report = crate::at_rest::reseal(&engine, || driver.reseal_storage().map(|_| ()), at_rest.after_reseal.as_ref())?;
+        if report.resealed > 0 {
+            eprintln!("storage-server: encryption: resealed {} records", report.resealed);
+        }
     }
     let hlc = Arc::new(Hlc::new(Arc::new(SystemClock), cfg.max_offset));
     let transport = TcpRangeTransport::new_with_tls(cfg.node_id, cfg.peers.clone(), cfg.token.clone(), Duration::from_secs(2), cfg.peer_tls.clone());
     let node = RangeNode::start(NodeServer::new(driver, Arc::clone(&hlc)), Arc::clone(&transport) as Arc<dyn Transport>, RuntimeConfig::default());
     transport.set_local(Arc::clone(&node));
     let gateway = GatewayConfig { nodes: ids, request_timeout: Duration::from_secs(10), call_timeout: Duration::from_secs(5) };
-    crate::StorageServer::start_documents_ranges(&cfg.bind_addr, engine, cfg.max_connections, cfg.security, RangeOptions { node, transport, gateway, hlc })
+    let options = RangeOptions { node, engine: Arc::clone(&engine), transport, gateway, hlc };
+    crate::StorageServer::start_documents_ranges(&cfg.bind_addr, engine, cfg.max_connections, cfg.security, options)
 }

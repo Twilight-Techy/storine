@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use storage_core::{
-    backup::{archive_wal_for_pitr, create_online_backup, restore_point_in_time},
+    backup::{archive_wal_for_pitr, create_online_backup, restore_point_in_time_with},
     AgentObjectRecord, EngineConfig, StorageEngine, StorageLayoutMode,
 };
 use storage_server::StorageClient;
@@ -48,7 +48,9 @@ fn print_usage() {
          \x20 bench <db_dir> [count]                            Run quick CLI throughput benchmark\n\
          \x20 backup <db_dir> <backup_dir>                      Online hot backup with WAL LSN manifest\n\
          \x20 archive-wal <db_dir> <backup_dir>                 Archive WAL segment for PITR replay\n\
-         \x20 restore-pitr <backup_dir> <restore_dir> <ts_ns>   Restore database to a nanosecond timestamp\n\
+         \x20 restore-pitr <backup_dir> <restore_dir> <time> [--archive <dir>]... [--wal <file>]...\n\
+         \x20                                                    Restore a backup as of <time> (RFC 3339 or ns since the epoch),\n\
+         \x20                                                    replaying archived WAL (a server's STORAGE_WAL_ARCHIVE) and WAL files\n\
          \x20 remote-health <addr>                              Health check a remote StorageServer\n\
          \x20 remote-compact <addr>                             Trigger remote arena compaction (admin)\n\
          \x20 remote-backup <addr> <backup_name>                Trigger remote backup under the server's backup root (admin)\n\
@@ -299,27 +301,42 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
             if args.len() < 4 {
                 print_usage();
                 return Err(storage_types::StorageError::invalid_key(
-                    "missing required <backup_dir>, <restore_dir>, and <target_ts_ns> for 'restore-pitr'",
+                    "missing required <backup_dir>, <restore_dir> and <time> for 'restore-pitr'",
                 ));
             }
             let backup_dir = Path::new(&args[1]);
             let restore_dir = Path::new(&args[2]);
-            let target_ts_ns: u64 = args[3].parse().map_err(|_| {
-                storage_types::StorageError::invalid_key(
-                    "target_ts_ns must be a valid 64-bit unsigned integer (nanoseconds since epoch)",
-                )
-            })?;
-            let engine = restore_point_in_time::<AgentObjectRecord>(
-                backup_dir,
-                restore_dir,
-                pitr_config(),
-                target_ts_ns,
-            )?;
-            let st = engine.stats();
-            println!(
-                "PITR restored to {:?} (target_ts_ns={})\n  Live Records: {}",
-                restore_dir, target_ts_ns, st.live_records,
-            );
+            let target_ts_ns = parse_time_arg(&args[3])?;
+            // WAL history beyond the backup's own: archive directories and WAL files.
+            let mut logs = Vec::new();
+            let mut rest = args[4..].iter();
+            while let Some(flag) = rest.next() {
+                match (flag.as_str(), rest.next()) {
+                    ("--archive" | "--wal", Some(p)) => logs.push(std::path::PathBuf::from(p)),
+                    _ => return Err(storage_types::StorageError::config(format!("restore-pitr: unexpected {flag:?} (options: --archive <dir>, --wal <file>)"))),
+                }
+            }
+            let manifest = storage_core::load_backup_manifest(&backup_dir.join("backup.meta"))?;
+            let encryption = storage_server::at_rest::from_env()?.map(|a| a.after_reseal.unwrap_or(a.startup));
+            let live = if manifest.collection_name == "documents" {
+                // A server's document data: the restored directory is one `storage-server` opens.
+                let config = EngineConfig {
+                    collection_name: "documents".into(),
+                    layout_mode: storage_core::document::DOCUMENT_LAYOUT,
+                    encryption,
+                    ..EngineConfig::default()
+                };
+                let engine = restore_point_in_time_with::<storage_core::DocumentRecord>(backup_dir, &logs, restore_dir, config, target_ts_ns)?;
+                engine.stats().live_records
+            } else {
+                let config = EngineConfig { encryption, ..pitr_config() };
+                let engine = restore_point_in_time_with::<AgentObjectRecord>(backup_dir, &logs, restore_dir, config, target_ts_ns)?;
+                engine.stats().live_records
+            };
+            println!("restored {} as of {} into {} ({live} records)", backup_dir.display(), args[3], restore_dir.display());
+            if manifest.collection_name == "documents" {
+                println!("start a server on it: storage-server {}", restore_dir.display());
+            }
             Ok(())
         }
         "remote-health" => {
@@ -558,6 +575,48 @@ fn connect_remote(addr: SocketAddr) -> storage_types::Result<StorageClient> {
 }
 
 /// Engine configuration with WAL archiving enabled (needed by backup / PITR commands).
+/// A point in time: nanoseconds since the epoch, or RFC 3339 (`2026-11-13T08:00:00Z`, with an
+/// optional fraction and a `Z` or `+hh:mm` offset).
+fn parse_time_arg(text: &str) -> storage_types::Result<u64> {
+    if let Ok(ns) = text.parse::<u64>() {
+        return Ok(ns);
+    }
+    parse_rfc3339(text).ok_or_else(|| storage_types::StorageError::config(format!("{text:?} is not a time: use 2026-11-13T08:00:00Z or nanoseconds since the epoch")))
+}
+
+fn parse_rfc3339(t: &str) -> Option<u64> {
+    let num = |s: &str| -> Option<i64> { (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok()).flatten() };
+    let (date, rest) = t.trim().split_once(['T', 't', ' '])?;
+    let mut d = date.splitn(3, '-');
+    let (y, m, day) = (num(d.next()?)?, num(d.next()?)?, num(d.next()?)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let (clock, offset) = if let Some(c) = rest.strip_suffix(['Z', 'z']) {
+        (c, 0)
+    } else {
+        let i = rest.rfind(['+', '-'])?;
+        let (h, mi) = rest[i + 1..].split_once(':')?;
+        let off = num(h)? * 3600 + num(mi)? * 60;
+        (&rest[..i], if &rest[i..=i] == "-" { -off } else { off })
+    };
+    let (hms, frac) = clock.split_once('.').unwrap_or((clock, ""));
+    let mut p = hms.splitn(3, ':');
+    let (h, mi, s) = (num(p.next()?)?, num(p.next()?)?, num(p.next()?)?);
+    if h > 23 || mi > 59 || s > 60 || frac.len() > 9 {
+        return None;
+    }
+    let frac_ns = if frac.is_empty() { 0 } else { num(frac)? * 10i64.pow(9 - frac.len() as u32) };
+    // Days since 1970-01-01 (Howard Hinnant's algorithm).
+    let yy = if m <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + day - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    let secs = days * 86_400 + h * 3600 + mi * 60 + s - offset;
+    u64::try_from(secs).ok()?.checked_mul(1_000_000_000)?.checked_add(frac_ns as u64)
+}
+
 fn pitr_config() -> EngineConfig {
     EngineConfig {
         wal_archive: true,

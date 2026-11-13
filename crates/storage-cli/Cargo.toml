@@ -24,3 +24,6 @@ storage-tls = { path = "../storage-tls" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+storage-codec = { path = "../storage-codec" }

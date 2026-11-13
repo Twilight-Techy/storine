@@ -73,6 +73,8 @@ pub struct RangeNode {
     gauges: Arc<[AtomicU64; GAUGES.len()]>,
     max_queued: usize,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// The ranges this node holds, as published by the event loop once a second.
+    placement: Arc<Mutex<String>>,
     /// Checkpoints the engine off the event loop ([`checkpoint_loop`]).
     checkpointer: Mutex<Option<JoinHandle<()>>>,
     stop_checkpoints: Arc<AtomicBool>,
@@ -108,10 +110,12 @@ impl RangeNode {
         let tick = cfg.tick;
         let gauges: Arc<[AtomicU64; GAUGES.len()]> = Arc::new(std::array::from_fn(|_| AtomicU64::new(0)));
         let g = Arc::clone(&gauges);
+        let placement = Arc::new(Mutex::new(String::from("[]")));
+        let p = Arc::clone(&placement);
         let engine = Arc::clone(server.driver.engine());
         let thread = std::thread::Builder::new()
             .name(format!("range-node-{id}"))
-            .spawn(move || event_loop(server, rx, transport, tick, q, b, g))
+            .spawn(move || event_loop(server, rx, transport, tick, q, b, g, p))
             .ok();
         let stop_checkpoints = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stop_checkpoints);
@@ -120,7 +124,7 @@ impl RangeNode {
             .name(format!("range-checkpoint-{id}"))
             .spawn(move || checkpoint_loop(&engine, &stop, interval))
             .ok();
-        Arc::new(Self { id, tx, queued, batch_bytes, gauges, max_queued: cfg.max_queued, thread: Mutex::new(thread), checkpointer: Mutex::new(checkpointer), stop_checkpoints, stopped: AtomicBool::new(false) })
+        Arc::new(Self { id, tx, queued, batch_bytes, gauges, placement, max_queued: cfg.max_queued, thread: Mutex::new(thread), checkpointer: Mutex::new(checkpointer), stop_checkpoints, stopped: AtomicBool::new(false) })
     }
 
     pub fn id(&self) -> NodeId {
@@ -134,6 +138,11 @@ impl RangeNode {
         out.push(format!("\"inbound_batch_bytes\":{}", self.batch_bytes.load(Ordering::Relaxed)));
         out.push(format!("\"queued_requests\":{}", self.queued.load(Ordering::Relaxed)));
         out.join(",")
+    }
+
+    /// The ranges this node holds (JSON, as of the last second): span, voters, leadership.
+    pub fn placement(&self) -> String {
+        self.placement.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Hands an encoded batch from another node to the event loop.
@@ -216,7 +225,8 @@ fn checkpoint_loop(engine: &crate::StorageEngine<crate::DocumentRecord>, stop: &
     }
 }
 
-fn event_loop(mut srv: NodeServer, rx: Receiver<Input>, transport: Arc<dyn Transport>, tick: Duration, queued: Arc<AtomicU64>, batch_bytes: Arc<AtomicU64>, gauges: Arc<[AtomicU64; GAUGES.len()]>) {
+#[allow(clippy::too_many_arguments)]
+fn event_loop(mut srv: NodeServer, rx: Receiver<Input>, transport: Arc<dyn Transport>, tick: Duration, queued: Arc<AtomicU64>, batch_bytes: Arc<AtomicU64>, gauges: Arc<[AtomicU64; GAUGES.len()]>, placement: Arc<Mutex<String>>) {
     // Request ids are this loop's own: replies go back through their channels.
     let trace = std::env::var_os("STORINE_NODE_TRACE").is_some();
     if trace {
@@ -301,6 +311,7 @@ fn event_loop(mut srv: NodeServer, rx: Receiver<Input>, transport: Arc<dyn Trans
             for (g, v) in gauges.iter().zip([ranges as u64, entries as u64, bytes, pending, latches, ts, replies, waiting.len() as u64]) {
                 g.store(v, Ordering::Relaxed);
             }
+            *placement.lock().unwrap_or_else(|p| p.into_inner()) = srv.driver.placement_json(1024);
             let expired: HashSet<u64> = waiting.iter().filter(|(_, (since, _))| since.elapsed() >= Duration::from_secs(60)).map(|(id, _)| *id).collect();
             if !expired.is_empty() {
                 waiting.retain(|id, _| !expired.contains(id));

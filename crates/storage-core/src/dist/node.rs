@@ -421,6 +421,15 @@ impl NodeDriver {
     }
 
     /// Reopens every range persisted on this node (after a restart).
+    /// Rewrites every replica's Raft log with the engine's current encryption settings and
+    /// drops snapshots written under older ones (`TASK-156`). Returns the replicas resealed.
+    pub fn reseal_storage(&self) -> Result<usize> {
+        for r in self.replicas.values() {
+            r.raft.reseal_storage()?;
+        }
+        Ok(self.replicas.len())
+    }
+
     pub fn reopen_ranges(&mut self) -> Result<Vec<RangeId>> {
         let ids = RaftNode::persisted_groups(&self.engine)?;
         for &r in &ids {
@@ -491,6 +500,42 @@ impl NodeDriver {
 
     pub fn ranges(&self) -> Vec<RangeId> {
         self.replicas.keys().copied().collect()
+    }
+
+    /// The ranges this node holds, as a JSON array for health reports (`TASK-156`): each
+    /// range's span (`start`, and `end` or `null` for the end of the key space), its voters,
+    /// and whether this node leads it. At most `limit` ranges are listed.
+    pub fn placement_json(&self, limit: usize) -> String {
+        fn key(bytes: &[u8]) -> String {
+            let mut s = String::from("\"");
+            for c in String::from_utf8_lossy(bytes).chars() {
+                match c {
+                    '"' => s.push_str("\\\""),
+                    '\\' => s.push_str("\\\\"),
+                    c if (c as u32) < 0x20 => s.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => s.push(c),
+                }
+            }
+            s.push('"');
+            s
+        }
+        let items: Vec<String> = self
+            .replicas
+            .iter()
+            .take(limit)
+            .map(|(&id, r)| {
+                let span = r.raft.span();
+                let voters: Vec<String> = r.raft.membership().voters().map(|v| v.to_string()).collect();
+                format!(
+                    "{{\"range\":{id},\"start\":{},\"end\":{},\"voters\":[{}],\"leader\":{}}}",
+                    key(&span.start),
+                    span.end.as_deref().map_or_else(|| "null".to_string(), key),
+                    voters.join(","),
+                    self.is_leader(id)
+                )
+            })
+            .collect();
+        format!("[{}]", items.join(","))
     }
 
     pub fn replica(&self, range: RangeId) -> Option<&Arc<Replica>> {

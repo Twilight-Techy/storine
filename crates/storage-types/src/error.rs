@@ -46,6 +46,9 @@ pub enum StorageError {
     },
     /// A value was rejected: arithmetic overflow, a bound violation, a type mismatch, or input
     /// that does not parse (e.g. a malformed decimal).
+    /// A setting (environment variable, flag or configuration file) is invalid; the message
+    /// names it and says what is expected.
+    Config { message: String },
     InvalidValue { reason: &'static str },
     /// This replica is not the Raft leader; writes (and linearizable reads) must go to
     /// `leader` (a node id) when it is known.
@@ -70,6 +73,11 @@ pub enum StorageError {
 impl StorageError {
     #[cold]
     #[inline(never)]
+    /// An invalid setting, described in `message`.
+    pub fn config(message: impl Into<String>) -> Self {
+        Self::Config { message: message.into() }
+    }
+
     pub fn invalid_key(reason: &'static str) -> Self {
         Self::InvalidKey { reason }
     }
@@ -207,6 +215,7 @@ impl fmt::Display for StorageError {
                 f,
                 "write outcome unknown (raft index {index} not yet confirmed by a quorum); retry with the same request id"
             ),
+            Self::Config { message } => write!(f, "invalid setting: {message}"),
             Self::Rejected { status, message } => {
                 write!(f, "server rejected the request (status {status:#04x}): {message}")
             }

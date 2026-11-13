@@ -2,6 +2,21 @@
 
 Versions follow [Semantic Versioning](https://semver.org). Before 1.0, a minor version (0.x) may change on-disk or wire formats; [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) says what each kind of release may change and how to upgrade.
 
+## Unreleased
+
+Three features that existed only in the embedded engine are now in the server: encryption at rest, point-in-time recovery and multi-region placement ([`docs/TECHNICAL.md`](docs/TECHNICAL.md) sections 7, 8 and 13).
+
+### Added
+
+- **Encryption at rest in the server**: `STORAGE_ENCRYPTION_KEYS` names a key file (`storage-server gen-key <file>` makes one; it must be readable by its owner only). Records, the WAL, index files, and now Raft logs and snapshots are sealed. Every start reseals whatever does not match the settings, so turning encryption on (with `STORAGE_ENCRYPTION_ALLOW_PLAINTEXT=1` once), rotating keys and turning it off (`STORAGE_ENCRYPTION_ACTIVE_KEY=none`) each take one restart. Health reports show the active key.
+- **Point-in-time recovery of a server**: `STORAGE_WAL_ARCHIVE=<dir>` archives the WAL at each checkpoint, kept for `STORAGE_WAL_ARCHIVE_RETAIN` (7 days by default). `storage-cli restore-pitr` now restores a server's document data, takes an RFC 3339 time, and reads the archive directory and a leftover WAL directly (`--archive`, `--wal`). Standalone and single-group servers; range clusters keep their cluster backups.
+- **Multi-region placement in range clusters**: localities in `--peers` (`id=host:port@region/zone`) and placement rules in `--zones <file>`: replica counts, required or avoided regions and zones, preferred leaseholder regions, zone or region survival, follower-read staleness, global collections and regional-by-row collections. Health reports list each node's ranges with their voters and leaders.
+- `EngineConfig::wal_archive_dir`, `restore_point_in_time_with`, `StorageEngine::encryption`, `RaftNode::reseal_storage`, and `StorageError::Config` for invalid settings.
+
+### Changed
+
+- With encryption on, Raft log frames and snapshot records are sealed, so a node with encryption can only exchange snapshots with nodes holding the same keys. Data written without encryption is read as before.
+
 ## 0.1.1 (2026-11-13)
 
 Binaries for Linux, macOS and Windows, and a web console. On-disk formats, the client protocol and the node-to-node protocol are unchanged from 0.1.0: a rolling upgrade works, and 0.1.0 and 0.1.1 nodes can run in one cluster.
