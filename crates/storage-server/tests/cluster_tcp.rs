@@ -210,13 +210,24 @@ fn test_three_node_cluster_over_tls() {
     let mut f = BTreeMap::new();
     f.insert("bal".to_string(), PropertyValue::Int64(100));
     // A write whose commit could not be confirmed in time (`CommitUnknown`, e.g. on a slow CI
-    // disk) is retried with the same request id, as every client does: it applies once.
+    // disk) is retried with the same request id, and a `NotLeader` answer is followed to the
+    // new leader, as every client does: the write applies once.
+    let addr_of: HashMap<NodeId, SocketAddr> = nodes.iter().map(|n| (n.id, n.addr)).collect();
     let write = |c: &mut StorageClient, w: DocWrite, id: u8| {
         let rid = Some([id; 16]);
         for attempt in 0.. {
             match c.doc_write(std::slice::from_ref(&w), rid) {
                 Ok(_) => return,
-                Err(StorageError::CommitUnknown { .. }) if attempt < 10 => continue,
+                Err(StorageError::CommitUnknown { .. }) if attempt < 20 => continue,
+                Err(StorageError::NotLeader { leader }) if attempt < 20 => {
+                    std::thread::sleep(Duration::from_millis(200));
+                    let to = leader.and_then(|l| NodeId::try_from(l).ok()).and_then(|l| addr_of.get(&l).copied()).unwrap_or(addr_of[&(1 + (attempt % 3) as NodeId)]);
+                    if let Ok(mut n) = StorageClient::connect_tls(to, &client_tls) {
+                        if n.authenticate(token).is_ok() {
+                            *c = n;
+                        }
+                    }
+                }
                 Err(e) => panic!("write {id}: {e:?} after {attempt} retries"),
             }
         }
