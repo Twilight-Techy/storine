@@ -31,6 +31,30 @@ fn put(collection: &str, key: &str) -> DocWrite {
     DocWrite { collection: collection.into(), key: key.into(), op: DocOp::Put(f), precondition: Precondition::None }
 }
 
+/// A connection kept across calls and replaced only after an error: tests that poll would
+/// otherwise open thousands of short connections, and macOS runners run out of local ports.
+struct Conn {
+    addr: SocketAddr,
+    c: Option<StorageClient>,
+}
+
+impl Conn {
+    fn new(addr: SocketAddr) -> Self {
+        Self { addr, c: None }
+    }
+
+    fn call<R>(&mut self, f: impl FnOnce(&mut StorageClient) -> Result<R, storage_types::StorageError>) -> Result<R, storage_types::StorageError> {
+        if self.c.is_none() {
+            self.c = Some(StorageClient::connect_timeout(self.addr, Duration::from_secs(1))?);
+        }
+        let r = f(self.c.as_mut().unwrap());
+        if r.is_err() {
+            self.c = None;
+        }
+        r
+    }
+}
+
 /// Files under `dir` that contain the marker.
 fn plaintext_in(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
@@ -127,7 +151,8 @@ fn a_standalone_server_turns_encryption_on_rotates_and_refuses_the_wrong_key() {
     let out = Command::new(env!("CARGO_BIN_EXE_storage-server")).arg("gen-key").arg(&keys).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let s = spawn(&data, addr, &[("STORAGE_ENCRYPTION_KEYS", &keys)], &[("STORAGE_ENCRYPTION_ALLOW_PLAINTEXT", "1")]);
-    wait_until("the reseal to finish", 60, || health(addr).contains("\"active_key\":1,\"keys\":[1],\"accept_plaintext\":false"));
+    let mut hc = Conn::new(addr);
+    wait_until("the reseal to finish", 60, || hc.call(|c| c.health()).is_ok_and(|h| h.contains("\"active_key\":1,\"keys\":[1],\"accept_plaintext\":false")));
     let mut c = client(addr);
     for i in 50..80 {
         c.doc_write(&[put("people", &format!("p{i}"))], None).unwrap();
@@ -140,7 +165,8 @@ fn a_standalone_server_turns_encryption_on_rotates_and_refuses_the_wrong_key() {
     // 3. Rotation: a second key becomes active; after the reseal, the first can go.
     Command::new(env!("CARGO_BIN_EXE_storage-server")).arg("gen-key").arg(&keys).output().unwrap();
     let s = spawn(&data, addr, &[("STORAGE_ENCRYPTION_KEYS", &keys)], &[]);
-    wait_until("key 2 to be active", 30, || health(addr).contains("\"active_key\":2"));
+    let mut hc = Conn::new(addr);
+    wait_until("key 2 to be active", 30, || hc.call(|c| c.health()).is_ok_and(|h| h.contains("\"active_key\":2")));
     std::thread::sleep(Duration::from_secs(2)); // the background reseal
     settle_and_stop(s);
     let only_two: String = std::fs::read_to_string(&keys).unwrap().lines().filter(|l| l.starts_with("2 ")).map(|l| format!("{l}\n")).collect();
@@ -204,10 +230,10 @@ fn a_range_cluster_keeps_no_plaintext_on_disk() {
             .unwrap()
         })
         .collect();
-    let write = |key: &str| {
+    let mut writer = Conn::new(addrs[0]);
+    let mut write = |key: &str| {
         for _ in 0..200 {
-            let Ok(mut c) = StorageClient::connect(addrs[0]) else { continue };
-            match c.doc_write(&[put("cards", key)], None) {
+            match writer.call(|c| c.doc_write(&[put("cards", key)], None)) {
                 Ok(_) => return,
                 Err(StorageError::NotLeader { .. } | StorageError::Rejected { .. } | StorageError::Io { .. } | StorageError::CommitUnknown { .. }) => {
                     std::thread::sleep(Duration::from_millis(100));
@@ -291,9 +317,8 @@ fn a_raft_cluster_turns_encryption_on_and_catches_up_a_node_from_sealed_storage(
     // 2. Every node restarts with the key, accepting plaintext until it has resealed.
     let mut nodes: Vec<Option<Server>> = (0..3).map(|i| Some(start(i, Some(&keys), true))).collect();
     for a in &addrs {
-        wait_until("every node to go strict", 90, || {
-            StorageClient::connect_timeout(*a, Duration::from_secs(1)).and_then(|mut c| c.health()).is_ok_and(|h| h.contains("\"accept_plaintext\":false"))
-        });
+        let mut hc = Conn::new(*a);
+        wait_until("every node to go strict", 90, || hc.call(|c| c.health()).is_ok_and(|h| h.contains("\"accept_plaintext\":false")));
     }
 
     // 3. Node 3 is down while the others write and compact their logs past it: a node compacts

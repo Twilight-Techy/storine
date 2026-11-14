@@ -13,6 +13,30 @@ use storage_core::{DocOp, DocWrite, Precondition};
 use storage_server::ranges::{start_range_server, RangeExtras, RangeServerConfig};
 use storage_server::{SecurityConfig, StorageClient};
 
+/// A connection kept across calls and replaced only after an error: tests that poll would
+/// otherwise open thousands of short connections, and macOS runners run out of local ports.
+struct Conn {
+    addr: SocketAddr,
+    c: Option<StorageClient>,
+}
+
+impl Conn {
+    fn new(addr: SocketAddr) -> Self {
+        Self { addr, c: None }
+    }
+
+    fn call<R>(&mut self, f: impl FnOnce(&mut StorageClient) -> Result<R, storage_types::StorageError>) -> Result<R, storage_types::StorageError> {
+        if self.c.is_none() {
+            self.c = Some(StorageClient::connect_timeout(self.addr, Duration::from_secs(1))?);
+        }
+        let r = f(self.c.as_mut().unwrap());
+        if r.is_err() {
+            self.c = None;
+        }
+        r
+    }
+}
+
 /// One range as a node's health report lists it.
 #[derive(Debug)]
 struct Placed {
@@ -113,10 +137,11 @@ fn replicas_and_leases_follow_the_placement_rules() {
         })
         .collect();
 
-    let write = |c: &str, k: &str| {
+    let mut writer = Conn::new(addrs[0]);
+    let mut write = |c: &str, k: &str| {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let ok = StorageClient::connect(addrs[0]).and_then(|mut cl| cl.doc_write(&[put(c, k)], None)).is_ok();
+            let ok = writer.call(|cl| cl.doc_write(&[put(c, k)], None)).is_ok();
             if ok {
                 return;
             }
@@ -138,12 +163,13 @@ fn replicas_and_leases_follow_the_placement_rules() {
     let eu = |n: u16| localities[&n].region == "eu";
     let deadline = Instant::now() + Duration::from_secs(180);
     let mut last = String::new();
+    let mut health: Vec<Conn> = addrs.iter().map(|a| Conn::new(*a)).collect();
     loop {
         let mut ok = true;
         let mut report = Vec::new();
-        for (i, a) in addrs.iter().enumerate() {
+        for (i, conn) in health.iter_mut().enumerate() {
             let node = (i + 1) as u16;
-            let Ok(h) = StorageClient::connect(*a).and_then(|mut c| c.health()) else {
+            let Ok(h) = conn.call(|c| c.health()) else {
                 ok = false;
                 continue;
             };
@@ -172,10 +198,10 @@ fn replicas_and_leases_follow_the_placement_rules() {
     // rules it has.
     std::thread::sleep(Duration::from_millis(1100));
     std::fs::write(&rules_file, "collection eu_only require=region:asia\n").unwrap();
-    for a in &addrs {
+    for conn in &mut health {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            let h = StorageClient::connect(*a).and_then(|mut c| c.health()).unwrap();
+            let h = conn.call(|c| c.health()).unwrap();
             if h.contains("\"placement_rules\"") && h.contains("fewer nodes satisfy") {
                 break;
             }

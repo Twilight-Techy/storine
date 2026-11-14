@@ -70,6 +70,26 @@ fn wait_leader(nodes: &[&Node]) -> usize {
     }
 }
 
+/// Applies `w` exactly once, as a client does: the same request id on every retry, after
+/// `CommitUnknown` or a lost connection, and `NotLeader` followed to the current leader. On a
+/// loaded CI runner leadership can move between any two writes.
+fn write_once(c: &mut StorageClient, nodes: &[&Node], w: &DocWrite, rid: u8) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match c.doc_write(std::slice::from_ref(w), Some([rid; 16])) {
+            Ok(_) => return,
+            Err(StorageError::NotLeader { .. } | StorageError::CommitUnknown { .. } | StorageError::Io { .. }) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+                let l = wait_leader(nodes);
+                if let Ok(n) = StorageClient::connect(nodes[l].addr) {
+                    *c = n;
+                }
+            }
+            Err(e) => panic!("write {rid}: {e:?}"),
+        }
+    }
+}
+
 fn deposit(amount: i64) -> DocWrite {
     DocWrite {
         collection: "acct".into(),
@@ -100,9 +120,15 @@ fn test_three_node_tcp_cluster_writes_redirects_and_failover() {
             Err(e) => panic!("first write: {e:?}"),
         }
     };
-    for _ in 0..20 {
-        c.doc_write(&[deposit(1)], None).unwrap();
+    let _ = l;
+    let all: Vec<&Node> = nodes.iter().collect();
+    for i in 0..20 {
+        write_once(&mut c, &all, &deposit(1), 10 + i);
     }
+    drop(all);
+    // The leader now (it may have changed on a loaded runner).
+    let l = wait_leader(&nodes.iter().collect::<Vec<_>>());
+    let mut c = StorageClient::connect(nodes[l].addr).unwrap();
     assert_eq!(c.doc_get("acct", "a").unwrap().unwrap().fields["bal"], PropertyValue::Int64(120));
 
     // A follower redirects writes and (by default) reads to the leader's address.
@@ -140,9 +166,11 @@ fn test_three_node_tcp_cluster_writes_redirects_and_failover() {
     drop(runtime);
     let l2 = wait_leader(&nodes.iter().collect::<Vec<_>>());
     let mut c2 = StorageClient::connect(nodes[l2].addr).unwrap();
-    for _ in 0..5 {
-        c2.doc_write(&[deposit(1)], None).unwrap();
+    let all: Vec<&Node> = nodes.iter().collect();
+    for i in 0..5 {
+        write_once(&mut c2, &all, &deposit(1), 40 + i);
     }
+    drop(all);
     assert_eq!(c2.doc_get("acct", "a").unwrap().unwrap().fields["bal"], PropertyValue::Int64(125));
 
     // The old node restarts and catches up.
