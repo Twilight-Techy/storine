@@ -1463,3 +1463,12 @@ This document defines the strict chronological execution order for building the 
   - Later CI runs: on Windows, leadership moved mid-test in the two older cluster tests (they now retry writes as clients do: same request id, `NotLeader` followed); on macOS, later tests failed with `EADDRNOTAVAIL` and hung, local ports exhausted by the new tests' polling, which opened a connection per health check and per write (they now keep their connections).
   - Speed: `server-load` and `tools/release/compare-versions.sh`; results in `BENCHMARK_REPORT.md` section 8.7.
 
+- [x] **TASK-158: Faster Single-Group Cluster Writes** — a write took about 45 ms on three separate machines, and adding clients barely helped. Disk syncs ran one after another on the commit path, several under the Raft state lock.
+  - Time spent in one write, measured locally: a log sync inside `propose` while holding the state lock, a full atomic rewrite of the Raft meta file when the commit index moved (temp file, sync, rename, directory sync), a second one for `last_applied`, and followers applying the previous entry before acknowledging.
+  - **Meta file**: a save of the same length rewrites the file in place with one sync. Other saves keep the atomic replace. A corrupt meta file is still an error. A two-slot design was tried first and dropped, because it turned corruption into a silent fallback (`test_raft_vote_safety_rules`).
+  - **Commit index** is no longer saved. Raft keeps it in memory, and it is learned again from the leader.
+  - **Apply** takes up to 256 committed entries at a time, with one `last_applied` save. Outcomes are published only after that save.
+  - **Leader log writes** happen outside the state lock (`propose_deferred`, then `persist_log`). Concurrent writers share one sync. The leader counts itself toward a quorum only up to what is on disk (`durable_log_index`). A failed log write ends the commit with `CommitUnknown`, and the next write rewrites the log. Test `test_deferred_proposals_count_only_once_durable`: proposals count only once on disk, a failed write counts for nothing, a retry repairs the file, and everything reads back after a reopen.
+  - **Followers** acknowledge once the entries are logged. A separate thread applies them (`set_deferred_apply`, `apply_pending`).
+  - `server-load` logs in with `STORAGE_TOKEN`, needed for servers on non-loopback addresses.
+  - Measured on Azure (three VMs, `polandcentral`), against v0.1.0: 20 → 106 writes a second from one client, and 30 → 238 from 16. Details in `BENCHMARK_REPORT.md` section 8.8.

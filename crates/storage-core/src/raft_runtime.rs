@@ -201,6 +201,19 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
                 .spawn(move || checkpoint_loop(&s))
                 .map_err(|e| StorageError::io("spawn raft checkpointer", e))?;
             shared.threads.lock().unwrap_or_else(|p| p.into_inner()).push(checkpointer);
+            // Followers acknowledge once entries are in their log; this thread applies them
+            // (`TASK-158`). A periodic pass also catches commits learned from heartbeats.
+            shared.node.set_deferred_apply(true);
+            let s = Arc::clone(&shared);
+            let applier = thread::Builder::new()
+                .name("storine-raft-apply".into())
+                .spawn(move || {
+                    while !s.shutdown.load(Ordering::Acquire) {
+                        let _ = s.node.apply_pending(Duration::from_millis(50));
+                    }
+                })
+                .map_err(|e| StorageError::io("spawn raft applier", e))?;
+            shared.threads.lock().unwrap_or_else(|p| p.into_inner()).push(applier);
         }
         reconcile_members(&shared);
         Ok(Arc::new(Self { shared }))
@@ -227,8 +240,15 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
     /// Replicates an atomic conditional batch and returns its applied outcome
     /// (`NotLeader` on followers, `CommitUnknown` if it could not be confirmed in time).
     pub fn commit(&self, ops: Vec<WriteOp<T>>) -> Result<Vec<WriteResult>> {
-        let (index, term) = self.shared.node.propose_ops_tagged(&ops)?;
+        // Followers receive the entry while the leader writes it (`TASK-158`); the write is
+        // shared with concurrent proposals, and the leader counts itself only once it is done.
+        let (index, term) = self.shared.node.propose_ops_deferred(&ops)?;
         self.after_propose();
+        if self.shared.node.persist_log().is_err() {
+            // Followers may still commit it: the outcome is unknown, not failed.
+            return Err(StorageError::CommitUnknown { index });
+        }
+        let _ = advance_commit(&self.shared);
         self.shared.node.wait_applied(index, term, self.shared.config.commit_timeout)
     }
 
@@ -396,6 +416,7 @@ impl<T: ZeroCopyRecord + Indexable> RaftRuntime<T> {
     pub fn stop(&self) {
         self.shared.shutdown.store(true, Ordering::Release);
         wake_replicators(&self.shared);
+        self.shared.node.wake_applier();
         loop {
             let threads = core::mem::take(&mut *self.shared.threads.lock().unwrap_or_else(|p| p.into_inner()));
             if threads.is_empty() {
@@ -667,7 +688,8 @@ fn advance_commit<T: ZeroCopyRecord + Indexable>(s: &Shared<T>) -> Result<u64> {
             .collect()
     };
     if members.is_voter(s.node.node_id()) {
-        matches.push(s.node.last_log_index());
+        // Only what this node holds on disk (`TASK-158`).
+        matches.push(s.node.durable_log_index());
     }
     matches.sort_unstable_by(|a, b| b.cmp(a));
     let Some(&quorum_index) = matches.get(quorum(&members) - 1) else {

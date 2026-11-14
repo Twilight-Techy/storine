@@ -1016,3 +1016,10 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Found and fixed**: Raft logs and snapshots held document contents in plaintext under engine encryption; they are now sealed.
 - **Verified locally**: Raft sealing unit test; the binary turning encryption on, rotating, retiring a key and refusing the wrong one; a range cluster with no plaintext on disk; a point-in-time restore exact to the moment on encrypted data; placement converging in a six-node, two-region cluster (and failing without its rule).
 
+## 2026-11-14: faster single-group cluster writes (`TASK-158`)
+
+- **Found**: a write paid about ten disk syncs one after another, several under the Raft state lock. Two of them were full atomic rewrites of the meta file, and followers applied before acknowledging.
+- **Changed**: the meta file is rewritten in place. The commit index is no longer saved. Apply runs in batches of up to 256 entries. The leader writes its log outside the state lock, so concurrent writes share one sync. Followers apply on their own thread.
+- **Measured** on three Azure VMs against v0.1.0 (`BENCHMARK_REPORT.md` section 8.8): 20 → 106 writes a second from one client (p50 47 → 8.3 ms), and 30 → 238 from 16.
+- **Verified locally**: Raft unit tests, and the cluster, membership, at-rest, placement and process-chaos tests. Clippy is clean for Linux, macOS and Windows.
+- Test machines now run on Azure for Students, in its allowed regions only.

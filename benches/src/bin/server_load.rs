@@ -5,7 +5,8 @@
 //!     server-load <addr>[,<addr>...] [threads=4] [secs=20] [value_bytes=200]
 //!
 //! Writes go to whichever node accepts them (the leader); each thread keeps its connection.
-//! Reads follow, on the same node, of keys this thread wrote.
+//! Reads follow, on the same node, of keys this thread wrote. With `STORAGE_TOKEN` set, every
+//! connection logs in with it first (servers on non-loopback addresses require a token).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -28,6 +29,12 @@ fn connect_writable(addrs: &[SocketAddr], probe: &DocWrite) -> StorageClient {
     loop {
         for a in addrs {
             if let Ok(mut c) = StorageClient::connect_timeout(*a, Duration::from_secs(1)) {
+                // `STORAGE_TOKEN`: log in first (servers on non-loopback addresses require it).
+                if let Ok(token) = std::env::var("STORAGE_TOKEN") {
+                    if c.authenticate(&token).is_err() {
+                        continue;
+                    }
+                }
                 if c.doc_write(std::slice::from_ref(probe), None).is_ok() {
                     return c;
                 }

@@ -11,15 +11,16 @@ Three features that existed only in the embedded engine are now in the server: e
 - **Encryption at rest in the server**: `STORAGE_ENCRYPTION_KEYS` names a key file (`storage-server gen-key <file>` makes one; it must be readable by its owner only). Records, the WAL, index files, and now Raft logs and snapshots are sealed. Every start reseals whatever does not match the settings, so turning encryption on (with `STORAGE_ENCRYPTION_ALLOW_PLAINTEXT=1` once), rotating keys and turning it off (`STORAGE_ENCRYPTION_ACTIVE_KEY=none`) each take one restart. Health reports show the active key.
 - **Point-in-time recovery of a server**: `STORAGE_WAL_ARCHIVE=<dir>` archives the WAL at each checkpoint, kept for `STORAGE_WAL_ARCHIVE_RETAIN` (7 days by default). `storage-cli restore-pitr` now restores a server's document data, takes an RFC 3339 time, and reads the archive directory and a leftover WAL directly (`--archive`, `--wal`). Standalone and single-group servers; range clusters keep their cluster backups.
 - **Multi-region placement in range clusters**: localities in `--peers` (`id=host:port@region/zone`) and placement rules in `--zones <file>`: replica counts, required or avoided regions and zones, preferred leaseholder regions, zone or region survival, follower-read staleness, global collections and regional-by-row collections. Health reports list each node's ranges with their voters and leaders. Each node reloads its rules file within 2 seconds of a change; rules that do not fit are refused and reported, and the previous ones stay.
-- `server-load` (`benches`): throughput and latency of writes and reads against a running server or cluster, and `tools/release/compare-versions.sh` to compare two source trees.
+- `server-load` (`benches`): throughput and latency of writes and reads against a running server or cluster (`STORAGE_TOKEN` to log in), and `tools/release/compare-versions.sh` to compare two source trees.
 - `EngineConfig::wal_archive_dir`, `restore_point_in_time_with`, `StorageEngine::encryption`, `RaftNode::reseal_storage`, and `StorageError::Config` for invalid settings.
 
 ### Measured
 
-- Against v0.1.0, with the new features off: no regression in the engine, network or server benchmarks ([`BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) section 8.7). Found on the way, unchanged since 0.1.0: a single-group cluster commits a write in about 90 ms.
+- Against v0.1.0, with the new features off: no regression in the engine, network or server benchmarks ([`BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) section 8.7). Found on the way, unchanged since 0.1.0: a single-group cluster commits a write in about 90 ms (fixed, see Changed).
 
 ### Changed
 
+- **Single-group cluster writes are 5–8× faster**: on three separate machines, 20 → 106 writes a second from one client (p50 47 → 8.3 ms) and 30 → 238 from 16. The leader writes its log outside the Raft state lock, so concurrent writes share one disk sync. The Raft meta file is rewritten in place. The commit index is no longer saved. Entries are applied in batches. Followers acknowledge before applying ([`BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) section 8.8). The durability guarantees are unchanged.
 - With encryption on, Raft log frames and snapshot records are sealed, so a node with encryption can only exchange snapshots with nodes holding the same keys. Data written without encryption is read as before.
 
 ## 0.1.1 (2026-11-13)

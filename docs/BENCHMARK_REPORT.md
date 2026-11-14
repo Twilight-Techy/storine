@@ -532,3 +532,20 @@ The changes since v0.1.0 that run on every request (sealing hooks in the Raft lo
 - **No regression**: every row is within the run-to-run spread of these benchmarks (a few per cent either way; the indexed 1-thread overwrite row moved −4.9 % here, and +2.2 % and +0.5 % in section 8.6's two x86 runs, where both sides ran the same engine code).
 - The 4 KiB checksum row reads 371 ns for v0.1.0 and 1,052 ns now, but the code is the same: v0.1.0's benchmark let the compiler hoist part of the work out of its loop (section 8.6). It is left out of the table.
 - **Found, not caused by these changes**: a single-group cluster commits a write in about 90 ms, so four clients reach 40 writes a second, in v0.1.0 as now. A standalone server takes 4 ms. On this machine the three nodes share four vCPUs and one disk, which explains some of it but not a factor of twenty. This needs its own investigation.
+
+### 8.8 Single-group cluster writes (`TASK-158`, 2026-11-14)
+
+Three Azure VMs in `polandcentral` (two `Standard_D2s_v4` and one `Standard_D2s_v3`, all Xeon Platinum 8272CL with 2 vCPUs, Premium SSD, one private subnet). Network round trip about 1.5 ms. One 4 KiB `O_DSYNC` write takes 4.2 ms. Both versions were built on the first VM for the same target. The three-node clusters ran with authentication on. `server-load` ran on node 1 for 10 s per row, over three alternating rounds. The table shows medians of writes.
+
+| Clients | v0.1.0 | now | Change |
+| :--- | ---: | ---: | ---: |
+| 1 | 20/s, p50 47 ms | 106/s, p50 8.3 ms | 5.3× |
+| 4 | 28/s, p50 134 ms | 152/s, p50 25 ms | 5.4× |
+| 16 | 30/s, p50 398 ms | 238/s, p50 65 ms | 7.9× |
+
+- **Before**: one write paid about ten disk syncs in a row. Several of them ran under the Raft state lock, so 16 clients were barely faster than one.
+- **Now**: 8.3 ms is close to its floor: the leader's log sync plus a follower's log sync and a round trip. Throughput keeps rising with more clients, because concurrent writes share syncs.
+- **Durability unchanged**: a write is acknowledged only when a majority holds it on disk. Its outcome is published only after `last_applied` is durable. A corrupt Raft meta file is still an error. All Raft unit tests passed, as did the cluster, membership, encryption-at-rest, placement and process-chaos tests.
+- **Local runs** (one `t4g` running all three nodes on one disk) also improved, from 26 to about 50–77 writes a second from one client, but they cannot separate the nodes' syncs from each other.
+- An earlier one-round run was invalid: the start script killed `storage-server` by name, the copied binaries had other names, and every row measured the first cluster. Caught because both versions gave identical numbers. The process name is now checked before each run.
+- **Cost**: three VMs for about 45 minutes on Azure for Students credit, deleted afterwards.

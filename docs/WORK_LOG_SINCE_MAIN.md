@@ -276,3 +276,7 @@ Yes:
 
 - Key-file encryption at rest (Raft logs and snapshots now sealed too), WAL archiving and `restore-pitr` for server data, and region placement rules for range clusters.
 
+### Faster single-group cluster writes (`TASK-158`) — 2026-11-14
+
+- Cluster writes are 5–8× faster on three Azure VMs: 106 a second from one client (was 20), 238 from 16 (was 30). The disk syncs no longer queue behind the Raft state lock, and fewer of them are needed.
+- `server-load` logs in with `STORAGE_TOKEN`.

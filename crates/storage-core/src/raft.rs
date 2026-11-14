@@ -25,7 +25,7 @@
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1018,6 +1018,8 @@ fn decode_log_entry(bytes: &[u8], cursor: usize) -> Result<(RaftLogEntry, usize)
 
 /// Compact the log once this many applied entries are retained in it.
 const RAFT_COMPACT_THRESHOLD: u64 = 8_192;
+/// Most entries applied before the applied index is saved and their writers answered.
+const APPLY_BATCH: usize = 256;
 /// The same in bytes: 8,192 entries of whole large documents would be tens of gigabytes in memory.
 const RAFT_COMPACT_BYTES: u64 = 64 << 20;
 /// What a compaction by bytes keeps for lagging followers.
@@ -1205,6 +1207,15 @@ struct RaftStorage {
     sync_data: bool,
     meta_file: Mutex<Option<File>>,
     log_file: Mutex<Option<File>>,
+    /// Serializes writes to the log file (`TASK-158`). Taken after the state lock, never
+    /// before it, so a leader can write its log without holding the state lock.
+    log_io: Mutex<()>,
+    /// Index of the last entry in the log file: appends write only what follows it, so the
+    /// file is always a prefix of the log in memory.
+    file_last: AtomicU64,
+    /// Bumped by every rewrite (truncation, compaction, snapshot, reseal): a leader write
+    /// prepared before one is abandoned rather than appended after it.
+    log_epoch: AtomicU64,
     /// Encryption settings for log frames and snapshot records (the engine's).
     seal: SealSource,
 }
@@ -1229,6 +1240,9 @@ impl RaftStorage {
             sync_data: true,
             meta_file: Mutex::new(None),
             log_file: Mutex::new(None),
+            log_io: Mutex::new(()),
+            file_last: AtomicU64::new(0),
+            log_epoch: AtomicU64::new(0),
             seal: SealSource::default(),
         }
     }
@@ -1363,6 +1377,16 @@ impl RaftStorage {
             };
             return f.seek(SeekFrom::Start(0)).and_then(|_| f.write_all(&full)).map_err(|e| StorageError::io("write raft meta", e));
         }
+        // Durable saves rewrite the record in place and sync once (`TASK-158`): it is far
+        // smaller than a disk sector, and a sector is written whole or not at all (the
+        // assumption PostgreSQL makes for its control file). A temporary file, a rename and a
+        // directory sync are needed only to create the file or to change its length.
+        let vfs = storage_types::vfs::at(&self.meta_path);
+        if vfs.exists(&self.meta_path) && vfs.file_len(&self.meta_path).ok() == Some(full.len() as u64) {
+            let io = |e| StorageError::io("write raft meta", e);
+            let mut f = vfs.open(&self.meta_path, OpenOpts::read_write()).map_err(|e| StorageError::io("open raft meta", e))?;
+            return f.seek(SeekFrom::Start(0)).and_then(|_| f.write_all(&full)).and_then(|()| f.sync_data()).map_err(io);
+        }
         atomic_write_replace(&self.meta_path, &full, self.sync_data)
     }
 
@@ -1378,6 +1402,34 @@ impl RaftStorage {
         out.extend_from_slice(&checksum_payload(&body).to_le_bytes());
         out.extend_from_slice(&body);
         Ok(())
+    }
+
+    /// Appends the entries of `log` that follow the last one in the file (`log` is in index
+    /// order, typically the whole log in memory). The file stays a prefix of the log.
+    fn append_suffix(&self, log: &[RaftLogEntry]) -> Result<()> {
+        let _io = self.log_io.lock().unwrap_or_else(|p| p.into_inner());
+        let after = self.file_last.load(Ordering::Acquire);
+        let pending = &log[log.partition_point(|e| e.index <= after)..];
+        if let Some(last) = pending.last() {
+            self.append_log(pending)?;
+            self.file_last.store(last.index, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    /// A leader's write prepared outside the state lock: appends `entries` (which follow
+    /// `after`) only if the file still ends at `after` and was not rewritten since `epoch`.
+    /// `false` when it changed: whoever changed it wrote what it needed.
+    fn append_if_unchanged(&self, epoch: u64, after: u64, entries: &[RaftLogEntry]) -> Result<bool> {
+        let _io = self.log_io.lock().unwrap_or_else(|p| p.into_inner());
+        if self.log_epoch.load(Ordering::Acquire) != epoch || self.file_last.load(Ordering::Acquire) != after {
+            return Ok(false);
+        }
+        if let Some(last) = entries.last() {
+            self.append_log(entries)?;
+            self.file_last.store(last.index, Ordering::Release);
+        }
+        Ok(true)
     }
 
     fn append_log(&self, entries: &[RaftLogEntry]) -> Result<()> {
@@ -1418,13 +1470,19 @@ impl RaftStorage {
     }
 
     fn rewrite_log(&self, log: &[RaftLogEntry]) -> Result<()> {
+        let _io = self.log_io.lock().unwrap_or_else(|p| p.into_inner());
+        self.log_epoch.fetch_add(1, Ordering::AcqRel);
         *self.log_file.lock().unwrap_or_else(|p| p.into_inner()) = None;
         let mut buf = Vec::new();
         let enc = self.seal.get();
         for e in log {
             self.encode_log_frame(enc.as_deref(), e, &mut buf)?;
         }
-        atomic_write_replace(&self.log_path, &buf, self.sync_data)
+        // Until the replacement is in place, nothing past the old file counts as written.
+        self.file_last.store(0, Ordering::Release);
+        atomic_write_replace(&self.log_path, &buf, self.sync_data)?;
+        self.file_last.store(log.last().map_or(0, |e| e.index), Ordering::Release);
+        Ok(())
     }
 
     fn load(&self) -> Result<Option<RaftState>> {
@@ -1505,6 +1563,8 @@ impl RaftStorage {
             self.rewrite_log(&st.log)?;
             self.save_hard_state(&st)?;
         }
+        // Everything loaded is in the file; appends continue after it.
+        self.file_last.store(st.log.last().map_or(0, |e| e.index), Ordering::Release);
 
         // Durable entries can never be fewer than the committed prefix we claim, and only applied
         // entries are ever compacted.
@@ -1545,6 +1605,11 @@ pub struct RaftNode<T: ZeroCopyRecord + Indexable> {
     leader_noop: AtomicU64,
     /// Signalled whenever entries are applied.
     applied_cv: Condvar,
+    /// Followers apply on a runtime's applier thread instead of before acknowledging
+    /// (`TASK-158`): an acknowledgement then waits for the log write only.
+    defer_apply: AtomicBool,
+    apply_wanted: Mutex<bool>,
+    apply_cv: Condvar,
     /// Last time a valid leader contacted this node or this node granted a vote (election timer).
     last_contact: Mutex<Instant>,
     /// When set, votes are refused while a leader was heard from within this window ("leader
@@ -1635,6 +1700,9 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             outcomes: Mutex::new(Outcomes::default()),
             leader_noop: AtomicU64::new(0),
             applied_cv: Condvar::new(),
+            defer_apply: AtomicBool::new(false),
+            apply_wanted: Mutex::new(false),
+            apply_cv: Condvar::new(),
             last_contact: Mutex::new(Instant::now()),
             vote_stickiness: Mutex::new(None),
             group,
@@ -1992,13 +2060,54 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
 
     /// [`Self::propose`], returning `(index, term)` for [`Self::wait_applied`].
     pub fn propose_tagged(&self, command: RaftCommand) -> Result<(u64, u64)> {
+        let tagged = self.propose_deferred(command)?;
+        self.persist_log()?;
+        Ok(tagged)
+    }
+
+    /// Followers stop applying before they acknowledge; a thread calling
+    /// [`Self::apply_pending`] applies instead (`TASK-158`). The networked runtime sets this.
+    pub fn set_deferred_apply(&self, on: bool) {
+        self.defer_apply.store(on, Ordering::Release);
+        if !on {
+            self.wake_applier();
+        }
+    }
+
+    /// Asks the applier thread to apply what has committed.
+    pub fn wake_applier(&self) {
+        *self.apply_wanted.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        self.apply_cv.notify_all();
+    }
+
+    /// Waits up to `wait` for [`Self::wake_applier`], then applies everything committed.
+    pub fn apply_pending(&self, wait: Duration) -> Result<()> {
+        {
+            let mut wanted = self.apply_wanted.lock().unwrap_or_else(|p| p.into_inner());
+            if !*wanted {
+                wanted = self.apply_cv.wait_timeout(wanted, wait).unwrap_or_else(|p| p.into_inner()).0;
+            }
+            *wanted = false;
+        }
+        self.apply_committed()
+    }
+
+    /// Leader: appends `command` to the log in memory only and returns `(index, term)`
+    /// (`TASK-158`). Followers may receive it at once; [`Self::persist_log`] writes it, and
+    /// this node counts toward a majority only for entries on disk ([`Self::durable_log_index`]),
+    /// so a commit never depends on an entry the leader could lose (Raft thesis §10.2.1).
+    pub fn propose_deferred(&self, command: RaftCommand) -> Result<(u64, u64)> {
         let mut st = self.lock_state();
         if st.role != RaftRole::Leader {
             return Err(StorageError::NotLeader { leader: st.leader_id.map(u64::from) });
         }
+        if st.log_dirty {
+            // A failed write left the file behind the log: rewrite it whole first.
+            self.storage.rewrite_log(&st.log)?;
+            st.log_dirty = false;
+        }
         let (prev, _) = st.last_log_index_and_term();
         let entry = RaftLogEntry { term: st.current_term, index: prev + 1, command };
-        self.append_durably(&mut st, core::slice::from_ref(&entry))?;
         let term = entry.term;
         st.push_entry(entry);
         self.outcomes
@@ -2007,6 +2116,64 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             .awaited
             .insert(prev + 1, term);
         Ok((prev + 1, term))
+    }
+
+    /// Writes every log entry not yet in the file, with one sync, without holding the state
+    /// lock: concurrent proposals share the write (group commit). A rewrite in between (a
+    /// truncation after losing leadership, a compaction) wrote what it needed; the write is
+    /// then prepared again.
+    pub fn persist_log(&self) -> Result<()> {
+        loop {
+            let (epoch, after, pending) = {
+                let mut st = self.lock_state();
+                if st.log_dirty {
+                    // A failed write may have left a torn tail: appending after it would hide
+                    // these entries from the next load. Rewrite the file whole first.
+                    self.storage.rewrite_log(&st.log)?;
+                    st.log_dirty = false;
+                }
+                let after = self.storage.file_last.load(Ordering::Acquire);
+                let from = st.log.partition_point(|e| e.index <= after);
+                if from == st.log.len() {
+                    return Ok(());
+                }
+                // Entries the file does not continue from (the log was compacted past it):
+                // a rewrite is due, which the next state-locked write performs.
+                if st.log[from].index != after + 1 && after != 0 {
+                    drop(st);
+                    let mut st = self.lock_state();
+                    st.log_dirty = true;
+                    self.storage.rewrite_log(&st.log)?;
+                    st.log_dirty = false;
+                    continue;
+                }
+                (self.storage.log_epoch.load(Ordering::Acquire), after, st.log[from..].to_vec())
+            };
+            match self.storage.append_if_unchanged(epoch, after, &pending) {
+                Ok(true) => return Ok(()),
+                Ok(false) => continue,
+                Err(e) => {
+                    // The file may hold part of the write: the next write rewrites it whole.
+                    self.lock_state().log_dirty = true;
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// The last log index this node holds on disk (its own vote toward a majority).
+    pub fn durable_log_index(&self) -> u64 {
+        let st = self.lock_state();
+        let on_disk = if st.log_dirty { 0 } else { self.storage.file_last.load(Ordering::Acquire) };
+        on_disk.max(st.snapshot_index).min(st.last_log_index())
+    }
+
+    /// [`Self::propose_ops_at_tagged`] without writing the log ([`Self::propose_deferred`]).
+    pub fn propose_ops_deferred(&self, ops: &[WriteOp<T>]) -> Result<(u64, u64)> {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        self.propose_deferred(RaftCommand::Ops(encode_raft_ops(ops, now_ns)?))
     }
 
     /// Leader: proposes an atomic conditional batch (see [`StorageEngine::commit`]) stamped with
@@ -2148,7 +2315,11 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
             st.log_dirty = false;
         }
         st.log_dirty = true;
-        self.storage.append_log(entries)?;
+        // Entries a leader proposed but has not written yet come first (`TASK-158`).
+        let after = self.storage.file_last.load(Ordering::Acquire);
+        let mut all: Vec<RaftLogEntry> = st.log[st.log.partition_point(|e| e.index <= after)..].to_vec();
+        all.extend_from_slice(entries);
+        self.storage.append_suffix(&all)?;
         st.log_dirty = false;
         Ok(())
     }
@@ -2477,23 +2648,28 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 st.log_dirty = true;
                 self.storage.rewrite_log(&st.log)?;
                 st.log_dirty = false;
-            } else if let Some(from) = new_from {
+            } else if new_from.is_some() {
                 st.log_dirty = true;
-                self.storage.append_log(&st.log[from..])?;
+                // From the file's end: includes entries this node proposed as leader but had
+                // not written yet, if the new leader kept them (`TASK-158`).
+                self.storage.append_suffix(&st.log)?;
                 st.log_dirty = false;
             }
 
             let match_index = last_new.min(st.last_log_index());
             if req.leader_commit > st.commit_index && req.leader_commit.min(match_index) > st.commit_index {
+                // Volatile in Raft (`TASK-158`): a restarted node learns it from the leader. The
+                // applied index, which must be durable, is saved as entries apply.
                 st.commit_index = req.leader_commit.min(match_index);
-                if st.durable_applied.is_none() {
-                    self.storage.save_hard_state(&st)?;
-                }
             }
             (st.current_term, match_index)
         };
 
-        self.apply_committed()?;
+        if self.defer_apply.load(Ordering::Acquire) {
+            self.wake_applier();
+        } else {
+            self.apply_committed()?;
+        }
 
         Ok(AppendEntriesResp {
             term,
@@ -2517,10 +2693,8 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 && quorum_index <= st.last_log_index()
                 && st.term_at(quorum_index) == Some(st.current_term)
             {
+                // Volatile in Raft (`TASK-158`): saved with the applied index as entries apply.
                 st.commit_index = quorum_index;
-                if st.durable_applied.is_none() {
-                    self.storage.save_hard_state(&st)?;
-                }
             }
         }
         self.apply_committed()?;
@@ -2540,39 +2714,68 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
     /// entry has been applied successfully, so a crash or error never skips an entry.
     fn apply_committed(&self) -> Result<()> {
         let _apply = self.apply_lock.lock().unwrap_or_else(|p| p.into_inner());
+        // Entries apply in batches (`TASK-158`): everything committed (up to a bound), then one
+        // save of the applied index, then the outcomes. A writer learns its result only once
+        // the index covering it is durable, so a crash can never apply an acknowledged entry
+        // twice; under concurrent writes, one save covers many entries.
         loop {
-            let next = {
-                let st = self.lock_state();
-                if st.last_applied >= st.commit_index {
+            let mut applied_upto = self.lock_state().last_applied;
+            let mut outcomes = Vec::new();
+            let mut failure = None;
+            while outcomes.len() < APPLY_BATCH {
+                let next = {
+                    let st = self.lock_state();
+                    if applied_upto >= st.commit_index {
+                        break;
+                    }
+                    st.entry_at(applied_upto + 1).cloned()
+                };
+                let Some(entry) = next else {
                     break;
+                };
+                match self.apply_entry_to_engine(&entry) {
+                    Ok(outcome) => {
+                        applied_upto = entry.index;
+                        outcomes.push((entry.index, entry.term, outcome));
+                    }
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
                 }
-                st.entry_at(st.last_applied + 1).cloned()
-            };
-            let Some(entry) = next else {
-                break;
-            };
-            let outcome = self.apply_entry_to_engine(&entry)?;
-            // Publish the outcome BEFORE advancing `last_applied`: a waiter that observes the
-            // index as applied is then guaranteed to find its result. Lock order is always
-            // `state -> outcomes`; neither lock is held while taking the other here.
-            {
-                let mut out = self.outcomes.lock().unwrap_or_else(|p| p.into_inner());
-                if out.awaited.get(&entry.index) == Some(&entry.term) {
-                    out.done.insert(entry.index, (entry.term, outcome));
+            }
+            if outcomes.is_empty() {
+                if let Some(e) = failure {
+                    return Err(e);
                 }
+                return self.compact_after_apply();
             }
             {
                 let mut st = self.lock_state();
-                st.last_applied = st.last_applied.max(entry.index);
+                st.last_applied = st.last_applied.max(applied_upto);
                 if st.durable_applied.is_none() {
                     self.storage.save_hard_state(&st)?;
                 }
             }
-            // Notify under the outcomes lock so a waiter between its check and its wait cannot
-            // miss the wake-up.
-            let _out = self.outcomes.lock().unwrap_or_else(|p| p.into_inner());
-            self.applied_cv.notify_all();
+            // Publish, then notify under the outcomes lock so a waiter between its check and
+            // its wait cannot miss the wake-up. Lock order is always `state -> outcomes`.
+            {
+                let mut out = self.outcomes.lock().unwrap_or_else(|p| p.into_inner());
+                for (index, term, outcome) in outcomes {
+                    if out.awaited.get(&index) == Some(&term) {
+                        out.done.insert(index, (term, outcome));
+                    }
+                }
+                self.applied_cv.notify_all();
+            }
+            if let Some(e) = failure {
+                return Err(e);
+            }
         }
+    }
+
+    /// Compacts the log once enough applied entries pile up (after [`Self::apply_committed`]).
+    fn compact_after_apply(&self) -> Result<()> {
         // Bound log memory and disk (anti-bloat): compact once enough applied entries pile up,
         // keeping a tail for lagging followers.
         let (applied, snapshot, by_bytes) = {
@@ -3475,6 +3678,47 @@ mod tests {
         drop(f);
         let again = RaftNode::new(9, engine).unwrap();
         assert_eq!(again.last_log_index(), 3);
+    }
+
+    /// A leader's proposal is in memory until `persist_log` writes it, and the leader counts
+    /// toward a majority only for what is on disk. A failed write counts for nothing, and the
+    /// next write repairs the file, so every entry survives a reopen (`TASK-158`).
+    #[test]
+    fn test_deferred_proposals_count_only_once_durable() {
+        let dir = std::env::temp_dir().join(format!("stge_raft_deferred_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Arc::new(StorageEngine::<AgentObjectRecord>::open(&dir, EngineConfig::default()).unwrap());
+        let a = RaftNode::new(1, Arc::clone(&engine)).unwrap();
+        let req = a.start_election().unwrap();
+        assert!(a.become_leader(req.term));
+        a.persist_log().unwrap(); // the no-op of its term
+        let base = a.last_log_index();
+        assert_eq!(a.durable_log_index(), base);
+
+        let (i1, _) = a.propose_deferred(RaftCommand::Noop).unwrap();
+        let (i2, _) = a.propose_deferred(RaftCommand::Noop).unwrap();
+        assert_eq!((i1, i2), (base + 1, base + 2));
+        assert_eq!(a.durable_log_index(), base, "not on disk yet");
+        a.persist_log().unwrap();
+        assert_eq!(a.durable_log_index(), i2);
+
+        let (i3, _) = a.propose_deferred(RaftCommand::Noop).unwrap();
+        a.storage.fail_next_append.store(true, Ordering::Relaxed);
+        assert!(a.persist_log().is_err());
+        assert!(a.durable_log_index() < i3, "a failed write must not count");
+        // A retry without a new proposal repairs the file and writes the entry.
+        a.persist_log().unwrap();
+        assert_eq!(a.durable_log_index(), i3);
+        let (i4, _) = a.propose_deferred(RaftCommand::Noop).unwrap();
+        a.persist_log().unwrap();
+        let term = a.current_term();
+        drop(a);
+
+        let again = RaftNode::new(1, engine).unwrap();
+        assert_eq!(again.last_log_index(), i4);
+        assert_eq!(again.current_term(), term, "the hard state saved in place reads back");
+        drop(again);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A follower may hold stale entries past the end of what an AppendEntries verified (a

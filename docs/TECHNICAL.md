@@ -242,7 +242,7 @@ The server prints one line when it is listening and exits with status 1 and a me
 
 ### Single-group Raft
 
-Three or five servers with `--node-id` and `--peers` replicate one copy of the data with Raft. Writes go to the leader and are acknowledged once a majority has logged them; reads go to the leader unless a client allows stale follower reads. Followers answer `NotLeader` with the leader's address, and every client follows it.
+Three or five servers with `--node-id` and `--peers` replicate one copy of the data with Raft. Writes go to the leader and are acknowledged once a majority has logged them and the leader has applied them. Concurrent writes share disk syncs, and followers apply in the background; reads go to the leader unless a client allows stale follower reads. Followers answer `NotLeader` with the leader's address, and every client follows it.
 
 ```bash
 export STORAGE_AUTH_TOKENS="admin-token-0123456789:admin" STORAGE_CLUSTER_TOKEN="node-token-0123456789"
@@ -488,6 +488,6 @@ Patch releases can be rolled through a cluster one node at a time; minor release
 - **TLS** supports one suite per version and Ed25519 certificates only; no client certificates.
 - **Change feeds** exist for range clusters only (`storage-cli changefeed`); the SDKs do not expose them.
 - **Soak testing** ran for 2 hours per cluster mode under constant faults; no multi-day soak has run, and the standalone server's periodic checkpoint is new in 0.1.1.
-- **Single-group cluster writes are slow**: about 90 ms each (40 a second from four clients) on one `c7i.xlarge` running all three nodes, against 4 ms on a standalone server; unchanged since 0.1.0 ([`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) section 8.7). Range clusters do not share this path.
+- **Single-group cluster writes wait for disk syncs**: a write takes about 8 ms on three separate 2-vCPU Azure VMs whose disk syncs take 4 ms (106 a second from one client, 238 from 16). A standalone server takes 4 ms. The write passes through two syncs in a row: the leader's log and a follower's log ([`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) section 8.8).
 - **macOS and Windows** pass the test suite in CI and smoke tests in the release build; the performance figures and soaks are from Linux.
 - The local `storage-cli` data commands work on the typed demo store, not on document data directories (section 12).
