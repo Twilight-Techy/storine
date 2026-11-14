@@ -524,11 +524,11 @@ The changes since v0.1.0 that run on every request (sealing hooks in the Raft lo
 | `update` (coalesced write) | 920 ns | 908 ns |
 | Secondary index | 2,343 ns | 2,325 ns |
 | TCP `GET`, plaintext / TLS | 8.9 / 11.7 µs | 8.9 / 11.6 µs |
-| `kv-compare` fill / read 4 threads / overwrite 4 threads | 751 k / 4.02 M / 1.37 M per s | 751 k / 4.06 M / 1.38 M per s |
+| `kv-compare` fill / read 4 threads / overwrite 4 threads | 751 k / 4.02 M / 1.37 M per s | 752 k / 4.06 M / 1.37 M per s |
 | `kv-compare` indexed overwrite, 1 thread | 383 k/s | 365 k/s (−4.9 %) |
 | Standalone server, 4 clients: writes | 931/s, p50 4.1 ms | 931/s, p50 3.9 ms |
 | 3-node cluster, 4 clients: writes | 40/s, p50 91 ms | 40/s, p50 93 ms |
 
-- **No regression**: every row is within the run-to-run spread of these benchmarks (a few per cent either way; the indexed 1-thread overwrite row moved −4.9 % here and +2.2 % in section 8.6's runs of the same code).
+- **No regression**: every row is within the run-to-run spread of these benchmarks (a few per cent either way; the indexed 1-thread overwrite row moved −4.9 % here, and +2.2 % and +0.5 % in section 8.6's two x86 runs, where both sides ran the same engine code).
 - The 4 KiB checksum row reads 371 ns for v0.1.0 and 1,052 ns now, but the code is the same: v0.1.0's benchmark let the compiler hoist part of the work out of its loop (section 8.6). It is left out of the table.
 - **Found, not caused by these changes**: a single-group cluster commits a write in about 90 ms, so four clients reach 40 writes a second, in v0.1.0 as now. A standalone server takes 4 ms. On this machine the three nodes share four vCPUs and one disk, which explains some of it but not a factor of twenty. This needs its own investigation.
