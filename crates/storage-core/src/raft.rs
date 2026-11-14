@@ -2756,10 +2756,10 @@ impl<T: ZeroCopyRecord + Indexable> RaftNode<T> {
                 if st.durable_applied.is_none() {
                     self.storage.save_hard_state(&st)?;
                 }
-            }
-            // Publish, then notify under the outcomes lock so a waiter between its check and
-            // its wait cannot miss the wake-up. Lock order is always `state -> outcomes`.
-            {
+                // Publish before the state lock is released: a waiter that sees `last_applied`
+                // cover its entry must find the outcome too, or it reports `CommitUnknown` for a
+                // write that succeeded. Notify under the outcomes lock so a waiter between its
+                // check and its wait cannot miss the wake-up. Lock order is `state -> outcomes`.
                 let mut out = self.outcomes.lock().unwrap_or_else(|p| p.into_inner());
                 for (index, term, outcome) in outcomes {
                     if out.awaited.get(&index) == Some(&term) {
