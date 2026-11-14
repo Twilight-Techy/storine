@@ -16,6 +16,14 @@ use storage_types::StorageError;
 
 const MARK: &str = "PLAINTEXT-MARK-at-rest-91c4";
 
+/// A 100 KB document holding the marker.
+fn big(collection: &str, key: &str) -> DocWrite {
+    let mut f = BTreeMap::new();
+    f.insert("secret".to_string(), PropertyValue::Text(format!("{MARK}-{key}")));
+    f.insert("pad".to_string(), PropertyValue::Text("x".repeat(100_000)));
+    DocWrite { collection: collection.into(), key: key.into(), op: DocOp::Put(f), precondition: Precondition::None }
+}
+
 fn put(collection: &str, key: &str) -> DocWrite {
     let mut f = BTreeMap::new();
     f.insert("secret".to_string(), PropertyValue::Text(format!("{MARK}-{key}")));
@@ -225,7 +233,9 @@ fn a_range_cluster_keeps_no_plaintext_on_disk() {
 
 fn spawn_node(data: &Path, addr: SocketAddr, id: u16, peers: &str, keys: Option<&Path>, allow_plain: bool) -> Server {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_storage-server"));
-    cmd.arg(data).arg(addr.to_string()).args(["--node-id", &id.to_string(), "--peers", peers]).stdout(Stdio::null()).stderr(Stdio::null());
+    // Each node's output goes to `<data>.log`, printed if the test fails.
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(data.with_extension("log")).unwrap();
+    cmd.arg(data).arg(addr.to_string()).args(["--node-id", &id.to_string(), "--peers", peers]).stdout(Stdio::null()).stderr(log);
     for k in ["STORAGE_ENCRYPTION_KEYS", "STORAGE_ENCRYPTION_ACTIVE_KEY", "STORAGE_ENCRYPTION_ALLOW_PLAINTEXT", "STORAGE_AUTH_TOKENS", "STORAGE_CLUSTER_TOKEN"] {
         cmd.env_remove(k);
     }
@@ -286,8 +296,8 @@ fn a_raft_cluster_turns_encryption_on_and_catches_up_a_node_from_sealed_storage(
         });
     }
 
-    // 3. Node 3 is down while the others write and compact their logs past it (a node
-    // compacts once 8,192 applied entries pile up, keeping 1,024: 10,000 writes is enough).
+    // 3. Node 3 is down while the others write and compact their logs past it: a node compacts
+    // once its log holds 64 MiB, keeping 16 MiB, so 700 writes of 100 KB are enough.
     nodes[2] = None;
     std::thread::scope(|sc| {
         for t in 0..4 {
@@ -295,18 +305,21 @@ fn a_raft_cluster_turns_encryption_on_and_catches_up_a_node_from_sealed_storage(
             sc.spawn(move || {
                 // One connection to the leader, kept while it accepts writes.
                 let mut leader: Option<StorageClient> = None;
-                for i in (40 + t..10_040).step_by(4) {
+                for i in (40 + t..740).step_by(4) {
                     let key = format!("p{i}");
+                    let w = big("people", &key);
                     if let Some(c) = leader.as_mut() {
-                        if c.doc_write(&[put("people", &key)], None).is_ok() {
+                        if c.doc_write(std::slice::from_ref(&w), None).is_ok() {
                             continue;
                         }
                     }
-                    cluster_write(addrs, &key);
                     leader = addrs.iter().find_map(|a| {
                         let mut c = StorageClient::connect_timeout(*a, Duration::from_millis(500)).ok()?;
-                        c.doc_write(&[put("people", &key)], None).ok().map(|_| c)
+                        c.doc_write(std::slice::from_ref(&w), None).ok().map(|_| c)
                     });
+                    if leader.is_none() {
+                        cluster_write(addrs, &key);
+                    }
                 }
             });
         }
@@ -315,7 +328,16 @@ fn a_raft_cluster_turns_encryption_on_and_catches_up_a_node_from_sealed_storage(
     nodes[2] = Some(start(2, Some(&keys), false));
     let mut c = client(addrs[2]);
     c.doc_command(storage_server::OP_SET_OPTIONS, &[1]).unwrap(); // follower reads
-    wait_until("node 3 to catch up", 120, || c.doc_get("people", "p10039").ok().flatten().is_some());
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while c.doc_get("people", "p739").ok().flatten().is_none() {
+        if Instant::now() > deadline {
+            for i in 0..3 {
+                eprintln!("--- node {} ---\n{}", i + 1, std::fs::read_to_string(data(i).with_extension("log")).unwrap_or_default());
+            }
+            panic!("node 3 never caught up");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
     assert!(c.doc_get("people", "p0").unwrap().is_some());
     // The leader had compacted its log past node 3: it caught up from a (sealed) snapshot.
     let snapshot_built = (0..2).any(|i| std::fs::read_dir(data(i)).unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with("_raft.snapshot")));

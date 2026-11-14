@@ -85,14 +85,21 @@ fn test_three_node_tcp_cluster_writes_redirects_and_failover() {
     let _ = std::fs::remove_dir_all(&dir);
     let addrs: HashMap<NodeId, SocketAddr> = (1..=3).map(|i| (i, free_port())).collect();
     let mut nodes: Vec<Node> = (1..=3).map(|i| start_node(&dir, i, &addrs)).collect();
-    let l = wait_leader(&nodes.iter().collect::<Vec<_>>());
-    let leader_addr = nodes[l].addr;
-
-    // Writes on the leader are replicated.
-    let mut c = StorageClient::connect(leader_addr).unwrap();
+    // Writes on the leader are replicated. On a slow runner leadership can move right after the
+    // first election: the first write retries on `NotLeader`, as clients do.
     let mut f = BTreeMap::new();
     f.insert("bal".to_string(), PropertyValue::Int64(100));
-    c.doc_write(&[DocWrite { collection: "acct".into(), key: "a".into(), op: DocOp::Put(f), precondition: Precondition::Absent }], None).unwrap();
+    let first = DocWrite { collection: "acct".into(), key: "a".into(), op: DocOp::Put(f), precondition: Precondition::Absent };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (l, mut c) = loop {
+        let l = wait_leader(&nodes.iter().collect::<Vec<_>>());
+        let mut c = StorageClient::connect(nodes[l].addr).unwrap();
+        match c.doc_write(std::slice::from_ref(&first), Some([7; 16])) {
+            Ok(_) => break (l, c),
+            Err(StorageError::NotLeader { .. }) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => panic!("first write: {e:?}"),
+        }
+    };
     for _ in 0..20 {
         c.doc_write(&[deposit(1)], None).unwrap();
     }
