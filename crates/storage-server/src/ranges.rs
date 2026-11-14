@@ -183,6 +183,7 @@ impl Transport for TcpRangeTransport {
 /// What a range-mode server holds.
 pub struct RangeContext {
     pub(crate) node: Arc<RangeNode>,
+    rules: Option<(std::path::PathBuf, RulesStatus)>,
     engine: Arc<storage_core::StorageEngine<storage_core::DocumentRecord>>,
     pub(crate) pool: Arc<WorkerPool>,
     /// `OP_KV` from other nodes' coordinators.
@@ -215,6 +216,8 @@ impl core::fmt::Debug for RangeContext {
 /// Everything a range-mode server needs (see [`crate::StorageServer::start_documents_ranges`]).
 pub struct RangeOptions {
     pub node: Arc<RangeNode>,
+    /// The watched placement rules file and what became of its last load.
+    pub(crate) rules: Option<(std::path::PathBuf, RulesStatus)>,
     /// The node's engine (health reports its encryption settings).
     pub engine: Arc<storage_core::StorageEngine<storage_core::DocumentRecord>>,
     pub transport: Arc<TcpRangeTransport>,
@@ -247,7 +250,7 @@ impl RangeContext {
     }
 
     pub(crate) fn new(o: RangeOptions, workers: usize) -> Self {
-        Self { node: o.node, engine: o.engine, pool: WorkerPool::new(workers, 16_384), kv_pool: WorkerPool::new(workers, 16_384), analytics: Arc::default(), transport: o.transport, gateway: o.gateway, hlc: o.hlc, cache: Arc::new(RwLock::new(RangeIndex::new())), plain: Arc::default(), backup_running: Arc::default() }
+        Self { node: o.node, rules: o.rules, engine: o.engine, pool: WorkerPool::new(workers, 16_384), kv_pool: WorkerPool::new(workers, 16_384), analytics: Arc::default(), transport: o.transport, gateway: o.gateway, hlc: o.hlc, cache: Arc::new(RwLock::new(RangeIndex::new())), plain: Arc::default(), backup_running: Arc::default() }
     }
 
     /// The node's backup slot, unless a backup or restore holds it (each occupies a worker for as
@@ -270,10 +273,22 @@ impl RangeContext {
             self.node.gauges(),
             self.transport.queued_bytes.load(Ordering::Relaxed),
             self.transport.dropped.load(Ordering::Relaxed),
-            crate::at_rest::health_field(self.engine.encryption()) + ",\"placement\":" + &self.node.placement(),
+            crate::at_rest::health_field(self.engine.encryption()) + &self.rules_field() + ",\"placement\":" + &self.node.placement(),
             crate::heap_fields()
         )
         .into_bytes()
+    }
+
+    /// `,"placement_rules":{"file":...,"error":...}` when rules come from a file.
+    fn rules_field(&self) -> String {
+        let Some((file, status)) = &self.rules else { return String::new() };
+        let esc = |s: &str| s.replace('\\', "/").replace('"', "'");
+        let err = status.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        format!(
+            ",\"placement_rules\":{{\"file\":\"{}\",\"error\":{}}}",
+            esc(&file.display().to_string()),
+            err.map_or("null".to_string(), |e| format!("\"{}\"", esc(&e)))
+        )
     }
 
     pub(crate) fn cluster_info(&self) -> Vec<u8> {
@@ -644,6 +659,43 @@ pub struct RangeExtras {
     /// same; see `crate::placement`).
     pub localities: std::collections::BTreeMap<NodeId, storage_core::dist::zone::Locality>,
     pub zones: storage_core::dist::zone::ZoneConfigs,
+    /// The file `zones` came from: watched, and reloaded when it changes (`TASK-157`).
+    pub zones_file: Option<std::path::PathBuf>,
+}
+
+/// What a range node last made of its placement rules file (`None`: loaded fine).
+pub(crate) type RulesStatus = Arc<Mutex<Option<String>>>;
+
+/// Reloads `file` when it changes, until the node stops (`TASK-157`). Rules that do not parse
+/// or do not fit the localities are refused: the node keeps its current rules and reports the
+/// error in its health report.
+fn watch_zones(file: std::path::PathBuf, node: std::sync::Weak<RangeNode>, status: RulesStatus) {
+    let stamp = |f: &std::path::Path| std::fs::metadata(f).and_then(|m| m.modified()).ok();
+    let mut seen = stamp(&file);
+    let _ = std::thread::Builder::new().name("storine-zones-watch".into()).spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(2));
+        let Some(node) = node.upgrade() else { return };
+        let now = stamp(&file);
+        if now == seen {
+            continue;
+        }
+        seen = now;
+        let result = std::fs::read_to_string(&file)
+            .map_err(|e| StorageError::io("read --zones file", e))
+            .and_then(|text| crate::placement::parse(&text))
+            .and_then(|zones| node.set_zones(zones));
+        let mut st = status.lock().unwrap_or_else(|p| p.into_inner());
+        match result {
+            Ok(()) => {
+                eprintln!("storage-server: placement rules reloaded from {}", file.display());
+                *st = None;
+            }
+            Err(e) => {
+                eprintln!("storage-server: placement rules in {} refused (the previous rules stay): {e}", file.display());
+                *st = Some(e.to_string());
+            }
+        }
+    });
 }
 
 /// Starts one node of a range cluster: on first start it holds one range over the whole key
@@ -693,6 +745,11 @@ pub fn start_range_server(cfg: RangeServerConfig) -> Result<crate::StorageServer
     let node = RangeNode::start(NodeServer::new(driver, Arc::clone(&hlc)), Arc::clone(&transport) as Arc<dyn Transport>, RuntimeConfig::default());
     transport.set_local(Arc::clone(&node));
     let gateway = GatewayConfig { nodes: ids, request_timeout: Duration::from_secs(10), call_timeout: Duration::from_secs(5) };
-    let options = RangeOptions { node, engine: Arc::clone(&engine), transport, gateway, hlc };
+    let rules = cfg.extras.zones_file.clone().map(|f| {
+        let status = RulesStatus::default();
+        watch_zones(f.clone(), Arc::downgrade(&node), Arc::clone(&status));
+        (f, status)
+    });
+    let options = RangeOptions { node, rules, engine: Arc::clone(&engine), transport, gateway, hlc };
     crate::StorageServer::start_documents_ranges(&cfg.bind_addr, engine, cfg.max_connections, cfg.security, options)
 }

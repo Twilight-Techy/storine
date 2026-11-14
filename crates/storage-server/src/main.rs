@@ -432,7 +432,7 @@ fn run_ranges(data_dir: &str, bind_addr: &str, max_connections: usize, security:
         max_connections,
         max_offset: Duration::from_millis(500),
         peer_tls,
-        extras: storage_server::ranges::RangeExtras { encryption: storage_server::at_rest::from_env()?, localities, zones },
+        extras: storage_server::ranges::RangeExtras { encryption: storage_server::at_rest::from_env()?, localities, zones, zones_file: zones_file.map(std::path::PathBuf::from) },
     })?;
     report((server.local_addr(), server.max_connections()), data_dir, server_auth(&server), &format!("documents, range node {node_id} of {n}"));
     park(server, once)

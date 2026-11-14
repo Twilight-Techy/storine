@@ -87,12 +87,13 @@ fn replicas_and_leases_follow_the_placement_rules() {
             (n, Locality::new(region, &format!("{region}-{}", (n - 1) % 3)))
         })
         .collect();
-    let zones = storage_server::placement::parse(
-        "default replicas=3 survival=zone\n\
-         collection eu_only require=region:eu lease=eu\n\
-         collection us_first lease=us\n",
-    )
-    .unwrap();
+    // The rules start without the eu-only one; it is added while the cluster runs, by editing
+    // the file every node watches.
+    std::fs::create_dir_all(&root).unwrap();
+    let rules_file = root.join("zones");
+    let first = "default replicas=3 survival=zone\ncollection us_first lease=us\n";
+    std::fs::write(&rules_file, first).unwrap();
+    let zones = storage_server::placement::parse(first).unwrap();
     storage_server::placement::check(&localities, 6, &zones).unwrap();
     let servers: Vec<_> = (0..6)
         .map(|i| {
@@ -106,7 +107,7 @@ fn replicas_and_leases_follow_the_placement_rules() {
                 max_connections: 256,
                 max_offset: Duration::from_millis(100),
                 peer_tls: None,
-                extras: RangeExtras { localities: localities.clone(), zones: zones.clone(), ..Default::default() },
+                extras: RangeExtras { localities: localities.clone(), zones: zones.clone(), zones_file: Some(rules_file.clone()), ..Default::default() },
             })
             .unwrap()
         })
@@ -128,6 +129,9 @@ fn replicas_and_leases_follow_the_placement_rules() {
         write("us_first", &format!("k{i}"));
         write("other", &format!("k{i}"));
     }
+
+    std::thread::sleep(Duration::from_millis(1100)); // a newer modification time
+    std::fs::write(&rules_file, format!("{first}collection eu_only require=region:eu lease=eu\n")).unwrap();
 
     // Converged: every replica of an eu_only range is in eu and its leader too; us_first ranges
     // are led from us; every range has three voters.
@@ -164,6 +168,21 @@ fn replicas_and_leases_follow_the_placement_rules() {
         std::thread::sleep(Duration::from_secs(1));
     }
     let _ = last;
+    // Rules that do not fit the localities are refused: every node reports why and keeps the
+    // rules it has.
+    std::thread::sleep(Duration::from_millis(1100));
+    std::fs::write(&rules_file, "collection eu_only require=region:asia\n").unwrap();
+    for a in &addrs {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let h = StorageClient::connect(*a).and_then(|mut c| c.health()).unwrap();
+            if h.contains("\"placement_rules\"") && h.contains("fewer nodes satisfy") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the bad rules were not reported: {h}");
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
     // Still one database: every document reads from any node.
     let mut c = StorageClient::connect(addrs[2]).unwrap();
     for coll in ["eu_only", "us_first", "other"] {

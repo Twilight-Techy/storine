@@ -38,5 +38,9 @@ name = "reactor-scale"
 path = "src/bin/reactor_scale.rs"
 
 [[bin]]
+name = "server-load"
+path = "src/bin/server_load.rs"
+
+[[bin]]
 name = "compaction-cost"
 path = "src/bin/compaction_cost.rs"

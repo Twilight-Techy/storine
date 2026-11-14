@@ -303,7 +303,7 @@ collection profiles regional-by-row regions=us-east,eu-west  # each row in its h
 | `global lead=1500ms` | Writes are timestamped ahead and wait out the lead, so every replica serves present-time reads; the lead must exceed twice the maximum clock offset (500 ms) |
 | `regional-by-row regions=R1,R2` | Keys written as `<region>\u0001<key>` live in their region, with leases there |
 
-The server refuses rules the localities cannot satisfy, such as too few nodes in a required region, or region survival with fewer than three regions. Every node's health report lists the ranges it holds in `placement`: span, voters, and whether it leads each. Change rules or localities with a rolling restart, giving every node the new file.
+The server refuses rules the localities cannot satisfy, such as too few nodes in a required region, or region survival with fewer than three regions. Every node's health report lists the ranges it holds in `placement`: span, voters, and whether it leads each. To change the rules, edit the file on every node: each node reloads it within 2 seconds, and the allocator moves data from its next round. Rules a node refuses (they do not parse, or the localities cannot satisfy them) leave its current rules in force; its health report shows the error under `placement_rules`. Changing a node's locality takes a restart of every node with the new `--peers`.
 
 ### TLS between nodes
 
@@ -430,7 +430,7 @@ Cluster nodes also keep their Raft logs and snapshots in the data directory. Two
 
 ### Monitoring
 
-`storage-cli remote-health` (or `OP_HEALTH`) returns JSON. A standalone or single-group node reports `status`, `live_records`, `total_reads`, `total_writes`, `hot_dirty_bytes` (written but not yet flushed) and `arena` (`segments`, `used`, `dead`, `live`, `compactions`, `removed`, `errors`, `last_error`). A range node reports `mode: "ranges"`, `ranges`, `log_entries`, `log_bytes`, queue and batch sizes, and `dropped_batches`. Every node also reports `encryption` (`"off"`, or the active key, the keys it holds and whether it still accepts plaintext), a standalone or single-group node `wal_archive` (the archive directory, when set), and a range node `placement` (the ranges it holds: span, voters, and whether it leads each).
+`storage-cli remote-health` (or `OP_HEALTH`) returns JSON. A standalone or single-group node reports `status`, `live_records`, `total_reads`, `total_writes`, `hot_dirty_bytes` (written but not yet flushed) and `arena` (`segments`, `used`, `dead`, `live`, `compactions`, `removed`, `errors`, `last_error`). A range node reports `mode: "ranges"`, `ranges`, `log_entries`, `log_bytes`, queue and batch sizes, and `dropped_batches`. Every node also reports `encryption` (`"off"`, or the active key, the keys it holds and whether it still accepts plaintext), a standalone or single-group node `wal_archive` (the archive directory, when set), and a range node `placement` (the ranges it holds: span, voters, and whether it leads each) and, with `--zones`, `placement_rules` (the file, and the error that kept its last change from applying, or `null`).
 
 `storage-cli remote-metrics` returns Prometheus text: `storine_live_records`, `storine_total_reads`, `storine_total_writes`, `storine_coalesced_flushes`, `storine_hot_dirty_bytes`, `storine_arena_*`, read and write latency summaries (`storine_read_latency_ns`, `storine_write_latency_ns`) and `storine_slow_rpcs` (requests over 10 ms; the last 256 are kept).
 
@@ -484,9 +484,10 @@ Patch releases can be rolled through a cluster one node at a time; minor release
 ## 15. Known limitations
 
 - **Tail latency** trails RocksDB and LMDB in some cases: fill p99.99 (about 0.7 ms against RocksDB's 16–20 µs), 4-writer overwrite p99.99 (2.1–3.0 ms against 0.5–1.3 ms), and durable p99.9 / p99.99 against LMDB ([`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) sections 8.4–8.5).
-- The **server binary** does not expose cold or paged index tiers; they are in the embedded API. Point-in-time recovery is not available on range clusters (they have cluster backups), and placement rules change only with a rolling restart.
+- The **server binary** does not expose cold or paged index tiers; they are in the embedded API. Point-in-time recovery is not available on range clusters (they have cluster backups), and changing a node's locality takes a restart of every node.
 - **TLS** supports one suite per version and Ed25519 certificates only; no client certificates.
 - **Change feeds** exist for range clusters only (`storage-cli changefeed`); the SDKs do not expose them.
 - **Soak testing** ran for 2 hours per cluster mode under constant faults; no multi-day soak has run, and the standalone server's periodic checkpoint is new in 0.1.1.
+- **Single-group cluster writes are slow**: about 90 ms each (40 a second from four clients) on one `c7i.xlarge` running all three nodes, against 4 ms on a standalone server; unchanged since 0.1.0 ([`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md) section 8.7). Range clusters do not share this path.
 - **macOS and Windows** pass the test suite in CI and smoke tests in the release build; the performance figures and soaks are from Linux.
 - The local `storage-cli` data commands work on the typed demo store, not on document data directories (section 12).

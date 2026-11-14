@@ -512,3 +512,23 @@ Release binaries are built for each architecture's baseline CPU (`-C target-cpu=
 - The checksum is faster on the x86 baseline build too, in both x86 runs (700 against 973 ns, then 739 against 1,033 ns). CRC32C uses the hardware instruction in both builds (chosen at run time); why the native build's code for the rest is slower was not investigated.
 - **Found**: the bench runner's checksum benchmark did not pass its input through `black_box`, so native builds partly hoisted the work out of the loop. Earlier checksum figures in this report (347 ns at section 8.4, 310 ns on Graviton2) measured less than one full call; it now takes 0.7–1.0 µs per 4 KiB on x86_64 and 0.63 µs on Graviton3.
 - The TCP and TLS rows vary by a few per cent between rounds in both directions: section 8.5 measured 8.6–9.0 µs and 11.5–11.7 µs for native builds.
+
+### 8.7 Encryption, recovery and placement against v0.1.0 (`TASK-157`, 2026-11-14)
+
+The changes since v0.1.0 that run on every request (sealing hooks in the Raft log path, the standalone checkpoint thread, placement reporting on range nodes, the Windows file fixes) measured against v0.1.0 on one on-demand `c7i.xlarge` (Xeon Platinum 8488C), both built for the machine, five alternating rounds, medians (`tools/release/compare-versions.sh`). Encryption, WAL archiving and placement rules were off: these are the costs everyone pays.
+
+| Benchmark | v0.1.0 | now |
+| :--- | ---: | ---: |
+| `with_ref` (hot read) | 63 ns | 62 ns |
+| `get_ref` (arena) | 68 ns | 66 ns |
+| `update` (coalesced write) | 920 ns | 908 ns |
+| Secondary index | 2,343 ns | 2,325 ns |
+| TCP `GET`, plaintext / TLS | 8.9 / 11.7 µs | 8.9 / 11.6 µs |
+| `kv-compare` fill / read 4 threads / overwrite 4 threads | 751 k / 4.02 M / 1.37 M per s | 751 k / 4.06 M / 1.38 M per s |
+| `kv-compare` indexed overwrite, 1 thread | 383 k/s | 365 k/s (−4.9 %) |
+| Standalone server, 4 clients: writes | 931/s, p50 4.1 ms | 931/s, p50 3.9 ms |
+| 3-node cluster, 4 clients: writes | 40/s, p50 91 ms | 40/s, p50 93 ms |
+
+- **No regression**: every row is within the run-to-run spread of these benchmarks (a few per cent either way; the indexed 1-thread overwrite row moved −4.9 % here and +2.2 % in section 8.6's runs of the same code).
+- The 4 KiB checksum row reads 371 ns for v0.1.0 and 1,052 ns now, but the code is the same: v0.1.0's benchmark let the compiler hoist part of the work out of its loop (section 8.6). It is left out of the table.
+- **Found, not caused by these changes**: a single-group cluster commits a write in about 90 ms, so four clients reach 40 writes a second, in v0.1.0 as now. A standalone server takes 4 ms. On this machine the three nodes share four vCPUs and one disk, which explains some of it but not a factor of twenty. This needs its own investigation.

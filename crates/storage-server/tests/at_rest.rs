@@ -222,3 +222,127 @@ fn a_range_cluster_keeps_no_plaintext_on_disk() {
     drop(servers);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+fn spawn_node(data: &Path, addr: SocketAddr, id: u16, peers: &str, keys: Option<&Path>, allow_plain: bool) -> Server {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_storage-server"));
+    cmd.arg(data).arg(addr.to_string()).args(["--node-id", &id.to_string(), "--peers", peers]).stdout(Stdio::null()).stderr(Stdio::null());
+    for k in ["STORAGE_ENCRYPTION_KEYS", "STORAGE_ENCRYPTION_ACTIVE_KEY", "STORAGE_ENCRYPTION_ALLOW_PLAINTEXT", "STORAGE_AUTH_TOKENS", "STORAGE_CLUSTER_TOKEN"] {
+        cmd.env_remove(k);
+    }
+    if let Some(k) = keys {
+        cmd.env("STORAGE_ENCRYPTION_KEYS", k);
+    }
+    if allow_plain {
+        cmd.env("STORAGE_ENCRYPTION_ALLOW_PLAINTEXT", "1");
+    }
+    Server(cmd.spawn().unwrap())
+}
+
+/// Writes through whichever node leads (followers answer `NotLeader`).
+fn cluster_write(addrs: &[SocketAddr], key: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        for a in addrs {
+            if let Ok(mut c) = StorageClient::connect_timeout(*a, Duration::from_millis(500)) {
+                if c.doc_write(&[put("people", key)], None).is_ok() {
+                    return;
+                }
+            }
+        }
+        assert!(Instant::now() < deadline, "no node accepted {key}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A single-group Raft cluster run by the real binary (`TASK-157`): plaintext at first, then
+/// encrypted on every node with one restart; a node that was down catches up (its peers have
+/// compacted their logs, so through a sealed snapshot), and no file of any node holds plaintext.
+#[test]
+fn a_raft_cluster_turns_encryption_on_and_catches_up_a_node_from_sealed_storage() {
+    let root = std::env::temp_dir().join(format!("stge_at_rest_raft_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let keys = root.join("keys");
+    storage_server::at_rest::add_key(&keys).unwrap();
+    let addrs: Vec<SocketAddr> = (0..3).map(|_| storage_types::testing::free_local_addr()).collect();
+    let peers: String = addrs.iter().enumerate().map(|(i, a)| format!("{}={a}", i + 1)).collect::<Vec<_>>().join(",");
+    let data = |i: usize| root.join(format!("n{}", i + 1));
+    let start = |i: usize, keys: Option<&Path>, allow: bool| spawn_node(&data(i), addrs[i], (i + 1) as u16, &peers, keys, allow);
+
+    // 1. Plaintext.
+    let nodes: Vec<Server> = (0..3).map(|i| start(i, None, false)).collect();
+    for i in 0..40 {
+        cluster_write(&addrs, &format!("p{i}"));
+    }
+    std::thread::sleep(Duration::from_secs(12)); // a checkpoint on every node
+    drop(nodes);
+    assert!(!plaintext_in(&root).is_empty(), "the test needs plaintext to start from");
+
+    // 2. Every node restarts with the key, accepting plaintext until it has resealed.
+    let mut nodes: Vec<Option<Server>> = (0..3).map(|i| Some(start(i, Some(&keys), true))).collect();
+    for a in &addrs {
+        wait_until("every node to go strict", 90, || {
+            StorageClient::connect_timeout(*a, Duration::from_secs(1)).and_then(|mut c| c.health()).is_ok_and(|h| h.contains("\"accept_plaintext\":false"))
+        });
+    }
+
+    // 3. Node 3 is down while the others write and compact their logs past it (a node
+    // compacts once 8,192 applied entries pile up, keeping 1,024: 10,000 writes is enough).
+    nodes[2] = None;
+    std::thread::scope(|sc| {
+        for t in 0..4 {
+            let addrs = &addrs[..2];
+            sc.spawn(move || {
+                // One connection to the leader, kept while it accepts writes.
+                let mut leader: Option<StorageClient> = None;
+                for i in (40 + t..10_040).step_by(4) {
+                    let key = format!("p{i}");
+                    if let Some(c) = leader.as_mut() {
+                        if c.doc_write(&[put("people", &key)], None).is_ok() {
+                            continue;
+                        }
+                    }
+                    cluster_write(addrs, &key);
+                    leader = addrs.iter().find_map(|a| {
+                        let mut c = StorageClient::connect_timeout(*a, Duration::from_millis(500)).ok()?;
+                        c.doc_write(&[put("people", &key)], None).ok().map(|_| c)
+                    });
+                }
+            });
+        }
+    });
+    std::thread::sleep(Duration::from_secs(12));
+    nodes[2] = Some(start(2, Some(&keys), false));
+    let mut c = client(addrs[2]);
+    c.doc_command(storage_server::OP_SET_OPTIONS, &[1]).unwrap(); // follower reads
+    wait_until("node 3 to catch up", 120, || c.doc_get("people", "p10039").ok().flatten().is_some());
+    assert!(c.doc_get("people", "p0").unwrap().is_some());
+    // The leader had compacted its log past node 3: it caught up from a (sealed) snapshot.
+    let snapshot_built = (0..2).any(|i| std::fs::read_dir(data(i)).unwrap().flatten().any(|e| e.file_name().to_string_lossy().ends_with("_raft.snapshot")));
+    assert!(snapshot_built, "node 3 caught up without a snapshot: the test did not exercise sealed snapshots");
+    std::thread::sleep(Duration::from_secs(12)); // checkpoints cut the WALs everywhere
+    drop(nodes);
+    let left = plaintext_in(&root);
+    assert!(left.is_empty(), "plaintext left in {left:?}");
+
+    // 4. A node given the wrong key does not serve its data.
+    let wrong = root.join("wrong");
+    storage_server::at_rest::add_key(&wrong).unwrap();
+    let mut s = start(0, Some(&wrong), false);
+    let refused = (0..50).any(|_| {
+        if s.0.try_wait().unwrap().is_some() {
+            return true;
+        }
+        if let Ok(mut c) = StorageClient::connect_timeout(addrs[0], Duration::from_millis(500)) {
+            let _ = c.doc_command(storage_server::OP_SET_OPTIONS, &[1]);
+            if c.doc_get("people", "p0").is_err() {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        false
+    });
+    assert!(refused, "data sealed with another key was served");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&root);
+}

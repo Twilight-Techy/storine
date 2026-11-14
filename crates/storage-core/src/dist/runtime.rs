@@ -59,6 +59,8 @@ pub trait Transport: Send + Sync {
 enum Input {
     Batch(Vec<u8>),
     Request(KvRequest, SyncSender<KvResponse>),
+    /// New placement rules (`TASK-157`), applied between passes.
+    Zones(crate::dist::zone::ZoneConfigs, SyncSender<Result<()>>),
     Stop,
 }
 
@@ -138,6 +140,15 @@ impl RangeNode {
         out.push(format!("\"inbound_batch_bytes\":{}", self.batch_bytes.load(Ordering::Relaxed)));
         out.push(format!("\"queued_requests\":{}", self.queued.load(Ordering::Relaxed)));
         out.join(",")
+    }
+
+    /// Replaces the placement rules while the node runs (`TASK-157`): checked against the
+    /// cluster's localities first, and refused (the old rules stay) when they do not fit. The
+    /// allocator applies them from its next round. Every node must be given the same rules.
+    pub fn set_zones(&self, zones: crate::dist::zone::ZoneConfigs) -> Result<()> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.tx.send(Input::Zones(zones, tx)).map_err(|_| StorageError::invalid_key("range node stopped"))?;
+        rx.recv_timeout(Duration::from_secs(10)).map_err(|_| StorageError::invalid_key("range node did not answer"))?
     }
 
     /// The ranges this node holds (JSON, as of the last second): span, voters, leadership.
@@ -268,6 +279,9 @@ fn event_loop(mut srv: NodeServer, rx: Receiver<Input>, transport: Arc<dyn Trans
                     next_id += 1;
                     waiting.insert(next_id, (Instant::now(), reply));
                     srv.submit(next_id, 0, req);
+                }
+                Input::Zones(zones, reply) => {
+                    let _ = reply.send(srv.driver.set_zones(zones));
                 }
             }
         }
