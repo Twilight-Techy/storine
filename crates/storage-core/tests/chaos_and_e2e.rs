@@ -506,11 +506,16 @@ fn crash_child_writer() {
 
 /// Ends the process at once, as a crash would: no destructor runs, so nothing the engine holds
 /// is flushed. `abort()` everywhere but macOS, whose crash reporter collects every `SIGABRT`
-/// before the process is reaped and has stalled CI runs; there, `exit` with abort's status ends
-/// the process just as abruptly for this test (it runs no Rust destructors).
+/// before the process is reaped and has stalled CI runs. There the process sends itself
+/// `SIGKILL`, which the crash reporter ignores. An earlier `exit(134)` still ran libc's exit
+/// handlers, and one CI run hung for two hours in them while the engine's flush thread was
+/// mid-write.
 fn crash() -> ! {
     if cfg!(target_os = "macos") {
-        std::process::exit(134)
+        let _ = std::process::Command::new("/bin/kill").args(["-KILL", &std::process::id().to_string()]).status();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
     }
     std::process::abort()
 }
