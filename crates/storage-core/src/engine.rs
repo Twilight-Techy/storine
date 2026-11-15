@@ -335,6 +335,16 @@ impl<T: ZeroCopyRecord> Deref for RecordRef<T> {
     }
 }
 
+#[cfg(test)]
+type DrainHook = Box<dyn Fn(&[InlineId])>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs after each queued batch `drain_and_flush_all` flushes on this thread.
+    static AFTER_DRAIN_BATCH: std::cell::RefCell<Option<DrainHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Deduplicated dirty-record queue for Write Coalescing (`TASK-015`, `F-CONC-04`).
 ///
 /// Writers add to it under one lock at up to millions of ids a second, and when the flusher
@@ -3690,43 +3700,85 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         Ok(true)
     }
 
-    /// Flushes every dirty record. `already_locked` is set when the caller holds all stripes.
+    /// Flushes every record that is dirty when it starts. `already_locked` is set when the
+    /// caller holds all stripes.
+    ///
+    /// The work is bounded: it takes only the ids queued when it starts, then makes one pass
+    /// over the records. Draining until the queue is empty never ended while writers kept
+    /// re-queueing records faster than they were flushed (the checkpoint ran for minutes and
+    /// filled the disk). Records written after the start need no flush: their callers' WAL
+    /// cutoff was taken before, so the log keeps their frames.
     fn drain_and_flush_all(&self, already_locked: bool) -> Result<usize> {
         // Every caller truncates the WAL afterwards: what it flushes must then survive a power
         // loss on its own, whatever the sync policy (the log no longer holds it).
         let sync = self.data_sync() || self.wal.is_some();
+        // One positional write per segment, as the background flusher does. It takes each
+        // record's stripe lock, so not when the caller holds them all.
+        let batched = !already_locked && self.arena.is_some() && !self.crypto_on.load(Ordering::Acquire);
         let mut total = 0usize;
-        loop {
+        // The queue is in arrival order and a record queued again goes to its back, so the
+        // first `pending` ids taken are exactly the ones queued now.
+        let mut pending = self.flush_queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).len();
+        while pending > 0 {
             let batch = {
                 let mut q = self
                     .flush_queue
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                q.drain_batch(256)
+                q.drain_batch(pending.min(FLUSH_BATCH))
             };
             if batch.is_empty() {
                 break;
             }
-            for (i, &id) in batch.iter().enumerate() {
-                match self.flush_single_record_impl(id, sync, already_locked, true) {
-                    Ok(true) => total += 1,
-                    Ok(false) => {}
-                    Err(e) => {
-                        // Keep the failed and not-yet-attempted keys queued for retry.
-                        for &rest in &batch[i..] {
-                            self.enqueue_flush(rest);
-                        }
-                        return Err(e);
+            pending -= batch.len();
+            total += self.flush_taken(&batch, sync, already_locked, batched)?;
+            #[cfg(test)]
+            AFTER_DRAIN_BATCH.with(|h| {
+                if let Some(f) = h.borrow().as_ref() {
+                    f(&batch);
+                }
+            });
+        }
+        // Also flush records marked dirty outside the queue, or taken by the background flusher
+        // and not finished yet.
+        for batch in self.primary.dirty_ids().chunks(FLUSH_BATCH) {
+            total += self.flush_taken(batch, sync, already_locked, batched)?;
+        }
+        Ok(total)
+    }
+
+    /// Flushes `batch`, ids [`Self::drain_and_flush_all`] took; returns how many it wrote. On an
+    /// error the ids not written are queued again for the background flusher.
+    fn flush_taken(&self, batch: &[InlineId], sync: bool, already_locked: bool, batched: bool) -> Result<usize> {
+        let mut total = 0usize;
+        let rest = if batched {
+            match self.flush_arena_batch(batch) {
+                Ok((rest, written)) => {
+                    total += written;
+                    rest
+                }
+                Err(e) => {
+                    // Nothing was published: every record is still dirty.
+                    for &id in batch {
+                        self.enqueue_flush(id);
                     }
+                    return Err(e);
                 }
             }
-        }
-        // Also flush any entries that were marked dirty outside the queue
-        for entry in self.primary.entries_snapshot() {
-            if entry.hot_dirty.is_some()
-                && self.flush_single_record_impl(entry.id, sync, already_locked, true)?
-            {
-                total += 1;
+        } else {
+            batch.to_vec()
+        };
+        for (i, &id) in rest.iter().enumerate() {
+            match self.flush_single_record_impl(id, sync, already_locked, true) {
+                Ok(true) => total += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    // Keep the failed and not-yet-attempted keys queued for retry.
+                    for &id in &rest[i..] {
+                        self.enqueue_flush(id);
+                    }
+                    return Err(e);
+                }
             }
         }
         Ok(total)
@@ -3798,7 +3850,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         // Common case: unencrypted frames headed for the arena, written as one batch.
         let rest = if self.arena.is_some() && !self.crypto_on.load(Ordering::Acquire) {
             match self.flush_arena_batch(batch) {
-                Ok(rest) => rest,
+                Ok((rest, _)) => rest,
                 Err(_) => {
                     // Nothing was published: everything stays dirty in RAM and is retried
                     // after a short back-off.
@@ -3825,18 +3877,19 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
 
     /// Flushes the dirty arena-bound records among `ids` with one positional write per segment
     /// (instead of one per record), and returns the ids it did not take (other layouts, frames
-    /// above the arena threshold, grouped records), for the per-record path.
+    /// above the arena threshold, grouped records), for the per-record path, with the number of
+    /// records it completed.
     ///
     /// Frames are read without the record's stripe lock and written; each record is then
     /// completed under its stripe lock, and only if no write, flush or compaction changed it
     /// meanwhile (`PrimaryIndex::complete_flush_at`). Otherwise the new frame is marked dead and
     /// the record stays as the other party left it. Batched frames are appended, never written
     /// into reused dead slots; the old slots are counted dead for compaction.
-    fn flush_arena_batch(&self, ids: &[InlineId]) -> Result<Vec<InlineId>> {
+    fn flush_arena_batch(&self, ids: &[InlineId]) -> Result<(Vec<InlineId>, usize)> {
         let (Some(arena), StorageLayoutMode::AdaptiveArena { arena_threshold_bytes, .. }) =
             (self.arena.as_ref(), self.config.layout_mode)
         else {
-            return Ok(ids.to_vec());
+            return Ok((ids.to_vec(), 0));
         };
         let mut rest = Vec::new();
         let mut items: Vec<(InlineId, Version, AlignedBytes, DiskLocation)> = Vec::with_capacity(ids.len());
@@ -3851,8 +3904,9 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             }
         }
         if items.is_empty() {
-            return Ok(rest);
+            return Ok((rest, 0));
         }
+        let mut written = 0usize;
         let frames: Vec<&[u8]> = items.iter().map(|(_, _, f, _)| f.as_slice()).collect();
         let locs = arena.write_records(&frames, false)?;
         drop(frames);
@@ -3861,6 +3915,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             let verified = !hdr.is_tombstone() && !hdr.flags_typed().contains(RecordFlags::COMPRESSED_LZ4);
             let _lock = self.locks.lock_one(id);
             if self.primary.complete_flush_at(id, version, old, DiskLocation::Arena(loc), verified) {
+                written += 1;
                 if let DiskLocation::Arena(old_loc) = old {
                     // Counted dead (for compaction) without offering the slot for reuse:
                     // batched frames are only ever appended.
@@ -3870,7 +3925,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                 arena.mark_dead(loc);
             }
         }
-        Ok(rest)
+        Ok((rest, written))
     }
 
     /// Writes the primary checkpoint and, for the paged index tier, the secondary indexes, all
@@ -4644,6 +4699,75 @@ mod coalescing_queue_tests {
             q.clear_for_reuse(10 * FLUSH_BATCH);
             assert!(q.is_empty());
             assert!(!q.free.is_empty(), "chunks are kept for reuse");
+        }
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_drain_tests {
+    use super::{EngineConfig, StorageEngine, AFTER_DRAIN_BATCH, FLUSH_BATCH};
+    use crate::model::AgentObjectRecord;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use storage_types::InlineId;
+    use storage_wal::SyncPolicy;
+
+    fn rec(i: usize, value: i64) -> (InlineId, AgentObjectRecord) {
+        let id = InlineId::new(&format!("r{i:05}")).unwrap();
+        (id, AgentObjectRecord::new(id, "t", value, value))
+    }
+
+    /// A checkpoint flushes what was dirty when it started and ends, however fast writers
+    /// re-dirty records. Here every batch it flushes is written again at once, so the queue
+    /// never empties: the drain that ran until it did never ended (the hook below gives up
+    /// after 100 batches instead). The rewrites stay in the WAL and survive a reopen.
+    #[test]
+    fn checkpoint_ends_while_every_flushed_record_is_rewritten() {
+        for layout in [crate::document::DOCUMENT_LAYOUT, super::StorageLayoutMode::DedicatedFiles] {
+            let dir = std::env::temp_dir().join(format!("stge_drain_bounded_{}_{:?}", std::process::id(), std::mem::discriminant(&layout)));
+            let _ = std::fs::remove_dir_all(&dir);
+            let cfg = EngineConfig { layout_mode: layout, wal_sync_policy: SyncPolicy::AsyncMemoryFirst, ..EngineConfig::default() };
+            let n = 3 * FLUSH_BATCH;
+            let engine = Arc::new(StorageEngine::<AgentObjectRecord>::open(&dir, cfg.clone()).unwrap());
+            // Stop the background flusher (as `Drop` does), so writes stay queued for the
+            // checkpoint alone. Without a flusher at all, writes flush at once and never queue.
+            engine.inner.shutdown.store(true, Ordering::SeqCst);
+            engine.inner.flush_cv.notify_all();
+            if let Some(h) = engine.flusher_handle.lock().unwrap().take() {
+                h.join().unwrap();
+            }
+            for i in 0..n {
+                let (id, r) = rec(i, 1);
+                engine.put(id, &r).unwrap();
+            }
+            let batches = Rc::new(Cell::new(0usize));
+            {
+                let (e, batches) = (Arc::downgrade(&engine), Rc::clone(&batches));
+                AFTER_DRAIN_BATCH.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(move |ids: &[InlineId]| {
+                        batches.set(batches.get() + 1);
+                        assert!(batches.get() <= 100, "the checkpoint keeps draining records written after it started");
+                        let e = e.upgrade().unwrap();
+                        for &id in ids {
+                            let i: usize = id.as_str()[1..].parse().unwrap();
+                            e.put(id, &rec(i, 2).1).unwrap();
+                        }
+                    }));
+                });
+            }
+            engine.checkpoint().unwrap();
+            AFTER_DRAIN_BATCH.with(|h| *h.borrow_mut() = None);
+            assert_eq!(batches.get(), n / FLUSH_BATCH, "only the batches queued at the start are drained");
+            drop(engine);
+            let engine = StorageEngine::<AgentObjectRecord>::open(&dir, cfg).unwrap();
+            for i in 0..n {
+                let (id, _) = rec(i, 0);
+                assert_eq!(engine.get_owned(id).unwrap().1.timestamp, 2, "r{i:05}: the rewrite after the checkpoint");
+            }
+            drop(engine);
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

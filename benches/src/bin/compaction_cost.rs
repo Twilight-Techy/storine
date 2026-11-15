@@ -61,6 +61,9 @@ impl Mode {
 
 struct Outcome {
     writes: u64,
+    /// From the writers' start until they stopped: longer than the run's length when a
+    /// checkpoint ran past its end (writers keep writing until it returns).
+    secs: f64,
     worst_us: u64,
     checkpoint_ms_max: u128,
     disk_mib: u64,
@@ -98,7 +101,8 @@ fn run(mode: Mode, secs: u64) -> storage_types::Result<Outcome> {
             Ok(())
         }));
     }
-    let end = Instant::now() + Duration::from_secs(secs);
+    let started = Instant::now();
+    let end = started + Duration::from_secs(secs);
     let mut checkpoint_ms_max = 0;
     let mut peak_disk_mib = 0;
     while Instant::now() < end {
@@ -113,13 +117,14 @@ fn run(mode: Mode, secs: u64) -> storage_types::Result<Outcome> {
         peak_disk_mib = peak_disk_mib.max(dat_bytes(&dir) >> 20);
     }
     stop.store(true, Ordering::Relaxed);
+    let elapsed = started.elapsed().as_secs_f64();
     for h in handles {
         h.join().map_err(|_| storage_types::StorageError::resource_exhausted("writer panicked"))??;
     }
     let disk_mib = dat_bytes(&dir) >> 20;
     drop(engine);
     let _ = std::fs::remove_dir_all(&dir);
-    Ok(Outcome { writes: writes.load(Ordering::Relaxed), worst_us: worst.load(Ordering::Relaxed), checkpoint_ms_max, disk_mib, peak_disk_mib })
+    Ok(Outcome { writes: writes.load(Ordering::Relaxed), secs: elapsed, worst_us: worst.load(Ordering::Relaxed), checkpoint_ms_max, disk_mib, peak_disk_mib })
 }
 
 fn main() -> storage_types::Result<()> {
@@ -133,7 +138,7 @@ fn main() -> storage_types::Result<()> {
             println!(
                 "{:>8} | {:>10.0} | {:>12} | {:>13} ms | {:>14} | {:>14}",
                 mode.name(),
-                o.writes as f64 / secs as f64,
+                o.writes as f64 / o.secs,
                 o.worst_us,
                 o.checkpoint_ms_max,
                 o.disk_mib,

@@ -576,6 +576,17 @@ impl PrimaryIndex {
         out
     }
 
+    /// The ids of live entries holding an unflushed frame (`hot_dirty`), without cloning entries.
+    pub fn dirty_ids(&self) -> Vec<InlineId> {
+        let mut out = Vec::new();
+        self.for_each_live(|e| {
+            if e.hot_dirty.is_some() {
+                out.push(e.id);
+            }
+        });
+        out
+    }
+
     /// Calls `f` for every live entry: RAM entries first, then tier entries they do not shadow.
     fn for_each_live(&self, mut f: impl FnMut(&PrimaryEntry)) {
         if !self.is_tiered() {

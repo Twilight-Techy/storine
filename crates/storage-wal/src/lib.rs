@@ -67,6 +67,18 @@ const MAX_SYNCS_IN_FLIGHT: u32 = 1;
 const TRUNCATE_CATCH_UP_ROUNDS: usize = 16;
 /// A tail this short is left for the locked final copy (writers wait while it is copied).
 const TRUNCATE_LOCKED_TAIL_BYTES: u64 = 1 << 20;
+/// Bytes a truncation copies per read and write.
+const TRUNCATE_COPY_CHUNK: usize = 1 << 20;
+
+#[cfg(test)]
+type RoundHook = Box<dyn Fn(&GroupCommitWal)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs at the start of each unlocked catch-up round of a truncation on this thread.
+    static BEFORE_CATCH_UP_ROUND: std::cell::RefCell<Option<RoundHook>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 const WAL_MAGIC: u32 = 0x5741_4C31; // "WAL1"
 const WAL_FRAME_HEADER_LEN: usize = 72;
@@ -1035,10 +1047,13 @@ impl GroupCommitWal {
     /// `archive_dir` is set, the removed frames are first written to
     /// `archive_dir/wal_<first_lsn>.log` for Point-in-Time Recovery.
     ///
-    /// Writers are held up only for the short second phase. The first phase notes how far the
+    /// Writers are held up only for the second phase, which is short unless they log faster
+    /// than the disk takes the copy (then it lasts as long as copying what they got ahead by:
+    /// back-pressure, where chasing them filled the disk). The first phase notes how far the
     /// WAL reaches and, without blocking appends, reads, filters and syncs that prefix, then
     /// copies what was appended meanwhile (up to [`TRUNCATE_CATCH_UP_ROUNDS`] times, until less
-    /// than [`TRUNCATE_LOCKED_TAIL_BYTES`] is left). The second copies the rest, unfiltered, and
+    /// than [`TRUNCATE_LOCKED_TAIL_BYTES`] is left, or until a round leaves no less than the one
+    /// before: writers outpacing the copy). The second copies the rest, unfiltered, and
     /// swaps the files. Those frames were
     /// all logged after the caller chose `cutoff_lsn` (or are still to be applied), so the old
     /// single-phase rewrite kept them too.
@@ -1144,12 +1159,24 @@ impl GroupCommitWal {
         // Catch up without the lock while appends keep coming: the file only grows, so its
         // bytes can be copied as they are (a frame cut in two is finished by the next copy).
         let mut copied = head_len;
+        let mut last_gap = u64::MAX;
         for _ in 0..TRUNCATE_CATCH_UP_ROUNDS {
+            #[cfg(test)]
+            BEFORE_CATCH_UP_ROUND.with(|h| {
+                if let Some(f) = h.borrow().as_ref() {
+                    f(self);
+                }
+            });
             // Frames known to be in the file (a lower bound; the locked copy takes the rest).
             let len = self.logical_end.load(Ordering::Acquire);
-            if len.saturating_sub(copied) < TRUNCATE_LOCKED_TAIL_BYTES {
+            let gap = len.saturating_sub(copied);
+            // A gap that did not shrink means writers append as fast as this copies (the disk
+            // is saturated): chasing them never ends and the log grows until the disk is full.
+            // The locked copy ends it, holding writers back for as long as it takes.
+            if gap < TRUNCATE_LOCKED_TAIL_BYTES || gap >= last_gap {
                 break;
             }
+            last_gap = gap;
             copied = self.copy_wal_bytes(copied, Some(len), &mut next)?;
             // Synced now, so the locked final sync only has the last copy to write out.
             next.sync_data()
@@ -1217,9 +1244,25 @@ impl GroupCommitWal {
             .map_err(|e| StorageError::io("open WAL tail", e))?;
         src.seek(SeekFrom::Start(from))
             .map_err(|e| StorageError::io("seek WAL tail", e))?;
-        let mut src = src.take(to.map_or(u64::MAX, |t| t.saturating_sub(from)));
-        let n = std::io::copy(&mut src, dst).map_err(|e| StorageError::io("copy WAL tail to replacement", e))?;
-        Ok(from + n)
+        let mut left = to.map_or(u64::MAX, |t| t.saturating_sub(from));
+        // 1 MiB at a time: `std::io::copy` between boxed files moves 8 KiB per read and write,
+        // too slow to catch up with writers appending a hundred MB a second.
+        let mut buf = vec![0u8; TRUNCATE_COPY_CHUNK.min(usize::try_from(left).unwrap_or(usize::MAX)).max(1)];
+        let mut copied = 0u64;
+        while left > 0 {
+            let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+            let n = match src.read(&mut buf[..want]) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(StorageError::io("copy WAL tail to replacement", e)),
+            };
+            dst.write_all(&buf[..n])
+                .map_err(|e| StorageError::io("copy WAL tail to replacement", e))?;
+            copied += n as u64;
+            left -= n as u64;
+        }
+        Ok(from + copied)
     }
 
     /// Removes every frame up to the current LSN (all operations are known to be checkpointed).
@@ -2145,6 +2188,57 @@ mod tests {
         // else at or below the cutoff may.
         let extra: Vec<u64> = got.iter().copied().filter(|l| expected.binary_search(l).is_err()).collect();
         assert!(extra.iter().all(|&l| l <= last_cutoff) && extra.len() <= 4, "frames the truncation should have removed: {extra:?}");
+        drop(wal);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A truncation whose catch-up copy cannot gain on the writers stops chasing them: the
+    /// first round that leaves no less than the one before goes to the locked copy. Before, it
+    /// kept chasing, and on a saturated disk the checkpoint never ended while the log grew until
+    /// the disk was full. Every frame still survives.
+    #[test]
+    fn test_truncation_stops_chasing_writers_it_cannot_gain_on() {
+        let dir = temp_dir("storage_wal_truncate_outpaced");
+        let wal_path = dir.join("engine.wal");
+        let wal = GroupCommitWal::open(&wal_path, SyncPolicy::AsyncMemoryFirst).unwrap();
+        let id = InlineId::new("k").unwrap();
+        let mut lsns = Vec::new();
+        for v in 0..64u64 {
+            lsns.push(wal.append_single(1, WalOpKind::Upsert, id, Version(v), &[1u8; 1024]).unwrap());
+        }
+        let cutoff = wal.current_lsn();
+        let rounds = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let appended = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let (rounds, appended) = (std::rc::Rc::clone(&rounds), std::rc::Rc::clone(&appended));
+            // Before every round, writers add 2 MiB (incompressible, so frames keep their size):
+            // the gap never shrinks.
+            let mut x = 0x9E37_79B9_7F4A_7C15u64;
+            let noise: Vec<u8> = (0..32 * 1024)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect();
+            BEFORE_CATCH_UP_ROUND.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |w: &GroupCommitWal| {
+                    rounds.set(rounds.get() + 1);
+                    for v in 0..64u64 {
+                        appended.borrow_mut().push(w.append_single(1, WalOpKind::Upsert, id, Version(1_000 + v), &noise).unwrap());
+                    }
+                    w.flush_buffered().unwrap();
+                }));
+            });
+        }
+        wal.checkpoint_truncate_before(cutoff, &|_| false, None).unwrap();
+        BEFORE_CATCH_UP_ROUND.with(|h| *h.borrow_mut() = None);
+        assert_eq!(rounds.get(), 2, "catch-up rounds: the second, which gained nothing, must end the chase");
+        wal.flush_buffered().unwrap();
+        let got: Vec<u64> = GroupCommitWal::recover_committed(&wal_path).unwrap().iter().map(|e| e.lsn).collect();
+        let want = appended.borrow().clone();
+        assert_eq!(got, want, "exactly the frames above the cutoff survive, in order");
         drop(wal);
         let _ = fs::remove_dir_all(&dir);
     }

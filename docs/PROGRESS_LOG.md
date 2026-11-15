@@ -1023,3 +1023,11 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Measured** on three Azure VMs against v0.1.0 (`BENCHMARK_REPORT.md` section 8.8): 20 → 106 writes a second from one client (p50 47 → 8.3 ms), and 30 → 238 from 16.
 - **Verified locally**: Raft unit tests, and the cluster, membership, at-rest, placement and process-chaos tests. Clippy is clean for Linux, macOS and Windows.
 - Test machines now run on Azure for Students, in its allowed regions only.
+
+## 2026-11-15: checkpoints that end under constant writes (`TASK-159`)
+
+- **Found**: `compaction-cost` never finished its `flush` mode on v0.1.0, v0.1.1 or `main`, and filled the disk. A checkpoint drained the flush queue until it was empty, which writers kept from happening. Then the WAL truncation chased writers that logged faster than the disk took the copy.
+- **Changed**: a checkpoint flushes what was dirty when it started. A truncation stops chasing once a round gains nothing, and copies in 1 MiB pieces.
+- **Measured** locally, before/after/after/before: every engine, server, cluster and reactor row within noise. `compaction-cost` finishes. Writers that outpace the disk now wait for the locked copy (worst write 9–47 s there); spreading that wait is not done.
+- **Verified locally**: three new regression tests (two fail on the old code), the `storage-core`, `storage-wal`, `storage-index` and `storage-mmap` tests, and clippy.
+
