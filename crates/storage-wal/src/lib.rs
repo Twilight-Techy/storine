@@ -69,6 +69,11 @@ const TRUNCATE_CATCH_UP_ROUNDS: usize = 16;
 const TRUNCATE_LOCKED_TAIL_BYTES: u64 = 1 << 20;
 /// Bytes a truncation copies per read and write.
 const TRUNCATE_COPY_CHUNK: usize = 1 << 20;
+/// How far, at least, writers may stay ahead of a truncation copy that has them throttled. The
+/// locked copy that ends the truncation then has about this much to copy (plus staged frames).
+const TRUNCATE_THROTTLE_FLOOR: u64 = 8 << 20;
+/// A throttled copy syncs this often, so writers never wait behind one long `fsync`.
+const TRUNCATE_THROTTLE_SYNC_BYTES: u64 = 8 << 20;
 
 #[cfg(test)]
 type RoundHook = Box<dyn Fn(&GroupCommitWal)>;
@@ -243,6 +248,27 @@ pub struct GroupCommitWal {
     alloc_end: AtomicU64,
     /// One checkpoint truncation at a time: between its two phases the file only grows.
     truncating: Mutex<()>,
+    /// Appends wait while the log reaches this offset (`u64::MAX`: no limit). A truncation that
+    /// cannot gain on writers sets it, so they slow down instead of all waiting for the locked
+    /// copy at once.
+    append_limit: CachePadded<AtomicU64>,
+    append_room: Mutex<()>,
+    append_room_cv: Condvar,
+}
+
+/// A truncation's hold on writers: `ahead` is how far past its copy they may log, once it
+/// throttles them. Dropping it lets them go.
+struct Throttle<'a> {
+    wal: &'a GroupCommitWal,
+    ahead: Option<u64>,
+}
+
+impl Drop for Throttle<'_> {
+    fn drop(&mut self) {
+        if self.ahead.is_some() {
+            self.wal.set_append_limit(u64::MAX);
+        }
+    }
 }
 
 impl core::fmt::Debug for GroupCommitWal {
@@ -450,6 +476,9 @@ impl GroupCommitWal {
             logical_end: AtomicU64::new(end),
             alloc_end: AtomicU64::new(end),
             truncating: Mutex::new(()),
+            append_limit: CachePadded::new(AtomicU64::new(u64::MAX)),
+            append_room: Mutex::new(()),
+            append_room_cv: Condvar::new(),
         })
     }
 
@@ -467,6 +496,7 @@ impl GroupCommitWal {
         version: Version,
         frame_bytes: &[u8],
     ) -> Result<u64> {
+        self.wait_for_append_room();
         // Hashed (and compressed) before the lock, which then covers only the header and copy.
         let prepared = (!self.policy.syncs()).then(|| PreparedBody::new(frame_bytes));
         let mut guard = self.lock_state();
@@ -571,6 +601,7 @@ impl GroupCommitWal {
             return Ok(0);
         }
         let count = ops.len() as u64;
+        self.wait_for_append_room();
         let mut guard = self.lock_state();
         if let Some(ref msg) = guard.broken {
             return Err(Self::broken_error(msg));
@@ -606,6 +637,39 @@ impl GroupCommitWal {
         self.wait_for(guard, my_seq)?;
         self.flush_buffered()?;
         Ok(commit_lsn)
+    }
+
+    /// Waits while a throttling truncation has writers far enough ahead of its copy
+    /// ([`Self::append_limit`]). One atomic load when no truncation throttles.
+    #[inline]
+    fn wait_for_append_room(&self) {
+        if self.append_limit.load(Ordering::Acquire) == u64::MAX {
+            return;
+        }
+        self.wait_for_append_room_slow();
+    }
+
+    #[cold]
+    fn wait_for_append_room_slow(&self) {
+        // Throttled writers count by `logical_end`, which staged frames reach only when flushed.
+        // An error marks the log broken; the append that follows reports it.
+        let _ = self.flush_buffered();
+        let mut room = self.append_room.lock().unwrap_or_else(|p| p.into_inner());
+        while self.logical_end.load(Ordering::Acquire) >= self.append_limit.load(Ordering::Acquire) {
+            // Timed, so a missed wake-up costs at most a millisecond.
+            room = self
+                .append_room_cv
+                .wait_timeout(room, std::time::Duration::from_millis(1))
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+    }
+
+    /// Sets [`Self::append_limit`] and wakes writers waiting for it.
+    fn set_append_limit(&self, limit: u64) {
+        let _room = self.append_room.lock().unwrap_or_else(|p| p.into_inner());
+        self.append_limit.store(limit, Ordering::Release);
+        self.append_room_cv.notify_all();
     }
 
     #[inline]
@@ -1160,6 +1224,8 @@ impl GroupCommitWal {
         // bytes can be copied as they are (a frame cut in two is finished by the next copy).
         let mut copied = head_len;
         let mut last_gap = u64::MAX;
+        // Lifts the writers' limit however this truncation ends.
+        let mut throttle = Throttle { wal: self, ahead: None };
         for _ in 0..TRUNCATE_CATCH_UP_ROUNDS {
             #[cfg(test)]
             BEFORE_CATCH_UP_ROUND.with(|h| {
@@ -1167,21 +1233,40 @@ impl GroupCommitWal {
                     f(self);
                 }
             });
+            // Staged frames (`AsyncMemoryFirst`) reach the file and `logical_end` only when
+            // flushed: without this, writers could be far ahead with the gap read as nothing.
+            self.flush_buffered()?;
             // Frames known to be in the file (a lower bound; the locked copy takes the rest).
             let len = self.logical_end.load(Ordering::Acquire);
             let gap = len.saturating_sub(copied);
-            // A gap that did not shrink means writers append as fast as this copies (the disk
-            // is saturated): chasing them never ends and the log grows until the disk is full.
-            // The locked copy ends it, holding writers back for as long as it takes.
-            if gap < TRUNCATE_LOCKED_TAIL_BYTES || gap >= last_gap {
+            if gap < TRUNCATE_LOCKED_TAIL_BYTES {
                 break;
             }
+            match throttle.ahead {
+                // Throttled writers are held near the floor: what is left goes to the locked copy.
+                Some(_) if gap <= TRUNCATE_THROTTLE_FLOOR + 2 * STAGED_FLUSH_BYTES as u64 => break,
+                Some(_) => {}
+                // A gap that did not shrink means writers append as fast as this copies (the
+                // disk is saturated): chasing them never ends and the log grows until the disk
+                // is full. Waiting for one locked copy of all of it held every writer for
+                // seconds. Instead they may stay only as far ahead as they are now, less half of
+                // every byte copied from here on: they keep writing at about half the copy's
+                // pace while the gap closes.
+                None if gap >= last_gap => {
+                    let ahead = self.logical_end.load(Ordering::Acquire).saturating_sub(copied).max(TRUNCATE_THROTTLE_FLOOR);
+                    throttle.ahead = Some(ahead);
+                    self.set_append_limit(copied.saturating_add(ahead));
+                }
+                None => {}
+            }
             last_gap = gap;
-            copied = self.copy_wal_bytes(copied, Some(len), &mut next)?;
+            copied = self.copy_wal_bytes(copied, Some(len), &mut next, Some(&mut throttle))?;
             // Synced now, so the locked final sync only has the last copy to write out.
             next.sync_data()
                 .map_err(|e| StorageError::io("fsync replacement WAL file", e))?;
         }
+        // Throttled writers stay held through the locked copy (released when `throttle` drops,
+        // after the swap): let go now, they would only make it longer.
 
         // Phase 2: copy the rest, appended since the last copy, and swap the files.
         self.with_exclusive_io(|io, poison| {
@@ -1190,7 +1275,7 @@ impl GroupCommitWal {
             let end = io
                 .stream_position()
                 .map_err(|e| StorageError::io("locate WAL end before checkpoint swap", e))?;
-            self.copy_wal_bytes(copied, Some(end), &mut next)?;
+            self.copy_wal_bytes(copied, Some(end), &mut next, None)?;
             next.sync_all()
                 .map_err(|e| StorageError::io("fsync replacement WAL file", e))?;
 
@@ -1237,7 +1322,10 @@ impl GroupCommitWal {
 
     /// Appends the active WAL's bytes `[from, to)` (to its end when `to` is `None`) to `dst`;
     /// returns the offset copied up to.
-    fn copy_wal_bytes(&self, from: u64, to: Option<u64>, dst: &mut VfsHandle) -> Result<u64> {
+    /// With a `throttle` that has writers limited, each chunk copied raises their limit by half
+    /// its size (down to [`TRUNCATE_THROTTLE_FLOOR`] ahead), and `dst` is synced every
+    /// [`TRUNCATE_THROTTLE_SYNC_BYTES`].
+    fn copy_wal_bytes(&self, from: u64, to: Option<u64>, dst: &mut VfsHandle, mut throttle: Option<&mut Throttle<'_>>) -> Result<u64> {
         let mut src = self
             .vfs
             .open(&self.path, OpenOpts::read())
@@ -1261,6 +1349,14 @@ impl GroupCommitWal {
                 .map_err(|e| StorageError::io("copy WAL tail to replacement", e))?;
             copied += n as u64;
             left -= n as u64;
+            if let Some(ahead) = throttle.as_mut().and_then(|t| t.ahead.as_mut()) {
+                if copied % TRUNCATE_THROTTLE_SYNC_BYTES < n as u64 {
+                    dst.sync_data()
+                        .map_err(|e| StorageError::io("fsync replacement WAL file", e))?;
+                }
+                *ahead = ahead.saturating_sub(n as u64 / 2).max(TRUNCATE_THROTTLE_FLOOR);
+                self.set_append_limit((from + copied).saturating_add(*ahead));
+            }
         }
         Ok(from + copied)
     }
@@ -2192,53 +2288,144 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A truncation whose catch-up copy cannot gain on the writers stops chasing them: the
-    /// first round that leaves no less than the one before goes to the locked copy. Before, it
-    /// kept chasing, and on a saturated disk the checkpoint never ended while the log grew until
-    /// the disk was full. Every frame still survives.
+    fn incompressible(len: usize) -> Vec<u8> {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// A truncation whose catch-up copy cannot gain on the writers throttles them instead of
+    /// chasing them: from the first round that leaves no less than the one before, writers may
+    /// stay only as far ahead as they were, less half of every byte copied since (never under
+    /// [`TRUNCATE_THROTTLE_FLOOR`]). Before, it chased them until the disk was full, and then
+    /// held every writer for one locked copy of all of it. The limit is lifted at the end, and
+    /// every frame survives.
     #[test]
-    fn test_truncation_stops_chasing_writers_it_cannot_gain_on() {
+    fn test_truncation_throttles_writers_it_cannot_gain_on() {
         let dir = temp_dir("storage_wal_truncate_outpaced");
         let wal_path = dir.join("engine.wal");
         let wal = GroupCommitWal::open(&wal_path, SyncPolicy::AsyncMemoryFirst).unwrap();
         let id = InlineId::new("k").unwrap();
-        let mut lsns = Vec::new();
         for v in 0..64u64 {
-            lsns.push(wal.append_single(1, WalOpKind::Upsert, id, Version(v), &[1u8; 1024]).unwrap());
+            wal.append_single(1, WalOpKind::Upsert, id, Version(v), &[1u8; 1024]).unwrap();
         }
         let cutoff = wal.current_lsn();
         let rounds = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let limits = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let appended = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         {
-            let (rounds, appended) = (std::rc::Rc::clone(&rounds), std::rc::Rc::clone(&appended));
-            // Before every round, writers add 2 MiB (incompressible, so frames keep their size):
-            // the gap never shrinks.
-            let mut x = 0x9E37_79B9_7F4A_7C15u64;
-            let noise: Vec<u8> = (0..32 * 1024)
-                .map(|_| {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    x as u8
-                })
-                .collect();
+            let (rounds, limits, appended) = (std::rc::Rc::clone(&rounds), std::rc::Rc::clone(&limits), std::rc::Rc::clone(&appended));
+            // Before every round until throttled, writers add 24 MiB (incompressible, so frames
+            // keep their size): the gap never shrinks. Throttled, they add nothing (this thread
+            // runs the copy, so it cannot wait for it).
+            let noise = incompressible(32 * 1024);
             BEFORE_CATCH_UP_ROUND.with(|h| {
                 *h.borrow_mut() = Some(Box::new(move |w: &GroupCommitWal| {
                     rounds.set(rounds.get() + 1);
-                    for v in 0..64u64 {
-                        appended.borrow_mut().push(w.append_single(1, WalOpKind::Upsert, id, Version(1_000 + v), &noise).unwrap());
+                    let limit = w.append_limit.load(Ordering::Acquire);
+                    limits.borrow_mut().push((limit, w.logical_end.load(Ordering::Acquire)));
+                    if limit == u64::MAX {
+                        for v in 0..768u64 {
+                            appended.borrow_mut().push(w.append_single(1, WalOpKind::Upsert, id, Version(1_000 + v), &noise).unwrap());
+                        }
+                        w.flush_buffered().unwrap();
                     }
-                    w.flush_buffered().unwrap();
                 }));
             });
         }
         wal.checkpoint_truncate_before(cutoff, &|_| false, None).unwrap();
         BEFORE_CATCH_UP_ROUND.with(|h| *h.borrow_mut() = None);
-        assert_eq!(rounds.get(), 2, "catch-up rounds: the second, which gained nothing, must end the chase");
+        let limits = limits.borrow().clone();
+        assert_eq!(rounds.get(), 3, "rounds: the second gained nothing and throttled, the third found nothing left: {limits:?}");
+        assert_eq!(limits[1].0, u64::MAX, "not throttled before the second round");
+        // The second round started with writers a gap `g` (24 MiB of payload plus headers)
+        // ahead and copied all of it: they may now be `g - g/2` past the copy, which reached the
+        // log's end (rounding: at most a byte per chunk).
+        let (limit, end) = limits[2];
+        let g = end - limits[1].1;
+        assert!(g > 24 << 20 && limit > end, "gap {g}, limit {limit}, end {end}");
+        assert!((limit - end).abs_diff(g - g / 2) <= 32, "writers {} ahead after copying {g} from {g} behind", limit - end);
+        assert_eq!(wal.append_limit.load(Ordering::Acquire), u64::MAX, "the limit is lifted when the truncation ends");
         wal.flush_buffered().unwrap();
         let got: Vec<u64> = GroupCommitWal::recover_committed(&wal_path).unwrap().iter().map(|e| e.lsn).collect();
         let want = appended.borrow().clone();
         assert_eq!(got, want, "exactly the frames above the cutoff survive, in order");
+        drop(wal);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Writers that log as fast as they can while truncations run, slowed by a pause before
+    /// each catch-up round, lose no frame, and none of them waits long for room: throttled,
+    /// they wait for the next copied chunk, not for a copy of everything they wrote.
+    #[test]
+    fn test_throttled_writers_lose_nothing_and_never_wait_long() {
+        let dir = temp_dir("storage_wal_truncate_throttled_writers");
+        let wal_path = dir.join("engine.wal");
+        let wal = Arc::new(GroupCommitWal::open(&wal_path, SyncPolicy::AsyncMemoryFirst).unwrap());
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut handles = Vec::new();
+        for t in 0..2u64 {
+            let (w, done, stop) = (Arc::clone(&wal), Arc::clone(&done), Arc::clone(&stop));
+            handles.push(std::thread::spawn(move || {
+                let id = InlineId::new(&format!("t{t}")).unwrap();
+                let noise = incompressible(32 * 1024);
+                let (mut lsns, mut worst) = (Vec::new(), std::time::Duration::ZERO);
+                // As fast as memory takes it, until throttled (at most 512 MiB each).
+                for v in 0..16_384u64 {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let started = std::time::Instant::now();
+                    lsns.push(w.append_single(1, WalOpKind::Upsert, id, Version(v), &noise).unwrap());
+                    worst = worst.max(started.elapsed());
+                }
+                done.fetch_add(1, Ordering::Relaxed);
+                (lsns, worst)
+            }));
+        }
+        let throttled = std::rc::Rc::new(std::cell::Cell::new(false));
+        {
+            let throttled = std::rc::Rc::clone(&throttled);
+            BEFORE_CATCH_UP_ROUND.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |w: &GroupCommitWal| {
+                    throttled.set(throttled.get() || w.append_limit.load(Ordering::Acquire) != u64::MAX);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }))
+            });
+        }
+        let mut last_cutoff = 0;
+        while done.load(Ordering::Relaxed) < 2 {
+            last_cutoff = wal.current_lsn();
+            wal.checkpoint_truncate_before(last_cutoff, &|_| false, None).unwrap();
+            if throttled.get() {
+                // One more truncation runs while the writers stop, so some start throttled.
+                stop.store(true, Ordering::Relaxed);
+            }
+        }
+        assert!(throttled.get(), "the writers never got far enough ahead to be throttled");
+        BEFORE_CATCH_UP_ROUND.with(|h| *h.borrow_mut() = None);
+        let mut expected = Vec::new();
+        let mut worst = std::time::Duration::ZERO;
+        for h in handles {
+            let (lsns, w) = h.join().unwrap();
+            expected.extend(lsns.into_iter().filter(|&l| l > last_cutoff));
+            worst = worst.max(w);
+        }
+        expected.sort_unstable();
+        wal.flush_buffered().unwrap();
+        let got: Vec<u64> = GroupCommitWal::recover_committed(&wal_path).unwrap().iter().map(|e| e.lsn).collect();
+        let missing: Vec<u64> = expected.iter().copied().filter(|l| got.binary_search(l).is_err()).collect();
+        assert!(missing.is_empty(), "frames above the last cutoff were lost: {missing:?}");
+        // Generous for slow CI disks; a locked copy of all 192 MiB is what this rules out there.
+        assert!(worst < std::time::Duration::from_secs(5), "a writer waited {worst:?} for one append");
+        assert_eq!(wal.append_limit.load(Ordering::Acquire), u64::MAX);
         drop(wal);
         let _ = fs::remove_dir_all(&dir);
     }

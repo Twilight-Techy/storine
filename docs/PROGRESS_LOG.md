@@ -1027,7 +1027,7 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 ## 2026-11-15: checkpoints that end under constant writes (`TASK-159`)
 
 - **Found**: `compaction-cost` never finished its `flush` mode on v0.1.0, v0.1.1 or `main`, and filled the disk. A checkpoint drained the flush queue until it was empty, which writers kept from happening. Then the WAL truncation chased writers that logged faster than the disk took the copy.
-- **Changed**: a checkpoint flushes what was dirty when it started. A truncation stops chasing once a round gains nothing, and copies in 1 MiB pieces.
-- **Measured** locally, before/after/after/before: every engine, server, cluster and reactor row within noise. `compaction-cost` finishes. Writers that outpace the disk now wait for the locked copy (worst write 9–47 s there); spreading that wait is not done.
-- **Verified locally**: three new regression tests (two fail on the old code), the `storage-core`, `storage-wal`, `storage-index` and `storage-mmap` tests, and clippy.
+- **Changed**: a checkpoint flushes what was dirty when it started. Once a truncation round gains nothing on the writers, they are throttled to about half the copy's pace until the gap is down to 8 MiB, instead of all waiting for one locked copy. Copies move 1 MiB at a time.
+- **Measured** locally, before/after/after/before: every engine, server, cluster and reactor row within noise. `compaction-cost` finishes, with its worst write at 0.22–0.86 s (9–47 s with a single locked copy).
+- **Verified locally**: four new regression tests (two fail on the old code), the `storage-core`, `storage-wal`, `storage-index` and `storage-mmap` tests, and clippy.
 

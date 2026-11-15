@@ -4,7 +4,7 @@
 //! empty, which writers re-dirtying records faster than it flushed kept from ever happening
 //! (`compaction-cost` ran for minutes and filled the disk). The deterministic regression test
 //! is `engine::checkpoint_drain_tests`; this one runs the real flusher and writers, and
-//! `storage-wal`'s `test_truncation_stops_chasing_writers_it_cannot_gain_on` covers writers that
+//! `storage-wal`'s `test_truncation_throttles_writers_it_cannot_gain_on` covers writers that
 //! outpace the disk.
 
 use std::collections::HashMap;
