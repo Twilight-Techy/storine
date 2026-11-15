@@ -18,6 +18,10 @@ Three features that existed only in the embedded engine are now in the server: e
 
 - Against v0.1.0, with the new features off: no regression in the engine, network or server benchmarks ([`BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) section 8.7). Found on the way, unchanged since 0.1.0: a single-group cluster commits a write in about 90 ms (fixed, see Changed).
 
+### Fixed
+
+- **Columnar snapshots could show half a transaction**: a merge running during a multi-document write could store one document's old version while the snapshot read another's new one. Rare: 1 run in 30 of the concurrency test. A changed document is now recorded for the columnar view only once its new version is readable.
+
 ### Changed
 
 - **Single-group cluster writes are 5–8× faster**: on three separate machines, 20 → 106 writes a second from one client (p50 47 → 8.3 ms) and 30 → 238 from 16. The leader writes its log outside the Raft state lock, so concurrent writes share one disk sync. The Raft meta file is rewritten in place. The commit index is no longer saved. Entries are applied in batches. Followers acknowledge before applying ([`BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) section 8.8). The durability guarantees are unchanged.

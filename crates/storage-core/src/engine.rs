@@ -3154,7 +3154,6 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         if T::INDEXED {
             self.apply_index_snapshot_diff(ordinal, &old_snap, &new_snap);
         }
-        self.notify_watches(id, &old_snap, &new_snap);
         if T::NAMED_EMBEDDINGS {
             self.sync_named_vectors(ordinal, record.named_embeddings());
         }
@@ -3181,6 +3180,11 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             disk_verified: false,
             hot_dirty: Some(frame),
         });
+        // Only once the new version is readable: a watcher that drains this id and reads the
+        // record must see this write. Recorded earlier, a columnar merge could drain it, read
+        // the old version into a segment and drop the id, leaving that row stale while other
+        // records of the same commit reached its delta (half a transfer in a snapshot).
+        self.notify_watches(id, &old_snap, &new_snap);
         self.set_ttl_ordinal(ordinal, ttl_expires_at_ns > 0);
 
         self.total_writes.add(1);
