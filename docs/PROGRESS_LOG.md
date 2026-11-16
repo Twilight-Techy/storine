@@ -1049,3 +1049,9 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **CI** found the rewritten WAL test (`TASK-159`) passing vacuously on fast runners: its writers finished before the throttle engaged. Writers are paced now (`3a1ac16`).
 - **Install scripts** pass on Linux x86_64 and arm64, macOS arm64 and x86_64, and Windows (PowerShell 5.1 and 7) against 0.1.1.
 - **Cost**: three Azure VMs for about 2.5 hours, deleted after; no AWS or Modal.
+
+## 2026-11-16: the website (`TASK-161`)
+
+- **Site**: `website/build.py` builds 46 pages (27 written for the site, 19 rendered from repository documents) into `website/_site`; `.github/workflows/site.yml` publishes it from `main` to GitHub Pages.
+- **Checked**: links and anchors (`--check`), headless Chromium at 1440 and 390 px, light and dark, no console errors or CSP violations; search; every Python example in the guides against a release server; the embedded example runs.
+- **Fixes found while writing it**: `storage-cli --help`, settings error messages, the `AsyncMemoryFirst` durability row in `TECHNICAL.md`, SDK install instructions.

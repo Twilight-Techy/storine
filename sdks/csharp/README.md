@@ -1,9 +1,10 @@
 # Storine for .NET
 
-No dependencies, .NET 8+. Async-first, thread-safe.
+No dependencies, .NET 8+. Async-first, thread-safe. The clients are installed from the [repository](https://github.com/Twilight-Techy/storine); they are not on package registries yet.
 
 ```bash
-dotnet add package Storine
+git clone https://github.com/Twilight-Techy/storine
+dotnet add reference storine/sdks/csharp/src/Storine/Storine.csproj
 ```
 
 ```csharp

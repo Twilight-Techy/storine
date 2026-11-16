@@ -796,7 +796,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageServer<T> {
                 if !addr.ip().is_loopback() {
                     return Err(StorageError::invalid_key(
                         "refusing to serve without authentication on a non-loopback address \
-                         (register tokens and set SecurityConfig::require_auth)",
+                         (set STORAGE_AUTH_TOKENS; embedders: register tokens and set SecurityConfig::require_auth)",
                     ));
                 }
             }

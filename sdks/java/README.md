@@ -1,6 +1,11 @@
 # Storine for Java
 
-No runtime dependencies, Java 17+.
+No runtime dependencies, Java 17+. The clients are installed from the [repository](https://github.com/Twilight-Techy/storine); they are not on package registries yet.
+
+```bash
+git clone https://github.com/Twilight-Techy/storine
+mvn -f storine/sdks/java/pom.xml install -DskipTests     # into your local Maven repository
+```
 
 ```xml
 <dependency>

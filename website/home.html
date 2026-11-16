@@ -1,0 +1,276 @@
+<section class="hero">
+  <div class="hero-inner">
+    <div>
+      <p class="eyebrow">Storine {{version}} · MIT or Apache-2.0</p>
+      <h1>The document database that is <span>fast</span>, exact and small.</h1>
+      <p class="sub">Embed it in a Rust program, run it as a server, or start three servers for a replicated cluster with automatic failover. Written in Rust, with no third-party dependencies.</p>
+      <div class="hero-cta">
+        <a class="btn btn-primary" href="{{link:website/content/quick-start.md}}">Get started</a>
+        <a class="btn btn-ghost" href="{{link:website/content/introduction.md}}">Read the docs</a>
+      </div>
+      <div class="install-group">
+        <div class="install-os" role="tablist">
+          <button type="button" role="tab" aria-selected="true" data-tab="Linux and macOS">Linux and macOS</button>
+          <button type="button" role="tab" aria-selected="false" data-tab="Windows">Windows</button>
+        </div>
+        <div class="install">
+          <code data-panel="Linux and macOS">curl -fsSL https://github.com/Twilight-Techy/storine/releases/latest/download/install.sh | sh</code>
+          <code data-panel="Windows" hidden>irm https://github.com/Twilight-Techy/storine/releases/latest/download/install.ps1 | iex</code>
+        </div>
+      </div>
+    </div>
+    <div class="hero-card">
+      <div class="tabs">
+        <div class="tab-list" role="tablist">
+          <button type="button" role="tab" aria-selected="true" data-tab="Python">Python</button>
+          <button type="button" role="tab" aria-selected="false" data-tab="TypeScript">TypeScript</button>
+          <button type="button" role="tab" aria-selected="false" data-tab="Go">Go</button>
+          <button type="button" role="tab" aria-selected="false" data-tab="Rust">Rust</button>
+          <button type="button" role="tab" aria-selected="false" data-tab="Java">Java</button>
+          <button type="button" role="tab" aria-selected="false" data-tab="C#">C#</button>
+        </div>
+        <div role="tabpanel" data-tab="Python"><div class="code"><pre><code>{{code:python}}
+import storine
+from decimal import Decimal
+from storine import add, gt
+
+db = storine.connect("storine://127.0.0.1:7878")
+accounts = db.collection("accounts")
+accounts.insert("alice", {"balance": Decimal("100.00")})
+accounts.insert("bob", {"balance": Decimal("0.00")})
+
+# Both changes or neither, and never below zero.
+with db.transaction() as tx:
+    tx.update("accounts", "alice",
+              add("balance", Decimal("-10.00"), min=0))
+    tx.update("accounts", "bob",
+              add("balance", Decimal("10.00")))
+
+accounts.create_index("balance")
+rich = accounts.find(gt("balance", Decimal("50")))
+{{/code}}</code></pre></div></div>
+        <div role="tabpanel" data-tab="TypeScript" hidden><div class="code"><pre><code>{{code:ts}}
+import { connect, add, gt, Decimal } from "storine";
+
+const db = connect("storine://127.0.0.1:7878");
+const accounts = db.collection("accounts");
+await accounts.insert("alice", { balance: new Decimal("100.00") });
+await accounts.insert("bob", { balance: new Decimal("0.00") });
+
+// Both changes or neither, and never below zero.
+await db.transaction((tx) => {
+  tx.update("accounts", "alice",
+    add("balance", new Decimal("-10.00"), { min: 0 }));
+  tx.update("accounts", "bob",
+    add("balance", new Decimal("10.00")));
+});
+
+await accounts.createIndex("balance");
+const rich = await accounts.find(gt("balance", new Decimal("50")));
+{{/code}}</code></pre></div></div>
+        <div role="tabpanel" data-tab="Go" hidden><div class="code"><pre><code>{{code:go}}
+db, err := storine.Connect("storine://127.0.0.1:7878")
+if err != nil { return err }
+defer db.Close()
+accounts := db.Collection("accounts")
+dec := storine.MustDecimal
+accounts.Insert(ctx, "alice", storine.Doc{"balance": dec("100.00")})
+accounts.Insert(ctx, "bob", storine.Doc{"balance": dec("0.00")})
+
+// Both changes or neither, and never below zero.
+_, err = db.Transaction(ctx, func(tx *storine.Tx) error {
+	tx.Update("accounts", "alice", storine.Add("balance", dec("-10.00")).Min(0))
+	tx.Update("accounts", "bob", storine.Add("balance", dec("10.00")))
+	return nil
+})
+
+rich, err := accounts.Find(ctx, storine.Query{Where: storine.Gt("balance", dec("50"))})
+{{/code}}</code></pre></div></div>
+        <div role="tabpanel" data-tab="Rust" hidden><div class="code"><pre><code>{{code:rust}}
+use storine::{add, dec, doc, gt, Query};
+
+let db = storine::connect("storine://127.0.0.1:7878")?;
+let accounts = db.collection("accounts");
+accounts.insert("alice", doc! { "balance" => dec("100.00") })?;
+accounts.insert("bob", doc! { "balance" => dec("0.00") })?;
+
+// Both changes or neither, and never below zero.
+db.transaction(|tx| {
+    tx.update("accounts", "alice", [add("balance", dec("-10.00")).min(0)]);
+    tx.update("accounts", "bob", [add("balance", dec("10.00"))]);
+    Ok(())
+})?;
+
+let rich = accounts.find(Query::new().filter(gt("balance", dec("50"))))?;
+{{/code}}</code></pre></div></div>
+        <div role="tabpanel" data-tab="Java" hidden><div class="code"><pre><code>{{code:java}}
+try (Storine db = Storine.connect("storine://127.0.0.1:7878")) {
+    Collection accounts = db.collection("accounts");
+    accounts.insert("alice", Map.of("balance", new BigDecimal("100.00")));
+    accounts.insert("bob", Map.of("balance", new BigDecimal("0.00")));
+
+    // Both changes or neither, and never below zero.
+    db.transaction(tx -> {
+        tx.update("accounts", "alice",
+            add("balance", new BigDecimal("-10.00")).min(0));
+        tx.update("accounts", "bob",
+            add("balance", new BigDecimal("10.00")));
+    });
+
+    var rich = accounts.find(new Query().where(gt("balance", new BigDecimal("50"))));
+}
+{{/code}}</code></pre></div></div>
+        <div role="tabpanel" data-tab="C#" hidden><div class="code"><pre><code>{{code:csharp}}
+await using var db = StorineClient.Connect("storine://127.0.0.1:7878");
+var accounts = db.Collection("accounts");
+await accounts.InsertAsync("alice", new Doc { ["balance"] = 100.00m });
+await accounts.InsertAsync("bob", new Doc { ["balance"] = 0.00m });
+
+// Both changes or neither, and never below zero.
+await db.TransactionAsync(tx =>
+{
+    tx.Update("accounts", "alice", Add("balance", -10.00m).Min(0));
+    tx.Update("accounts", "bob", Add("balance", 10.00m));
+});
+
+var rich = await accounts.FindAsync(Gt("balance", 50m));
+{{/code}}</code></pre></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="section-head">
+    <h2>Everything a document database needs, in a few megabytes</h2>
+    <p>Each tool is a single file with nothing else to install. The engine, the network server, TLS, the SQL gateway and the web console are all built from the Rust standard library.</p>
+  </div>
+  <div class="grid">
+    <a class="card" href="{{link:website/content/documents.md}}">
+      <span class="card-icon"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M7 3h7l5 5v13H7z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M14 3v5h5M10 13h6M10 17h6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+      <h3>Documents, done properly</h3>
+      <p>Collections of JSON-like documents with versions, preconditions, time to live, and atomic writes across collections.</p>
+    </a>
+    <a class="card" href="{{link:website/content/concepts.md#field-values}}">
+      <span class="card-icon"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M5 12h14M12 5v14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg></span>
+      <h3>Exact money</h3>
+      <p>Decimals up to 38 digits, mapped to each language's exact decimal type. Server-side <code>add</code> with bounds makes an overdraft impossible.</p>
+    </a>
+    <a class="card" href="{{link:website/content/queries.md}}">
+      <span class="card-icon"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="m16 16 4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+      <h3>Queries and indexes</h3>
+      <p>Filters on nested fields, sorting, keyset paging, up to 16 secondary indexes per collection, and exact results every time.</p>
+    </a>
+    <a class="card" href="{{link:website/content/indexes.md#vector-indexes}}">
+      <span class="card-icon"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><circle cx="6" cy="17" r="2" fill="currentColor"/><circle cx="12" cy="7" r="2" fill="currentColor"/><circle cx="18" cy="14" r="2" fill="currentColor"/><path d="M6 17 12 7l6 7" fill="none" stroke="currentColor" stroke-width="1.6"/></svg></span>
+      <h3>Vector search</h3>
+      <p>Nearest-neighbour queries by cosine similarity, with an HNSW index for large collections and exact scoring of every candidate.</p>
+    </a>
+    <a class="card" href="{{link:website/content/analytics.md}}">
+      <span class="card-icon"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M5 20V11M12 20V5M19 20v-6" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg></span>
+      <h3>Analytics on the server</h3>
+      <p>Grouped aggregates with exact sums, and an optional columnar copy of a collection for vectorized, parallel scans.</p>
+    </a>
+    <a class="card" href="{{link:website/content/security.md}}">
+      <span class="card-icon"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3" fill="none" stroke="currentColor" stroke-width="2"/></svg></span>
+      <h3>Secure by default</h3>
+      <p>Tokens with roles, TLS for clients and between nodes, encryption at rest with key rotation, and point-in-time recovery.</p>
+    </a>
+  </div>
+</section>
+
+<section class="band">
+  <div class="section bench">
+    <div>
+      <div class="section-head">
+        <h2>Fast where it counts</h2>
+        <p>A read takes about 60 nanoseconds in process and 9 microseconds over the network. Against LMDB and RocksDB at equal durability, Storine leads every throughput row.</p>
+      </div>
+      <a href="{{link:docs/BENCHMARK_REPORT.md}}">Every measurement, with the method and the machine →</a>
+    </div>
+    <div>
+      <div class="bars">
+        <p class="bar-title">Random reads, 4 threads (million per second)</p>
+        <div class="bar-row me"><span>Storine</span><span class="bar"><i class="w100"></i></span><span class="v">4.1–4.2 M</span></div>
+        <div class="bar-row"><span>LMDB</span><span class="bar"><i class="w73"></i></span><span class="v">2.9–3.2 M</span></div>
+        <div class="bar-row"><span>RocksDB</span><span class="bar"><i class="w24"></i></span><span class="v">0.96–1.04 M</span></div>
+        <p class="bar-title">Overwrites, 4 threads (million per second)</p>
+        <div class="bar-row me"><span>Storine</span><span class="bar"><i class="w100"></i></span><span class="v">1.30–1.36 M</span></div>
+        <div class="bar-row"><span>RocksDB</span><span class="bar"><i class="w42"></i></span><span class="v">0.54–0.59 M</span></div>
+        <div class="bar-row"><span>LMDB</span><span class="bar"><i class="w10"></i></span><span class="v">0.13 M</span></div>
+        <p class="bar-title">Durable writes with fsync, 4 threads (per second)</p>
+        <div class="bar-row me"><span>Storine</span><span class="bar"><i class="w100"></i></span><span class="v">3,000</span></div>
+        <div class="bar-row"><span>RocksDB</span><span class="bar"><i class="w29"></i></span><span class="v">860</span></div>
+        <div class="bar-row"><span>LMDB</span><span class="bar"><i class="w16"></i></span><span class="v">470</span></div>
+      </div>
+      <small>1,000,000 keys on an AWS c7i.xlarge, three rounds each. Storine trails in some tail-latency cases, listed in the report.</small>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="section-head">
+    <h2>One engine, three ways to run it</h2>
+    <p>The same storage engine and the same data model, from a library call to a cluster that spreads data across regions.</p>
+  </div>
+  <div class="modes">
+    <div class="card">
+      <h3>Embedded</h3>
+      <p>Link <code>storage-core</code> into a Rust program and open a store in a folder. No server, no network.</p>
+      <div class="code"><pre><code>{{code:rust}}
+let store = DocumentStore::open("./data",
+    EngineConfig::default())?;
+store.put("accounts", "alice", fields)?;
+{{/code}}</code></pre></div>
+      <a class="more" href="{{link:website/content/embedding.md}}">Embedding the engine →</a>
+    </div>
+    <div class="card">
+      <h3>Server</h3>
+      <p>One process serves clients in eight languages, the SQL gateway and the web console.</p>
+      <div class="code"><pre><code>{{code:bash}}
+storage-server ./data 127.0.0.1:7878
+storine-console storine://127.0.0.1:7878
+{{/code}}</code></pre></div>
+      <a class="more" href="{{link:website/content/server.md}}">Running a server →</a>
+    </div>
+    <div class="card">
+      <h3>Cluster</h3>
+      <p>Three servers replicate with Raft and fail over on their own. Add <code>--ranges</code> to partition data and place it by region.</p>
+      <div class="code"><pre><code>{{code:bash}}
+storage-server ./n1 10.0.0.1:7878 --node-id 1 \
+  --peers 1=10.0.0.1:7878,2=10.0.0.2:7878,3=10.0.0.3:7878
+{{/code}}</code></pre></div>
+      <a class="more" href="{{link:website/content/clusters.md}}">Clusters →</a>
+    </div>
+  </div>
+</section>
+
+<section class="band">
+  <div class="section">
+    <div class="section-head">
+      <h2>Speaks your stack</h2>
+      <p>Clients for eight languages share one API, need only their standard library, retry without ever applying a write twice, and follow a cluster's leader on their own. Apps written for PostgreSQL, MySQL or SQL Server can switch by changing a connection string.</p>
+    </div>
+    <div class="langs">
+      <a href="{{link:sdks/python/README.md}}">Python</a>
+      <a href="{{link:sdks/typescript/README.md}}">TypeScript / Node.js</a>
+      <a href="{{link:sdks/go/README.md}}">Go</a>
+      <a href="{{link:sdks/java/README.md}}">Java</a>
+      <a href="{{link:sdks/csharp/README.md}}">C# / .NET</a>
+      <a href="{{link:sdks/rust/README.md}}">Rust</a>
+      <a href="{{link:sdks/php/README.md}}">PHP</a>
+      <a href="{{link:sdks/ruby/README.md}}">Ruby</a>
+      <a href="{{link:crates/storage-sql/README.md}}">PostgreSQL, MySQL and SQL Server protocols</a>
+    </div>
+    <a href="{{link:website/content/console.md}}"><img class="shot" src="{{link:assets/docs_images_console-documents.png}}" alt="The Storine console: a collection of documents with a filter, and one document open for editing" width="1360" height="820" loading="lazy"></a>
+  </div>
+</section>
+
+<section class="section cta">
+  <h2>Try it in a minute</h2>
+  <p>Install the four tools, start a server, and open the console. The quick start walks through it in your language.</p>
+  <div class="hero-cta">
+    <a class="btn btn-primary" href="{{link:website/content/quick-start.md}}">Quick start</a>
+    <a class="btn btn-ghost" href="https://github.com/Twilight-Techy/storine">View on GitHub</a>
+  </div>
+</section>

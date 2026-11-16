@@ -283,7 +283,7 @@ class Client:
         return versions
 
     def collections(self) -> List[str]:
-        """Names of every declared collection."""
+        """Names of every collection with metadata or documents (range clusters: with metadata)."""
         status, _v, body = self._request(w.OP_DOC_INFO, b"\x03", idempotent=True)
         if status != w.ST_OK:
             self._raise(status, body)

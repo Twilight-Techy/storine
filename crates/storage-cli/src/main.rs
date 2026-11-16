@@ -21,22 +21,64 @@ use storage_types::{InlineId, RecordHeader};
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        print_usage();
+        eprintln!("{}", usage());
         return ExitCode::from(1);
+    }
+    match args[1].as_str() {
+        "-h" | "--help" | "help" => {
+            println!("{}", usage());
+            return ExitCode::SUCCESS;
+        }
+        "-V" | "--version" => {
+            println!("storage-cli {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        cmd if !COMMANDS.contains(&cmd) => {
+            eprintln!("error: unknown command '{cmd}': run storage-cli --help for the commands");
+            return ExitCode::from(2);
+        }
+        _ => {}
     }
 
     match run_command(&args[1..]) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e}");
+            // Settings and usage errors travel as `InvalidKey` / `Config`: print their message
+            // alone, not the "invalid primary key" / "invalid setting" prefix of their Display.
+            match &e {
+                storage_types::StorageError::InvalidKey { reason } => eprintln!("error: {reason}"),
+                storage_types::StorageError::Config { message } => eprintln!("error: {message}"),
+                _ => eprintln!("error: {e}"),
+            }
             ExitCode::from(1)
         }
     }
 }
 
-fn print_usage() {
-    eprintln!(
-        "Usage: storage-cli <command> [args...]\n\
+const COMMANDS: &[&str] = &[
+    "stats",
+    "put",
+    "get",
+    "inspect-header",
+    "verify",
+    "compact",
+    "snapshot",
+    "bench",
+    "backup",
+    "archive-wal",
+    "restore-pitr",
+    "remote-health",
+    "remote-compact",
+    "remote-backup",
+    "remote-restore",
+    "changefeed",
+    "remote-checkpoint",
+    "remote-metrics",
+    "cluster",
+];
+
+fn usage() -> &'static str {
+    "Usage: storage-cli <command> [args...]\n\
          Commands:\n\
          \x20 stats <db_dir>                                    Show engine & mmap telemetry\n\
          \x20 put <db_dir> <id> <title> <score> [tags_csv]      Upsert an AgentObjectRecord\n\
@@ -69,8 +111,9 @@ fn print_usage() {
          TLS when STORAGE_TLS_CA names the PEM certificates to trust (STORAGE_TLS_SERVER_NAME: the\n\
          name to expect in the server's certificate; default: its address).\n\
          cluster changes can be sent to any member: a follower's redirect to the leader is followed.\n\
-         backup / archive-wal / restore-pitr enable WAL archiving (required for PITR)."
-    );
+         backup / archive-wal / restore-pitr enable WAL archiving (required for PITR).\n\
+         \n\
+         -h, --help prints this help; -V, --version prints the version."
 }
 
 fn run_command(args: &[String]) -> storage_types::Result<()> {
@@ -93,7 +136,7 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
         }
         "put" => {
             if args.len() < 5 {
-                print_usage();
+                eprintln!("{}", usage());
                 return Err(storage_types::StorageError::invalid_key(
                     "missing required arguments for 'put'",
                 ));
@@ -118,7 +161,7 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
         }
         "get" => {
             if args.len() < 3 {
-                print_usage();
+                eprintln!("{}", usage());
                 return Err(storage_types::StorageError::invalid_key(
                     "missing required arguments for 'get'",
                 ));
@@ -150,7 +193,7 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
         }
         "inspect-header" => {
             if args.len() < 2 {
-                print_usage();
+                eprintln!("{}", usage());
                 return Err(storage_types::StorageError::invalid_key(
                     "missing required <rec_file_path> for 'inspect-header'",
                 ));
@@ -207,7 +250,7 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
         }
         "snapshot" => {
             if args.len() < 3 {
-                print_usage();
+                eprintln!("{}", usage());
                 return Err(storage_types::StorageError::invalid_key(
                     "missing required <db_dir> and <dest_dir> for 'snapshot'",
                 ));
@@ -268,7 +311,7 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
         }
         "backup" => {
             if args.len() < 3 {
-                print_usage();
+                eprintln!("{}", usage());
                 return Err(storage_types::StorageError::invalid_key(
                     "missing required <db_dir> and <backup_dir> for 'backup'",
                 ));
@@ -285,7 +328,7 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
         }
         "archive-wal" => {
             if args.len() < 3 {
-                print_usage();
+                eprintln!("{}", usage());
                 return Err(storage_types::StorageError::invalid_key(
                     "missing required <db_dir> and <backup_dir> for 'archive-wal'",
                 ));
@@ -299,7 +342,7 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
         }
         "restore-pitr" => {
             if args.len() < 4 {
-                print_usage();
+                eprintln!("{}", usage());
                 return Err(storage_types::StorageError::invalid_key(
                     "missing required <backup_dir>, <restore_dir> and <time> for 'restore-pitr'",
                 ));
@@ -355,7 +398,7 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
         }
         "remote-backup" => {
             if args.len() < 3 {
-                print_usage();
+                eprintln!("{}", usage());
                 return Err(storage_types::StorageError::invalid_key(
                     "missing required <addr> and <dest_path> for 'remote-backup'",
                 ));
@@ -369,7 +412,7 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
         }
         "remote-restore" => {
             if args.len() < 3 {
-                print_usage();
+                eprintln!("{}", usage());
                 return Err(storage_types::StorageError::invalid_key("missing required <addr> and <backup_name> for 'remote-restore'"));
             }
             let mut client = connect_remote(parse_addr(Some(&args[1]))?)?;
@@ -392,10 +435,7 @@ fn run_command(args: &[String]) -> storage_types::Result<()> {
             Ok(())
         }
         "cluster" => cluster_command(args),
-        _ => {
-            print_usage();
-            Err(storage_types::StorageError::invalid_key("unknown CLI command"))
-        }
+        other => unreachable!("{other} is checked against COMMANDS in main"),
     }
 }
 
@@ -407,7 +447,7 @@ fn changefeed_command(args: &[String]) -> storage_types::Result<()> {
     use storage_server::ranges::JsonlSink;
 
     if args.len() < 4 {
-        print_usage();
+        eprintln!("{}", usage());
         return Err(storage_types::StorageError::invalid_key("missing required <addr>, <out.jsonl> and <cursor_file> for 'changefeed'"));
     }
     let addr = parse_addr(Some(&args[1]))?;
@@ -528,7 +568,7 @@ fn cluster_command(args: &[String]) -> storage_types::Result<()> {
         "promote" => (CLUSTER_PROMOTE, id()?, ""),
         "remove" => (CLUSTER_REMOVE, id()?, ""),
         _ => {
-            print_usage();
+            eprintln!("{}", usage());
             return Err(StorageError::invalid_key("unknown cluster command"));
         }
     };

@@ -2,6 +2,18 @@
 
 Versions follow [Semantic Versioning](https://semver.org). Before 1.0, a minor version (0.x) may change on-disk or wire formats; [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) says what each kind of release may change and how to upgrade.
 
+## Unreleased
+
+### Added
+
+- **A website** with the whole documentation: guides, every option, each client's API, the protocol and the benchmarks, searchable. Built by `website/build.py` (standard library only) and published from `main` by `.github/workflows/site.yml`.
+
+### Fixed
+
+- `storage-cli --help` printed an error; it now prints the commands and exits 0, `--version` prints the version, and an unknown command is named.
+- Configuration errors of `storage-server` and `storage-cli` no longer start with "invalid primary key:".
+- Documentation: `AsyncMemoryFirst` can lose the last flush interval of writes on a process crash (it said nothing); SDK READMEs now say how to install each client from the repository, as none is on a package registry yet.
+
 ## 0.2.0 (2026-11-16)
 
 Three features that existed only in the embedded engine are now in the server: encryption at rest, point-in-time recovery and multi-region placement ([`docs/TECHNICAL.md`](docs/TECHNICAL.md) sections 7, 8 and 13). Single-group cluster writes are 5–8× faster, checkpoints end under any write load, the web console was redesigned, and install scripts set Storine up in one line.

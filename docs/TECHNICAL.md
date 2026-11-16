@@ -1,6 +1,6 @@
 # Storine technical reference
 
-How Storine works and how to run it: every program, option, environment variable, default and limit, as of version 0.1.1. For a first look, start with the [README](../README.md). The wire protocol is specified in [`protocol/PROTOCOL.md`](../protocol/PROTOCOL.md), measurements are in [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md), and upgrade rules in [`COMPATIBILITY.md`](COMPATIBILITY.md).
+How Storine works and how to run it: every program, option, environment variable, default and limit, as of version 0.2.0. For a first look, start with the [README](../README.md). The wire protocol is specified in [`protocol/PROTOCOL.md`](../protocol/PROTOCOL.md), measurements are in [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md), and upgrade rules in [`COMPATIBILITY.md`](COMPATIBILITY.md).
 
 **Contents**
 
@@ -107,7 +107,7 @@ The WAL's `SyncPolicy` decides when a write is durable:
 | :--- | :--- | :--- |
 | `Immediate` | its own `fsync` | nothing |
 | `GroupCommit { max_batch_entries }` (default, 64) | an `fsync` it shares with concurrent writers | nothing |
-| `AsyncMemoryFirst` | the log write reaches the OS (no `fsync`) | the writes since the last flush. A process crash loses nothing |
+| `AsyncMemoryFirst` | the log write is staged in memory; the background flusher hands it to the OS every `flush_interval_ms` (no `fsync`) | a process crash loses the writes of the last flush interval; a power failure, whatever the OS had not yet written back |
 
 The WAL is one file per engine (`wal/<name>.wal`). A **checkpoint** flushes every buffered record, syncs the record files and segments, then cuts the WAL: recovery replays only what was written since. Who checkpoints:
 
@@ -165,7 +165,7 @@ use storage_core::{DocumentStore, EngineConfig};
 let store = DocumentStore::open("./data", EngineConfig::default())?;
 store.put("accounts", "alice", fields)?;
 let doc = store.get("accounts", "alice")?;
-store.checkpoint()?; // cut the WAL: an embedded engine does not do it on its own
+store.engine().checkpoint()?; // cut the WAL: an embedded engine does not do it on its own
 ```
 
 `EngineConfig` fields and defaults:

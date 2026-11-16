@@ -2,6 +2,8 @@
 
 No dependencies, `#![forbid(unsafe_code)]`, blocking I/O (from async code, call it inside `spawn_blocking`).
 
+The clients are installed from the [repository](https://github.com/Twilight-Techy/storine); they are not on package registries yet.
+
 ```toml
 [dependencies]
 storine = { git = "https://github.com/twilight-techy/storine", package = "storine" }

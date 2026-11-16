@@ -562,7 +562,13 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e}");
+            // Settings and usage errors travel as `InvalidKey` / `Config`: print their message
+            // alone, not the "invalid primary key" / "invalid setting" prefix of their Display.
+            match &e {
+                StorageError::InvalidKey { reason } => eprintln!("error: {reason}"),
+                StorageError::Config { message } => eprintln!("error: {message}"),
+                _ => eprintln!("error: {e}"),
+            }
             ExitCode::from(1)
         }
     }

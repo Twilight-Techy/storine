@@ -17,6 +17,7 @@
 </p>
 
 <p align="center">
+  <a href="https://twilight-techy.github.io/storine/">Website and docs</a> ·
   <a href="#get-started">Get started</a> ·
   <a href="#clients">Clients</a> ·
   <a href="#run-a-cluster">Clusters</a> ·
@@ -140,6 +141,7 @@ Clients list the servers and find the leader themselves: `storine://token@10.0.0
 
 | | |
 | :--- | :--- |
+| [Documentation website](https://twilight-techy.github.io/storine/) | Guides, every option, and each client's API, searchable |
 | [Technical reference](docs/TECHNICAL.md) | How it works, every option, operations, limits |
 | [Wire protocol](protocol/PROTOCOL.md) | For writing a client |
 | [Benchmarks](docs/BENCHMARK_REPORT.md) | Every measurement, with the method and the machine |
@@ -149,7 +151,7 @@ Clients list the servers and find the leader themselves: `storine://token@10.0.0
 
 ## Status
 
-Storine 0.1 is the first release. Its test suite, crash tests and 2-hour soak tests under constant faults pass on every release, but it has not yet run in production for long. Read the [known limitations](CHANGELOG.md) before you rely on it, and back up.
+Storine is young: 0.2 is its third release. Its test suite, crash tests and 2-hour soak tests under constant faults pass on every release, but it has not yet run in production for long. Read the [known limitations](CHANGELOG.md) before you rely on it, and back up.
 
 ## License
 

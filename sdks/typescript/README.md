@@ -1,6 +1,12 @@
 # Storine for Node.js / TypeScript
 
-No runtime dependencies. Node.js 18+.
+No runtime dependencies. Node.js 18+. The clients are installed from the [repository](https://github.com/Twilight-Techy/storine); they are not on package registries yet.
+
+```bash
+git clone https://github.com/Twilight-Techy/storine
+(cd storine/sdks/typescript && npm install && npm run build)
+npm install ./storine/sdks/typescript        # from your project
+```
 
 ```ts
 import { connect, add, gt, eq, Decimal } from "storine";

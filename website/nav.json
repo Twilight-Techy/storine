@@ -1,0 +1,66 @@
+[
+  {"title": "Home", "pages": [
+    {"src": "website/home.html", "url": "", "title": "Storine"}
+  ]},
+  {"title": "Get started", "pages": [
+    {"src": "website/content/introduction.md", "url": "docs/"},
+    {"src": "website/content/installation.md", "url": "docs/installation/"},
+    {"src": "website/content/quick-start.md", "url": "docs/quick-start/"},
+    {"src": "website/content/concepts.md", "url": "docs/concepts/"}
+  ]},
+  {"title": "Build with Storine", "pages": [
+    {"src": "website/content/documents.md", "url": "docs/documents/"},
+    {"src": "website/content/queries.md", "url": "docs/queries/"},
+    {"src": "website/content/indexes.md", "url": "docs/indexes/"},
+    {"src": "website/content/analytics.md", "url": "docs/analytics/"},
+    {"src": "website/content/embedding.md", "url": "docs/embedding/"}
+  ]},
+  {"title": "Tools", "pages": [
+    {"src": "website/content/server.md", "url": "docs/server/"},
+    {"src": "website/content/console.md", "url": "docs/console/"},
+    {"src": "website/content/cli.md", "url": "docs/cli/"},
+    {"src": "crates/storage-sql/README.md", "url": "docs/sql/", "title": "SQL gateway", "description": "Point applications written for PostgreSQL, MySQL or SQL Server at Storine by changing their connection string."}
+  ]},
+  {"title": "Clusters", "pages": [
+    {"src": "website/content/clusters.md", "url": "docs/clusters/"},
+    {"src": "website/content/range-clusters.md", "url": "docs/range-clusters/"},
+    {"src": "website/content/placement.md", "url": "docs/placement/"}
+  ]},
+  {"title": "Operations", "pages": [
+    {"src": "website/content/security.md", "url": "docs/security/"},
+    {"src": "website/content/encryption.md", "url": "docs/encryption/"},
+    {"src": "website/content/backups.md", "url": "docs/backups/"},
+    {"src": "website/content/monitoring.md", "url": "docs/monitoring/"},
+    {"src": "website/content/storage.md", "url": "docs/storage/"},
+    {"src": "docs/COMPATIBILITY.md", "url": "docs/upgrades/", "title": "Upgrades and compatibility", "nav": "Upgrades", "description": "What each kind of release may change, and how to move a server or cluster to a new version."},
+    {"src": "website/content/troubleshooting.md", "url": "docs/troubleshooting/"}
+  ]},
+  {"title": "Clients", "pages": [
+    {"src": "website/content/clients/index.md", "url": "docs/clients/"},
+    {"src": "sdks/python/README.md", "url": "docs/clients/python/", "title": "Python client", "nav": "Python"},
+    {"src": "sdks/typescript/README.md", "url": "docs/clients/typescript/", "title": "TypeScript and JavaScript client", "nav": "TypeScript / Node.js"},
+    {"src": "sdks/go/README.md", "url": "docs/clients/go/", "title": "Go client", "nav": "Go"},
+    {"src": "sdks/java/README.md", "url": "docs/clients/java/", "title": "Java client", "nav": "Java"},
+    {"src": "sdks/csharp/README.md", "url": "docs/clients/csharp/", "title": "C# and .NET client", "nav": "C# / .NET"},
+    {"src": "sdks/rust/README.md", "url": "docs/clients/rust/", "title": "Rust client", "nav": "Rust"},
+    {"src": "sdks/php/README.md", "url": "docs/clients/php/", "title": "PHP client", "nav": "PHP"},
+    {"src": "sdks/ruby/README.md", "url": "docs/clients/ruby/", "title": "Ruby client", "nav": "Ruby"},
+    {"src": "sdks/README.md", "url": "docs/clients/writing-a-client/", "title": "Writing a client", "nav": "Writing a client", "description": "What every official client does, and how to add one for another language."}
+  ]},
+  {"title": "Reference", "pages": [
+    {"src": "website/content/reference/configuration.md", "url": "docs/reference/configuration/"},
+    {"src": "website/content/reference/values.md", "url": "docs/reference/values/"},
+    {"src": "website/content/reference/errors.md", "url": "docs/reference/errors/"},
+    {"src": "website/content/reference/limits.md", "url": "docs/reference/limits/"},
+    {"src": "protocol/PROTOCOL.md", "url": "docs/reference/protocol/", "title": "Wire protocol", "description": "The binary protocol every client speaks: framing, status codes, value encoding and every document operation."},
+    {"src": "website/content/reference/architecture.md", "url": "docs/reference/architecture/"},
+    {"src": "docs/TECHNICAL.md", "url": "docs/reference/technical/", "title": "Technical reference", "nav": "Everything on one page", "description": "Every program, option, environment variable, default and limit on a single page."},
+    {"src": "docs/BENCHMARK_REPORT.md", "url": "docs/reference/benchmarks/", "title": "Benchmark report", "nav": "Benchmarks", "description": "Every measurement, with the method and the machine it ran on."},
+    {"src": "website/content/reference/limitations.md", "url": "docs/reference/limitations/"}
+  ]},
+  {"title": "Project", "pages": [
+    {"src": "CONTRIBUTING.md", "url": "docs/contributing/", "title": "Contributing"},
+    {"src": "docs/RELEASE.md", "url": "docs/release-process/", "title": "Release process", "description": "The checks every release passes before it is published."},
+    {"src": "CHANGELOG.md", "url": "changelog/", "title": "Changelog"}
+  ]}
+]

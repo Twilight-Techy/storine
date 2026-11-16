@@ -1,6 +1,13 @@
 # Storine for PHP
 
-Standard library only (no extensions beyond PHP's defaults), PHP 8.1+.
+Standard library only (no extensions beyond PHP's defaults), PHP 8.1+. The clients are installed from the [repository](https://github.com/Twilight-Techy/storine); they are not on package registries yet.
+
+```bash
+git clone https://github.com/Twilight-Techy/storine
+```
+
+Then `require 'storine/sdks/php/src/autoload.php';`, or add `storine/sdks/php` to `composer.json` as a
+[path repository](https://getcomposer.org/doc/05-repositories.md#path) and `composer require storine/storine`.
 
 ```php
 use Storine\{Decimal, FieldOp, Filter, Storine, Transaction};

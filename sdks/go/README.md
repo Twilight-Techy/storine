@@ -1,6 +1,6 @@
 # Storine for Go
 
-Standard library only, Go 1.21+.
+Standard library only, Go 1.21+. The clients are installed from the [repository](https://github.com/Twilight-Techy/storine); they are not on package registries yet.
 
 ```bash
 go get github.com/twilight-techy/storine/sdks/go

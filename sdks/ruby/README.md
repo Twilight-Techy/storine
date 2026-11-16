@@ -1,6 +1,11 @@
 # Storine for Ruby
 
-Standard library only, Ruby 3.2+.
+Standard library only, Ruby 3.2+. The clients are installed from the [repository](https://github.com/Twilight-Techy/storine); they are not on package registries yet.
+
+```bash
+git clone https://github.com/Twilight-Techy/storine
+cd storine/sdks/ruby && gem build storine.gemspec && gem install storine-*.gem
+```
 
 ```ruby
 require "storine"
