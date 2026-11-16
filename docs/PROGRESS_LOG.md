@@ -1056,3 +1056,7 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Checked**: links and anchors (`--check`), headless Chromium at 1440 and 390 px, light and dark, no console errors or CSP violations; search; every Python example in the guides against a release server; the embedded example runs.
 - **Fixes found while writing it**: `storage-cli --help`, settings error messages, the `AsyncMemoryFirst` durability row in `TECHNICAL.md`, SDK install instructions.
 - **Vercel**: the site is also at https://storine.vercel.app. The Vercel project `storine` is connected to the repository and builds it with `vercel.json` (the same `website/build.py --check`, for the root path), skipping commits that change nothing the site uses.
+
+## 2026-11-16: 0.2.1
+
+- A patch release for the `storage-cli --help` fix and clearer configuration errors. Since `v0.2.0` only command-line messages, documentation and tests changed, so the release checks were CI on five platforms and the release workflow's install verification; the chaos, soak, SDK and sanitizer checks were not repeated.

@@ -2,17 +2,30 @@
 
 Versions follow [Semantic Versioning](https://semver.org). Before 1.0, a minor version (0.x) may change on-disk or wire formats; [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) says what each kind of release may change and how to upgrade.
 
-## Unreleased
+## 0.2.1 (2026-11-16)
+
+A patch release: clearer command-line messages, and the documentation website. The engine, the protocols and the on-disk formats are those of 0.2.0.
+
+**Upgrading from 0.2.0**: replace the binaries (`install.sh` / `install.ps1` again) and restart. A cluster can be upgraded one node at a time, and 0.2.0 and 0.2.1 nodes can run together.
+
+### Formats and protocols
+
+- **On-disk formats, client protocol, node-to-node protocol**: unchanged from 0.2.0.
+
+### Release checks
+
+CI on Linux x86_64 and arm64, macOS arm64 and x86_64, and Windows: the test suite, lints, binary sizes and the install scripts. The release workflow installs the published binaries with the install scripts on each platform and checks their version. The checklist's chaos runs, soaks, SDK suites and sanitizers were not repeated: no code they cover changed since 0.2.0.
 
 ### Added
 
-- **A website** with the whole documentation: guides, every option, each client's API, the protocol and the benchmarks, searchable. Built by `website/build.py` (standard library only) and published from `main` by `.github/workflows/site.yml`.
+- **A website** with the whole documentation: guides, every option, each client's API, using an ORM through the SQL gateway, the protocol and the benchmarks, searchable. At https://storine.vercel.app and https://twilight-techy.github.io/storine/, rebuilt from `main` on every push (`website/build.py`, standard library only).
 
 ### Fixed
 
-- `storage-cli --help` printed an error; it now prints the commands and exits 0, `--version` prints the version, and an unknown command is named.
-- Configuration errors of `storage-server` and `storage-cli` no longer start with "invalid primary key:".
-- Documentation: `AsyncMemoryFirst` can lose the last flush interval of writes on a process crash (it said nothing); SDK READMEs now say how to install each client from the repository, as none is on a package registry yet.
+- **`storage-cli --help` printed an error** ("invalid primary key: unknown CLI command"). It now prints the commands and exits 0, `-V` / `--version` print the version, and an unknown command is named, with exit status 2.
+- **Configuration errors** of `storage-server` and `storage-cli` no longer start with "invalid primary key:", and refusing a network address without tokens now names `STORAGE_AUTH_TOKENS`.
+- **Documentation**: `AsyncMemoryFirst` can lose the last flush interval of writes on a process crash (`TECHNICAL.md` said nothing was lost); every SDK README says how to install the client from the repository (the C# and Java ones named packages that were never published); the Python README lists `nearest`, vector indexes and partial reads.
+- A cluster membership test could fail on a slow machine after a leader change (seen once on Windows CI); it retries on the new leader, as a client would. Test only.
 
 ## 0.2.0 (2026-11-16)
 

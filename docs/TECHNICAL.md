@@ -1,6 +1,6 @@
 # Storine technical reference
 
-How Storine works and how to run it: every program, option, environment variable, default and limit, as of version 0.2.0. For a first look, start with the [README](../README.md). The wire protocol is specified in [`protocol/PROTOCOL.md`](../protocol/PROTOCOL.md), measurements are in [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md), and upgrade rules in [`COMPATIBILITY.md`](COMPATIBILITY.md).
+How Storine works and how to run it: every program, option, environment variable, default and limit, as of version 0.2.1. For a first look, start with the [README](../README.md). The wire protocol is specified in [`protocol/PROTOCOL.md`](../protocol/PROTOCOL.md), measurements are in [`BENCHMARK_REPORT.md`](BENCHMARK_REPORT.md), and upgrade rules in [`COMPATIBILITY.md`](COMPATIBILITY.md).
 
 **Contents**
 
