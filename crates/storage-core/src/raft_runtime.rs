@@ -1356,12 +1356,37 @@ mod tests {
             Member { id: 1, addr: String::new(), voter: false },
         ])
         .is_err());
-        // The learner is promoted later, and removed again.
-        c.runtimes[l].promote(4, Duration::from_secs(5)).unwrap();
+        // The learner is promoted later, and removed again. The voters isolated above may still
+        // force an election after rejoining, which leaves a change's commit unknown on a slow
+        // machine (seen on Windows CI): retry on the current leader, as a client would, until
+        // the membership shows the change.
+        let l = change_until(&c, &[1, 2, 3, 4], |r| r.promote(4, Duration::from_secs(5)));
         assert_eq!(voters(&c.nodes[l].membership()), vec![1, 2, 3, 4]);
-        c.runtimes[l].remove_member(4).unwrap();
+        let l = change_until(&c, &[1, 2, 3], |r| r.remove_member(4));
         assert_eq!(voters(&c.nodes[l].membership()), vec![1, 2, 3]);
         c.put(l, "d").unwrap();
+    }
+
+    /// Applies a membership change through the current leader among the first three nodes,
+    /// retrying after a leader change, until that leader's voters are `want`; returns its index.
+    fn change_until(
+        c: &Cluster,
+        want: &[NodeId],
+        op: impl Fn(&RaftRuntime<DocumentRecord>) -> Result<()>,
+    ) -> usize {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let l = c.leader_among(&[0, 1, 2], Duration::from_secs(5));
+            if voters(&c.nodes[l].membership()) == want {
+                return l;
+            }
+            match op(&c.runtimes[l]) {
+                Ok(()) => {}
+                Err(StorageError::CommitUnknown { .. } | StorageError::NotLeader { .. }) => {}
+                Err(e) => panic!("membership change failed: {e}"),
+            }
+            assert!(Instant::now() < deadline, "membership never became {want:?}");
+        }
     }
 
     #[test]
