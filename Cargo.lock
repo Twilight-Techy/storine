@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "storage-benches"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-core",
@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "storage-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-core",
@@ -34,14 +34,14 @@ dependencies = [
 
 [[package]]
 name = "storage-codec"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "storage-types",
 ]
 
 [[package]]
 name = "storage-columnar"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-mmap",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "storage-console"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-core",
@@ -60,7 +60,7 @@ dependencies = [
 
 [[package]]
 name = "storage-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-columnar",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "storage-graph"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-index",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "storage-index"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-mmap",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "storage-mmap"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-types",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "storage-server"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-core",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "storage-sql"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-core",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "storage-tls"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-types",
@@ -133,11 +133,11 @@ dependencies = [
 
 [[package]]
 name = "storage-types"
-version = "0.2.1"
+version = "0.3.0"
 
 [[package]]
 name = "storage-wal"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-types",
@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "storine"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "storage-tls",
 ]

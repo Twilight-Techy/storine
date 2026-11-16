@@ -2,13 +2,32 @@
 
 Versions follow [Semantic Versioning](https://semver.org). Before 1.0, a minor version (0.x) may change on-disk or wire formats; [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) says what each kind of release may change and how to upgrade.
 
-## Unreleased
+## 0.3.0 (2026-11-16)
+
+Faster tails for embedded bulk loads and many writers. The slowest 0.01% of writes during a load fell from 1.1 ms to 23–30 µs when the store is told its size, and the worst stall with four writers on four CPUs from 6.5–8.1 ms to 4.3–4.6 ms ([`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) section 8.11).
+
+This is a minor release because the Rust API gained a field: `EngineConfig` literals that list every field without `..Default::default()` must add `expected_records`. Nothing else is incompatible.
+
+**Upgrading from 0.2.x**: replace the binaries (`install.sh` / `install.ps1` again) and restart. The on-disk formats and both protocols are unchanged, so, unlike a usual minor release, a cluster can be upgraded one node at a time and 0.2.x and 0.3.0 nodes can run together. Embedders: add `expected_records` to `EngineConfig` literals that need it.
+
+### Formats and protocols
+
+- **On-disk formats, client protocol, node-to-node protocol**: unchanged from 0.2.0.
+- **Rust API**: `EngineConfig::expected_records` (new field), `StorageEngine::reserve_records`, `PrimaryIndex::reserve`.
+
+### Release checks
+
+CI on Linux x86_64 and arm64, macOS arm64 and x86_64, and Windows: the test suite, lints, binary sizes and the install scripts. Process chaos, 40 runs on x86_64 and on arm64. The power-loss suite (a crash at every I/O call) also runs with `expected_records` set. Benchmarks against 0.2.1, LMDB and RocksDB (section 8.11). Not repeated: the soaks, SDK suites and sanitizers, since replication, the protocols, the clients and the `unsafe` code are unchanged since 0.2.0.
 
 ### Added
-- `EngineConfig::expected_records` and `StorageEngine::reserve_records`: size the primary index up front so a bulk load does not pause while its tables double (fill p99.99 1.1 ms → 23–30 µs). A checkpoint load sizes the index from its entry count.
 
-### Changed
-- The flush queue no longer grows its dedup set under its lock; the flusher grows it ahead of time. The worst 4-writer overwrite stall fell from 6.5–8.1 ms to 4.3–4.6 ms.
+- **`EngineConfig::expected_records`** and **`StorageEngine::reserve_records(n)`** size the primary index for a known number of records, so a bulk load doesn't pause each time the index doubles (fill p99.99 1.1 ms → 23–30 µs, level with RocksDB). The memory is what the index reaches at that size anyway, taken up front: 150–300 bytes per record. Default 0: grow as before.
+- A restart sizes the index from the checkpoint's record count instead of growing it while loading.
+
+### Fixed
+
+- **4–8 ms write stalls with several writers.** A writer could rebuild the flush queue's duplicate check under the queue lock while every other writer waited. The background flusher now grows and pre-touches it outside the lock. The remaining 99.99th percentile with four writers on four CPUs (2.2–2.5 ms) comes from the scheduler, with more busy threads than CPUs; with a CPU to spare it is about 70 µs.
+- A WAL test could fail on a slow machine before its truncations overlapped the writers (seen once on Windows CI). Test only.
 
 ## 0.2.1 (2026-11-16)
 

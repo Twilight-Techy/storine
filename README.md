@@ -151,7 +151,7 @@ Clients list the servers and find the leader themselves: `storine://token@10.0.0
 
 ## Status
 
-Storine is young: 0.2 is its third release. Its test suite, crash tests and 2-hour soak tests under constant faults pass on every release, but it has not yet run in production for long. Read the [known limitations](CHANGELOG.md) before you rely on it, and back up.
+Storine is young: 0.3 is its fifth release. Its test suite and crash tests pass on every release, and 2-hour soak tests under constant faults passed for 0.2, but it has not yet run in production for long. Read the [known limitations](CHANGELOG.md) before you rely on it, and back up.
 
 ## License
 
