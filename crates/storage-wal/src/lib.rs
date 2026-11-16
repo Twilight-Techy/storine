@@ -2375,7 +2375,8 @@ mod tests {
 
     /// Writers that log faster than a truncation can copy keep logging while it runs, and are
     /// held together only for the last few MiB. The copy is slowed to about 50 MiB/s (20 ms per
-    /// 1 MiB chunk) so the writers outpace it on any machine. Throttled, each writer waits for
+    /// 1 MiB chunk) and the two writers paced at about 100 MiB/s each, so they outpace it by the
+    /// same margin on any machine. Throttled, each writer waits for
     /// the next copied chunk; the locked copy that ends the truncation has about
     /// [`TRUNCATE_THROTTLE_FLOOR`] left. Before, a copy that could not gain on the writers took
     /// the lock and copied everything they had got ahead by, holding every writer for all of it
@@ -2397,10 +2398,17 @@ mod tests {
                 let id = InlineId::new(&format!("t{t}")).unwrap();
                 let noise = incompressible(32 * 1024);
                 let (mut lsns, mut worst) = (Vec::new(), std::time::Duration::ZERO);
-                // As fast as memory takes it, until told to stop (at most 512 MiB each).
+                // About 100 MiB/s each, four times the copy's pace together, until told to stop
+                // (at most 512 MiB each). Paced so the ratio is the same on any machine: unpaced,
+                // fast runners wrote all of it before the first truncation could throttle them.
+                let began = std::time::Instant::now();
                 for v in 0..16_384u64 {
                     if stop.load(Ordering::Relaxed) {
                         break;
+                    }
+                    let due = std::time::Duration::from_micros(v * 320);
+                    if let Some(wait) = due.checked_sub(began.elapsed()) {
+                        std::thread::sleep(wait);
                     }
                     let started = std::time::Instant::now();
                     lsns.push(w.append_single(1, WalOpKind::Upsert, id, Version(v), &noise).unwrap());

@@ -1037,4 +1037,4 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Verified**: console unit and end-to-end tests, a new test that the page loads nothing from another origin, clippy, and a headless Chromium run through every view in light, dark and phone layouts.
 - **Also fixed**: `storage-server --help` now prints help instead of starting a server (`8c990fe`).
 - **Also fixed**: collections made only of documents are now listed (standalone and single-group servers), so they appear in the console's sidebar and in `collections()`.
-- **Stronger test**: the concurrent WAL truncation test now slows the copy and counts the bytes copied while every writer is held (at most 21 MiB). The code before the throttle fails it with 122–154 MiB; the old version of the test passed on it.
+- **Stronger test**: the concurrent WAL truncation test now slows the copy and counts the bytes copied while every writer is held (at most 21 MiB), with writers paced at a fixed multiple of the copy's speed. The code before the throttle fails it with 57 MiB; the old version of the test passed on it.
