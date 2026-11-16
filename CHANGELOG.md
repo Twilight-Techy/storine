@@ -2,6 +2,14 @@
 
 Versions follow [Semantic Versioning](https://semver.org). Before 1.0, a minor version (0.x) may change on-disk or wire formats; [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) says what each kind of release may change and how to upgrade.
 
+## Unreleased
+
+### Added
+- `EngineConfig::expected_records` and `StorageEngine::reserve_records`: size the primary index up front so a bulk load does not pause while its tables double (fill p99.99 1.1 ms → 23–30 µs). A checkpoint load sizes the index from its entry count.
+
+### Changed
+- The flush queue no longer grows its dedup set under its lock; the flusher grows it ahead of time. The worst 4-writer overwrite stall fell from 6.5–8.1 ms to 4.3–4.6 ms.
+
 ## 0.2.1 (2026-11-16)
 
 A patch release: clearer command-line messages, and the documentation website. The engine, the protocols and the on-disk formats are those of 0.2.0.

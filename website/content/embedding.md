@@ -92,6 +92,7 @@ Give a record type a `SCHEMA_VERSION`. Records written by an older version are u
 | `index_tier` | `Memory` | `Paged` keeps secondary indexes in memory-mapped pages on disk |
 | `primary_tier` | `Memory` | `Cold` keeps the primary index as of the last checkpoint on disk |
 | `encryption`, `decrypted_cache_bytes` | none, 256 MiB | Encryption at rest, below |
+| `expected_records` | `0` | About how many records the store will hold. The primary index is sized for that many at open, so a bulk load doesn't pause while its tables double. Costs 150–300 bytes per expected record up front, the memory the index would reach at that size anyway. `reserve_records(n)` does the same on an open store, before an import |
 
 ### Layouts
 

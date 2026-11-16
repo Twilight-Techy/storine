@@ -222,6 +222,38 @@ impl PrimaryIndex {
         }
     }
 
+    /// Makes room for `additional` more records, so the shard tables and the ordinal table do
+    /// not grow (rehash or copy whole, under their lock) while writes run. A shard's table
+    /// grows by doubling, so without this a bulk load stalls a write at each doubling: about
+    /// 380 times for a million records, each for up to ~0.7 ms on 4 vCPUs.
+    ///
+    /// Shards get an even share plus 1/16 and 64 entries of slack for hash skew. With a cold
+    /// tier attached RAM holds only changes since the last checkpoint, so nothing is reserved.
+    pub fn reserve(&self, additional: usize) -> Result<()> {
+        if additional == 0 || self.is_tiered() {
+            return Ok(());
+        }
+        let share = additional / PRIMARY_SHARDS;
+        let per_shard = share + share / 16 + 64;
+        for idx in 0..PRIMARY_SHARDS {
+            let mut shard = self.write_shard(idx);
+            let want = per_shard.saturating_sub(shard.by_id.capacity() - shard.by_id.len());
+            shard
+                .by_id
+                .try_reserve(want)
+                .map_err(|_| StorageError::resource_exhausted("primary index memory"))?;
+        }
+        let mut table = self.write_table();
+        if table.cold.is_none() {
+            let spare = table.ids.capacity() - table.ids.len();
+            table
+                .ids
+                .try_reserve(additional.saturating_sub(spare))
+                .map_err(|_| StorageError::resource_exhausted("ordinal table memory"))?;
+        }
+        Ok(())
+    }
+
     /// Keeps live ids in byte order from now on (call before serving: ids written while it
     /// runs may be missed). `O(N log N)` once, then `O(log N)` per new or removed id.
     pub fn enable_ordered_ids(&self) {
@@ -1000,6 +1032,59 @@ mod tests {
         entries.sort_by_key(|e| e.0);
         let (ords, _) = idx.scan_ordinals_paginated(false, None, 0, None, |_, _| true);
         (entries, ords.into_iter().map(|(o, id)| (o.0, id)).collect(), idx.len())
+    }
+
+    /// Capacity of every shard table and of the ordinal table.
+    fn capacities(idx: &PrimaryIndex) -> (Vec<usize>, usize) {
+        let shards = (0..PRIMARY_SHARDS).map(|i| idx.read_shard(i).by_id.capacity()).collect();
+        (shards, idx.read_table().ids.capacity())
+    }
+
+    #[test]
+    fn test_reserve_keeps_tables_from_growing_during_a_load() {
+        const N: usize = 50_000;
+        let idx = PrimaryIndex::new();
+        idx.reserve(N).unwrap();
+        let before = capacities(&idx);
+        assert!(before.1 >= N);
+        for i in 0..N {
+            let id = InlineId::new(&format!("user:{i:08}")).unwrap();
+            let mut e = entry(id);
+            e.ordinal = idx.allocate_ordinal(id);
+            idx.upsert(e);
+        }
+        assert_eq!(idx.len(), N);
+        assert_eq!(capacities(&idx), before, "a table grew during a reserved load");
+        // Reserving no more than the room left changes nothing.
+        let fresh = PrimaryIndex::new();
+        fresh.reserve(N).unwrap();
+        let sized = capacities(&fresh);
+        fresh.reserve(N / 2).unwrap();
+        assert_eq!(capacities(&fresh), sized);
+    }
+
+    #[test]
+    fn test_checkpoint_load_sizes_the_index_once() {
+        let dir = std::env::temp_dir().join(format!("storine-reserve-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("p.idx");
+        let src = PrimaryIndex::new();
+        for i in 0..20_000 {
+            let id = InlineId::new(&format!("k{i}")).unwrap();
+            let mut e = entry(id);
+            e.ordinal = src.allocate_ordinal(id);
+            src.upsert(e);
+        }
+        crate::save_primary_checkpoint(&src, &path).unwrap();
+        let loaded = PrimaryIndex::new();
+        crate::load_primary_checkpoint(&loaded, &path).unwrap();
+        assert_eq!(observe(&loaded), observe(&src));
+        // Sized up front: the even share plus slack is at least what each shard holds.
+        for i in 0..PRIMARY_SHARDS {
+            let s = loaded.read_shard(i);
+            assert!(s.by_id.capacity() >= 20_000 / PRIMARY_SHARDS, "shard {i} undersized");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

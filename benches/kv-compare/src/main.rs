@@ -161,6 +161,9 @@ impl<T: BenchRecord> Storine<T> {
             wal_sync_policy: policy,
             // `KV_HOT_DIRTY_MB`: the unflushed-data cap (experiments only; default 64 MiB).
             max_hot_dirty_bytes: std::env::var("KV_HOT_DIRTY_MB").ok().and_then(|v| v.parse::<usize>().ok()).map_or(64 << 20, |m| m << 20),
+            // The load size is known, as LMDB's map size is: size the index for it.
+            // `KV_NO_RESERVE=1` leaves it to grow (for A/B runs).
+            expected_records: if std::env::var_os("KV_NO_RESERVE").is_some() { 0 } else { n },
             ..EngineConfig::default()
         };
         let engine = StorageEngine::open(dir, cfg).expect("open storine");

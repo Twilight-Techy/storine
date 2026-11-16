@@ -3,7 +3,7 @@ title: Known limitations
 description: What Storine does not do yet, and where it trails other databases.
 ---
 
-- **Tail latency** trails RocksDB and LMDB in some cases: fill p99.99 (about 0.7 ms against RocksDB's 16–20 µs), 4-writer overwrite p99.99 (2.1–3.0 ms against 0.5–1.3 ms), and durable p99.9 and p99.99 against LMDB ([benchmark report](../../../docs/BENCHMARK_REPORT.md), sections 8.4–8.5).
+- **Tail latency** trails RocksDB in one case: 4 writers overwriting on 4 CPUs, p99.99 2.2–2.5 ms against 0.26–0.30 ms. That is the scheduler: four writers plus the flusher are more busy threads than CPUs. With a CPU to spare, it is about 70 µs. Bulk loads match RocksDB when the store is told its size (`expected_records`). Durable p99.9 and p99.99 trail LMDB on fast-sync disks ([benchmark report](../../../docs/BENCHMARK_REPORT.md), sections 8.5 and 8.11).
 - **Single-group cluster writes wait for two disk syncs** in a row, the leader's log and then a follower's: about 8 ms on disks whose syncs take 4 ms. Concurrency raises throughput (section 8.8).
 - **The server does not expose the cold and paged index tiers**. They are in the [embedded API](../embedding.md#cold-tiers).
 - **Point-in-time recovery is not available on range clusters**, which have cluster backups instead.

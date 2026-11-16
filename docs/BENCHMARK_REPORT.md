@@ -621,3 +621,30 @@ Same machine as section 8.9. `compaction-cost` writes as fast as it can in memor
 | Three-node cluster, 16 clients | 372 | 377 |
 
 Engine and reactor rows were within noise. The server's default sync policy logs much slower than this disk copies, so it never reaches the throttle.
+
+### 8.11 Bulk-load sizing and the 4-writer tail (`TASK-162`, 2026-11-16)
+
+Same harness (`benches/kv-compare`, 1,000,000 records of 288 bytes, 4 threads) on an Azure `Standard_D4s_v4` (4 vCPU Xeon Platinum 8272CL, Premium SSD, kernel 7.0, `target-cpu=native`). This CPU is older than section 8.5's, so compare rows within this section only. "Before" is `v0.2.1`; three alternating rounds; ranges are the lowest and highest.
+
+**Fill p99.99.** The cause was known (section 8.3): a primary-index shard rehashes whole each time it doubles. `EngineConfig::expected_records` (and `StorageEngine::reserve_records`) now sizes every shard and the ordinal table once, up front; the harness passes the load size, as LMDB is given a map size. A checkpoint load also sizes the index from its entry count.
+
+| | Before | After, sized | After, `KV_NO_RESERVE=1` | RocksDB no WAL | LMDB |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| fill, ops/s | 473–497 k | 488–502 k | 464–494 k | 280–373 k | 111–112 k |
+| fill p99.9 | 17.8–18.5 µs | 15.0–17.8 µs | 17.8–19.3 µs | 15.7–17.3 µs | 24.7–25.2 µs |
+| fill p99.99 | 1.11–1.13 ms | **23–30 µs** | 1.13–1.20 ms | 26–37 µs | 43–47 µs |
+
+**4-writer overwrite tail, traced** (`perf sched` and off-CPU stacks matched to operations over 1 ms):
+- The worst stalls (4–8 ms) were one writer rehashing the flush queue's dedup set under the queue lock while the other three slept on it. The set keeps its capacity between takes but grew whenever a take was larger than any before. Now the flusher reserves twice the last take outside the lock and touches the new memory there (page faults under the lock could sleep behind another thread's `mprotect`). A writer that still finds the set full queues the id without remembering it rather than rehashing; a duplicate is harmless (the second copy finds the record clean, or is marked dead).
+- What remains is the scheduler. Four writers and the flusher are five busy threads on four CPUs. A writer woken from a short lock wait is placed on its waker's CPU and waits out the waker's slice (2.1 ms on this kernel) while other CPUs idle; the p99.99 sits at that slice. With three writers, leaving the flusher a CPU, p99.99 is **69 µs** at the same throughput (904 k/s). A 0.3 ms slice halves it. Tried and not kept: yielding for up to 200 µs before blocking (no change), and the flusher at `SCHED_IDLE` (p99.99 1.2–1.9 ms but 10 % fewer writes, and the dirty budget filled).
+
+| overwrite, 4 threads | Before | After | RocksDB no WAL | RocksDB WAL | LMDB |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| ops/s | 865–951 k | 905–933 k | 283–306 k | 152–166 k | 65–67 k |
+| p99.9 | 0.20–0.33 ms | 0.23–0.29 ms | 53–76 µs | 0.23–0.33 ms | 11–12 ms |
+| p99.99 | 2.3–2.6 ms | 2.2–2.5 ms | **0.26–0.30 ms** | 2.7–2.9 ms | 33–40 ms |
+| max | 6.5–8.1 ms | **4.3–4.6 ms** | 1.1–146 ms | 3.3–5.4 ms | 151–213 ms |
+
+**Durable puts on this disk** (Premium SSD, about 2 ms per sync): Storine's 4-writer p99.99 is 21–22 ms against RocksDB's 26–32 ms; LMDB's starved writers hit the harness's 4.29 s cap. Unchanged by this work, as expected.
+
+**Verified:** `storage-index` and `storage-core` unit tests and clippy locally; new tests `test_reserve_keeps_tables_from_growing_during_a_load`, `test_checkpoint_load_sizes_the_index_once`, `full_dedup_set_queues_without_growing`. One on-demand `D4s_v4` for about 2 h 15 min (about $0.45), deleted.

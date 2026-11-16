@@ -1060,3 +1060,9 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 ## 2026-11-16: 0.2.1
 
 - A patch release for the `storage-cli --help` fix and clearer configuration errors. Since `v0.2.0` only command-line messages, documentation and tests changed, so the release checks were CI on five platforms and the release workflow's install verification; the chaos, soak, SDK and sanitizer checks were not repeated.
+
+## 2026-11-16: bulk-load sizing and the 4-writer tail (`TASK-162`)
+
+- **Fill**: the primary index can be sized up front (`expected_records`, `reserve_records`); checkpoint loads size it from their count. Fill p99.99 went from 1.1 ms to 23–30 µs, level with RocksDB on the same VM.
+- **4-writer overwrite**: the 4–8 ms stalls were a writer rehashing the flush queue's dedup set under its lock. The flusher now grows and pre-touches it outside the lock, and a full set no longer grows under it. Max 6.5–8.1 → 4.3–4.6 ms. The p99.99 of 2.2–2.5 ms is scheduler placement with more busy threads than CPUs (69 µs with three writers). Details in section 8.11 of the benchmark report.
+- **Cost**: one Azure D4s_v4 for about 2 h 15 min, deleted.

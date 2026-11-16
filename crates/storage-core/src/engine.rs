@@ -193,6 +193,13 @@ pub struct EngineConfig {
     /// Byte budget of the decrypted-frame cache used when `encryption` is set
     /// (default 256 MiB). Warm reads of cached records allocate nothing.
     pub decrypted_cache_bytes: usize,
+    /// About how many records the store will hold (default 0: grow as needed). The primary
+    /// index is sized for this many at open, so a bulk load does not stall writes while its
+    /// tables double. The memory (150-300 bytes per expected record: the tables round up to
+    /// powers of two) is taken at open rather than as records arrive, and is what the index
+    /// would reach at that size anyway. Too high a guess holds memory for nothing; too low a
+    /// guess only means the tables grow past it as before.
+    pub expected_records: usize,
 }
 
 impl Default for EngineConfig {
@@ -214,6 +221,7 @@ impl Default for EngineConfig {
             primary_tier: PrimaryTier::Memory,
             encryption: None,
             decrypted_cache_bytes: 256 * 1024 * 1024,
+            expected_records: 0,
         }
     }
 }
@@ -345,6 +353,21 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// A distinct id for each `i` below 2^32, built without allocating (pre-touching memory only).
+fn filler_id(i: usize) -> InlineId {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut raw = [0u8; 24];
+    raw[0] = 8;
+    for (k, b) in raw[1..9].iter_mut().enumerate() {
+        *b = HEX[(i >> (28 - 4 * k)) & 15];
+    }
+    InlineId::from_raw_bytes(raw).unwrap_or(InlineId::EMPTY)
+}
+
+/// Capacity from which a writer stops growing the flush queue's dedup set under the queue lock
+/// (rehashing 4,096 ids takes microseconds; a set of 100,000 takes milliseconds).
+const QUEUE_SET_GROW_LIMIT: usize = 4096;
+
 /// Deduplicated dirty-record queue for Write Coalescing (`TASK-015`, `F-CONC-04`).
 ///
 /// Writers add to it under one lock at up to millions of ids a second, and when the flusher
@@ -366,9 +389,18 @@ struct CoalescingQueue {
 impl CoalescingQueue {
     #[inline]
     fn enqueue(&mut self, id: InlineId) -> bool {
-        if !self.in_queue.insert(id) {
+        if self.in_queue.len() < self.in_queue.capacity() || self.in_queue.capacity() < QUEUE_SET_GROW_LIMIT {
+            if !self.in_queue.insert(id) {
+                return false;
+            }
+        } else if self.in_queue.contains(&id) {
             return false;
         }
+        // A full set of `QUEUE_SET_GROW_LIMIT` or more ids is not grown here: that rehashes it whole under the queue lock while every
+        // writer waits (traced at 2-6 ms on 4 vCPUs). The id is queued unremembered instead, so
+        // it may be queued twice; the flush publishes only the first copy (the second finds the
+        // record clean, and a batched second copy is marked dead). The flusher grows the set
+        // outside the lock before the queue is reused (`reserve_ids`).
         if self.chunks.back().is_none_or(|c| c.len() == FLUSH_BATCH) {
             let chunk = self.free.pop().unwrap_or_else(|| Vec::with_capacity(FLUSH_BATCH));
             self.chunks.push_back(chunk);
@@ -419,6 +451,33 @@ impl CoalescingQueue {
         self.free.truncate(max_ids / FLUSH_BATCH);
         self.len = 0;
         self.in_queue.clear();
+    }
+
+    /// Makes room for `ids` more ids, in the dedup set and in free chunks, with the memory
+    /// already touched: call it outside the queue lock. A writer that page-faults on fresh
+    /// memory under the lock can sleep behind another thread's `mprotect` (glibc growing a heap
+    /// for a frame allocation), and every writer then waits on the lock (traced at 1-4 ms).
+    fn reserve_ids(&mut self, ids: usize) {
+        let room = self.in_queue.capacity().saturating_sub(self.in_queue.len());
+        if ids > room {
+            let before = self.in_queue.capacity();
+            let grown = self.in_queue.try_reserve(ids - room).is_ok() && self.in_queue.capacity() > before;
+            if grown && self.in_queue.is_empty() {
+                // A fresh table: fill it to capacity (no growth) and clear it, so every bucket
+                // page is resident before writers use it.
+                for i in 0..self.in_queue.capacity() {
+                    self.in_queue.insert(filler_id(i));
+                }
+                self.in_queue.clear();
+            }
+        }
+        let chunks = ids.div_ceil(FLUSH_BATCH);
+        while self.free.len() < chunks {
+            let mut chunk = Vec::with_capacity(FLUSH_BATCH);
+            chunk.resize(FLUSH_BATCH, InlineId::EMPTY);
+            chunk.clear();
+            self.free.push(chunk);
+        }
     }
 
     fn recycle(&mut self, mut chunk: Vec<InlineId>) {
@@ -698,6 +757,7 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         let cold_manifest = base_dir.join("indexes").join(format!("{stem}_primary.cold"));
         let open_seal = file_seal(config.encryption.as_ref());
         let primary_stamp = load_primary_state(&primary, &idx_path, &cold_manifest, config.primary_tier, &open_seal)?;
+        primary.reserve(config.expected_records.saturating_sub(primary.len()))?;
         let floor_path = base_dir.join(format!("{stem}.vfloor"));
         let version_floor = load_version_floor(&floor_path)?;
 
@@ -2198,6 +2258,13 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         self.inner.checkpoint_and_truncate(lsn)?;
         let copied = copy_dir_recursive(self.inner.paths.base_dir(), dest_dir)?;
         Ok((copied, lsn))
+    }
+
+    /// Makes room in the primary index for `additional` more records, as
+    /// [`EngineConfig::expected_records`] does at open: call it before a bulk import so writes
+    /// do not stall while the index tables double. Takes each index lock once.
+    pub fn reserve_records(&self, additional: usize) -> Result<()> {
+        self.inner.primary.reserve(additional)
     }
 
     /// Returns a snapshot of engine telemetry and performance counters (`F-OPS-06`).
@@ -3817,6 +3884,7 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                 // anew; a flush that finds a record clean skips it.
                 std::mem::replace(&mut *q, std::mem::take(&mut spare))
             };
+            let taken = queued.len();
             let mut failed_at = None;
             for (n, batch) in queued.chunks.iter().enumerate() {
                 if !self.flush_ids(batch, interval) {
@@ -3834,7 +3902,12 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
             }
             // Kept for the next take: its chunks and set stay allocated and resident, so
             // writers refilling it touch no fresh memory.
-            queued.clear_for_reuse(self.spare_flush_queue_ids());
+            let max_ids = self.spare_flush_queue_ids();
+            queued.clear_for_reuse(max_ids);
+            // Grow its dedup set here, outside the lock, to twice the largest take seen: a
+            // writer that outgrows it rehashes the whole set under the queue lock, and every
+            // other writer waits (traced at 4-6 ms on 4 vCPUs).
+            queued.reserve_ids((taken * 2).min(max_ids));
             spare = queued;
         }
     }
@@ -4667,11 +4740,41 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<usize> {
 
 #[cfg(test)]
 mod coalescing_queue_tests {
-    use super::{CoalescingQueue, FLUSH_BATCH};
+    use super::{CoalescingQueue, FLUSH_BATCH, QUEUE_SET_GROW_LIMIT};
     use storage_types::InlineId;
 
     fn id(i: usize) -> InlineId {
         InlineId::new(&format!("r{i}")).unwrap()
+    }
+
+    /// A full set past the grow limit stops growing under the lock: ids are still queued (some
+    /// possibly twice), none is lost, and the set grows only through `reserve_ids`.
+    #[test]
+    fn full_dedup_set_queues_without_growing() {
+        let mut q = CoalescingQueue::default();
+        q.reserve_ids(QUEUE_SET_GROW_LIMIT);
+        let cap = q.in_queue.capacity();
+        let n = cap + 3 * FLUSH_BATCH;
+        for i in 0..n {
+            q.enqueue(id(i));
+        }
+        assert_eq!(q.in_queue.capacity(), cap, "set grew under the lock");
+        // Remembered ids still coalesce; past the set's room an id may be queued again.
+        assert!(!q.enqueue(id(0)));
+        let mut out = q.drain_batch(usize::MAX);
+        assert_eq!(out.len(), n);
+        out.sort_unstable();
+        out.dedup();
+        assert_eq!(out.len(), n, "every id queued exactly once here");
+        q.clear_for_reuse(10 * FLUSH_BATCH);
+        q.reserve_ids(2 * n);
+        assert!(q.in_queue.capacity() >= 2 * n);
+        assert!(q.in_queue.is_empty(), "pre-touching leaves the set empty");
+        assert!(q.free.len() * FLUSH_BATCH >= 2 * n);
+        assert!(q.free.iter().all(|c| c.is_empty() && c.capacity() == FLUSH_BATCH));
+        let fillers: std::collections::HashSet<_> = (0..100_000).map(super::filler_id).collect();
+        assert_eq!(fillers.len(), 100_000);
+        assert!(!fillers.contains(&InlineId::EMPTY));
     }
 
     /// Ids come out once each, in arrival order, across chunk boundaries and partial drains,

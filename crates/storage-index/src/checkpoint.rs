@@ -534,6 +534,8 @@ fn load_v3(index: &PrimaryIndex, body: &[u8], count: u64) -> Result<usize> {
             "checkpoint entry count exceeds file size",
         ));
     }
+    // Sized once from the validated count instead of doubling through the load.
+    index.reserve(count as usize)?;
     let mut cursor = 24usize;
     for _ in 0..count {
         index.restore_entry_at(decode_v3_entry(body, &mut cursor)?)?;
@@ -554,6 +556,7 @@ fn load_v2(index: &PrimaryIndex, body: &[u8], count: u64) -> Result<usize> {
             "checkpoint entry count exceeds file size",
         ));
     }
+    index.reserve(count as usize)?;
     let mut cursor = 16usize;
     for _ in 0..count {
         let entry = decode_v2_entry(body, &mut cursor)?;
