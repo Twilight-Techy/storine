@@ -1038,3 +1038,14 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Also fixed**: `storage-server --help` now prints help instead of starting a server (`8c990fe`).
 - **Also fixed**: collections made only of documents are now listed (standalone and single-group servers), so they appear in the console's sidebar and in `collections()`.
 - **Stronger test**: the concurrent WAL truncation test now slows the copy and counts the bytes copied while every writer is held (at most 21 MiB), with writers paced at a fixed multiple of the copy's speed. The code before the throttle fails it with 57 MiB; the old version of the test passed on it.
+
+## 2026-11-16: 0.2.0 release checks
+
+- **Process chaos**: 40/40 on x86_64 (Azure D4s_v4) and 40/40 on arm64 (this Graviton2 machine), then 10/10 on each after the `NotLeader` fix.
+- **Soaks**, 2 h each on D4s_v4 (4 vCPU; the student quota allows no 8-vCPU VM): both passed. Range cluster 630–750 MiB per node, flat; single group 850–940 MiB, nearly flat. Side by side for 10 minutes on the same VM size, 0.1.1 used 744–760 MiB for 5,191 writes and 0.2.0 813–846 MiB for 27,181: no regression, the 0.1.0 figure (334 MiB) came from another machine.
+- **SDKs**: 8 suites, one server and range clusters. The Python cluster test found `NotLeader` replies carrying error text in the address field (fixed, `662bfad`); all 16 runs pass after. Go's suite needs `-count=1` when only the server binary changes: it caches results otherwise.
+- **Upgrade from 0.1.1**: single server (clean stop and kill), 3-node cluster and range cluster; every document, index and indexed query read back, then writes and a restart.
+- **Miri and AddressSanitizer** clean. The checklist command needed an absolute suppressions path, a symbolizer and the full unwinder (`RELEASE.md` fixed).
+- **CI** found the rewritten WAL test (`TASK-159`) passing vacuously on fast runners: its writers finished before the throttle engaged. Writers are paced now (`3a1ac16`).
+- **Install scripts** pass on Linux x86_64 and arm64, macOS arm64 and x86_64, and Windows (PowerShell 5.1 and 7) against 0.1.1.
+- **Cost**: three Azure VMs for about 2.5 hours, deleted after; no AWS or Modal.

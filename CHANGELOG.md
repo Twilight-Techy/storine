@@ -2,12 +2,33 @@
 
 Versions follow [Semantic Versioning](https://semver.org). Before 1.0, a minor version (0.x) may change on-disk or wire formats; [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) says what each kind of release may change and how to upgrade.
 
-## Unreleased
+## 0.2.0 (2026-11-16)
 
-Three features that existed only in the embedded engine are now in the server: encryption at rest, point-in-time recovery and multi-region placement ([`docs/TECHNICAL.md`](docs/TECHNICAL.md) sections 7, 8 and 13).
+Three features that existed only in the embedded engine are now in the server: encryption at rest, point-in-time recovery and multi-region placement ([`docs/TECHNICAL.md`](docs/TECHNICAL.md) sections 7, 8 and 13). Single-group cluster writes are 5–8× faster, checkpoints end under any write load, the web console was redesigned, and install scripts set Storine up in one line.
+
+**Upgrading from 0.1.x**: back up, stop every node, start 0.2.0 on the same data directories ([`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)). Data written by 0.1.1 is read as it is: tested for a single server (stopped cleanly and killed), a 3-node cluster and a 3-node range cluster. Mixed-version clusters are not supported, and 0.1.x cannot open data that 0.2.0 has written.
+
+### Formats and protocols
+
+- **On-disk formats**: read forward from 0.1.x. New only when encryption at rest is turned on: sealed Raft log frames and snapshot records.
+- **Client protocol**: additive. A `NotLeader` reply's body is now always a leader address or empty (see Fixed). Health reports gain the active encryption key and, on range clusters, each node's ranges.
+- **Node-to-node protocol**: every node of a cluster must run 0.2.0.
+
+### Release checks
+
+Run on the release candidate (`docs/RELEASE.md`); the fixes they led to are listed under Fixed.
+
+- **Process chaos**: 40 of 40 runs on x86_64 (Azure, 4 vCPU) and 40 of 40 on arm64 (Graviton2, 2 vCPU), then 10 more on each after the `NotLeader` fix.
+- **Soaks, 2 hours each** on 4-vCPU, 16 GB VMs (the checklist's 8 vCPU did not fit the cloud quota), with 125–141 of each fault (kill, stop, partition, half-open connection, delay): balances conserved and every key linearizable. Range cluster: at most 630–750 MiB per node, flat, disk 104–228 MiB, at most 87 descriptors. Single group: 850–940 MiB per node, nearly flat, disk 50–145 MiB, at most 36 descriptors. That is above the 334 MiB of the 0.1.0 soak, which ran on another machine: in 10-minute soaks on the same VM size, 0.1.1 peaked at 744–760 MiB for 5,191 writes and 0.2.0 at 813–846 MiB for 27,181.
+- **SDKs**: all 8 suites against one server and against a range cluster, with TLS; the Python suite found the `NotLeader` bug, and all 16 runs pass with the fix.
+- **Upgrade**: data written by 0.1.1 (single server stopped cleanly and killed, 3-node cluster, 3-node range cluster) read by 0.2.0, then written to and restarted.
+- **Undefined behaviour**: Miri and AddressSanitizer clean.
+- **Binary sizes** (Linux x86_64 release build): `storage-server` 4.8 MB, `storage-cli` 1.5 MB, `storine-sql` 6.7 MB, `storine-console` 0.83 MB, under the 5.5, 1.75, 8 and 1 MiB ceilings.
+- **Benchmarks**: no regression against 0.1.1 ([`BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) sections 8.9 and 8.10).
 
 ### Added
 
+- **Install scripts**: `curl -fsSL https://github.com/Twilight-Techy/storine/releases/latest/download/install.sh | sh` on Linux and macOS, `irm https://github.com/Twilight-Techy/storine/releases/latest/download/install.ps1 | iex` on Windows. They download the archive for the system, check it against the release's `SHA256SUMS`, and put the four tools on the PATH (`STORINE_VERSION`, `STORINE_INSTALL_DIR`). CI runs them on five platforms, and every release is installed with them after it is published.
 - **Encryption at rest in the server**: `STORAGE_ENCRYPTION_KEYS` names a key file (`storage-server gen-key <file>` makes one; it must be readable by its owner only). Records, the WAL, index files, and now Raft logs and snapshots are sealed. Every start reseals whatever does not match the settings, so turning encryption on (with `STORAGE_ENCRYPTION_ALLOW_PLAINTEXT=1` once), rotating keys and turning it off (`STORAGE_ENCRYPTION_ACTIVE_KEY=none`) each take one restart. Health reports show the active key.
 - **Point-in-time recovery of a server**: `STORAGE_WAL_ARCHIVE=<dir>` archives the WAL at each checkpoint, kept for `STORAGE_WAL_ARCHIVE_RETAIN` (7 days by default). `storage-cli restore-pitr` now restores a server's document data, takes an RFC 3339 time, and reads the archive directory and a leftover WAL directly (`--archive`, `--wal`). Standalone and single-group servers; range clusters keep their cluster backups.
 - **Multi-region placement in range clusters**: localities in `--peers` (`id=host:port@region/zone`) and placement rules in `--zones <file>`: replica counts, required or avoided regions and zones, preferred leaseholder regions, zone or region survival, follower-read staleness, global collections and regional-by-row collections. Health reports list each node's ranges with their voters and leaders. Each node reloads its rules file within 2 seconds of a change; rules that do not fit are refused and reported, and the previous ones stay.
@@ -21,6 +42,7 @@ Three features that existed only in the embedded engine are now in the server: e
 
 ### Fixed
 
+- **`NotLeader` replies could carry error text where clients expect an address**: a write or read that lost leadership on its way through the cluster answered with the error's message in the address field, and clients tried to connect to it (the Python SDK failed with `label too long`). The body is now the leader's address, or empty when it is not known. Present since 0.1.0; found by the release SDK run.
 - **Checkpoints that never ended under constant writes**: a `flush_all` checkpoint kept flushing records that writers re-queued, and the WAL truncation kept chasing writers that logged faster than the disk could copy. Both now end. Writers that outpace the copy are slowed to about half its pace instead of being stopped: the worst write fell from 9–47 s to under 1 s ([`BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) section 8.10).
 - **Collections made only of documents were not listed**: `collections()` in every SDK, the CLI and the console returned only collections with an index or other metadata. Standalone and single-group servers now list every collection holding documents too; range clusters still list declared collections only.
 - **`storage-server --help` started a server** with a data directory named `--help`. `--help`/`-h` now print the options and `--version`/`-V` the version. An unknown option is an error instead of being ignored.
