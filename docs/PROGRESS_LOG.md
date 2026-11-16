@@ -1055,3 +1055,4 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Site**: `website/build.py` builds 46 pages (27 written for the site, 19 rendered from repository documents) into `website/_site`; `.github/workflows/site.yml` publishes it from `main` to GitHub Pages.
 - **Checked**: links and anchors (`--check`), headless Chromium at 1440 and 390 px, light and dark, no console errors or CSP violations; search; every Python example in the guides against a release server; the embedded example runs.
 - **Fixes found while writing it**: `storage-cli --help`, settings error messages, the `AsyncMemoryFirst` durability row in `TECHNICAL.md`, SDK install instructions.
+- **Vercel**: the site is also at https://storine.vercel.app. The Vercel project `storine` is connected to the repository and builds it with `vercel.json` (the same `website/build.py --check`, for the root path), skipping commits that change nothing the site uses.

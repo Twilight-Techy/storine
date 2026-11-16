@@ -1,0 +1,19 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "",
+  "buildCommand": "python3 website/build.py --check --out website/_site --base /",
+  "outputDirectory": "website/_site",
+  "ignoreCommand": "git diff --quiet HEAD^ HEAD -- website vercel.json docs sdks protocol CHANGELOG.md CONTRIBUTING.md README.md Cargo.toml crates/storage-sql/README.md crates/storage-core/examples",
+  "trailingSlash": true,
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
+        { "key": "X-Frame-Options", "value": "DENY" }
+      ]
+    }
+  ]
+}
