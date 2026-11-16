@@ -55,6 +55,16 @@ fn layouts() -> Vec<(&'static str, EngineConfig)> {
             },
         ),
         (
+            // The index sized up front (`TASK-162`): reserved beyond what the workload writes,
+            // and re-sized on every reopen from the checkpoint's count.
+            "arena-sized",
+            EngineConfig {
+                layout_mode: StorageLayoutMode::AdaptiveArena { arena_threshold_bytes: 4096, segment_capacity: 64 * 1024 },
+                expected_records: 4 * IDS as usize * 64,
+                ..base.clone()
+            },
+        ),
+        (
             "paged",
             EngineConfig {
                 layout_mode: StorageLayoutMode::AdaptiveArena { arena_threshold_bytes: 4096, segment_capacity: 64 * 1024 },
