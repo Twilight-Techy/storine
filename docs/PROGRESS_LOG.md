@@ -1036,3 +1036,4 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Changed**: the web console keeps each collection's query, columns and aggregates, recent and saved queries, pins, recent documents and preferences in the browser per server, and unsaved edits for the tab. Added a command palette, keyboard navigation, a live overview, a tree view, column sorting and choice, aggregate charts and undo for deletes. Still no libraries.
 - **Verified**: console unit and end-to-end tests, a new test that the page loads nothing from another origin, clippy, and a headless Chromium run through every view in light, dark and phone layouts.
 - **Also fixed**: `storage-server --help` now prints help instead of starting a server (`8c990fe`).
+- **Also fixed**: collections made only of documents are now listed (standalone and single-group servers), so they appear in the console's sidebar and in `collections()`.

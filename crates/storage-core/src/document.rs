@@ -876,6 +876,9 @@ pub struct DocumentStore {
     meta: RwLock<FastHashMap<String, (Option<Version>, CollectionInfo)>>,
     /// Columnar projections and their background merger (`TASK-126`).
     columnar: Arc<crate::columnar::ColumnarRegistry>,
+    /// Name of each collection tag seen by [`Self::list_collections`], with one ordinal that held
+    /// it, so a later listing checks that ordinal instead of reading a record.
+    collection_names: RwLock<FastHashMap<InlineId, (String, storage_types::RecordOrdinal)>>,
 }
 
 impl core::fmt::Debug for DocumentStore {
@@ -915,6 +918,7 @@ impl DocumentStore {
             sink: RwLock::new(sink),
             meta: RwLock::new(FastHashMap::default()),
             columnar: Arc::new(crate::columnar::ColumnarRegistry::default()),
+            collection_names: RwLock::new(FastHashMap::default()),
         };
         store.reload_metadata()?;
         store.sync_columnar()?;
@@ -977,8 +981,9 @@ impl DocumentStore {
         (current, info)
     }
 
-    /// Every declared collection (one with metadata: created through an index, the SQL adapter
-    /// or [`Self::set_collection_extra`]), sorted by name.
+    /// Every collection, sorted by name: each declared one (with metadata: created through an
+    /// index, the SQL adapter or [`Self::set_collection_extra`]), and each that holds documents
+    /// (with default metadata). `$`-prefixed system collections are left out.
     pub fn list_collections(&self) -> Vec<CollectionInfo> {
         if self.reload_metadata().is_err() {
             return Vec::new();
@@ -990,8 +995,57 @@ impl DocumentStore {
             .values()
             .map(|(_, info)| info.clone())
             .collect();
+        let declared: std::collections::HashSet<String> = v.iter().map(|i| i.name.clone()).collect();
+        for name in self.collections_with_documents() {
+            if !declared.contains(&name) {
+                v.push(CollectionInfo { name, ..Default::default() });
+            }
+        }
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
+    }
+
+    /// Names of the non-system collections holding at least one document. Each document carries
+    /// a tag of its collection's name hash; the name is read from one record the first time a
+    /// tag is seen, after which a point lookup confirms that record still has the tag.
+    fn collections_with_documents(&self) -> Vec<String> {
+        let tags = self.engine.tag_index();
+        let primary = self.engine.primary_index();
+        let live = tags.tags_on_field(COLLECTION_FIELD_ID);
+        let mut cache = self.collection_names.write().unwrap_or_else(|p| p.into_inner());
+        let mut out = Vec::with_capacity(live.len());
+        for &tag in &live {
+            let key = [(COLLECTION_FIELD_ID, tag)];
+            let cached = cache.get(&tag).filter(|(_, ord)| tags.matches_ordinal(*ord, &key, &[], &[])).map(|(n, _)| n.clone());
+            let name = match cached {
+                Some(n) => Some(n),
+                None => {
+                    let found = tags.get_bitmap(COLLECTION_FIELD_ID, tag).to_vec().into_iter().find_map(|ord| {
+                        let id = primary.resolve_ordinal(ord)?;
+                        let name = self.engine.with_ref(id, |view| view.archived().collection.as_str(view.payload()).to_owned()).ok()?;
+                        (collection_tag(&name) == tag).then_some((name, ord))
+                    });
+                    match found {
+                        Some((n, ord)) => {
+                            cache.insert(tag, (n.clone(), ord));
+                            Some(n)
+                        }
+                        None => {
+                            cache.remove(&tag);
+                            None
+                        }
+                    }
+                }
+            };
+            if let Some(n) = name.filter(|n| !n.starts_with('$')) {
+                out.push(n);
+            }
+        }
+        if cache.len() > live.len() {
+            let live: std::collections::HashSet<InlineId> = live.into_iter().collect();
+            cache.retain(|t, _| live.contains(t));
+        }
+        out
     }
 
     // ── Reads ──
@@ -1992,6 +2046,64 @@ mod tests {
 
     fn fields(pairs: &[(&str, PropertyValue)]) -> BTreeMap<String, PropertyValue> {
         pairs.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect()
+    }
+
+    fn names(s: &DocumentStore) -> Vec<String> {
+        s.list_collections().into_iter().map(|i| i.name).collect()
+    }
+
+    #[test]
+    fn collections_with_only_documents_are_listed() {
+        listing_on(crate::engine::IndexTier::Memory, "list_plain_mem");
+    }
+
+    #[test]
+    fn collections_with_only_documents_are_listed_on_paged_indexes() {
+        listing_on(crate::engine::IndexTier::Paged, "list_plain_paged");
+    }
+
+    fn listing_on(tier: crate::engine::IndexTier, name: &str) {
+        let dir = std::env::temp_dir().join(format!("stge_doc_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = || EngineConfig {
+            layout_mode: crate::engine::StorageLayoutMode::AdaptiveArena { arena_threshold_bytes: 256 * 1024, segment_capacity: 16 * 1024 * 1024 },
+            index_tier: tier,
+            ..EngineConfig::default()
+        };
+        let s = DocumentStore::open(&dir, config()).unwrap();
+        let one = || fields(&[("n", PropertyValue::Int64(1))]);
+        s.put("plain", "a", one()).unwrap();
+        s.put("plain", "b", one()).unwrap();
+        s.put("indexed", "a", one()).unwrap();
+        s.create_index("indexed", "n").unwrap();
+        s.create_index("declared_empty", "n").unwrap();
+        // Declared ones keep their metadata; the others get the default. `$meta` stays hidden.
+        assert_eq!(names(&s), ["declared_empty", "indexed", "plain"]);
+        let all = s.list_collections();
+        assert_eq!(all.iter().find(|i| i.name == "indexed").unwrap().indexes, ["n"]);
+        assert!(all.iter().find(|i| i.name == "plain").unwrap().indexes.is_empty());
+        // A second listing uses the cached names and gives the same answer.
+        assert_eq!(names(&s), ["declared_empty", "indexed", "plain"]);
+        // On paged indexes the tags now sit in the checkpointed directory, which still lists
+        // them after their postings are removed.
+        s.engine().checkpoint().unwrap();
+        // Emptied, an undeclared collection disappears, whichever record the cache remembers.
+        s.delete("plain", "a").unwrap();
+        assert_eq!(names(&s), ["declared_empty", "indexed", "plain"]);
+        s.delete("plain", "b").unwrap();
+        assert_eq!(names(&s), ["declared_empty", "indexed"]);
+        s.put("plain", "c", one()).unwrap();
+        assert_eq!(names(&s), ["declared_empty", "indexed", "plain"]);
+        assert_eq!(s.drop_collection("plain").unwrap(), 1);
+        assert_eq!(names(&s), ["declared_empty", "indexed"]);
+        // After a reopen the names come back from the records.
+        s.put("later", "x", one()).unwrap();
+        s.engine().checkpoint().unwrap();
+        drop(s);
+        let s = DocumentStore::open(&dir, config()).unwrap();
+        assert_eq!(names(&s), ["declared_empty", "indexed", "later"]);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -149,6 +149,12 @@ impl TagIndex {
         dispatch!(self, i => i.get_bitmap(field_id, tag))
     }
 
+    /// Every tag on `field_id` with postings; the paged tier may also list a tag emptied since
+    /// its last checkpoint.
+    pub fn tags_on_field(&self, field_id: u16) -> Vec<InlineId> {
+        dispatch!(self, i => i.tags_on_field(field_id))
+    }
+
     /// Exact (memory tier) or upper-bound (paged tier) posting count; `0` only if empty.
     pub fn cardinality(&self, field_id: u16, tag: InlineId) -> usize {
         dispatch!(self, i => i.cardinality(field_id, tag))

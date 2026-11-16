@@ -528,6 +528,17 @@ impl BitmapTagIndex {
             .is_some_and(|bm| bm.contains(ord))
     }
 
+    /// Every tag on `field_id` holding a non-empty bitmap.
+    pub fn tags_on_field(&self, field_id: u16) -> Vec<InlineId> {
+        self.map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(&(f, _), bm)| f == field_id && !bm.is_empty())
+            .map(|(&(_, t), _)| t)
+            .collect()
+    }
+
     /// Every `(field_id, tag)` key currently holding a non-empty bitmap.
     pub fn keys(&self) -> Vec<(u16, InlineId)> {
         self.map

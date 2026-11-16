@@ -388,6 +388,12 @@ impl PagedBitmapIndex {
         st.union_of(&keys)
     }
 
+    /// Every tag on `field_id` that may hold postings: one whose postings were all removed since
+    /// the last checkpoint can still be listed, so callers check the postings they rely on.
+    pub fn tags_on_field(&self, field_id: u16) -> Vec<InlineId> {
+        self.read().keys(|&(f, _)| f == field_id).into_iter().map(|(_, t)| t).collect()
+    }
+
     /// Union of every tag on `field_id` (`IS NOT NULL`).
     pub fn all_on_field_bitmap(&self, field_id: u16) -> CompressedBitmap {
         let st = self.read();
