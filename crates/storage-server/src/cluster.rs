@@ -273,6 +273,18 @@ impl<T: ZeroCopyRecord + Indexable> ClusterContext<T> {
             .unwrap_or_default()
     }
 
+    /// Fills in the body of a `NotLeader` reply that names the leader (`version`) but not its
+    /// address, as replies made from a [`StorageError::NotLeader`] do; any other reply is kept.
+    pub(crate) fn leader_address(&self, reply: JobResponse) -> JobResponse {
+        match reply {
+            (crate::STATUS_NOT_LEADER, leader, body) if body.is_empty() && leader != 0 => match NodeId::try_from(leader) {
+                Ok(id) => (crate::STATUS_NOT_LEADER, leader, self.addr_of(id).into_bytes()),
+                Err(_) => (crate::STATUS_NOT_LEADER, 0, body),
+            },
+            other => other,
+        }
+    }
+
     /// `NotLeader` reply: version = leader node id (`0` unknown), body = leader client address.
     pub(crate) fn not_leader(&self, leader: Option<NodeId>) -> JobResponse {
         let addr = leader.map(|l| self.addr_of(l)).unwrap_or_default();

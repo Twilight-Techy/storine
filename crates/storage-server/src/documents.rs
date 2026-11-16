@@ -136,8 +136,11 @@ pub(crate) fn error_reply(e: &StorageError) -> Reply {
         return (STATUS_COMMIT_UNKNOWN, *index, e.to_string().into_bytes());
     }
     if let StorageError::NotLeader { leader } = e {
-        // Version field carries the leader's node id (0 = unknown).
-        return (STATUS_NOT_LEADER, leader.unwrap_or(0), e.to_string().into_bytes());
+        // Version field carries the leader's node id (0 = unknown). The body is the leader's
+        // address (`PROTOCOL.md`), which is not known here: empty, and the cluster layer fills it
+        // in when it knows the node (`cluster::ClusterContext::leader_address`). Clients connect
+        // to a non-empty body, so it must never hold the error text.
+        return (STATUS_NOT_LEADER, leader.unwrap_or(0), Vec::new());
     }
     body.extend_from_slice(e.to_string().as_bytes());
     (status_for(e), 0, body)
@@ -461,3 +464,18 @@ pub(crate) fn doc_admin(store: &dyn DocBackend, body: &[u8], allow_writes: bool)
     run().unwrap_or_else(|e| error_reply(&e))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `NotLeader` reply's body is a leader address clients connect to: never error text
+    /// (a Python client once tried to resolve "not the leader ..." as a host name).
+    #[test]
+    fn a_not_leader_reply_carries_no_text() {
+        for leader in [None, Some(2)] {
+            let (status, version, body) = error_reply(&StorageError::NotLeader { leader });
+            assert_eq!((status, version), (STATUS_NOT_LEADER, leader.unwrap_or(0)));
+            assert!(body.is_empty(), "body {:?}", String::from_utf8_lossy(&body));
+        }
+    }
+}

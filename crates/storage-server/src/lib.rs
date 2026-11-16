@@ -1323,9 +1323,14 @@ fn drive_connection<T: ZeroCopyRecord + Indexable>(
                 }
                 return ConnStep::Progress;
             }
-            Ok((status, ver, body)) => {
+            Ok(job_reply) => {
                 conn.pending_job = None;
                 conn.deferred = None;
+                // Writes and read barriers that lost leadership on the way name the leader by id.
+                let (status, ver, body) = match shared.cluster {
+                    Some(ref cl) => cl.leader_address(job_reply),
+                    None => job_reply,
+                };
                 return match conn.send_or_queue_response(status, ver, &body) {
                     Ok(()) => ConnStep::Progress,
                     Err(_) => ConnStep::Closed,
