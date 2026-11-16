@@ -54,6 +54,14 @@ Memory-mapped files are counted in the page cache, which the operating system re
 
 Each run makes a new key, so links from an earlier run stop working. Use the link printed by the running console, or set `STORINE_CONSOLE_KEY` for a fixed one. When reaching it through another host name, add `--allow-host`.
 
+## Common questions
+
+**Does a cluster need exactly three servers?** No. A single-group cluster can have up to 256 members; three or five voters are usual because a write needs a majority, and learners add copies without voting. A range cluster spreads data over any number of nodes. See [how many servers](clusters.md#how-many-servers).
+
+**Can I use SQLite, or a SQLite driver?** No: SQLite is a library inside your program, not a server. Use the PostgreSQL endpoint of the SQL gateway, or embed the engine from Rust. See [coming from SQLite](orms.md#coming-from-sqlite).
+
+**Does Storine work with my ORM?** Through the SQL gateway, yes: SQLAlchemy, Django, Prisma, TypeORM, Sequelize, Drizzle, GORM, Hibernate, Entity Framework Core, Eloquent and ActiveRecord are tested. See [using an ORM](orms.md).
+
 ## Still stuck?
 
 Search the [issues](https://github.com/Twilight-Techy/storine/issues), or open one with the version (`storage-server --version`), the operating system, the command line, and the error.

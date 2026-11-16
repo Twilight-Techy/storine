@@ -7,6 +7,8 @@ A **range cluster** splits the key space into **ranges**. Each range is replicat
 
 Use it when the data or the write load is more than three machines should each hold in full, or when you want to [place data by region](placement.md).
 
+A range cluster can have any number of nodes. Each range keeps three replicas by default (1 to 15 with [placement rules](placement.md#rules)), so start with at least three nodes; more nodes spread the ranges further, and each node holds only its share.
+
 ## Starting one
 
 Add `--ranges` to every node:

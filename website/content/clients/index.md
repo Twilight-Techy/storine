@@ -14,7 +14,7 @@ description: Official clients for eight languages share one API, need only their
 | PHP | 8.1 | `Storine\Decimal` | [PHP](../../../sdks/php/README.md) |
 | Ruby | 3.2, with the `bigdecimal` gem | `Storine::Decimal` | [Ruby](../../../sdks/ruby/README.md) |
 
-No SQL driver needed? The [SQL gateway](../../../crates/storage-sql/README.md) lets PostgreSQL, MySQL and SQL Server drivers and ORMs talk to Storine.
+These clients work with documents and are not ORMs. To use an ORM (SQLAlchemy, Django, Prisma, TypeORM, Sequelize, Drizzle, GORM, Hibernate, Entity Framework Core, Eloquent, ActiveRecord), go through the [SQL gateway](../../../crates/storage-sql/README.md): see [using an ORM](../orms.md).
 
 ## Installing
 

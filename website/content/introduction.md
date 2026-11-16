@@ -13,7 +13,7 @@ The engine is written in Rust with no third-party runtime crates. The network se
 | :--- | :--- | :--- |
 | **Embedded** | Link the `storage-core` crate into a Rust program and open a store in a folder | [Embedding the engine](embedding.md) |
 | **Server** | Run `storage-server` and connect from any of eight languages, from SQL tools or from the web console | [Running a server](server.md) |
-| **Cluster** | Start three or five servers that know each other. They replicate with Raft and fail over on their own. With `--ranges`, data is split into ranges spread across nodes and placed by region | [Clusters](clusters.md) |
+| **Cluster** | Start servers that know each other, usually three or five. They replicate with Raft and fail over on their own. With `--ranges`, data is split into ranges spread across any number of nodes and placed by region | [Clusters](clusters.md) |
 
 The data model and the guarantees are the same in all three.
 
@@ -25,7 +25,7 @@ Each release ships four programs for Linux, macOS and Windows:
 | :--- | :--- |
 | `storage-server` | The database server, standalone or as a cluster node. It also creates TLS certificates and encryption keys |
 | `storine-console` | A web console for any server or cluster: browse and edit documents, run aggregates, manage indexes, watch health |
-| `storine-sql` | A gateway that speaks the PostgreSQL, MySQL and SQL Server protocols, so existing apps can use Storine |
+| `storine-sql` | A gateway that speaks the PostgreSQL, MySQL and SQL Server protocols, so existing apps and their ORMs can use Storine ([using an ORM](orms.md)) |
 | `storage-cli` | Administration from the command line: health, metrics, backups, restores, membership changes, change feeds |
 
 Client libraries for Python, TypeScript and JavaScript, Go, Java, C#, Rust, PHP and Ruby live in the repository under `sdks/`. See [Clients](clients/index.md).
@@ -42,6 +42,7 @@ Client libraries for Python, TypeScript and JavaScript, Go, Java, C#, Rust, PHP 
 
 - [Install Storine](installation.md), then follow the [quick start](quick-start.md).
 - Learn the [core concepts](concepts.md): collections, documents, values, versions and request ids.
+- Using SQLAlchemy, Django, Prisma, Hibernate, Entity Framework or another ORM? Read [using an ORM](orms.md).
 - Running it for real? Read [security](security.md), [backups](backups.md) and [monitoring](monitoring.md).
 - Every option on one page: the [configuration reference](reference/configuration.md).
 

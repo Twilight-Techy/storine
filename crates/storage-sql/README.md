@@ -20,7 +20,8 @@ storine-sql --storine storine://h1,h2,h3     # or in front of a running Storine 
             [--kerberos-keytab FILE]         # SQL Server Kerberos logins (below)
 ```
 
-Then point the application at it, exactly as you would at the database it was written for:
+Then point the application at it, exactly as you would at the database it was written for (a
+setup for each tested ORM is in [Using an ORM](../../website/content/orms.md)):
 
 ```text
 postgresql://app:secret@127.0.0.1:5432/shop
@@ -323,7 +324,10 @@ what Django's and Rails' test databases and Prisma's shadow databases rely on.
 - **Not supported**: PostgreSQL extensions other than pgvector's SQL. Unsupported statements fail
   with SQLSTATE `0A000` and a message naming the feature; nothing else is silently ignored except
   session settings that do not apply (e.g. `SET search_path`, `SET NAMES`).
-- An **SQLite** endpoint is not available (SQLite is an in-process library, not a server).
+- An **SQLite** endpoint is not available (SQLite is an in-process library, not a server). Run
+  `storine-sql --data DIR` beside the app and switch its dialect to PostgreSQL, which accepts
+  SQLite's `INSERT OR REPLACE` and `ON CONFLICT`; or embed the engine from Rust
+  ([Using an ORM](../../website/content/orms.md#coming-from-sqlite)).
 
 ## Development
 

@@ -3,13 +3,30 @@ title: Clusters
 description: Replicate a database across three or five servers with Raft, fail over automatically, and change the cluster's members while it runs.
 ---
 
-Three or five servers that list each other form a **single-group cluster**. They keep one copy of the data each, replicated with Raft:
+Servers that list each other form a **single-group cluster**. They keep one copy of the data each, replicated with Raft:
 
 - one node is the **leader**. Writes go to it, and it acknowledges a write once a majority of nodes have it in their logs and it has applied it;
 - the others are **followers**. They apply the log in the background, and answer clients with the leader's address;
 - if the leader stops, the others elect a new one within about a second, and clients follow it on their own.
 
-A cluster of three survives losing one node; a cluster of five survives two. To spread data across more nodes than that, use a [range cluster](range-clusters.md).
+## How many servers
+
+A cluster can have any number of members, up to 256. A write needs a majority of the **voters**, so the number of voters decides how many failures the cluster survives:
+
+| Voters | Majority | Survives losing |
+| ---: | ---: | :--- |
+| 1 | 1 | nothing (use a standalone server instead) |
+| 2 | 2 | nothing: either one stopping halts writes |
+| 3 | 2 | 1 node |
+| 4 | 3 | 1 node |
+| 5 | 3 | 2 nodes |
+| 7 | 4 | 3 nodes |
+
+So **three or five** is the usual choice. An even number adds a machine without surviving more failures, and every extra voter is one more log a write may wait for.
+
+Members can also be **learners**: they receive the whole log and keep a full copy, but do not vote, so they add copies, such as a warm spare, without changing the majority: writes never wait for them. See [changing membership](#changing-membership).
+
+Every node of a single-group cluster holds all the data. To spread data across more nodes than that, so each holds only part of it, use a [range cluster](range-clusters.md), which has no such limit.
 
 ## Starting a cluster
 
