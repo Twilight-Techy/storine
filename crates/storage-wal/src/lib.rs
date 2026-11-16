@@ -2259,9 +2259,13 @@ mod tests {
         let wal_path = dir.join("engine.wal");
         let wal = Arc::new(GroupCommitWal::open(&wal_path, SyncPolicy::AsyncMemoryFirst).unwrap());
         let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        // Writers run until truncations have overlapped them, however slow the disk (a slow CI
-        // runner once finished all writes during the first truncation).
+        // Writers run until truncations have overlapped them, however slow the disk: a slow CI
+        // runner once finished all writes during the first truncation, and a Windows runner once
+        // wrote 200,000 frames per writer before the first one ended. So the bound is time, not
+        // a count. Truncations remove what they cut, so the file stays about as large as the
+        // writers' lead over the copy, which the throttle bounds.
         let truncations_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         let mut handles = Vec::new();
         for t in 0..4u64 {
             let (w, done, truncs) = (Arc::clone(&wal), Arc::clone(&done), Arc::clone(&truncations_done));
@@ -2269,7 +2273,7 @@ mod tests {
                 let id = InlineId::new(&format!("t{t}")).unwrap();
                 let mut lsns = Vec::new();
                 let mut v = 0u64;
-                while v < 4_000 || (truncs.load(Ordering::Relaxed) < 3 && v < 200_000) {
+                while v < 4_000 || (truncs.load(Ordering::Relaxed) < 3 && std::time::Instant::now() < deadline) {
                     lsns.push(w.append_single(1, WalOpKind::Upsert, id, Version(v), &[t as u8; 3 * 1024]).unwrap());
                     v += 1;
                 }
