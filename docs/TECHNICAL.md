@@ -193,6 +193,7 @@ store.checkpoint()?; // cut the WAL: an embedded engine does not do it on its ow
 storage-server [data_dir] [bind_addr] [options]
 storage-server gen-ca <dir>
 storage-server gen-cert <ca-dir> <out-dir> <name>[,<name>...]
+storage-server gen-key <key-file>
 ```
 
 `data_dir` defaults to `./server_data` and `bind_addr` to `127.0.0.1:7878`.
@@ -207,6 +208,10 @@ storage-server gen-cert <ca-dir> <out-dir> <name>[,<name>...]
 | `--records agent` | | Serve the typed demo record engine instead of documents |
 | `--zones FILE` | | Placement rules of a range cluster (section 7), the same file on every node |
 | `--once` | | Start, print the banner and exit (for scripts and tests) |
+| `-h`, `--help` | | Print the options and exit |
+| `-V`, `--version` | | Print the version and exit |
+
+An unknown option is an error, so a mistyped flag never becomes the data directory.
 
 | Environment variable | Meaning |
 | :--- | :--- |

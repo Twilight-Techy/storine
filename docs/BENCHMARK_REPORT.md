@@ -549,3 +549,75 @@ Three Azure VMs in `polandcentral` (two `Standard_D2s_v4` and one `Standard_D2s_
 - **Local runs** (one `t4g` running all three nodes on one disk) also improved, from 26 to about 50–77 writes a second from one client, but they cannot separate the nodes' syncs from each other.
 - An earlier one-round run was invalid: the start script killed `storage-server` by name, the copied binaries had other names, and every row measured the first cluster. Caught because both versions gave identical numbers. The process name is now checked before each run.
 - **Cost**: three VMs for about 45 minutes on Azure for Students credit, deleted afterwards.
+
+### 8.9 v0.1.0, v0.1.1 and `main` side by side (2026-11-15)
+
+The dev workstation: 2 Neoverse-N1 cores (arm64), 8 GB RAM, an EBS volume of about 143 MB/s. Each version was built from its tag, or `main` at `8073f1d`, into its own target directory. The versions ran one after another, once each. Another session's build shared the two cores during the run, so throughput rows move by 20–50% between runs. Median latencies were steadier, so they decide where throughput is noisy. The three-node cluster ran all three nodes on this one machine and disk.
+
+Three-node cluster writes, 4 KiB values (`server-load`, 10 s per row):
+
+| Clients | v0.1.0 | v0.1.1 | `main` |
+| :--- | ---: | ---: | ---: |
+| 1 | 23/s, p50 40 ms | 24/s, p50 40 ms | 88/s, p50 10 ms |
+| 4 | 36/s, p50 100 ms | 35/s, p50 106 ms | 186/s, p50 20 ms |
+| 16 | 40/s, p50 311 ms | 39/s, p50 310 ms | 340/s, p50 46 ms |
+
+This is the `TASK-158` speed-up (section 8.8) on one machine instead of three. Cluster reads stayed at 0.1–0.25 ms p50 in all three versions.
+
+Single server (`server-load`, writes per second and write p50):
+
+| Clients | v0.1.0 | v0.1.1 | `main` |
+| :--- | ---: | ---: | ---: |
+| 1 | 572/s, 1.09 ms | 677/s, 1.08 ms | 834/s, 1.03 ms |
+| 4 | 928/s, 2.93 ms | 844/s, 3.11 ms | 891/s, 2.94 ms |
+| 16 | 869/s, 9.48 ms | 830/s, 9.75 ms | 827/s, 9.88 ms |
+
+The throughput differences follow the shared cores, not the versions: the medians are the same within 4%.
+
+Engine (`bench-runner`, p50 in ns):
+
+| Benchmark | v0.1.0 | v0.1.1 | `main` |
+| :--- | ---: | ---: | ---: |
+| Hot read (`with_ref`) | 104 | 104 | 101 |
+| Mmap arena read (`get_ref`) | 135 | 134 | 133 |
+| Encrypted read, warm cache | 111 | 112 | 114 |
+| Encrypted read, cold decrypt | 1,698 | 1,617 | 1,600 |
+| Cold primary tier | 1,862 | 1,838 | 1,912 |
+| Coalesced hot write | 1,756 | 1,756 | 1,748 |
+| Secondary index (tag bitmap + range) | 4,849 | 4,923 | 4,832 |
+| Cosine similarity, 64-dim | 28 | 29 | 29 |
+| Checksum, 4 KB | 310 | 1,591 | 1,584 |
+
+- **Checksum**: v0.1.1 and `main` match. v0.1.0's 310 ns is not a faster checksum. Its benchmark did not pass the input through `black_box`, so it measured less than one full call. v0.1.1 fixed the benchmark (section 8.6).
+- **Network `GET` frame** (one run each): p50 21, 36 and 23 µs plaintext, and 32, 29 and 70 µs with TLS. These rows swing the most when the cores are shared. The alternating run in section 8.7 found v0.1.0 and the newer code equal (8.9 µs plaintext, 11.6–11.7 µs TLS).
+
+Reactor (`reactor-scale`, p50 per request with idle connections open): 23–43 µs on v0.1.0, 24–41 µs on v0.1.1 and 23–24 µs on `main`, from 0 to 8,000 idle connections.
+
+Analytics (`olap-bench`, 500,000 rows): the first pass of all three showed scattered differences, such as `h15` at 235, 63 and 110 ms. Three alternating rounds of v0.1.1 and `main` on the queries that differed gave minimums of:
+
+| Query | v0.1.1 (ms) | `main` (ms) |
+| :--- | ---: | ---: |
+| h4 | 10.2–12.4 | 10.5–11.9 |
+| h5 | 20.0–23.0 | 19.5–21.4 |
+| h6 | 1.9–2.8 | 2.0–2.5 |
+| h15 | 56.5–61.4 | 58.7–68.4 |
+
+`h15` is the closest call, and probably noise: the load average was 2.2–5.6 on two cores.
+
+`compaction-cost` did not finish on any version. Its `flush` mode never ended under constant writes, and the log filled the 40 GB disk. That was `TASK-159`, fixed in section 8.10. Its `none` mode, which never checkpoints, ran at 139k, 269k and 204k writes a second.
+
+### 8.10 Checkpoints under constant writes (`TASK-159`, 2026-11-15)
+
+Same machine as section 8.9. `compaction-cost` writes as fast as it can in memory-first mode, about 290,000 writes a second. That logs faster than the disk can take a copy of the log.
+
+- **Before**: a `flush_all` checkpoint never ended, because the flush queue and the log truncation both chased the writers. After the first fix alone, the truncation's locked copy held every writer until it caught up: the worst write took 9–47 s.
+- **Now**: every mode finishes. The worst write takes 0.22–0.86 s and throughput is unchanged. Checkpoints take 11–36 s, once 79 s, since the disk cannot go faster. The `compact` mode ends at 121–142 MiB on disk against about 1 GB for `flush`.
+- **Nothing slower**: against the build before `TASK-159`, over four alternating pairs on a quiet machine (medians of writes a second):
+
+| Benchmark | Before | After |
+| :--- | ---: | ---: |
+| Single server, 16 clients | 1,031 | 1,040 |
+| Three-node cluster, 1 client | 111 | 113 |
+| Three-node cluster, 16 clients | 372 | 377 |
+
+Engine and reactor rows were within noise. The server's default sync policy logs much slower than this disk copies, so it never reaches the throttle.

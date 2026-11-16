@@ -17,9 +17,12 @@ Three features that existed only in the embedded engine are now in the server: e
 ### Measured
 
 - Against v0.1.0, with the new features off: no regression in the engine, network or server benchmarks ([`BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) section 8.7). Found on the way, unchanged since 0.1.0: a single-group cluster commits a write in about 90 ms (fixed, see Changed).
+- v0.1.0, v0.1.1 and this code side by side on one arm64 machine: cluster writes 4–9× faster, everything else within noise ([`BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) section 8.9).
 
 ### Fixed
 
+- **Checkpoints that never ended under constant writes**: a `flush_all` checkpoint kept flushing records that writers re-queued, and the WAL truncation kept chasing writers that logged faster than the disk could copy. Both now end. Writers that outpace the copy are slowed to about half its pace instead of being stopped: the worst write fell from 9–47 s to under 1 s ([`BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) section 8.10).
+- **`storage-server --help` started a server** with a data directory named `--help`. `--help`/`-h` now print the options and `--version`/`-V` the version. An unknown option is an error instead of being ignored.
 - **Columnar snapshots could show half a transaction**: a merge running during a multi-document write could store one document's old version while the snapshot read another's new one. Rare: 1 run in 30 of the concurrency test. A changed document is now recorded for the columnar view only once its new version is readable.
 
 ### Changed

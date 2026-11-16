@@ -2,6 +2,7 @@
 //!
 //! Usage: `storage-server [data_dir] [bind_addr] [--max-connections N] [--records agent]
 //!         [--node-id N (--peers 1=host:port,2=host:port,3=host:port | --join)] [--once]`
+//! (`storage-server --help` prints the options; an unknown option is an error.)
 //!
 //! Cluster mode (`--node-id` + `--peers`, every member listed including this one): the node joins
 //! a Raft group; writes go through consensus on the leader, followers redirect clients to it.
@@ -239,9 +240,67 @@ fn spawn_archive_pruner(dir: std::path::PathBuf, retain: Duration) {
     });
 }
 
+/// Flags that take a value, then flags that stand alone.
+const VALUE_FLAGS: [&str; 5] = ["--max-connections", "--records", "--node-id", "--peers", "--zones"];
+const SWITCH_FLAGS: [&str; 3] = ["--once", "--ranges", "--join"];
+
+const USAGE: &str = "\
+usage: storage-server [data_dir] [bind_addr] [options]
+       storage-server gen-ca <dir>
+       storage-server gen-cert <ca-dir> <out-dir> <name>[,<name>...]
+       storage-server gen-key <key-file>
+
+data_dir defaults to ./server_data and bind_addr to 127.0.0.1:7878.
+
+options:
+  --max-connections N   connection ceiling (also STORAGE_MAX_CONNECTIONS)
+  --records agent       serve the legacy typed agent records instead of documents
+  --node-id N           this node's id in a cluster (1-65535)
+  --peers 1=host:port,...
+                        every cluster member, this one included (bootstraps a new cluster)
+  --join                wait to be added to an existing cluster (with --node-id, no --peers)
+  --ranges              run a range cluster node (needs --node-id and --peers)
+  --zones FILE          placement rules for a range cluster
+  --once                start, report the address and exit (for checks)
+  -h, --help            print this help
+  -V, --version         print the version
+
+environment: STORAGE_AUTH_TOKENS, STORAGE_BACKUP_ROOT, STORAGE_RATE_LIMIT,
+STORAGE_TLS_CERT, STORAGE_TLS_KEY, STORAGE_TLS_CA, STORAGE_CLUSTER_TOKEN,
+STORAGE_ENCRYPTION_KEYS, STORAGE_WAL_ARCHIVE, STORAGE_WAL_ARCHIVE_RETAIN.
+See the storage-server docs for what each one does.
+";
+
+/// What the command line asks for before anything is opened: help, the version, or a server.
+/// An unknown flag is an error, so a mistyped flag never becomes a data directory.
+fn early_command(args: &[String]) -> Result<Option<String>> {
+    let mut rest = args.iter().skip(1);
+    while let Some(a) = rest.next() {
+        match a.as_str() {
+            "-h" | "--help" | "help" => return Ok(Some(USAGE.to_string())),
+            "-V" | "--version" => return Ok(Some(format!("storage-server {}\n", env!("CARGO_PKG_VERSION")))),
+            f if VALUE_FLAGS.contains(&f) => {
+                if rest.next().is_none() {
+                    return Err(StorageError::config(format!("{f} needs a value (see storage-server --help)")));
+                }
+            }
+            f if SWITCH_FLAGS.contains(&f) => {}
+            f if f.starts_with('-') => {
+                return Err(StorageError::config(format!("unknown option {f} (see storage-server --help)")));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
 fn run() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if certificate_command(&args)? {
+        return Ok(());
+    }
+    if let Some(text) = early_command(&args)? {
+        print!("{text}");
         return Ok(());
     }
     let positional: Vec<&String> = {
@@ -252,7 +311,7 @@ fn run() -> Result<()> {
                 skip_next = false;
                 continue;
             }
-            if a == "--max-connections" || a == "--records" || a == "--node-id" || a == "--peers" || a == "--zones" {
+            if VALUE_FLAGS.contains(&a.as_str()) {
                 skip_next = true;
                 continue;
             }
