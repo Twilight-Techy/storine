@@ -88,6 +88,8 @@ Prefer building it yourself? `cargo build --release` with Rust 1.82 or newer.
 
 `storine-console` is a web console for any Storine server or cluster. Browse and edit documents (edits check the version, so you never overwrite someone else's change), filter and sort, run grouped aggregates, manage indexes, and watch the cluster and each node's health. It runs on your machine and only a browser holding the link it prints can use it.
 
+It remembers your work in the browser: each collection's filter, sort, columns and aggregates, your recent and saved queries, pinned collections, recently opened documents, and unsaved edits, which survive a reload. Press `Ctrl K` (`⌘K` on a Mac) to jump anywhere, and `?` for the keyboard shortcuts. The page is three files with no libraries and loads nothing from the internet.
+
 | Analytics | Overview, dark mode |
 | :---: | :---: |
 | <img src="docs/images/console-analytics.png" alt="Grouped aggregates by city" width="440"> | <img src="docs/images/console-overview-dark.png" alt="Cluster and health overview in dark mode" width="440"> |

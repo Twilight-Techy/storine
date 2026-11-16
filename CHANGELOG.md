@@ -27,6 +27,7 @@ Three features that existed only in the embedded engine are now in the server: e
 
 ### Changed
 
+- **The web console was redesigned and keeps its state**: each collection's filter, sort, columns and aggregates, recent and saved queries, pinned collections and recent documents are remembered per server in the browser, and unsaved edits survive a reload. New: a command palette (`Ctrl K` / `⌘K`), keyboard navigation, a live overview with sparklines, a tree view of documents, sorting by column headers, a column chooser, compact rows, aggregate charts, downloading a page as JSON, and undo after deleting a document. Still three files with no libraries.
 - **Single-group cluster writes are 5–8× faster**: on three separate machines, 20 → 106 writes a second from one client (p50 47 → 8.3 ms) and 30 → 238 from 16. The leader writes its log outside the Raft state lock, so concurrent writes share one disk sync. The Raft meta file is rewritten in place. The commit index is no longer saved. Entries are applied in batches. Followers acknowledge before applying ([`BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) section 8.8). The durability guarantees are unchanged.
 - With encryption on, Raft log frames and snapshot records are sealed, so a node with encryption can only exchange snapshots with nodes holding the same keys. Data written without encryption is read as before.
 

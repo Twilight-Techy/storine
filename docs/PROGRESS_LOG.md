@@ -1031,3 +1031,8 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **Measured** locally, before/after/after/before: every engine, server, cluster and reactor row within noise. `compaction-cost` finishes, with its worst write at 0.22–0.86 s (9–47 s with a single locked copy).
 - **Verified locally**: four new regression tests (two fail on the old code), the `storage-core`, `storage-wal`, `storage-index` and `storage-mmap` tests, and clippy.
 
+## 2026-11-16: a console that remembers (`TASK-160`)
+
+- **Changed**: the web console keeps each collection's query, columns and aggregates, recent and saved queries, pins, recent documents and preferences in the browser per server, and unsaved edits for the tab. Added a command palette, keyboard navigation, a live overview, a tree view, column sorting and choice, aggregate charts and undo for deletes. Still no libraries.
+- **Verified**: console unit and end-to-end tests, a new test that the page loads nothing from another origin, clippy, and a headless Chromium run through every view in light, dark and phone layouts.
+- **Also fixed**: `storage-server --help` now prints help instead of starting a server (`8c990fe`).

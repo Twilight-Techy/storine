@@ -154,3 +154,22 @@ fn the_console_browses_edits_and_aggregates_a_real_server() {
     assert_eq!(dropped.get("deleted").and_then(Json::as_u64), Some(5));
     assert_eq!(api(port, "GET", "nothing", "").0, 404);
 }
+
+/// The web app ships as three files with no dependencies: nothing may load a script, style,
+/// font or image from anywhere else, and the page's CSP (`http.rs`) would block it anyway.
+#[test]
+fn the_web_app_loads_nothing_from_elsewhere() {
+    for (name, text) in [("index.html", crate::INDEX_HTML), ("app.js", crate::APP_JS), ("app.css", crate::APP_CSS)] {
+        for banned in ["https://", "//cdn", "@import", "import(", "import ", "require(", "<script src=\"http", "url(http", "fonts.g"] {
+            assert!(!text.contains(banned), "{name} contains {banned:?}");
+        }
+        // The only absolute URLs: the SVG namespace and the console's own example link.
+        for (at, _) in text.match_indices("http://") {
+            let rest = &text[at..];
+            assert!(rest.starts_with("http://www.w3.org/2000/svg") || rest.starts_with("http://127.0.0.1:7880/"), "{name}: unexpected URL {}", &rest[..rest.len().min(60)]);
+        }
+    }
+    let scripts: Vec<_> = crate::INDEX_HTML.match_indices("<script").collect();
+    assert_eq!(scripts.len(), 1, "index.html loads exactly one script, /app.js");
+    assert!(crate::INDEX_HTML.contains("<script src=\"/app.js\" defer></script>"));
+}
