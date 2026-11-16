@@ -60,3 +60,44 @@ jobs:
             [ "$size" -lt "$max" ] || { echo "::error::$bin is $size bytes, over its $max-byte ceiling"; fail=1; }
           done
           exit $fail
+
+  # The install scripts (tools/install) against the latest published release, on each system
+  # they support. The release workflow runs them again on the version it publishes.
+  installers:
+    name: installers ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: tools/install
+      - name: install.sh
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          STORINE_INSTALL_DIR="$RUNNER_TEMP/storine" sh tools/install/install.sh
+          "$RUNNER_TEMP/storine/storine-console" --help | grep -q "web console"
+          "$RUNNER_TEMP/storine/storage-server" gen-ca "$RUNNER_TEMP/ca" > /dev/null
+      - name: install.ps1 in Windows PowerShell 5.1 (what `irm | iex` runs in by default)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $env:STORINE_INSTALL_DIR = "$env:RUNNER_TEMP\storine51"
+          ./tools/install/install.ps1
+          if (-not (Test-Path "$env:RUNNER_TEMP\storine51\storage-server.exe")) { throw 'not installed' }
+      - name: install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:STORINE_INSTALL_DIR = "$env:RUNNER_TEMP\storine"
+          ./tools/install/install.ps1
+          $help = & "$env:RUNNER_TEMP\storine\storine-console.exe" --help | Out-String
+          if ($help -notmatch 'web console') { throw "storine-console --help: $help" }
+          & "$env:RUNNER_TEMP\storine\storage-server.exe" gen-ca "$env:RUNNER_TEMP\ca"
+          if ($LASTEXITCODE -ne 0) { throw "storage-server gen-ca failed" }
+          # The installer put the directory on the user's PATH for new terminals.
+          if (([Environment]::GetEnvironmentVariable('Path', 'User') -split ';') -notcontains "$env:RUNNER_TEMP\storine") { throw 'not on the user PATH' }

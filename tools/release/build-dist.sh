@@ -100,6 +100,8 @@ trap 'kill "${server:-}" 2> /dev/null || true; rm -rf "$tmp"' EXIT
 "$bin/storage-server$exe" gen-ca "$tmp/ca" > /dev/null
 "$bin/storage-server$exe" gen-cert "$tmp/ca" "$tmp/node" localhost > /dev/null
 "$bin/storine-sql$exe" --help > /dev/null
+# 0.2.0 on: the server reports the version being released.
+case "$version" in 0.1.*) ;; *) "$bin/storage-server$exe" --version | grep -qx "storage-server $version" ;; esac
 "$bin/storine-console$exe" --help | grep -q "web console"
 { "$bin/storage-cli$exe" 2>&1 || true; } | grep -q remote-health
 port=$((20000 + RANDOM % 20000))

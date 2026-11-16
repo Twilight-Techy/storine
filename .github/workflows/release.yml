@@ -74,12 +74,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Changelog at the tag
+      - name: Changelog and install scripts at the tag
         uses: actions/checkout@v5
         with:
           ref: refs/tags/${{ env.TAG }}
           path: src
-          sparse-checkout: CHANGELOG.md
+          sparse-checkout: |
+            CHANGELOG.md
+            tools/install/
           sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@v4
         with:
@@ -97,4 +99,38 @@ jobs:
           [ -s notes.md ] || echo "See CHANGELOG.md." > notes.md
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
             || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Storine ${TAG#v}" --notes-file notes.md
-          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber *.tar.gz *.zip SHA256SUMS
+          # The install scripts, when the tag has them (0.2.0 on), so that
+          # releases/latest/download/install.sh always names the newest one.
+          if [ -d ../src/tools/install ]; then cp ../src/tools/install/install.sh ../src/tools/install/install.ps1 .; fi
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber *.tar.gz *.zip SHA256SUMS $(ls install.sh install.ps1 2> /dev/null)
+
+  # Installs what was just published with the release's own install scripts, on every
+  # platform it ships for, and checks the version the binaries report.
+  verify:
+    needs: publish
+    name: install ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025]
+    steps:
+      - name: install.sh
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/install.sh" -o install.sh
+          STORINE_VERSION="$TAG" STORINE_INSTALL_DIR="$RUNNER_TEMP/storine" sh install.sh
+          "$RUNNER_TEMP/storine/storage-server" --version | tee /dev/stderr | grep -qx "storage-server ${TAG#v}"
+      - name: install.ps1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Invoke-WebRequest -UseBasicParsing "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:TAG/install.ps1" -OutFile install.ps1
+          $env:STORINE_VERSION = $env:TAG
+          $env:STORINE_INSTALL_DIR = "$env:RUNNER_TEMP\storine"
+          ./install.ps1
+          $v = (& "$env:RUNNER_TEMP\storine\storage-server.exe" --version | Out-String).Trim()
+          Write-Host $v
+          if ($v -ne "storage-server $($env:TAG.TrimStart('v'))") { throw "unexpected version: $v" }

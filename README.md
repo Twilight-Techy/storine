@@ -47,24 +47,38 @@
 
 ## Get started
 
-**1. Download** the archive for your system from the [latest release](https://github.com/Twilight-Techy/storine/releases/latest) and unpack it.
+**1. Install.** On Linux or macOS:
+
+```bash
+curl -fsSL https://github.com/Twilight-Techy/storine/releases/latest/download/install.sh | sh
+```
+
+On Windows, in PowerShell:
+
+```powershell
+irm https://github.com/Twilight-Techy/storine/releases/latest/download/install.ps1 | iex
+```
+
+The script downloads the four tools for your system, checks them against the release's checksums, and puts them in `~/.local/bin` (`/usr/local/bin` as root) or `%LOCALAPPDATA%\Programs\Storine\bin`, which it adds to your PATH. Set `STORINE_VERSION` for another version, or `STORINE_INSTALL_DIR` for another folder.
+
+You can also download an archive from the [latest release](https://github.com/Twilight-Techy/storine/releases/latest) yourself and unpack it:
 
 | System | Archive |
 | :--- | :--- |
-| Linux (x86_64, arm64) | `storine-<version>-x86_64-linux.tar.gz`, `storine-<version>-aarch64-linux.tar.gz` |
-| macOS (Apple silicon, Intel) | `storine-<version>-aarch64-macos.tar.gz`, `storine-<version>-x86_64-macos.tar.gz` |
-| Windows (x86_64) | `storine-<version>-x86_64-windows.zip` |
+| Linux (x86_64, arm64; glibc 2.28 or newer) | `storine-<version>-x86_64-linux.tar.gz`, `storine-<version>-aarch64-linux.tar.gz` |
+| macOS 11 or newer (Apple silicon, Intel) | `storine-<version>-aarch64-macos.tar.gz`, `storine-<version>-x86_64-macos.tar.gz` |
+| Windows 10 or newer (x86_64) | `storine-<version>-x86_64-windows.zip` |
 
 **2. Start a server:**
 
 ```bash
-bin/storage-server ./data 127.0.0.1:7878
+storage-server ./data 127.0.0.1:7878
 ```
 
 **3. Open the console** in another terminal, and follow the link it prints:
 
 ```bash
-bin/storine-console storine://127.0.0.1:7878
+storine-console storine://127.0.0.1:7878
 ```
 
 **4. Use it from your code**, here in Python:
