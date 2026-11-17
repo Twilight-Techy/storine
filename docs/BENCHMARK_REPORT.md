@@ -648,3 +648,23 @@ Same harness (`benches/kv-compare`, 1,000,000 records of 288 bytes, 4 threads) o
 **Durable puts on this disk** (Premium SSD, about 2 ms per sync): Storine's 4-writer p99.99 is 21–22 ms against RocksDB's 26–32 ms; LMDB's starved writers hit the harness's 4.29 s cap. Unchanged by this work, as expected.
 
 **Verified:** `storage-index` and `storage-core` unit tests and clippy locally; new tests `test_reserve_keeps_tables_from_growing_during_a_load`, `test_checkpoint_load_sizes_the_index_once`, `full_dedup_set_queues_without_growing`. One on-demand `D4s_v4` for about 2 h 15 min (about $0.45), deleted.
+
+### 8.12 Removing the writers' shared locks (`TASK-164`, 2026-11-17)
+
+Section 8.11 put the 4-writer p99.99 down to writers waking behind a preempted lock holder. Two changes removed both shared locks from the memory-first write path. The flush queue was sharded by record id (16 shards). Each writer thread got its own WAL staging stripe, with LSNs from one atomic counter and a drain that merges the stripes in LSN order. Same harness and VM type as section 8.11 (`Standard_D4s_v4`, `target-cpu=native`, 1,000,000 records, write phases only), three alternating rounds against `v0.3.0`:
+
+| overwrite | `v0.3.0` | sharded queue | both changes |
+| :--- | ---: | ---: | ---: |
+| 4 threads, ops/s | 897–975 k | 962–983 k | 892–926 k |
+| 4 threads, p99.9 | 229–301 µs | 140–154 µs | 316–353 µs |
+| 4 threads, p99.99 | 2.15–2.40 ms | 2.53–2.61 ms | 2.15–2.33 ms |
+| 8 threads, ops/s | 796–821 k | 808–830 k | 769–805 k |
+| 8 threads, p99.99 | 3.15–3.56 ms | 3.32–3.71 ms | 3.99–4.18 ms |
+
+One writer: 21–51 µs for all three. Two writers on a 2-CPU arm64 machine gave the same picture (p99.99 2.2–2.9 ms for every build).
+
+**Not kept.** No lock was left for a writer to wait on, and the p99.99 did not move. So the cause is plain CPU oversubscription: four writers and the busy flusher are five runnable threads on four CPUs, and a preempted writer waits a scheduler slice (about 2 ms) whatever it holds. The WAL change touched what recovery reads and made eight writers slower, for no gain. The sharded queue improved the p99.9 but not the p99.99, so it is not worth a second code path either. The patch is kept outside the repository.
+
+**Kept.** A bug found on the way: stopping an engine notified its flusher without holding the queue's lock. A notify that landed between the flusher's check and its untimed wait was lost, and the shutdown's join waited forever on an idle engine. It is now notified under the lock.
+
+**What helps instead** is a free CPU for the flusher (three writers on four CPUs: 69 µs, section 8.11), or a flusher that needs less CPU. One `D4s_v4` for about 50 minutes (about $0.17), deleted.

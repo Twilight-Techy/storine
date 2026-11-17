@@ -2468,7 +2468,13 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
 impl<T: ZeroCopyRecord + Indexable> Drop for StorageEngine<T> {
     fn drop(&mut self) {
         self.inner.shutdown.store(true, Ordering::SeqCst);
-        self.inner.flush_cv.notify_all();
+        // Notified under the queue's lock: the flusher tests `shutdown` holding it and then
+        // sleeps with no timeout, so a notify landing between its test and its wait was lost
+        // and the join below waited forever on an idle engine.
+        {
+            let _q = self.inner.flush_queue.lock().unwrap_or_else(|p| p.into_inner());
+            self.inner.flush_cv.notify_all();
+        }
         if let Ok(mut handle_opt) = self.flusher_handle.lock() {
             if let Some(handle) = handle_opt.take() {
                 let _ = handle.join();
@@ -4842,7 +4848,10 @@ mod checkpoint_drain_tests {
             // Stop the background flusher (as `Drop` does), so writes stay queued for the
             // checkpoint alone. Without a flusher at all, writes flush at once and never queue.
             engine.inner.shutdown.store(true, Ordering::SeqCst);
-            engine.inner.flush_cv.notify_all();
+            {
+                let _q = engine.inner.flush_queue.lock().unwrap();
+                engine.inner.flush_cv.notify_all();
+            }
             if let Some(h) = engine.flusher_handle.lock().unwrap().take() {
                 h.join().unwrap();
             }

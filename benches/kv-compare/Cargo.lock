@@ -686,14 +686,14 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "storage-codec"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "storage-types",
 ]
 
 [[package]]
 name = "storage-columnar"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-mmap",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "storage-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-columnar",
@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "storage-graph"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-index",
@@ -724,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "storage-index"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-mmap",
@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "storage-mmap"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-types",
@@ -741,11 +741,11 @@ dependencies = [
 
 [[package]]
 name = "storage-types"
-version = "0.1.0"
+version = "0.3.0"
 
 [[package]]
 name = "storage-wal"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "storage-codec",
  "storage-types",

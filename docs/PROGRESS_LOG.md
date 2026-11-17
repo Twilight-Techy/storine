@@ -1067,6 +1067,12 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **4-writer overwrite**: the 4–8 ms stalls were a writer rehashing the flush queue's dedup set under its lock. The flusher now grows and pre-touches it outside the lock, and a full set no longer grows under it. Max 6.5–8.1 → 4.3–4.6 ms. The p99.99 of 2.2–2.5 ms is scheduler placement with more busy threads than CPUs (69 µs with three writers). Details in section 8.11 of the benchmark report.
 - **Cost**: one Azure D4s_v4 for about 2 h 15 min, deleted.
 
+## 2026-11-17: the 4-writer tail is CPU oversubscription (`TASK-164`)
+
+- Removed both shared locks from the memory-first write path (sharded flush queue, per-writer WAL staging) and measured against `v0.3.0` on an Azure `D4s_v4` and locally: the 4-writer p99.99 did not move, and 8 writers got slower with the WAL change. Five busy threads on four CPUs is the cause. Neither change kept (benchmark report section 8.12).
+- Kept: the engine's shutdown now notifies its flusher under the queue's lock; before, a notify between the flusher's check and its untimed wait was lost and the join hung.
+- **Cost**: one Azure VM for about 50 minutes, deleted.
+
 ## 2026-11-17: reserve from the server, the clients and SQL (`TASK-163`)
 
 - `reserve(count)` in the server (`OP_DOC_ADMIN` 12), all eight client libraries and SQL (`storine_reserve`). Range clusters: the receiving node sends each peer its share (`OP_RANGE_RESERVE`); a three-node test sees every node sized. `STORAGE_EXPECTED_DOCUMENTS` sizes the index at start (`index_capacity` in health shows it). Release builds retry the compiler install; CI caps the test step at 75 minutes; `TASK-164` plans the 4-writer tail for 0.4.0. `reserve` then became admin-only (server) and superuser-only (SQL): one call can take gigabytes of address space, which Windows counts against its commit limit at once. Checked live from Python, TypeScript, Go, Java, Ruby, PHP, C# and Rust (through the gateway test), including the server's limit error. Replaces the 0.3.0 published on 2026-11-16, whose files only our own release checks had downloaded.
