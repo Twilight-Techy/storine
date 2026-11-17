@@ -54,6 +54,7 @@ await foreach (var d in accounts.ScanAsync()) { /* every document, any collectio
 | `c.CreateIndexAsync` / `c.DropIndexAsync` / `c.InfoAsync` / `c.DropAsync` | Indexes (up to 16 per collection) and collection management. |
 | `c.NearestAsync(field, vector, k: 10, where: null, exact: false)` | The `k` documents whose `field` is most similar to `vector` (cosine), best first; `doc.Score` is the similarity. |
 | `c.CreateVectorIndexAsync(field, dims)` / `c.DropVectorIndexAsync(field)` / `c.VectorIndexesAsync()` | Vector indexes for `NearestAsync` (`VectorIndex(Field, Dims, Ready)`). |
+| `c.ReserveAsync(count)` | Room for about `count` more documents before a bulk import, so writes don't pause while the index grows (at most 100,000,000 per call; no effect on range clusters yet). Needs server 0.3. |
 | `c.AggregateAsync(aggregation)` / `c.ScanColumnsAsync(fields, where, pageSize: 1000)` / `c.EnableColumnarAsync()` / `c.DisableColumnarAsync()` | Analytics (below). |
 | `db.TransactionAsync(tx => ...)` | Writes committed atomically when the lambda returns; `tx.RequireVersion` / `tx.RequireExists` add checks. |
 | `db.CollectionsAsync()` / `db.ClusterInfoAsync()` | Introspection. |

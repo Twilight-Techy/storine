@@ -629,6 +629,16 @@ impl DocBackend for RangeBackend {
     fn drop_columnar(&self, c: &str) -> Result<()> {
         self.with(|g| docs::set_columnar(g, c, false))
     }
+
+    /// Accepted and checked, with no effect yet: a range cluster's documents sit on many
+    /// nodes, and sizing them would need a node-to-node request.
+    fn reserve(&self, c: &str, count: u64) -> Result<()> {
+        storage_core::validate_collection_name(c, false)?;
+        if count > storage_core::MAX_RESERVE_DOCUMENTS {
+            return Err(StorageError::invalid_value("reserve at most 100,000,000 documents per call"));
+        }
+        Ok(())
+    }
 }
 
 /// How to start one range-cluster node ([`start_range_server`]).

@@ -120,6 +120,11 @@ fn generated_request_id() -> [u8; 16] {
 
 /// Rejects empty, overlong or reserved-character collection names. Names starting with `$` are
 /// reserved for the system (`allow_system`).
+/// The most documents one [`DocumentStore::reserve`] call may make room for: about 15-30 GB of
+/// index address space, of which only the table's control bytes (about 130 MB) are touched up
+/// front.
+pub const MAX_RESERVE_DOCUMENTS: u64 = 100_000_000;
+
 pub fn validate_collection_name(name: &str, allow_system: bool) -> Result<()> {
     let ok_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
     let body = if allow_system { name.strip_prefix('$').unwrap_or(name) } else { name };
@@ -1547,6 +1552,18 @@ impl DocumentStore {
     /// Adds a secondary index on the top-level `field` and indexes existing documents.
     /// Fails beyond [`MAX_DOCUMENT_INDEXES`] indexes per collection.
     ///
+    /// Makes room for about `count` more documents in `collection` before an import, so writes
+    /// do not pause while the index doubles (`TASK-163`). All collections share one primary
+    /// index, so this sizes that index; the name is checked and otherwise only names the intent.
+    /// At most [`MAX_RESERVE_DOCUMENTS`] per call.
+    pub fn reserve(&self, collection: &str, count: u64) -> Result<()> {
+        validate_collection_name(collection, false)?;
+        if count > MAX_RESERVE_DOCUMENTS {
+            return Err(StorageError::invalid_value("reserve at most 100,000,000 documents per call"));
+        }
+        self.engine.reserve_records(count as usize)
+    }
+
     /// Three steps keep the index exact under concurrent writes: (1) the index is published as
     /// *building*, so every write from then on maintains it; (2) existing documents are rewritten
     /// at their current version (a document changed meanwhile already carries the index); (3) the

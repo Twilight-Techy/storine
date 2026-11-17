@@ -51,6 +51,7 @@ db.close();
 | `c.find(where, { orderBy, limit, offset })`, `c.first`, `c.count`, `c.scan` | Queries. `where` is a filter (`eq`, `ne`, `lt`, `le`, `gt`, `ge`, `between`, `isIn`, `prefix`, `contains`, `exists`, `missing`, `keyPrefix`, `and`, `or`, `not`) or `{ field: value }`. `orderBy: "-price"` sorts descending. |
 | `c.nearest(field, vector, { k = 10, where, exact = false })` | The `k` documents whose `field` (a list of numbers) is most similar to `vector` (cosine), best first; similarity in `doc.score`. |
 | `c.createVectorIndex(field, dims)`, `c.dropVectorIndex(field)`, `c.vectorIndexes()` | Vector indexes for `nearest` (`[{ field, dims, ready }]`). |
+| `c.reserve(count)` | Room for about `count` more documents before a bulk import, so writes don't pause while the index grows (at most 100,000,000 per call; no effect on range clusters yet). Needs server 0.3. |
 | `c.createIndex(field)`, `c.dropIndex(field)`, `c.info()`, `c.drop()` | Indexes (up to 16 per collection) and collection management. |
 | `c.aggregate(aggregates, { where, groupBy, orderBy, limit, memoryBudget, spillBudget })`, `c.scanColumns(fields, { where, pageSize })`, `c.enableColumnar()`, `c.disableColumnar()` | Analytics (below). |
 | `db.transaction(tx => ...)` | Buffered writes committed atomically; `tx.require(...)` adds a version check. |

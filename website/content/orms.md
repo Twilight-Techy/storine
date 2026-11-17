@@ -204,6 +204,16 @@ production:
 
 ActiveRecord 8 is tested with the `postgresql` adapter and with `trilogy` for MySQL: migrations, associations, aggregates, `lock_version` optimistic locking, `update_counters` and transactions. Rails' test databases work, since `CREATE DATABASE` makes a separate database.
 
+## Bulk imports
+
+Before a large import, tell the store how many rows are coming. It sizes its index once, so the import doesn't pause each time the index doubles:
+
+```sql
+SELECT storine_reserve('orders', 1000000);
+```
+
+Run it as raw SQL from any ORM (`session.execute(text(...))`, `connection.cursor().execute(...)`, `prisma.$queryRaw`, `db.Exec`, `DB::select`, `ActiveRecord::Base.connection.execute`). It needs `INSERT` on the table and returns `true`. One call covers up to 100,000,000 documents: each row counts as one, plus one per unique constraint. It is only a hint. It changes no data, and range clusters accept it without effect for now. Most useful for imports of millions of rows; with fewer, the pauses are under a millisecond anyway.
+
 ## Migrations and schema changes
 
 ORMs create and change tables with ordinary DDL, which the gateway applies to its own catalog. Every way above of creating a schema is tested: `create_all`, `migrate`, `db push`, `synchronize`, `AutoMigrate`, `hbm2ddl`, Rails migrations and EF Core's table creation.

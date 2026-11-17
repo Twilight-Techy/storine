@@ -217,6 +217,11 @@ impl Store {
         Ok(())
     }
 
+    /// Room for about `count` more documents in `collection` before an import (`TASK-163`).
+    pub fn reserve(&self, collection: &str, count: u64) -> SqlResult<()> {
+        Ok(self.client.collection(&self.c(collection)).reserve(count)?)
+    }
+
     pub fn count(&self, collection: &str, filter: Option<Filter>) -> SqlResult<u64> {
         Ok(self.client.collection(&self.c(collection)).count(filter)?)
     }

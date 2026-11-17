@@ -502,6 +502,15 @@ class Collection(_Writer):
                                           nearest=(field, [float(x) for x in vector], k, exact))
         return docs
 
+    def reserve(self, count: int) -> None:
+        """Makes room for about `count` more documents before a bulk import, so writes don't pause while the server's index grows (at most 100,000,000 per call). A hint: nothing else changes, and range clusters accept it without effect for now."""
+        if count < 0:
+            raise ValueError("count must not be negative")
+        out = bytearray(b"\x0c")
+        put_str(out, self.name)
+        out += struct.pack("<Q", count)
+        self._admin(w.OP_DOC_ADMIN, bytes(out))
+
     def create_vector_index(self, field: str, dims: int) -> None:
         """Indexes a top-level field holding `dims` numbers for `nearest` (at most 4 per collection);
         existing documents included. Writes of other values to that field are then refused."""

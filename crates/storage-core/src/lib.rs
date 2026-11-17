@@ -41,7 +41,7 @@ pub use catalog::{CatalogTransaction, CollectionMeta, DatabaseCatalog, ErasedCol
 pub use document::{
     CollectionInfo, CommitSink, DocOp, DocPage, DocQuery, DocWrite, Direction, Document,
     DocumentRecord, DocumentStore, Filter, WriteSummary, ByteRange, MAX_BYTE_RANGE, MAX_DOCUMENT_INDEXES,
-    MAX_PROJECTION_FIELDS,
+    MAX_PROJECTION_FIELDS, MAX_RESERVE_DOCUMENTS, validate_collection_name,
 };
 pub use engine::{
     EncryptionConfig, IndexTier, PrimaryTier, ResealReport, Precondition, WriteKind, WriteOp, WriteResult,

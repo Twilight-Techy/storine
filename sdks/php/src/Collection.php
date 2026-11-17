@@ -282,6 +282,17 @@ final class Collection
         $this->admin(Wire::OP_DOC_ADMIN, "\x07", $field, pack('V', $dims));
     }
 
+    /**
+     * Makes room for about `count` more documents before a bulk import, so writes don't pause while the server's index grows (at most 100,000,000 per call). A hint: nothing else changes, and range clusters accept it without effect for now.
+     */
+    public function reserve(int $count): void
+    {
+        if ($count < 0) {
+            throw new \InvalidArgumentException('count must not be negative');
+        }
+        $this->admin(Wire::OP_DOC_ADMIN, "\x0c", null, pack('P', $count));
+    }
+
     public function dropVectorIndex(string $field): void
     {
         $this->admin(Wire::OP_DOC_ADMIN, "\x08", $field);

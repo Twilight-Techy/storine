@@ -1003,6 +1003,23 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
             Datum::Int(crate::exec::dml::nextval(&ex.s.engine, &text(&a0))?)
         }
         "currval" => Datum::Int(ex.s.last_insert_id),
+        // `storine_reserve(table, rows)`: room for `rows` more rows before an import, so the
+        // store's index does not pause writes while it grows (`TASK-163`). Each row is one
+        // document plus one marker per unique constraint. Needs INSERT on the table.
+        "storine_reserve" => {
+            let table = ex.s.engine.table(&text(&a0))?;
+            ex.s.require_table(&table, "INSERT", &[])?;
+            let rows = u64::try_from(int(arg(args, 1))?)
+                .map_err(|_| SqlError::numeric_out_of_range("storine_reserve: rows must not be negative"))?;
+            let docs = rows.saturating_mul(1 + table.uniques.len() as u64);
+            if docs > storage_core::MAX_RESERVE_DOCUMENTS {
+                return Err(SqlError::numeric_out_of_range(
+                    "storine_reserve: at most 100,000,000 documents per call (rows times one plus the unique constraints)",
+                ));
+            }
+            ex.s.engine.store.reserve(&table.collection, docs)?;
+            Datum::Bool(true)
+        }
         "setval" => {
             ex.s.require_sequence(&text(&a0))?;
             let v = int(arg(args, 1))?;
@@ -2517,7 +2534,8 @@ pub fn return_type(
         | "has_any_column_privilege"
         | "has_column_privilege"
         | "starts_with"
-        | "pg_is_in_recovery" => DataType::Bool,
+        | "pg_is_in_recovery"
+        | "storine_reserve" => DataType::Bool,
         "abs" | "round" | "ceil" | "ceiling" | "floor" | "trunc" | "mod" => return arg_ty(0),
         "array_agg" => DataType::Array(Box::new(arg_ty(0).unwrap_or(DataType::Text))),
         "date_part" | "extract" => DataType::Numeric(None),

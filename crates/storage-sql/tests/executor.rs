@@ -815,3 +815,23 @@ fn discard_reset_and_close_really_reset_the_session() {
     assert_eq!(err(&mut s, "CLOSE c1"), "34000");
     ok(&mut s, "DISCARD PLANS");
 }
+
+/// `storine_reserve(table, rows)` (`TASK-163`): sizes the store before an import, needs INSERT on
+/// the table, and refuses unknown tables, negative counts and counts past the limit.
+#[test]
+fn storine_reserve_sizes_before_an_import() {
+    let db = setup("reserve");
+    let mut s = db.engine.new_session(Dialect::Postgres, "app", None);
+    ok(&mut s, "CREATE TABLE orders (id INT PRIMARY KEY, sku TEXT UNIQUE, qty INT)");
+    assert_eq!(one(&mut s, "SELECT storine_reserve('orders', 5000)"), "t");
+    let values: Vec<String> = (0..2000).map(|i| format!("({i}, 'sku{i}', {})", i % 7)).collect();
+    ok(&mut s, &format!("INSERT INTO orders VALUES {}", values.join(", ")));
+    assert_eq!(one(&mut s, "SELECT count(*) FROM orders"), "2000");
+    // Calling it again, or for less room than is left, changes nothing.
+    assert_eq!(one(&mut s, "SELECT storine_reserve('orders', 10)"), "t");
+    assert_eq!(err(&mut s, "SELECT storine_reserve('missing', 10)"), "42P01");
+    assert_eq!(err(&mut s, "SELECT storine_reserve('orders', -1)"), "22003");
+    // One document per row plus one marker per unique constraint: 2 per row here.
+    assert_eq!(err(&mut s, "SELECT storine_reserve('orders', 60000000)"), "22003");
+    assert_eq!(one(&mut s, "SELECT storine_reserve('orders', 50000000)"), "t");
+}

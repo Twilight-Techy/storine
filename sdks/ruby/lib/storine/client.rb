@@ -508,6 +508,14 @@ module Storine
       query(where, nil, k, 0, nil, [field, vector.map { |x| Float(x) }, k, exact])[2]
     end
 
+    # Makes room for about `count` more documents before a bulk import, so writes don't pause while the server's index grows (at most 100,000,000 per call). A hint: nothing else changes, and range clusters accept it without effect for now.
+    def reserve(count)
+      raise ArgumentError, "count must not be negative" if count.negative?
+
+      admin(Wire::OP_DOC_ADMIN, "\x0c", nil, [count].pack("Q<"))
+      nil
+    end
+
     # Indexes a top-level field holding `dims` numbers for #nearest (at most 4 per collection);
     # existing documents included. Writes of other values to that field are then refused.
     def create_vector_index(field, dims) = admin(Wire::OP_DOC_ADMIN, "\x07", field, [dims].pack("V"))

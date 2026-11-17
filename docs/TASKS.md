@@ -1499,3 +1499,8 @@ This document defines the strict chronological execution order for building the 
 - [x] **TASK-162: Bulk-Load Sizing and the 4-Writer Tail** — the two tail-latency gaps left in section 8.3 of the benchmark report. Asked for: fix what can be fixed.
   - **Fill**: `EngineConfig::expected_records`, `StorageEngine::reserve_records`, `PrimaryIndex::reserve`; checkpoint loads reserve their entry count. Fill p99.99 1.1 ms → 23–30 µs.
   - **4-writer overwrite**: traced. The flush queue's dedup set no longer grows under the lock (`reserve_ids`, `QUEUE_SET_GROW_LIMIT`); max 6.5–8.1 → 4.3–4.6 ms. The remaining p99.99 (2.2–2.5 ms) is the scheduler with five busy threads on four CPUs; 69 µs with a CPU to spare. Report section 8.11.
+
+- [x] **TASK-163: Reserve From the Server, the Clients and SQL** — `TASK-162` sized the index only for embedders. Asked for: the same through the server, the client libraries, the SQL gateway and ORMs.
+  - **Server**: `OP_DOC_ADMIN` sub-command `12` (`str collection | u64 count`) calls `DocumentStore::reserve`, which sizes the store's one primary index. At most 100,000,000 per call. Range clusters accept it without effect (sizing would need a node-to-node request).
+  - **Clients**: `reserve` in all eight libraries, each checked against a running server.
+  - **SQL**: `storine_reserve(table, rows)`, rows times one plus the unique constraints, needs `INSERT`. Automatic sizing per statement was considered and dropped: without the total up front it moves the rebuild earlier rather than avoiding it.

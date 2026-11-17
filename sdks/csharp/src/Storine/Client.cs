@@ -672,6 +672,12 @@ public sealed class Collection
         return client.CallAsync(Wire.OpDocAdmin, Wire.CreateVectorIndex(Name, field, dims), ct);
     }
 
+    /// <summary>
+    /// Makes room for about <paramref name="count"/> more documents before a bulk import, so writes don't pause while the server's index grows (at most 100,000,000 per call). A hint: nothing else changes, and range clusters accept it without effect for now.
+    /// </summary>
+    public Task ReserveAsync(ulong count, CancellationToken ct = default) =>
+        client.CallAsync(Wire.OpDocAdmin, Wire.Reserve(Name, count), ct);
+
     /// <summary>Removes the vector index on <paramref name="field"/>.</summary>
     public Task DropVectorIndexAsync(string field, CancellationToken ct = default) =>
         client.CallAsync(Wire.OpDocAdmin, Wire.Admin(8, Name, field), ct);

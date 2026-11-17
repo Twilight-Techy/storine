@@ -278,6 +278,14 @@ public final class Collection {
         client.call(Wire.OP_DOC_ADMIN, Wire.createVectorIndex(name, field, dims));
     }
 
+    /**
+     * Makes room for about {@code count} more documents before a bulk import, so writes don't pause while the server's index grows (at most 100,000,000 per call). A hint: nothing else changes, and range clusters accept it without effect for now.
+     */
+    public void reserve(long count) {
+        if (count < 0) throw new InvalidException("count must not be negative");
+        client.call(Wire.OP_DOC_ADMIN, Wire.reserve(name, count));
+    }
+
     public void dropVectorIndex(String field) {
         client.call(Wire.OP_DOC_ADMIN, Wire.admin(8, name, field));
     }

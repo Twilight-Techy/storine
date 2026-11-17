@@ -1067,6 +1067,10 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **4-writer overwrite**: the 4–8 ms stalls were a writer rehashing the flush queue's dedup set under its lock. The flusher now grows and pre-touches it outside the lock, and a full set no longer grows under it. Max 6.5–8.1 → 4.3–4.6 ms. The p99.99 of 2.2–2.5 ms is scheduler placement with more busy threads than CPUs (69 µs with three writers). Details in section 8.11 of the benchmark report.
 - **Cost**: one Azure D4s_v4 for about 2 h 15 min, deleted.
 
+## 2026-11-17: reserve from the server, the clients and SQL (`TASK-163`)
+
+- `reserve(count)` in the server (`OP_DOC_ADMIN` 12), all eight client libraries and SQL (`storine_reserve`). Checked live from Python, TypeScript, Go, Java, Ruby, PHP, C# and Rust (through the gateway test), including the server's limit error. Replaces the 0.3.0 published on 2026-11-16, whose files only our own release checks had downloaded.
+
 ## 2026-11-16: 0.3.0
 
 - A minor release for `TASK-162`: `EngineConfig::expected_records` is a new public field, so Rust struct literals listing every field break. Formats and protocols are unchanged, so clusters can still upgrade one node at a time.

@@ -252,6 +252,14 @@ final class Wire {
         return out.toByteArray();
     }
 
+    static byte[] reserve(String collection, long count) {
+        Values.Out out = new Values.Out();
+        out.u8(12);
+        out.str(collection);
+        out.u64(count);
+        return out.toByteArray();
+    }
+
     static byte[] createVectorIndex(String collection, String field, int dims) {
         Values.Out out = new Values.Out();
         out.u8(7);

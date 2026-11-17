@@ -33,6 +33,7 @@ Every client uses the same words, in its language's style:
 | Querying | `find`, `first`, `count`, `scan`, `nearest` |
 | Filters | `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `between`, `in`, `prefix`, `contains`, `exists`, `missing`, `key_prefix`, `and`, `or`, `not` |
 | Indexes | `create_index`, `drop_index`, `create_vector_index`, `drop_vector_index`, `vector_indexes`, `info`, `drop` |
+| Bulk imports | `reserve(count)`: room for that many more documents first, so the import doesn't pause while the index grows |
 | Analytics | `aggregate`, `scan_columns`, `enable_columnar`, `disable_columnar` |
 
 The guides ([documents](../documents.md), [queries](../queries.md), [indexes](../indexes.md), [analytics](../analytics.md)) explain each one with Python examples.

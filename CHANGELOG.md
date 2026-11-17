@@ -4,23 +4,25 @@ Versions follow [Semantic Versioning](https://semver.org). Before 1.0, a minor v
 
 ## 0.3.0 (2026-11-16)
 
-Faster tails for embedded bulk loads and many writers. The slowest 0.01% of writes during a load fell from 1.1 ms to 23–30 µs when the store is told its size, and the worst stall with four writers on four CPUs from 6.5–8.1 ms to 4.3–4.6 ms ([`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) section 8.11).
+Bulk imports that don't pause, and shorter stalls with many writers. Telling the store how many records are coming before an import, from the embedded API, any client library or SQL, cut the slowest 0.01% of writes during a load from 1.1 ms to 23–30 µs. The worst stall with four writers on four CPUs fell from 6.5–8.1 ms to 4.3–4.6 ms ([`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md) section 8.11).
 
 This is a minor release because the Rust API gained a field: `EngineConfig` literals that list every field without `..Default::default()` must add `expected_records`. Nothing else is incompatible.
 
-**Upgrading from 0.2.x**: replace the binaries (`install.sh` / `install.ps1` again) and restart. The on-disk formats and both protocols are unchanged, so, unlike a usual minor release, a cluster can be upgraded one node at a time and 0.2.x and 0.3.0 nodes can run together. Embedders: add `expected_records` to `EngineConfig` literals that need it.
+**Upgrading from 0.2.x**: replace the binaries (`install.sh` / `install.ps1` again) and restart. The on-disk formats and the node-to-node protocol are unchanged, and the client protocol only gained a command, so, unlike a usual minor release, a cluster can be upgraded one node at a time and 0.2.x and 0.3.0 nodes can run together. `reserve` needs a 0.3 server: a 0.2 server answers it with `Invalid`. Embedders: add `expected_records` to `EngineConfig` literals that need it.
 
 ### Formats and protocols
 
-- **On-disk formats, client protocol, node-to-node protocol**: unchanged from 0.2.0.
-- **Rust API**: `EngineConfig::expected_records` (new field), `StorageEngine::reserve_records`, `PrimaryIndex::reserve`.
+- **On-disk formats, node-to-node protocol**: unchanged from 0.2.0.
+- **Client protocol**: additive. `OP_DOC_ADMIN` sub-command `12` reserve (`str collection | u64 count`).
+- **Rust API**: `EngineConfig::expected_records` (new field), `StorageEngine::reserve_records`, `DocumentStore::reserve`, `PrimaryIndex::reserve`.
 
 ### Release checks
 
-CI on Linux x86_64 and arm64, macOS arm64 and x86_64, and Windows: the test suite, lints, binary sizes and the install scripts. Process chaos, 40 runs on x86_64 and on arm64. The power-loss suite (a crash at every I/O call) also runs with `expected_records` set. Benchmarks against 0.2.1, LMDB and RocksDB (section 8.11). Not repeated: the soaks, SDK suites and sanitizers, since replication, the protocols, the clients and the `unsafe` code are unchanged since 0.2.0.
+CI on Linux x86_64 and arm64, macOS arm64 and x86_64, and Windows: the test suite, lints, binary sizes and the install scripts. Process chaos, 40 runs on x86_64 and on arm64. The power-loss suite (a crash at every I/O call) also runs with `expected_records` set. Benchmarks against 0.2.1, LMDB and RocksDB (section 8.11). `reserve` was checked from each of the eight client libraries against a running server, and through SQL. Not repeated: the soaks, full SDK suites and sanitizers, since replication, the node-to-node protocol and the `unsafe` code are unchanged since 0.2.0, and the clients only gained `reserve`.
 
 ### Added
 
+- **Reserve before an import**, everywhere: `reserve(count)` on a collection in all eight client libraries (`ReserveAsync` in C#, `Reserve(ctx, count)` in Go), and `SELECT storine_reserve('table', rows)` in the SQL gateway, which any ORM can run as raw SQL. The server sizes its index for that many more documents, so the import doesn't pause each time the index doubles. A hint: at most 100,000,000 per call, no data changes, and range clusters accept it without effect for now.
 - **`EngineConfig::expected_records`** and **`StorageEngine::reserve_records(n)`** size the primary index for a known number of records, so a bulk load doesn't pause each time the index doubles (fill p99.99 1.1 ms → 23–30 µs, level with RocksDB). The memory is what the index reaches at that size anyway, taken up front: 150–300 bytes per record. Default 0: grow as before.
 - A restart sizes the index from the checkpoint's record count instead of growing it while loading.
 

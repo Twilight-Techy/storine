@@ -867,6 +867,18 @@ func (c *Collection) admin(ctx context.Context, op byte, sub byte, field *string
 	return c.client.call(ctx, op, w.b)
 }
 
+// Reserve makes room for about count more documents before a bulk import, so writes don't pause
+// while the server's index grows (at most 100,000,000 per call). A hint: nothing else changes,
+// and range clusters accept it without effect for now.
+func (c *Collection) Reserve(ctx context.Context, count uint64) error {
+	w := &writer{}
+	w.u8(12)
+	w.str(c.name)
+	w.u64(count)
+	_, _, err := c.client.call(ctx, opDocAdmin, w.b)
+	return err
+}
+
 // CreateVectorIndex indexes a top-level field holding dims numbers for Nearest (at most 4 per
 // collection); existing documents included. Writes of other values to that field are then refused.
 func (c *Collection) CreateVectorIndex(ctx context.Context, field string, dims int) error {

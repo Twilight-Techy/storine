@@ -639,6 +639,17 @@ export class Collection<T extends Fields = Fields> {
     await this.admin(w.OP.DOC_ADMIN, concat(Uint8Array.of(7), w.str(this.name), w.str(field), n));
   }
 
+  /**
+   * Makes room for about `count` more documents before a bulk import, so writes don't pause while the server's index grows (at most 100,000,000 per call). A hint: nothing else changes, and range clusters accept it without effect for now.
+   */
+  async reserve(count: number | bigint): Promise<void> {
+    const c = BigInt(count);
+    if (c < 0n) throw new RangeError("count must not be negative");
+    const n = new Uint8Array(8);
+    new DataView(n.buffer).setBigUint64(0, c, true);
+    await this.admin(w.OP.DOC_ADMIN, concat(Uint8Array.of(12), w.str(this.name), n));
+  }
+
   async dropVectorIndex(field: string): Promise<void> {
     await this.admin(w.OP.DOC_ADMIN, concat(Uint8Array.of(8), w.str(this.name), w.str(field)));
   }

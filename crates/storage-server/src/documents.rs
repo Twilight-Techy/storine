@@ -35,6 +35,8 @@ pub const INFO_VECTOR_INDEXES: u8 = 9;
 /// Columnar storage (`TASK-126`, `TASK-129`): enable / disable (`str collection`).
 pub const ADMIN_CREATE_COLUMNAR: u8 = 10;
 pub const ADMIN_DROP_COLUMNAR: u8 = 11;
+/// Room for more documents before an import (`TASK-163`): `str collection | u64 count`.
+pub const ADMIN_RESERVE: u8 = 12;
 
 pub(crate) type Reply = (u8, u64, Vec<u8>);
 
@@ -58,6 +60,7 @@ pub(crate) trait DocBackend {
     fn drop_vector_index(&self, c: &str, f: &str) -> storage_types::Result<()>;
     fn create_columnar(&self, c: &str) -> storage_types::Result<()>;
     fn drop_columnar(&self, c: &str) -> storage_types::Result<()>;
+    fn reserve(&self, c: &str, count: u64) -> storage_types::Result<()>;
 }
 
 impl DocBackend for DocumentStore {
@@ -108,6 +111,9 @@ impl DocBackend for DocumentStore {
     }
     fn create_columnar(&self, c: &str) -> storage_types::Result<()> {
         DocumentStore::create_columnar(self, c)
+    }
+    fn reserve(&self, c: &str, count: u64) -> storage_types::Result<()> {
+        DocumentStore::reserve(self, c, count)
     }
     fn drop_columnar(&self, c: &str) -> storage_types::Result<()> {
         DocumentStore::drop_columnar(self, c)
@@ -360,7 +366,8 @@ pub(crate) fn admin_is_slow(body: &[u8]) -> bool {
                 | ADMIN_CREATE_VECTOR_INDEX
                 | ADMIN_DROP_VECTOR_INDEX
                 | ADMIN_CREATE_COLUMNAR
-                | ADMIN_DROP_COLUMNAR)
+                | ADMIN_DROP_COLUMNAR
+                | ADMIN_RESERVE)
         )
     )
 }
@@ -380,6 +387,7 @@ pub(crate) fn doc_admin(store: &dyn DocBackend, body: &[u8], allow_writes: bool)
                 | ADMIN_DROP_VECTOR_INDEX
                 | ADMIN_CREATE_COLUMNAR
                 | ADMIN_DROP_COLUMNAR
+                | ADMIN_RESERVE
         );
         if is_write && !allow_writes {
             return Err(StorageError::invalid_value("use OP_DOC_ADMIN for schema changes"));
@@ -437,6 +445,12 @@ pub(crate) fn doc_admin(store: &dyn DocBackend, body: &[u8], allow_writes: bool)
                 }
                 (STATUS_OK, 0, Vec::new())
             }
+            ADMIN_RESERVE => {
+                let c = r.str()?.to_owned();
+                let count = r.u64()?;
+                store.reserve(&c, count)?;
+                (STATUS_OK, 0, Vec::new())
+            }
             INFO_VECTOR_INDEXES => {
                 let c = r.str()?.to_owned();
                 let info = store.collection_info(&c)?;
@@ -477,5 +491,34 @@ mod tests {
             assert_eq!((status, version), (STATUS_NOT_LEADER, leader.unwrap_or(0)));
             assert!(body.is_empty(), "body {:?}", String::from_utf8_lossy(&body));
         }
+    }
+
+    fn reserve_body(c: &str, count: u64) -> Vec<u8> {
+        let mut b = vec![ADMIN_RESERVE];
+        put_str(&mut b, c);
+        b.extend_from_slice(&count.to_le_bytes());
+        b
+    }
+
+    /// `ADMIN_RESERVE` (`TASK-163`): accepted on `OP_DOC_ADMIN`, refused on the read-only
+    /// `OP_DOC_INFO`, and checked: collection name, the per-call limit, trailing bytes.
+    #[test]
+    fn reserve_is_a_checked_write_command() {
+        let dir = std::env::temp_dir().join(format!("storine_reserve_wire_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = DocumentStore::open(&dir, storage_core::EngineConfig::default()).unwrap();
+        assert_eq!(doc_admin(&store, &reserve_body("orders", 10_000), true).0, STATUS_OK);
+        assert_eq!(doc_admin(&store, &reserve_body("orders", 10_000), false).0, STATUS_INVALID);
+        assert_eq!(doc_admin(&store, &reserve_body("orders", storage_core::MAX_RESERVE_DOCUMENTS + 1), true).0, STATUS_INVALID);
+        assert_eq!(doc_admin(&store, &reserve_body("", 1), true).0, STATUS_INVALID);
+        let mut trailing = reserve_body("orders", 1);
+        trailing.push(0);
+        assert_eq!(doc_admin(&store, &trailing, true).0, STATUS_INVALID);
+        assert!(admin_is_slow(&reserve_body("orders", 1)));
+        // The store still works after sizing.
+        store.put("orders", "a", BTreeMap::new()).unwrap();
+        assert!(store.get("orders", "a").unwrap().is_some());
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

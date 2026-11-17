@@ -186,6 +186,15 @@ internal static class Wire
         return w.ToArray();
     }
 
+    internal static byte[] Reserve(string collection, ulong count)
+    {
+        var w = new Values.Writer();
+        w.U8(12);
+        w.Str(collection);
+        w.U64(count);
+        return w.ToArray();
+    }
+
     internal static byte[] CreateVectorIndex(string collection, string field, int dims)
     {
         var w = new Values.Writer();

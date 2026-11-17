@@ -258,6 +258,10 @@ FROM items WHERE body <> '' ORDER BY distance LIMIT 10;
   There is no deadlock detection between advisory locks: use timeouts or try-locks if two
   tasks take several of them in different orders.
 
+## Bulk imports
+
+`SELECT storine_reserve('table', rows)` sizes the store's index for `rows` more rows before an import, so the import doesn't pause while the index doubles. It needs `INSERT` on the table and returns `true`. Each row counts as one document plus one per unique constraint, and one call covers at most 100,000,000 documents (SQLSTATE `22003` beyond, or for a negative count). It changes no data; range clusters accept it without effect for now.
+
 ## Transactions and money safety
 
 Every statement runs in a transaction: an explicit one (`BEGIN` ... `COMMIT`) or an implicit
