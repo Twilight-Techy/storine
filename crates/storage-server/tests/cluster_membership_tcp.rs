@@ -99,6 +99,25 @@ fn wait_leader(nodes: &[&Node]) -> usize {
     }
 }
 
+/// Writes `writes` on the current leader, following a leader change: an early election can move
+/// leadership right after [`wait_leader`] saw it (Windows CI, 2026-11-17). `NotLeader` means the
+/// write was not applied, so retrying it cannot apply it twice. Updates `l` and `c` to the leader
+/// that took it.
+fn write_on_leader(nodes: &[&Node], l: &mut usize, c: &mut StorageClient, writes: &[DocWrite]) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match c.doc_write(writes, None) {
+            Ok(_) => return,
+            Err(StorageError::NotLeader { .. }) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+                *l = wait_leader(nodes);
+                *c = StorageClient::connect(nodes[*l].addr).unwrap();
+            }
+            Err(e) => panic!("write failed: {e:?}"),
+        }
+    }
+}
+
 fn deposit() -> DocWrite {
     DocWrite {
         collection: "acct".into(),
@@ -170,22 +189,22 @@ fn test_cluster_grows_and_the_leader_removes_itself_over_tcp() {
     let mut nodes: Vec<Node> = (1..=3)
         .map(|i| start_node(&dir, i, addrs[&i], &addrs))
         .collect();
-    let l = wait_leader(&nodes.iter().collect::<Vec<_>>());
+    let mut l = wait_leader(&nodes.iter().collect::<Vec<_>>());
     let mut c = StorageClient::connect(nodes[l].addr).unwrap();
     let mut f = BTreeMap::new();
     f.insert("bal".to_string(), PropertyValue::Int64(100));
-    c.doc_write(
-        &[DocWrite {
-            collection: "acct".into(),
-            key: "a".into(),
-            op: DocOp::Put(f),
-            precondition: Precondition::Absent,
-        }],
-        None,
-    )
-    .unwrap();
-    for _ in 0..10 {
-        c.doc_write(&[deposit()], None).unwrap();
+    let first = [DocWrite {
+        collection: "acct".into(),
+        key: "a".into(),
+        op: DocOp::Put(f),
+        precondition: Precondition::Absent,
+    }];
+    {
+        let three: Vec<&Node> = nodes.iter().collect();
+        write_on_leader(&three, &mut l, &mut c, &first);
+        for _ in 0..10 {
+            write_on_leader(&three, &mut l, &mut c, &[deposit()]);
+        }
     }
 
     // Node 4 starts knowing nothing about the cluster.
@@ -213,10 +232,10 @@ fn test_cluster_grows_and_the_leader_removes_itself_over_tcp() {
     let old = nodes[l].id;
     c.cluster_change(CLUSTER_REMOVE, old, "").unwrap();
     let rest: Vec<&Node> = nodes.iter().filter(|n| n.id != old).collect();
-    let l2 = wait_leader(&rest);
+    let mut l2 = wait_leader(&rest);
     let mut c2 = StorageClient::connect(rest[l2].addr).unwrap();
     for _ in 0..5 {
-        c2.doc_write(&[deposit()], None).unwrap();
+        write_on_leader(&rest, &mut l2, &mut c2, &[deposit()]);
     }
     for n in &rest {
         wait_balance(n, 115);

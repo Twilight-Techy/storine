@@ -1076,8 +1076,25 @@ fn servers() -> &'static Servers {
     })
 }
 
+/// The OS ran short of local ports or socket buffers, which these sweeps can cause by opening
+/// thousands of short connections (`WSAENOBUFS` 10055 on Windows, `EADDRNOTAVAIL` on macOS):
+/// worth waiting out, unlike anything the server did.
+fn out_of_sockets(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::AddrInUse)
+        || e.raw_os_error() == Some(10055)
+}
+
 fn connect(addr: SocketAddr) -> TcpStream {
-    let s = TcpStream::connect(addr).expect("connect");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let s = loop {
+        match TcpStream::connect(addr) {
+            Ok(s) => break s,
+            Err(e) if out_of_sockets(&e) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => panic!("connect: {e:?}"),
+        }
+    };
     s.set_read_timeout(Some(Duration::from_secs(5)))
         .expect("timeout");
     s.set_write_timeout(Some(Duration::from_secs(5)))
