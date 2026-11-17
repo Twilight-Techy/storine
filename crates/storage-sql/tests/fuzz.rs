@@ -1119,6 +1119,10 @@ fn too_costly(sql: &str) -> bool {
         "sleep",
         "waitfor",
         "copy",
+        // Sizes the store's index for up to 100,000,000 documents on purpose (gigabytes of
+        // address space): an allocation the caller asks for, not one a length field sized.
+        // Its limits are tested in `executor.rs` (`storine_reserve_sizes_before_an_import`).
+        "storine_reserve",
     ]
     .iter()
     .any(|w| l.contains(w))
