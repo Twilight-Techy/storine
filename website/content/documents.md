@@ -47,7 +47,7 @@ for row in rows:
     orders.put(row["id"], row)
 ```
 
-The server sizes its index once, so the import doesn't pause each time the index doubles. It is only a hint: it changes no data, takes the memory the index would reach anyway, and allows up to 100,000,000 per call. It matters for imports of millions of documents; below that the pauses are under a millisecond. From SQL or an ORM, use `SELECT storine_reserve('table', rows)` ([ORMs](orms.md#bulk-imports)). On a range cluster every node is sized for its share. To size the server once for everyone instead, with no call at all, start it with `STORAGE_EXPECTED_DOCUMENTS` ([server settings](server.md)).
+The server sizes its index once, so the import doesn't pause each time the index doubles. It needs an admin token, since one call can take gigabytes of address space. It is only a hint: it changes no data, takes the memory the index would reach anyway, and allows up to 100,000,000 per call. It matters for imports of millions of documents; below that the pauses are under a millisecond. From SQL or an ORM, use `SELECT storine_reserve('table', rows)` ([ORMs](orms.md#bulk-imports)). On a range cluster every node is sized for its share. To size the server once for everyone instead, with no call at all, start it with `STORAGE_EXPECTED_DOCUMENTS` ([server settings](server.md)).
 
 ## Updating fields on the server
 

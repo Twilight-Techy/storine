@@ -207,3 +207,36 @@ fn a_standalone_server_cuts_its_wal() {
     drop(reopened);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `reserve` (`TASK-163`) needs the admin role: a write token, which may run every other
+/// collection command, is refused, and an admin token is not.
+#[test]
+fn reserve_needs_the_admin_role() {
+    let dir = std::env::temp_dir().join(format!("storine_reserve_role_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(DocumentStore::open(&dir, EngineConfig::default()).unwrap());
+    let security = SecurityConfig::new(true)
+        .with_token("writer-token-0123456789", storage_server::RbacRole::ReadWrite)
+        .with_token("admin-token-0123456789", storage_server::RbacRole::Admin);
+    let server = StorageServer::start_documents("127.0.0.1:0", Arc::clone(&store), 100, security, None).unwrap();
+    let mut body = vec![storage_server::documents::ADMIN_RESERVE];
+    storage_core::document_wire::put_str(&mut body, "orders");
+    body.extend_from_slice(&10_000u64.to_le_bytes());
+    let mut index = vec![ADMIN_CREATE_INDEX];
+    storage_core::document_wire::put_str(&mut index, "orders");
+    storage_core::document_wire::put_str(&mut index, "sku");
+
+    let mut writer = StorageClient::connect(server.local_addr()).unwrap();
+    writer.authenticate("writer-token-0123456789").unwrap();
+    assert_eq!(writer.raw_call(OP_DOC_ADMIN, &index).unwrap().0, storage_server::STATUS_OK);
+    let (status, _, msg) = writer.raw_call(OP_DOC_ADMIN, &body).unwrap();
+    assert_eq!(status, storage_server::STATUS_UNAUTHORIZED, "{}", String::from_utf8_lossy(&msg));
+    // The connection stays usable.
+    assert_eq!(writer.raw_call(OP_DOC_ADMIN, &index).unwrap().0, storage_server::STATUS_OK);
+
+    let mut admin = StorageClient::connect(server.local_addr()).unwrap();
+    admin.authenticate("admin-token-0123456789").unwrap();
+    assert_eq!(admin.raw_call(OP_DOC_ADMIN, &body).unwrap().0, storage_server::STATUS_OK);
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
+}

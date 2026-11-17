@@ -1005,10 +1005,13 @@ pub fn scalar(ex: &Exec<'_>, name: &str, args: &[Datum]) -> SqlResult<Datum> {
         "currval" => Datum::Int(ex.s.last_insert_id),
         // `storine_reserve(table, rows)`: room for `rows` more rows before an import, so the
         // store's index does not pause writes while it grows (`TASK-163`). Each row is one
-        // document plus one marker per unique constraint. Needs INSERT on the table.
+        // document plus one marker per unique constraint. Superusers only: one call can take
+        // gigabytes of address space (and the server wants an admin token for it too).
         "storine_reserve" => {
+            if !ex.s.engine.acl()?.is_superuser(ex.s.current_role()) {
+                return Err(SqlError::new("42501", "permission denied: storine_reserve needs a superuser"));
+            }
             let table = ex.s.engine.table(&text(&a0))?;
-            ex.s.require_table(&table, "INSERT", &[])?;
             let rows = u64::try_from(int(arg(args, 1))?)
                 .map_err(|_| SqlError::numeric_out_of_range("storine_reserve: rows must not be negative"))?;
             let docs = rows.saturating_mul(1 + table.uniques.len() as u64);

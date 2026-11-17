@@ -760,7 +760,7 @@ impl Collection<'_> {
 
     /// Makes room for about `count` more documents before a bulk import, so writes don't pause
     /// while the server's index grows (at most 100,000,000 per call). A hint: nothing else
-    /// changes; on a range cluster every node is sized for its share.
+    /// changes; on a range cluster every node is sized for its share. Needs an admin token.
     pub fn reserve(&self, count: u64) -> Result<()> {
         let mut body = wire::encode_admin(12, &self.name, None)?;
         body.extend_from_slice(&count.to_le_bytes());

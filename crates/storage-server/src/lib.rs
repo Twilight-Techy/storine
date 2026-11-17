@@ -1550,6 +1550,20 @@ fn execute_request<T: ZeroCopyRecord + Indexable>(
     raw_id: [u8; 24],
     body: Vec<u8>,
 ) -> ConnStep {
+    // `reserve` takes index memory for up to 100,000,000 documents in one call (gigabytes of
+    // address space, counted against Windows' commit limit at once), so it needs Admin although
+    // the other collection commands need only ReadWrite. The opcode check above cannot see it:
+    // the sub-command is in the body.
+    if op == OP_DOC_ADMIN && body.first() == Some(&documents::ADMIN_RESERVE) && conn.role < RbacRole::Admin {
+        return if conn
+            .send_or_queue_response(STATUS_UNAUTHORIZED, 0, b"reserve needs the admin role")
+            .is_err()
+        {
+            ConnStep::Closed
+        } else {
+            ConnStep::Progress
+        };
+    }
     if let Some(ref rc) = shared.ranges {
         return route_ranges(conn, rc, &shared.security, shard, op, body);
     }

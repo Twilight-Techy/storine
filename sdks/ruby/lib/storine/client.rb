@@ -508,7 +508,7 @@ module Storine
       query(where, nil, k, 0, nil, [field, vector.map { |x| Float(x) }, k, exact])[2]
     end
 
-    # Makes room for about `count` more documents before a bulk import, so writes don't pause while the server's index grows (at most 100,000,000 per call). A hint: nothing else changes; on a range cluster every node is sized for its share.
+    # Makes room for about `count` more documents before a bulk import, so writes don't pause while the server's index grows (at most 100,000,000 per call). A hint: nothing else changes; on a range cluster every node is sized for its share. Needs an admin token.
     def reserve(count)
       raise ArgumentError, "count must not be negative" if count.negative?
 

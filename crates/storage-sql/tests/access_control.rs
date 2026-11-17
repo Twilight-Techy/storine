@@ -638,3 +638,17 @@ fn audit_row_security_holds() {
     drop((a, low));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// `storine_reserve` (`TASK-163`) is for superusers: a role with every privilege on the table
+/// is still refused, since one call can take gigabytes of address space.
+#[test]
+fn storine_reserve_needs_a_superuser() {
+    let (e, _keep, _d) = engine("reserve");
+    let mut a = e.new_session(Dialect::Postgres, "admin", None);
+    setup(&mut a);
+    ok(&mut a, "GRANT ALL ON t TO ann");
+    assert_eq!(rows(&mut a, "SELECT storine_reserve('t', 1000)"), vec![vec!["t".to_owned()]]);
+    let mut u = e.new_session(Dialect::Postgres, "ann", None);
+    refused(&mut u, "SELECT storine_reserve('t', 1000)");
+    ok(&mut u, "INSERT INTO t VALUES (9, 'ann', 's9', 90)");
+}

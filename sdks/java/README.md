@@ -65,7 +65,7 @@ try (Storine db = Storine.connect("storine://127.0.0.1:7878")) {   // or "storin
 | `c.createIndex` / `c.dropIndex` / `c.info` / `c.drop` | Indexes (up to 16 per collection) and collection management. |
 | `c.nearest(field, vector, k[, where, exact])` | The `k` documents whose `field` is most similar to `vector` (cosine), best first; `doc.score()` is the similarity. |
 | `c.createVectorIndex(field, dims)` / `c.dropVectorIndex(field)` / `c.vectorIndexes()` | Vector indexes for `nearest` (`VectorIndex(field, dims, ready)`). |
-| `c.reserve(count)` | Room for about `count` more documents before a bulk import, so writes don't pause while the index grows (at most 100,000,000 per call; range clusters size every node for its share). Needs server 0.3. |
+| `c.reserve(count)` | Room for about `count` more documents before a bulk import, so writes don't pause while the index grows (at most 100,000,000 per call; range clusters size every node for its share). Needs server 0.3 and an admin token. |
 | `c.aggregate(aggregation)` / `c.scanColumns(fields, where[, pageSize])` / `c.enableColumnar()` / `c.disableColumnar()` | Analytics (below). |
 | `db.transaction(tx -> ...)` | Writes committed atomically when the lambda returns; `tx.requireVersion` / `tx.requireExists` add checks. |
 | `db.collections()` / `db.clusterInfo()` | Introspection. |

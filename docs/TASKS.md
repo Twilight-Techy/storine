@@ -1504,7 +1504,7 @@ This document defines the strict chronological execution order for building the 
   - **Server**: `OP_DOC_ADMIN` sub-command `12` (`str collection | u64 count`) calls `DocumentStore::reserve`, which sizes the store's one primary index. At most 100,000,000 per call. Range clusters size every node for its share (`OP_RANGE_RESERVE`, `0x2F`, node to node).
   - **Clients**: `reserve` in all eight libraries, each checked against a running server.
   - **Server setting**: `STORAGE_EXPECTED_DOCUMENTS` sizes the index at start, for every client and ORM; range nodes take their share. `index_capacity` in the health report.
-  - **SQL**: `storine_reserve(table, rows)`, rows times one plus the unique constraints, needs `INSERT`. Automatic sizing per statement was considered and dropped: without the total up front it moves the rebuild earlier rather than avoiding it.
+  - **SQL**: `storine_reserve(table, rows)`, rows times one plus the unique constraints, superusers only (`42501` otherwise). Automatic sizing per statement was considered and dropped: without the total up front it moves the rebuild earlier rather than avoiding it.
 
 - [ ] **TASK-164 (0.4.0): The 4-Writer Tail on Saturated CPUs** — with four writers on four CPUs, p99.99 of memory-first overwrites is 2.2–2.5 ms (69 µs with three writers). Better than RocksDB with its WAL (2.7–2.9 ms), behind RocksDB without one (0.26–0.30 ms). Benchmark report section 8.11 has the traces.
   - **Cause**: every writer takes two shared locks, the WAL state lock (LSN and staging) and the flush-queue lock. When a holder is preempted, the others sleep on it; a woken writer is placed on its waker's CPU and waits out a 2.1 ms slice while other CPUs idle.

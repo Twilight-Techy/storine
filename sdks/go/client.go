@@ -869,7 +869,7 @@ func (c *Collection) admin(ctx context.Context, op byte, sub byte, field *string
 
 // Reserve makes room for about count more documents before a bulk import, so writes don't pause
 // while the server's index grows (at most 100,000,000 per call). A hint: nothing else changes,
-// and on a range cluster every node is sized for its share.
+// and on a range cluster every node is sized for its share. Needs an admin token.
 func (c *Collection) Reserve(ctx context.Context, count uint64) error {
 	w := &writer{}
 	w.u8(12)

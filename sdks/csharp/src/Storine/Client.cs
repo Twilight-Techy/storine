@@ -673,7 +673,7 @@ public sealed class Collection
     }
 
     /// <summary>
-    /// Makes room for about <paramref name="count"/> more documents before a bulk import, so writes don't pause while the server's index grows (at most 100,000,000 per call). A hint: nothing else changes; on a range cluster every node is sized for its share.
+    /// Makes room for about <paramref name="count"/> more documents before a bulk import, so writes don't pause while the server's index grows (at most 100,000,000 per call). A hint: nothing else changes; on a range cluster every node is sized for its share. Needs an admin token.
     /// </summary>
     public Task ReserveAsync(ulong count, CancellationToken ct = default) =>
         client.CallAsync(Wire.OpDocAdmin, Wire.Reserve(Name, count), ct);
