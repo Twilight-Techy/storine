@@ -8,13 +8,14 @@ description: The health report, Prometheus metrics and slow-request log, what ea
 `storage-cli remote-health <addr>` prints a node's health report as JSON. Any role may read it. A standalone server:
 
 ```json
-{"status":"ok","live_records":0,"total_reads":0,"total_writes":0,"hot_dirty_bytes":0,"arena":{"segments":1,"used":0,"dead":0,"live":0,"compactions":0,"removed":0,"errors":0,"last_error":""},"encryption":"off"}
+{"status":"ok","live_records":0,"index_capacity":3584,"total_reads":0,"total_writes":0,"hot_dirty_bytes":0,"arena":{"segments":1,"used":0,"dead":0,"live":0,"compactions":0,"removed":0,"errors":0,"last_error":""},"encryption":"off"}
 ```
 
 | Field | Meaning |
 | :--- | :--- |
 | `status` | `ok` while the node serves |
 | `live_records` | Documents stored |
+| `index_capacity` | Documents the index holds before it next grows. `reserve` and `STORAGE_EXPECTED_DOCUMENTS` raise it |
 | `total_reads`, `total_writes` | Since the server started |
 | `hot_dirty_bytes` | Written but not yet flushed to the record files. Stays low unless the disk falls behind |
 | `arena.segments`, `used`, `dead`, `live` | Segment files and their bytes. `dead` is space that compaction will reclaim |

@@ -2267,6 +2267,11 @@ impl<T: ZeroCopyRecord + Indexable> StorageEngine<T> {
         self.inner.primary.reserve(additional)
     }
 
+    /// Records the primary index can hold before it next grows (`reserve_records` raises it).
+    pub fn index_capacity(&self) -> usize {
+        self.inner.primary.capacity()
+    }
+
     /// Returns a snapshot of engine telemetry and performance counters (`F-OPS-06`).
     pub fn stats(&self) -> EngineStats {
         let pool_stats = self.inner.mmap_pool.stats();

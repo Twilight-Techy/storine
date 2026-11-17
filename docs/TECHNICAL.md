@@ -227,6 +227,7 @@ An unknown option is an error, so a mistyped flag never becomes the data directo
 | `STORAGE_ENCRYPTION_ALLOW_PLAINTEXT` | `1`: accept existing plaintext while it is encrypted (turning encryption on for a database with data) |
 | `STORAGE_WAL_ARCHIVE` | Directory where checkpoints archive the WAL for point-in-time recovery (section 13); not on range clusters |
 | `STORAGE_WAL_ARCHIVE_RETAIN` | How long archived WAL is kept: `7d` by default, or hours (`48h`) or minutes (`90m`) |
+| `STORAGE_EXPECTED_DOCUMENTS` | About how many documents the database will hold (at most 1,000,000,000). The index is sized for them at start, so imports don't pause while it grows, for every client and ORM with no code change. Range nodes take the whole cluster's count and size for their share |
 | `STORINE_REACTOR=poll` | Use `poll` instead of `epoll` / `kqueue` / AFD poll |
 | `STORINE_THREADS` | Analytics parallelism |
 | `STORINE_SIMD=portable` | Use the portable column kernels |

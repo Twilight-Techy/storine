@@ -254,6 +254,12 @@ impl PrimaryIndex {
         Ok(())
     }
 
+    /// Entries the RAM shards can hold without growing (memory tier: the index's room; with a
+    /// cold tier, room for changes since the last checkpoint).
+    pub fn capacity(&self) -> usize {
+        (0..PRIMARY_SHARDS).map(|i| self.read_shard(i).by_id.capacity()).sum()
+    }
+
     /// Keeps live ids in byte order from now on (call before serving: ids written while it
     /// runs may be missed). `O(N log N)` once, then `O(log N)` per new or removed id.
     pub fn enable_ordered_ids(&self) {

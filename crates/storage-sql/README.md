@@ -260,7 +260,7 @@ FROM items WHERE body <> '' ORDER BY distance LIMIT 10;
 
 ## Bulk imports
 
-`SELECT storine_reserve('table', rows)` sizes the store's index for `rows` more rows before an import, so the import doesn't pause while the index doubles. It needs `INSERT` on the table and returns `true`. Each row counts as one document plus one per unique constraint, and one call covers at most 100,000,000 documents (SQLSTATE `22003` beyond, or for a negative count). It changes no data; range clusters accept it without effect for now.
+`SELECT storine_reserve('table', rows)` sizes the store's index for `rows` more rows before an import, so the import doesn't pause while the index doubles. It needs `INSERT` on the table and returns `true`. Each row counts as one document plus one per unique constraint, and one call covers at most 100,000,000 documents (SQLSTATE `22003` beyond, or for a negative count). It changes no data; on a range cluster every node is sized for its share.
 
 ## Transactions and money safety
 

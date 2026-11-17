@@ -212,7 +212,9 @@ Before a large import, tell the store how many rows are coming. It sizes its ind
 SELECT storine_reserve('orders', 1000000);
 ```
 
-Run it as raw SQL from any ORM (`session.execute(text(...))`, `connection.cursor().execute(...)`, `prisma.$queryRaw`, `db.Exec`, `DB::select`, `ActiveRecord::Base.connection.execute`). It needs `INSERT` on the table and returns `true`. One call covers up to 100,000,000 documents: each row counts as one, plus one per unique constraint. It is only a hint. It changes no data, and range clusters accept it without effect for now. Most useful for imports of millions of rows; with fewer, the pauses are under a millisecond anyway.
+Run it as raw SQL from any ORM (`session.execute(text(...))`, `connection.cursor().execute(...)`, `prisma.$queryRaw`, `db.Exec`, `DB::select`, `ActiveRecord::Base.connection.execute`). It needs `INSERT` on the table and returns `true`. One call covers up to 100,000,000 documents: each row counts as one, plus one per unique constraint. It is only a hint. It changes no data; on a range cluster every node is sized for its share. Most useful for imports of millions of rows; with fewer, the pauses are under a millisecond anyway.
+
+To cover every import with no SQL at all, start the server with `STORAGE_EXPECTED_DOCUMENTS` set to about how many documents the database will hold ([server settings](server.md)). The ORM then needs nothing.
 
 ## Migrations and schema changes
 

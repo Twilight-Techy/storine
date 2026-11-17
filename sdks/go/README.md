@@ -56,7 +56,7 @@ err = accounts.Scan(ctx, nil, func(d *storine.Document) error { ...; return nil 
 | `c.Find(ctx, Query{Where, OrderBy, Limit, Offset})` / `c.First` / `c.Count(ctx, where)` / `c.Scan(ctx, where, fn)` | Queries. `Where` is a filter: `Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`, `Between`, `In`, `Prefix`, `Contains`, `Exists`, `Missing`, `KeyPrefix`, `And`, `Or`, `Not`, or `Match(Doc{...})`; `nil` matches all. `"-price"` sorts descending. |
 | `c.Nearest(ctx, field, vector, NearestOptions{K, Where, Exact})` | The `K` (default 10) documents whose `field` (a list of numbers) is most similar to `vector` (`[]float32`, cosine), best first; similarity in `doc.Score()`. |
 | `c.CreateVectorIndex(ctx, field, dims)` / `c.DropVectorIndex(ctx, field)` / `c.VectorIndexes(ctx)` | Vector indexes for `Nearest` (`[]VectorIndex{Field, Dims, Ready}`). |
-| `c.Reserve(ctx, count)` | Room for about `count` more documents before a bulk import, so writes don't pause while the index grows (at most 100,000,000 per call; no effect on range clusters yet). Needs server 0.3. |
+| `c.Reserve(ctx, count)` | Room for about `count` more documents before a bulk import, so writes don't pause while the index grows (at most 100,000,000 per call; range clusters size every node for its share). Needs server 0.3. |
 | `c.CreateIndex` / `c.DropIndex` / `c.Info` / `c.Drop` | Indexes (up to 16 per collection) and collection management. |
 | `db.Transaction(ctx, func(tx *Tx) error)` | Writes committed atomically when `fn` returns nil; `tx.RequireVersion` / `tx.RequireExists` add checks. |
 | `db.Collections(ctx)` / `db.ClusterInfo(ctx)` | Introspection. |

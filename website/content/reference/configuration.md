@@ -40,6 +40,7 @@ storage-server gen-key <key-file>
 | `STORAGE_ENCRYPTION_ALLOW_PLAINTEXT` | off | `1`: accept plaintext while encrypting |
 | `STORAGE_WAL_ARCHIVE` | none | WAL archive folder for point-in-time recovery |
 | `STORAGE_WAL_ARCHIVE_RETAIN` | `7d` | Archive retention: `Nd`, `Nh` or `Nm` |
+| `STORAGE_EXPECTED_DOCUMENTS` | `0`: grow as needed | About how many documents the database will hold, at most 1,000,000,000 (`_` or `,` may group digits). The index is sized for them at start. On a range cluster, set the whole cluster's count on every node; each sizes for its share |
 | `STORINE_REACTOR` | the platform's best | `poll` to use `poll` |
 | `STORINE_THREADS` | the CPU count | Analytics parallelism |
 | `STORINE_SIMD` | the CPU's best | `portable` for the portable kernels |

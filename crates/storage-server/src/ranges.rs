@@ -34,7 +34,7 @@ use storage_types::{Result, StorageError};
 
 use crate::cluster::WorkerPool;
 use crate::documents::DocBackend;
-use crate::{StorageClient, OP_KV, OP_RANGE_BATCH, STATUS_OK};
+use crate::{StorageClient, OP_KV, OP_RANGE_BATCH, OP_RANGE_RESERVE, STATUS_OK};
 
 /// Batches waiting for one peer before new ones are dropped.
 const PEER_QUEUE: usize = 1024;
@@ -260,7 +260,16 @@ impl RangeContext {
     }
 
     pub(crate) fn backend(&self) -> RangeBackend {
-        RangeBackend { gw: Mutex::new(Gateway::new(Arc::clone(&self.transport) as Arc<dyn Transport>, self.gateway.clone(), Arc::clone(&self.hlc), Arc::clone(&self.cache)).sharing_collections(Arc::clone(&self.plain))) }
+        RangeBackend {
+            gw: Mutex::new(Gateway::new(Arc::clone(&self.transport) as Arc<dyn Transport>, self.gateway.clone(), Arc::clone(&self.hlc), Arc::clone(&self.cache)).sharing_collections(Arc::clone(&self.plain))),
+            transport: Arc::clone(&self.transport),
+            engine: Arc::clone(&self.engine),
+        }
+    }
+
+    /// This node's store.
+    pub(crate) fn engine(&self) -> Arc<storage_core::StorageEngine<storage_core::DocumentRecord>> {
+        Arc::clone(&self.engine)
     }
 
     /// `OP_CLUSTER_INFO` body: every node coordinates, so each reports itself as the node to
@@ -269,8 +278,9 @@ impl RangeContext {
     /// `OP_HEALTH` in range mode: what the node holds in memory, for operators and the soak.
     pub(crate) fn health(&self) -> Vec<u8> {
         format!(
-            "{{\"status\":\"ok\",\"mode\":\"ranges\",{},\"outbound_batch_bytes\":{},\"dropped_batches\":{}{}{}}}",
+            "{{\"status\":\"ok\",\"mode\":\"ranges\",{},\"index_capacity\":{},\"outbound_batch_bytes\":{},\"dropped_batches\":{}{}{}}}",
             self.node.gauges(),
+            self.engine.index_capacity(),
             self.transport.queued_bytes.load(Ordering::Relaxed),
             self.transport.dropped.load(Ordering::Relaxed),
             crate::at_rest::health_field(self.engine.encryption()) + &self.rules_field() + ",\"placement\":" + &self.node.placement(),
@@ -321,6 +331,31 @@ impl RangeContext {
 /// The document API through a gateway (one per request).
 pub(crate) struct RangeBackend {
     gw: Mutex<Gateway>,
+    transport: Arc<TcpRangeTransport>,
+    engine: Arc<storage_core::StorageEngine<storage_core::DocumentRecord>>,
+}
+
+/// Copies of each range a cluster of `nodes` keeps (the allocator's default, at most `nodes`).
+const RESERVE_REPLICAS: u64 = 3;
+
+/// A node's share of `count` reserved documents in a cluster of `nodes`: ranges are spread
+/// evenly once a large import has split them, and each document is stored on
+/// `min(3, nodes)` nodes.
+pub(crate) fn reserve_share(count: u64, nodes: u64) -> u64 {
+    let nodes = nodes.max(1);
+    count.saturating_mul(RESERVE_REPLICAS.min(nodes)).div_ceil(nodes)
+}
+
+/// `OP_RANGE_RESERVE` on the receiving node: sizes its store for its share.
+pub(crate) fn run_range_reserve(engine: &storage_core::StorageEngine<storage_core::DocumentRecord>, body: &[u8]) -> crate::documents::Reply {
+    let Ok(raw) = <[u8; 8]>::try_from(body) else {
+        return (crate::STATUS_INVALID, 0, b"OP_RANGE_RESERVE takes a u64 count".to_vec());
+    };
+    let count = u64::from_le_bytes(raw).min(storage_core::MAX_RESERVE_DOCUMENTS);
+    match engine.reserve_records(count as usize) {
+        Ok(()) => (STATUS_OK, 0, Vec::new()),
+        Err(e) => crate::documents::error_reply(&e),
+    }
 }
 
 impl RangeBackend {
@@ -630,12 +665,21 @@ impl DocBackend for RangeBackend {
         self.with(|g| docs::set_columnar(g, c, false))
     }
 
-    /// Accepted and checked, with no effect yet: a range cluster's documents sit on many
-    /// nodes, and sizing them would need a node-to-node request.
+    /// Sizes every node for its share ([`reserve_share`]): this one directly, the others with
+    /// `OP_RANGE_RESERVE`. A hint: a node that cannot be reached is skipped (it grows as before),
+    /// so an import never fails over it.
     fn reserve(&self, c: &str, count: u64) -> Result<()> {
         storage_core::validate_collection_name(c, false)?;
         if count > storage_core::MAX_RESERVE_DOCUMENTS {
             return Err(StorageError::invalid_value("reserve at most 100,000,000 documents per call"));
+        }
+        let share = reserve_share(count, self.transport.peers.len() as u64);
+        self.engine.reserve_records(share as usize)?;
+        let me = self.transport.me;
+        for &peer in self.transport.peers.keys().filter(|&&p| p != me) {
+            if let Ok(mut client) = self.transport.connect(peer, self.transport.timeout) {
+                let _ = client.raw_call(OP_RANGE_RESERVE, &share.to_le_bytes());
+            }
         }
         Ok(())
     }
@@ -671,6 +715,9 @@ pub struct RangeExtras {
     pub zones: storage_core::dist::zone::ZoneConfigs,
     /// The file `zones` came from: watched, and reloaded when it changes (`TASK-157`).
     pub zones_file: Option<std::path::PathBuf>,
+    /// `STORAGE_EXPECTED_DOCUMENTS` (`TASK-163`): documents the whole cluster is expected to
+    /// hold; this node sizes its store for its share at start ([`reserve_share`]).
+    pub expected_documents: u64,
 }
 
 /// What a range node last made of its placement rules file (`None`: loaded fine).
@@ -723,7 +770,7 @@ pub fn start_range_server(cfg: RangeServerConfig) -> Result<crate::StorageServer
     let mut ids: Vec<NodeId> = cfg.peers.keys().copied().collect();
     ids.sort_unstable();
     let encryption = cfg.extras.encryption.clone();
-    let engine = Arc::new(StorageEngine::<DocumentRecord>::open(&cfg.data_dir, EngineConfig { collection_name: "ranges".into(), layout_mode: storage_core::document::DOCUMENT_LAYOUT, wal_sync_policy: storage_core::dist::range_wal_policy(), encryption: encryption.as_ref().map(|e| e.startup.clone()), ..EngineConfig::default() })?);
+    let engine = Arc::new(StorageEngine::<DocumentRecord>::open(&cfg.data_dir, EngineConfig { collection_name: "ranges".into(), layout_mode: storage_core::document::DOCUMENT_LAYOUT, wal_sync_policy: storage_core::dist::range_wal_policy(), encryption: encryption.as_ref().map(|e| e.startup.clone()), expected_records: reserve_share(cfg.extras.expected_documents, cfg.peers.len() as u64) as usize, ..EngineConfig::default() })?);
     let incarnation = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
     let node_cfg = NodeConfig {
         seed: u64::from(cfg.node_id),

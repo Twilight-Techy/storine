@@ -8,7 +8,22 @@ use storage_sql::exec::{Engine, EngineConfig, Outcome, Session};
 use storage_sql::parser::parse;
 use storage_sql::{Dialect, SqlError, SqlResult};
 
+/// Fails this test binary after 10 minutes (it normally takes seconds). On 2026-11-16 three of
+/// these tests hung on a macOS runner that had run out of local ports and held it for 1.5 hours;
+/// the harness's "has been running for over 60 seconds" lines name the stuck ones.
+fn watchdog() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(600));
+            eprintln!("access_control: still running after 10 minutes; a test is stuck (see the lines above)");
+            std::process::exit(101);
+        });
+    });
+}
+
 fn engine(name: &str) -> (Arc<Engine>, storage_sql::embedded::Embedded, std::path::PathBuf) {
+    watchdog();
     let dir = std::env::temp_dir().join(format!("storine_acl_{name}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let config = EngineConfig { bootstrap_users: Some(HashSet::from(["admin".to_owned()])), ..EngineConfig::default() };

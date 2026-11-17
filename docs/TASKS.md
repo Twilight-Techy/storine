@@ -1501,6 +1501,12 @@ This document defines the strict chronological execution order for building the 
   - **4-writer overwrite**: traced. The flush queue's dedup set no longer grows under the lock (`reserve_ids`, `QUEUE_SET_GROW_LIMIT`); max 6.5–8.1 → 4.3–4.6 ms. The remaining p99.99 (2.2–2.5 ms) is the scheduler with five busy threads on four CPUs; 69 µs with a CPU to spare. Report section 8.11.
 
 - [x] **TASK-163: Reserve From the Server, the Clients and SQL** — `TASK-162` sized the index only for embedders. Asked for: the same through the server, the client libraries, the SQL gateway and ORMs.
-  - **Server**: `OP_DOC_ADMIN` sub-command `12` (`str collection | u64 count`) calls `DocumentStore::reserve`, which sizes the store's one primary index. At most 100,000,000 per call. Range clusters accept it without effect (sizing would need a node-to-node request).
+  - **Server**: `OP_DOC_ADMIN` sub-command `12` (`str collection | u64 count`) calls `DocumentStore::reserve`, which sizes the store's one primary index. At most 100,000,000 per call. Range clusters size every node for its share (`OP_RANGE_RESERVE`, `0x2F`, node to node).
   - **Clients**: `reserve` in all eight libraries, each checked against a running server.
+  - **Server setting**: `STORAGE_EXPECTED_DOCUMENTS` sizes the index at start, for every client and ORM; range nodes take their share. `index_capacity` in the health report.
   - **SQL**: `storine_reserve(table, rows)`, rows times one plus the unique constraints, needs `INSERT`. Automatic sizing per statement was considered and dropped: without the total up front it moves the rebuild earlier rather than avoiding it.
+
+- [ ] **TASK-164 (0.4.0): The 4-Writer Tail on Saturated CPUs** — with four writers on four CPUs, p99.99 of memory-first overwrites is 2.2–2.5 ms (69 µs with three writers). Better than RocksDB with its WAL (2.7–2.9 ms), behind RocksDB without one (0.26–0.30 ms). Benchmark report section 8.11 has the traces.
+  - **Cause**: every writer takes two shared locks, the WAL state lock (LSN and staging) and the flush-queue lock. When a holder is preempted, the others sleep on it; a woken writer is placed on its waker's CPU and waits out a 2.1 ms slice while other CPUs idle.
+  - **Plan**: (1) per-writer WAL staging with LSNs from one atomic counter, merged in LSN order by the flusher (file order must stay LSN order); (2) a flush queue sharded by record id, so a writer touches one shard; (3) measure p99.99 and throughput with 4 and 8 writers on 4 vCPUs against `v0.3.0`, plus process chaos and the power-loss suite, since (1) changes what recovery reads.
+  - **Done when**: 4-writer p99.99 under 0.5 ms on 4 vCPUs, with no throughput loss and no recovery change visible to the tests.

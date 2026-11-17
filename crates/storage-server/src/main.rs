@@ -43,6 +43,8 @@
 //! - `STORAGE_WAL_ARCHIVE`: a directory (preferably on another disk) where checkpoints archive
 //!   the WAL for point-in-time recovery (`storage-cli restore-pitr`), kept for
 //!   `STORAGE_WAL_ARCHIVE_RETAIN` (default `7d`). Not on range clusters.
+//! - `STORAGE_EXPECTED_DOCUMENTS`: about how many documents the database will hold; the index
+//!   is sized for them at start (range nodes: their share), as a client's `reserve` would.
 //!
 //! Placement (range clusters): `--peers 1=host:port@region/zone,...` gives every node's
 //! locality and `--zones <file>` the placement rules, the same on every node (`placement`).
@@ -194,6 +196,26 @@ fn spawn_reseal<T: storage_codec::ZeroCopyRecord + storage_index::Indexable + 's
     });
 }
 
+/// The most `STORAGE_EXPECTED_DOCUMENTS` accepts: at 150-300 bytes of index each, a billion
+/// documents is already 150-300 GB of address space.
+const MAX_EXPECTED_DOCUMENTS: u64 = 1_000_000_000;
+
+/// `STORAGE_EXPECTED_DOCUMENTS` (`TASK-163`): about how many documents the database will hold.
+/// The index is sized for them at start, so imports don't pause while it doubles; the same as
+/// every client calling `reserve` once. `_` and `,` may group digits. Unset or `0`: grow as
+/// needed.
+fn expected_documents_from_env() -> Result<u64> {
+    let Ok(raw) = env::var("STORAGE_EXPECTED_DOCUMENTS") else { return Ok(0) };
+    let digits: String = raw.trim().chars().filter(|c| !matches!(c, '_' | ',')).collect();
+    let n = digits
+        .parse::<u64>()
+        .map_err(|_| StorageError::config(format!("STORAGE_EXPECTED_DOCUMENTS must be a whole number of documents, not '{raw}'")))?;
+    if n > MAX_EXPECTED_DOCUMENTS {
+        return Err(StorageError::config("STORAGE_EXPECTED_DOCUMENTS is at most 1,000,000,000"));
+    }
+    Ok(n)
+}
+
 /// `STORAGE_WAL_ARCHIVE`: where checkpoints archive the WAL for point-in-time recovery
 /// (`TASK-156`), and `STORAGE_WAL_ARCHIVE_RETAIN` (`7d` by default; `h` and `m` units too):
 /// how long archived segments are kept.
@@ -267,7 +289,8 @@ options:
 
 environment: STORAGE_AUTH_TOKENS, STORAGE_BACKUP_ROOT, STORAGE_RATE_LIMIT,
 STORAGE_TLS_CERT, STORAGE_TLS_KEY, STORAGE_TLS_CA, STORAGE_CLUSTER_TOKEN,
-STORAGE_ENCRYPTION_KEYS, STORAGE_WAL_ARCHIVE, STORAGE_WAL_ARCHIVE_RETAIN.
+STORAGE_ENCRYPTION_KEYS, STORAGE_WAL_ARCHIVE, STORAGE_WAL_ARCHIVE_RETAIN,
+STORAGE_EXPECTED_DOCUMENTS.
 See the storage-server docs for what each one does.
 ";
 
@@ -369,6 +392,7 @@ fn run() -> Result<()> {
     let engine_config = EngineConfig {
         encryption: at_rest.as_ref().map(|a| a.startup.clone()),
         wal_archive_dir: archive.as_ref().map(|(d, _)| d.clone()),
+        expected_records: expected_documents_from_env()? as usize,
         ..EngineConfig::default()
     };
     if let Some((dir, retain)) = archive {
@@ -491,7 +515,7 @@ fn run_ranges(data_dir: &str, bind_addr: &str, max_connections: usize, security:
         max_connections,
         max_offset: Duration::from_millis(500),
         peer_tls,
-        extras: storage_server::ranges::RangeExtras { encryption: storage_server::at_rest::from_env()?, localities, zones, zones_file: zones_file.map(std::path::PathBuf::from) },
+        extras: storage_server::ranges::RangeExtras { encryption: storage_server::at_rest::from_env()?, localities, zones, zones_file: zones_file.map(std::path::PathBuf::from), expected_documents: expected_documents_from_env()? },
     })?;
     report((server.local_addr(), server.max_connections()), data_dir, server_auth(&server), &format!("documents, range node {node_id} of {n}"));
     park(server, once)

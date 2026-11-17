@@ -300,3 +300,37 @@ fn a_range_cluster_authenticates() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `index_capacity` from a node's health report.
+fn index_capacity(addr: SocketAddr) -> u64 {
+    let health = StorageClient::connect(addr).unwrap().health().unwrap();
+    let at = health.find("\"index_capacity\":").expect("index_capacity in health") + 17;
+    health[at..].chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap()
+}
+
+/// `reserve` on a range cluster (`TASK-163`): any node takes it, and every node is sized for its
+/// share (count times three copies over three nodes: the whole count here).
+#[test]
+fn reserve_sizes_every_node() {
+    let root = std::env::temp_dir().join(format!("storine_range_reserve_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let cluster = start(&root.join("data"), &root.join("backups"));
+    let before: Vec<u64> = cluster.addrs.iter().map(|a| index_capacity(*a)).collect();
+    let mut body = vec![12u8];
+    storage_core::document_wire::put_str(&mut body, "orders");
+    body.extend_from_slice(&200_000u64.to_le_bytes());
+    let (status, _, msg) = retrying(cluster.addrs[1], |c| c.raw_call(storage_server::OP_DOC_ADMIN, &body));
+    assert_eq!(status, storage_server::STATUS_OK, "{}", String::from_utf8_lossy(&msg));
+    for (i, addr) in cluster.addrs.iter().enumerate() {
+        let after = index_capacity(*addr);
+        assert!(after >= 200_000, "node {} sized to {after} (was {})", i + 1, before[i]);
+    }
+    // The limit holds on range clusters too.
+    let mut over = vec![12u8];
+    storage_core::document_wire::put_str(&mut over, "orders");
+    over.extend_from_slice(&(storage_core::MAX_RESERVE_DOCUMENTS + 1).to_le_bytes());
+    let (status, _, _) = StorageClient::connect(cluster.addrs[0]).unwrap().raw_call(storage_server::OP_DOC_ADMIN, &over).unwrap();
+    assert_eq!(status, storage_server::STATUS_INVALID);
+    drop(cluster);
+    let _ = std::fs::remove_dir_all(&root);
+}

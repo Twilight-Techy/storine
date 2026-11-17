@@ -222,7 +222,7 @@ Body: `u8 command | arguments`.
 | `9` vector indexes | `0x25` | `str collection` | `u32 n | (str field | u32 dims | u8 ready)*` |
 | `10` enable columnar | `0x23` | `str collection` | `Ok`; the collection is also kept as column segments for analytics (§5.5, §5.6), built in the background |
 | `11` disable columnar | `0x23` | `str collection` | `Ok`; segments are deleted (analytics then read the row store) |
-| `12` reserve | `0x23` | `str collection | u64 count` | `Ok`; room for about `count` more documents, so an import does not pause while the index grows. A hint: at most 100,000,000 per call (`Invalid` beyond), accepted without effect by range clusters. Servers before 0.3 answer `Invalid` (unknown command) |
+| `12` reserve | `0x23` | `str collection | u64 count` | `Ok`; room for about `count` more documents, so an import does not pause while the index grows. A hint: at most 100,000,000 per call (`Invalid` beyond); a range cluster sizes every node for its share. Servers before 0.3 answer `Invalid` (unknown command) |
 
 `info := str name | u32 n | str index* | u32 m | str building_index* | map body (metadata)`.
 At most 16 secondary indexes and 4 vector indexes (up to 4,096 dimensions) per collection; indexes
@@ -318,5 +318,5 @@ documented in `crates/storage-server/src/lib.rs`. SDKs do not need them.
 ## 8. Not yet in this specification
 
 Range clusters answer `OP_CHANGEFEED` (`0x2E`, admin role): a poll-based feed of every change,
-used by `storage-cli changefeed`. Its body and those of the other range-cluster opcodes (`0x2B`–`0x2D`)
+used by `storage-cli changefeed`. Its body and those of the other range-cluster opcodes (`0x2B`–`0x2D`, and `0x2F`, which carries a node's share of a `reserve`)
 are internal and may change between minor versions; SDKs do not use them.

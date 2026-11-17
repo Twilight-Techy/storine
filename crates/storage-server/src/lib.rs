@@ -134,6 +134,9 @@ pub const OP_ADMIN_RESTORE: u8 = 0x2D;
 /// One page of a changefeed (range clusters, `TASK-144`). Admin: it reads every collection, and
 /// holds history back on every node.
 pub const OP_CHANGEFEED: u8 = 0x2E;
+/// Range cluster (`TASK-163`, Admin role, between nodes): `u64 count`; the receiving node sizes
+/// its store for `count` more records, its share of a client's `reserve`.
+pub const OP_RANGE_RESERVE: u8 = 0x2F;
 
 /// `OP_CLUSTER_CHANGE` actions.
 pub const CLUSTER_ADD_VOTER: u8 = 1;
@@ -177,7 +180,7 @@ const fn required_role(op: u8) -> Option<RbacRole> {
         | OP_DOC_ADMIN => Some(RbacRole::ReadWrite),
         OP_RAFT_VOTE | OP_RAFT_APPEND | OP_RAFT_SNAPSHOT | OP_MIGRATE_VSHARD | OP_ADMIN_BACKUP
         | OP_ADMIN_COMPACT | OP_ADMIN_CHECKPOINT | OP_CLUSTER_CHANGE | OP_RANGE_BATCH | OP_KV
-        | OP_ADMIN_RESTORE | OP_CHANGEFEED => Some(RbacRole::Admin),
+        | OP_ADMIN_RESTORE | OP_CHANGEFEED | OP_RANGE_RESERVE => Some(RbacRole::Admin),
         _ => None,
     }
 }
@@ -189,6 +192,7 @@ const fn max_body_len(op: u8) -> usize {
         OP_AUTH => MAX_AUTH_BODY,
         OP_ADMIN_BACKUP | OP_ADMIN_RESTORE => 4096,
         OP_CHANGEFEED => 64 * 1024,
+        OP_RANGE_RESERVE => 8,
         OP_QUERY_HYBRID => 64,
         OP_RAFT_VOTE => 64,
         OP_PUT_RAW_FRAME | OP_CAS_PUT | OP_BATCH_GET | OP_BATCH_PUT | OP_RAFT_APPEND
@@ -1532,6 +1536,7 @@ const fn op_name(op: u8) -> &'static str {
         OP_KV => "kv",
         OP_ADMIN_RESTORE => "admin_restore",
         OP_CHANGEFEED => "changefeed",
+        OP_RANGE_RESERVE => "range_reserve",
         _ => "unknown",
     }
 }
@@ -1641,6 +1646,10 @@ fn route_ranges(conn: &mut NonBlockingConn, rc: &ranges::RangeContext, security:
         OP_CHANGEFEED => {
             let backend = rc.backend();
             Box::new(move || ranges::run_changefeed(&backend, &body))
+        }
+        OP_RANGE_RESERVE => {
+            let engine = rc.engine();
+            Box::new(move || ranges::run_range_reserve(&engine, &body))
         }
         OP_SET_OPTIONS => {
             conn.follower_reads = body.first().is_some_and(|f| f & 1 != 0);
@@ -1976,8 +1985,8 @@ fn execute_local<T: ZeroCopyRecord + Indexable>(
                 .map(|c| if c == '"' || c == '\\' || c.is_control() { '\'' } else { c })
                 .collect();
             let health = format!(
-                "{{\"status\":\"ok\",\"live_records\":{},\"total_reads\":{},\"total_writes\":{},\"hot_dirty_bytes\":{},\"arena\":{{\"segments\":{},\"used\":{},\"dead\":{},\"live\":{},\"compactions\":{},\"removed\":{},\"errors\":{},\"last_error\":\"{}\"}}{}{}}}",
-                st.live_records, st.total_reads, st.total_writes, st.hot_dirty_bytes,
+                "{{\"status\":\"ok\",\"live_records\":{},\"index_capacity\":{},\"total_reads\":{},\"total_writes\":{},\"hot_dirty_bytes\":{},\"arena\":{{\"segments\":{},\"used\":{},\"dead\":{},\"live\":{},\"compactions\":{},\"removed\":{},\"errors\":{},\"last_error\":\"{}\"}}{}{}}}",
+                st.live_records, engine.index_capacity(), st.total_reads, st.total_writes, st.hot_dirty_bytes,
                 st.arena_segments, st.arena_used_bytes, st.arena_dead_bytes, engine.arena_live_bytes(),
                 st.arena_compactions, st.arena_compacted_segments, st.arena_compaction_errors, last_error,
                 at_rest::health_field(engine.encryption()) + &engine.wal_archive_dir().map_or(String::new(), |d| format!(",\"wal_archive\":\"{}\"", d.display().to_string().replace('\\', "/").replace('"', "'"))),

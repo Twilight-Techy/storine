@@ -7,7 +7,6 @@ description: What Storine does not do yet, and where it trails other databases.
 - **Single-group cluster writes wait for two disk syncs** in a row, the leader's log and then a follower's: about 8 ms on disks whose syncs take 4 ms. Concurrency raises throughput (section 8.8).
 - **The server does not expose the cold and paged index tiers**. They are in the [embedded API](../embedding.md#cold-tiers).
 - **Point-in-time recovery is not available on range clusters**, which have cluster backups instead.
-- **`reserve` has no effect on range clusters** yet: they accept it, but their documents sit on many nodes and are not sized.
 - **Changing a node's locality** in a range cluster takes a restart of every node.
 - **Range clusters list only collections with an index or metadata.**
 - **TLS** supports one cipher suite per version, Ed25519 certificates only, and no client certificates. .NET on Windows cannot connect with TLS, as its TLS stack lacks Ed25519.

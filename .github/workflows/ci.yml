@@ -41,6 +41,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
+        # Normally 18-44 minutes (Windows slowest). A hung test fails the step here instead of
+        # holding the runner until the job's 2-hour limit (macOS, 2026-11-16).
+        timeout-minutes: 75
         run: cargo test --release --workspace --no-fail-fast
       # The ceilings apply to what ships: the release build for the baseline CPU
       # (tools/release/build-dist.sh), not this runner's `native` build, which AVX-512

@@ -107,3 +107,42 @@ fn known_flags_still_start_the_server() {
     assert!(text.contains("max_connections: 4"), "{text}");
     assert!(dir.path().join("data").is_dir());
 }
+
+/// `STORAGE_EXPECTED_DOCUMENTS` (`TASK-163`): the server starts with its index sized for that
+/// many documents (seen in the health report), and refuses a value that is not a count.
+#[test]
+fn expected_documents_sizes_the_index_at_start() {
+    let dir = tempdir();
+    let bad = Command::new(env!("CARGO_BIN_EXE_storage-server"))
+        .args(["data", "127.0.0.1:0", "--once"])
+        .env("STORAGE_EXPECTED_DOCUMENTS", "lots")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("STORAGE_EXPECTED_DOCUMENTS"), "{bad:?}");
+
+    let addr = storage_types::testing::free_local_addr();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_storage-server"))
+        .args(["data", &addr.to_string()])
+        .env("STORAGE_EXPECTED_DOCUMENTS", "300_000")
+        .current_dir(dir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut health = None;
+    for _ in 0..100 {
+        if let Ok(mut c) = storage_server::StorageClient::connect(addr) {
+            health = c.health().ok();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let health = health.expect("the server answered");
+    let at = health.find("\"index_capacity\":").expect("index_capacity") + 17;
+    let capacity: u64 = health[at..].chars().take_while(char::is_ascii_digit).collect::<String>().parse().unwrap();
+    assert!(capacity >= 300_000, "index sized for {capacity}");
+}

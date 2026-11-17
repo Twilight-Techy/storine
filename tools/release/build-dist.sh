@@ -38,7 +38,21 @@ exe=""
 name="storine-$version-$arch-$os"
 
 if [ "$os" = linux ] && { ! command -v gcc > /dev/null || ! command -v objdump > /dev/null; }; then
-  dnf -y -q install gcc binutils tar gzip > /dev/null
+  # Mirrors sometimes lag each other (2026-11-17: arm64 appstream had a gcc whose libgcc baseos
+  # did not have yet). --nobest takes the newest gcc that installs; failures are retried with
+  # fresh metadata, which may come from another mirror.
+  for attempt in 1 2 3 4; do
+    if dnf -y -q --nobest install gcc binutils tar gzip > /dev/null; then
+      break
+    fi
+    if [ "$attempt" = 4 ]; then
+      echo "build-dist: installing the compiler failed 4 times" >&2
+      exit 1
+    fi
+    echo "build-dist: dnf install failed (attempt $attempt), retrying with fresh metadata" >&2
+    dnf clean metadata > /dev/null 2>&1 || true
+    sleep $((attempt * 30))
+  done
 fi
 if ! command -v cargo > /dev/null; then
   curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --default-toolchain "$toolchain"
