@@ -1070,6 +1070,7 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 ## 2026-11-17: reserve from the server, the clients and SQL (`TASK-163`)
 
 - `reserve(count)` in the server (`OP_DOC_ADMIN` 12), all eight client libraries and SQL (`storine_reserve`). Range clusters: the receiving node sends each peer its share (`OP_RANGE_RESERVE`); a three-node test sees every node sized. `STORAGE_EXPECTED_DOCUMENTS` sizes the index at start (`index_capacity` in health shows it). Release builds retry the compiler install; CI caps the test step at 75 minutes; `TASK-164` plans the 4-writer tail for 0.4.0. `reserve` then became admin-only (server) and superuser-only (SQL): one call can take gigabytes of address space, which Windows counts against its commit limit at once. Checked live from Python, TypeScript, Go, Java, Ruby, PHP, C# and Rust (through the gateway test), including the server's limit error. Replaces the 0.3.0 published on 2026-11-16, whose files only our own release checks had downloaded.
+- **CI before the tag**: Windows hit two test flakes (a write sent during a leader change, and socket buffers running out in the SQL fuzzer); both tests now retry. macOS then hung for the third time in the engine crash test's child process. Its parent now kills a child that is still alive after 2 minutes, which is a crash too, so the check is unchanged; a watchdog fails the test after 15 minutes and names the stuck step. 25 local runs passed in 17–19 s, and a forced hang in every child still kept every acknowledged write.
 
 ## 2026-11-16: 0.3.0
 

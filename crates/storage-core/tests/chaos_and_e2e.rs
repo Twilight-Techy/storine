@@ -537,11 +537,61 @@ fn crash_config(variant: usize) -> EngineConfig {
     }
 }
 
+/// Collects a crash child's output until it dies. The child crashes itself; if it is still alive
+/// after `CHILD_DEADLINE` the parent kills it with `SIGKILL` (`TerminateProcess` on Windows).
+/// Either way the process ends without running a destructor, so every line it printed is an
+/// acknowledged write that must survive. macOS CI runs hung three times in a crashing child
+/// (TASK-158, 0.3.0); the deadline turns that into an ordinary crash instead of a stuck job.
+/// The output is read on its own thread and collected with a timeout, so a pipe held open by
+/// anything the child started cannot stall the parent either.
+fn child_stdout_until_death(child: &mut std::process::Child, variant: usize, round: u64) -> String {
+    use std::io::Read;
+    const CHILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+    let mut pipe = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if start.elapsed() > CHILD_DEADLINE {
+            eprintln!("variant {variant} round {round}: crash child still alive after {CHILD_DEADLINE:?}; killing it");
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    if let Some(status) = status {
+        assert!(!status.success(), "child must die by a crash, not exit cleanly");
+    }
+    let buf = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap_or_else(|_| {
+        panic!("variant {variant} round {round}: crash child's output never closed")
+    });
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 #[test]
 fn test_process_kill_crash_recovery_preserves_every_acknowledged_write() {
     use std::collections::BTreeMap;
     use std::process::{Command, Stdio};
 
+    // A stuck recovery fails the run in 15 minutes, naming the step, instead of the CI timeout.
+    let step = std::sync::Arc::new(std::sync::Mutex::new(String::from("starting")));
+    {
+        let step = step.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(900));
+            eprintln!("crash test stuck after 15 minutes at: {}", step.lock().unwrap());
+            std::process::exit(101);
+        });
+    }
     let exe = std::env::current_exe().unwrap();
     for layout_idx in 0..CRASH_VARIANTS {
         let dir = std::env::temp_dir().join(format!("storage_e2e_kill_{layout_idx}"));
@@ -550,17 +600,18 @@ fn test_process_kill_crash_recovery_preserves_every_acknowledged_write() {
 
         // Two consecutive crashes on the same directory (recovery of a recovered database).
         for round in 1..=2u64 {
-            let output = Command::new(&exe)
+            *step.lock().unwrap() = format!("variant {layout_idx} round {round}: crash child");
+            let mut child = Command::new(&exe)
                 .args(["--exact", "crash_child_writer", "--nocapture", "--test-threads=1"])
                 .env("STORINE_CRASH_DIR", &dir)
                 .env("STORINE_CRASH_LAYOUT", layout_idx.to_string())
                 .env("STORINE_CRASH_SEED", (round * 7 + layout_idx as u64).to_string())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
-                .output()
+                .spawn()
                 .unwrap();
-            assert!(!output.status.success(), "child must die by abort()");
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let stdout = child_stdout_until_death(&mut child, layout_idx, round);
+            for line in stdout.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 match parts.as_slice() {
                     ["ACK", "PUT", n, score] => {
@@ -574,6 +625,7 @@ fn test_process_kill_crash_recovery_preserves_every_acknowledged_write() {
             }
             assert!(!expected.is_empty());
 
+            *step.lock().unwrap() = format!("variant {layout_idx} round {round}: recovery and checks");
             let engine = StorageEngine::<AgentObjectRecord>::open(&dir, crash_config(layout_idx)).unwrap();
             for n in 0..60u64 {
                 let key = InlineId::new(&format!("k{n:03}")).unwrap();
