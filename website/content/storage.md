@@ -59,6 +59,7 @@ Rewritten and deleted documents leave dead space in segments. **Compaction** cop
 - The buffer of unflushed writes is capped at 64 MiB.
 - Memory-mapped files count towards the page cache, not the process's own heap. At most 16,384 mappings and 4 GiB are mapped at once; colder ones are unmapped.
 - Segments can hold up to twice the live data before compaction.
+- `reserve` before an import takes the index memory for that many documents at once (150–300 bytes each), instead of as they arrive.
 - With `STORAGE_WAL_ARCHIVE`, plan for the archive too: about as much as you write in the retention period.
 
 Measured in the 0.2.0 release soaks (2 hours under constant faults, 4-vCPU VMs): a single-group node peaked at 850–940 MiB resident and 50–145 MiB on disk; a range node at 630–750 MiB resident and 104–228 MiB on disk, flat over time.

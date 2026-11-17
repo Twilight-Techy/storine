@@ -183,7 +183,7 @@ store.engine().checkpoint()?; // cut the WAL: an embedded engine does not do it 
 | `index_tier`, `primary_tier` | `Memory`, `Memory` | Section 3, cold tiers |
 | `encryption`, `decrypted_cache_bytes` | none, 256 MiB | Section 3, encryption at rest |
 
-`DocumentStore` offers `get`, `get_fields` (only some paths), `read_bytes` (a range of a large value), `put`, `insert`, `delete`, `patch`, `write` (an atomic batch across collections, with preconditions and a request id), `query`, `scan_collection`, index and vector index management, columnar storage, `aggregate`, `scan_columns`, `list_collections` (every collection with metadata or documents; on range clusters, those with metadata), `collection_info` and `drop_collection`. Backups: `create_online_backup`, `archive_wal_for_pitr` and `restore_point_in_time` (section 13).
+`DocumentStore` offers `get`, `get_fields` (only some paths), `read_bytes` (a range of a large value), `put`, `insert`, `delete`, `patch`, `write` (an atomic batch across collections, with preconditions and a request id), `query`, `scan_collection`, index and vector index management, columnar storage, `reserve` (room for more documents before an import), `aggregate`, `scan_columns`, `list_collections` (every collection with metadata or documents; on range clusters, those with metadata), `collection_info` and `drop_collection`. Backups: `create_online_backup`, `archive_wal_for_pitr` and `restore_point_in_time` (section 13).
 
 ---
 

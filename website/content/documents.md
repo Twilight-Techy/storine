@@ -37,6 +37,18 @@ people.delete("alan")
 
 `put` and `replace` replace the whole document: fields you leave out are gone. To change some fields and keep the rest, use `update`.
 
+## Bulk imports
+
+Before importing many documents, say how many are coming:
+
+```python
+orders.reserve(1_000_000)        # room for a million more documents
+for row in rows:
+    orders.put(row["id"], row)
+```
+
+The server sizes its index once, so the import doesn't pause each time the index doubles. It is only a hint: it changes no data, takes the memory the index would reach anyway, and allows up to 100,000,000 per call. It matters for imports of millions of documents; below that the pauses are under a millisecond. From SQL or an ORM, use `SELECT storine_reserve('table', rows)` ([ORMs](orms.md#bulk-imports)). Range clusters accept it without effect for now.
+
 ## Updating fields on the server
 
 `update` sends field operations, applied by the server to the current version in one atomic step:
