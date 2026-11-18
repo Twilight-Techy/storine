@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <a href="https://twilight-techy.github.io/storine/">Website and docs</a> ·
+  <a href="https://storine.twilighttechy.dev/">Website and docs</a> ·
   <a href="#get-started">Get started</a> ·
   <a href="#clients">Clients</a> ·
   <a href="#run-a-cluster">Clusters</a> ·
@@ -141,7 +141,7 @@ Clients list the servers and find the leader themselves: `storine://token@10.0.0
 
 | | |
 | :--- | :--- |
-| [Documentation website](https://twilight-techy.github.io/storine/) | Guides, every option, and each client's API, searchable |
+| [Documentation website](https://storine.twilighttechy.dev/) | Guides, every option, and each client's API, searchable |
 | [Technical reference](docs/TECHNICAL.md) | How it works, every option, operations, limits |
 | [Wire protocol](protocol/PROTOCOL.md) | For writing a client |
 | [Benchmarks](docs/BENCHMARK_REPORT.md) | Every measurement, with the method and the machine |

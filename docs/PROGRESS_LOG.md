@@ -1067,6 +1067,10 @@ A line-by-line review of every crate against `RULES.md` found that several earli
 - **4-writer overwrite**: the 4–8 ms stalls were a writer rehashing the flush queue's dedup set under its lock. The flusher now grows and pre-touches it outside the lock, and a full set no longer grows under it. Max 6.5–8.1 → 4.3–4.6 ms. The p99.99 of 2.2–2.5 ms is scheduler placement with more busy threads than CPUs (69 µs with three writers). Details in section 8.11 of the benchmark report.
 - **Cost**: one Azure D4s_v4 for about 2 h 15 min, deleted.
 
+## 2026-11-18: the website at storine.twilighttechy.dev
+
+- The Vercel project `storine` now serves https://storine.twilighttechy.dev (a CNAME at the domain's DNS host). The README and the repository's homepage point there. https://storine.vercel.app and the GitHub Pages copy keep working.
+
 ## 2026-11-18: a cheaper, politer flusher (`TASK-165`)
 
 - The flusher's batch fetch reads only what it needs, and it yields its CPU after each batch. 8-writer p99.99 3.05–3.32 → 2.91–3.07 ms on a `D4s_v4`; 4 writers 1.92–2.31 → 1.79–2.03 ms; throughput unchanged. A shorter per-thread scheduler slice changed nothing. Details in benchmark report section 8.13.
