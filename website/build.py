@@ -22,6 +22,9 @@ import posixpath
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SITE = os.path.join(ROOT, "website")
 REPO_URL = "https://github.com/Twilight-Techy/storine"
+# The canonical address: share previews (Open Graph) need absolute URLs, and the GitHub Pages
+# copy points search engines here.
+SITE_URL = "https://storine.twilighttechy.dev/"
 BLOB = REPO_URL + "/blob/main/"
 TREE = REPO_URL + "/tree/main/"
 
@@ -563,10 +566,34 @@ class Site:
 <meta name="color-scheme" content="light dark">
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: https://img.shields.io https://github.com; style-src 'self'; script-src 'self'; connect-src 'self'">
 <link rel="icon" href="{self.asset(page, 'logo.svg')}" type="image/svg+xml">
+<link rel="apple-touch-icon" href="{self.asset(page, 'icon-180.png')}">
+{self.share_tags(page, title, desc)}
 <link rel="stylesheet" href="{self.asset(page, 'site.css')}?v={self.version}">
 <script src="{self.asset(page, 'theme.js')}?v={self.version}"></script>
 <script src="{self.asset(page, 'site.js')}?v={self.version}" defer></script>
 </head>"""
+
+    def share_tags(self, page, title, desc):
+        """Open Graph and Twitter card tags, read by WhatsApp, Slack, X, LinkedIn and others."""
+        t = html.escape(title, quote=True)
+        tags = ""
+        if page.url != "404.html":
+            url = SITE_URL + page.url
+            tags += f'<link rel="canonical" href="{url}">\n<meta property="og:url" content="{url}">\n'
+        return tags + f"""<meta property="og:type" content="website">
+<meta property="og:site_name" content="Storine">
+<meta property="og:title" content="{t}">
+<meta property="og:description" content="{desc}">
+<meta property="og:image" content="{SITE_URL}og.png">
+<meta property="og:image:type" content="image/png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Storine: the document database that is fast, exact and small.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{t}">
+<meta name="twitter:description" content="{desc}">
+<meta name="twitter:image" content="{SITE_URL}og.png">
+<meta name="theme-color" content="#4f46e5">"""
 
     def header(self, page, active):
         home = self.relative(page, "")
@@ -820,12 +847,12 @@ class Site:
                 rel = os.path.relpath(os.path.join(dirpath, f), ROOT).replace(os.sep, "/")
                 if f.endswith(".md") and rel not in listed:
                     errors.append(f"{rel}: not in website/nav.json")
-        # Nothing may load from another origin (links to other sites are fine).
+        # Nothing may load from another origin (links to other sites, and the canonical address, are fine).
         for dirpath, _, files in os.walk(self.out):
             for f in files:
                 if f.endswith((".html", ".css", ".js")):
                     text = open(os.path.join(dirpath, f), encoding="utf-8").read()
-                    for m in re.finditer(r'<(?:script|link|iframe)\b[^>]*\b(?:src|href)="(https?:)?//', text):
+                    for m in re.finditer(r'<(?:script|link(?![^>]*\brel="canonical")|iframe)\b[^>]*\b(?:src|href)="(https?:)?//', text):
                         errors.append(f"{f}: loads from another origin: {m.group(0)}")
                     for m in re.finditer(r"url\(\s*['\"]?https?://|@import\s+['\"]?https?://", text):
                         errors.append(f"{f}: loads from another origin: {m.group(0)}")
