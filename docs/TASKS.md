@@ -1511,4 +1511,9 @@ This document defines the strict chronological execution order for building the 
   - **Tried**: a flush queue sharded by record id, and per-writer WAL staging stripes with LSNs from one atomic counter, merged in LSN order by the drain (file order stayed LSN order; new tests checked it under racing drains).
   - **Result** (benchmark report section 8.12): p99.99 unchanged at 4 writers on a `D4s_v4` (2.15–2.61 ms against 2.15–2.40 ms) and on 2 CPUs locally; 8 writers worse with the WAL change. The cause is CPU oversubscription, not lock-holder preemption: five busy threads on four CPUs, so a preempted writer waits a scheduler slice. Neither change kept; the patch is outside the repository.
   - **Kept**: a lost-wakeup fix. `Drop` notified the flusher without the queue's lock, so an idle engine's shutdown could wait forever.
-  - **Next, if wanted**: make the flusher cheaper in CPU, or document leaving a core free for it. Not started.
+  - **Next**: `TASK-165`.
+- [x] **TASK-165: A Cheaper Flusher** — take less CPU time from writers when they fill every CPU.
+  - Profile: 34 % index-entry fetch (a whole-entry copy, mostly cache misses), 32 % kernel copies into the page cache, 7 % completion.
+  - **Kept**: the batch flush reads only version, location and frame; the flusher yields after each 512-record batch (8-writer p99.99 3.05–3.32 → 2.91–3.07 ms on a `D4s_v4`, throughput unchanged).
+  - **Not kept**: a 0.1 ms per-thread scheduler slice (Linux 7.0), on the flusher or on every thread: no change.
+  - **Result**: p99.99 still about one scheduler slice with writers on every CPU (benchmark report section 8.13). Untested idea for later: writers flushing small batches themselves when the CPUs are saturated, so no separate thread competes.

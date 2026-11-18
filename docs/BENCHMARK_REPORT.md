@@ -668,3 +668,20 @@ One writer: 21–51 µs for all three. Two writers on a 2-CPU arm64 machine gave
 **Kept.** A bug found on the way: stopping an engine notified its flusher without holding the queue's lock. A notify that landed between the flusher's check and its untimed wait was lost, and the shutdown's join waited forever on an idle engine. It is now notified under the lock.
 
 **What helps instead** is a free CPU for the flusher (three writers on four CPUs: 69 µs, section 8.11), or a flusher that needs less CPU. One `D4s_v4` for about 50 minutes (about $0.17), deleted.
+
+### 8.13 A cheaper, politer flusher (`TASK-165`, 2026-11-18)
+
+Section 8.12 showed the 4-writer tail is five busy threads on four CPUs. This tried to take less CPU time from the writers. A profile of the flusher during a 2-writer overwrite: 34 % fetching each record's index entry (a copy of the whole 96-byte entry, mostly cache misses), 32 % in the kernel copying the log and the records into the page cache, 7 % completing each record. Same VM type and harness as section 8.11, three alternating rounds against `main`:
+
+| overwrite | `main` | lighter fetch | lighter fetch + yield |
+| :--- | ---: | ---: | ---: |
+| 4 threads, ops/s | 998 k–1.02 M | 987–996 k | 934 k–1.02 M |
+| 4 threads, p99.99 | 1.92–2.31 ms | 2.14–2.42 ms | 1.79–2.03 ms |
+| 8 threads, ops/s | 814–839 k | 850–895 k | 830–857 k |
+| 8 threads, p99.99 | 3.05–3.32 ms | 3.06–3.17 ms | **2.91–3.07 ms** |
+
+- **Lighter fetch**: the flusher reads only the version, location and frame. No measurable change, as the cache misses stay; kept because it does less.
+- **Yield**: the flusher yields its CPU after each batch of 512 records. A small gain that held in every round at 8 writers; kept.
+- **Shorter scheduler slice** (Linux 7.0 per-thread slices, 0.1 ms, set from outside on the flusher alone and on every thread): no change. Not kept.
+
+The p99.99 stays near one scheduler slice whenever writers fill every CPU. The flusher's remaining work is mostly copying data into the page cache, which it cannot skip. A tail under 0.5 ms needs either a free CPU for the flusher (69 µs with three writers on four CPUs, section 8.11) or no separate flusher competing at all, for instance writers flushing small batches themselves when the CPUs are saturated. That is untested. One `D4s_v4` for about 75 minutes (about $0.25), deleted.

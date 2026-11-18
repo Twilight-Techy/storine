@@ -3902,6 +3902,11 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
                     failed_at = Some(n);
                     break;
                 }
+                // With every CPU busy, the flusher otherwise keeps one for a whole scheduler slice
+                // (about 2 ms) while a writer it displaced waits: yielding after each batch hands
+                // that CPU back sooner. 8-writer p99.99 3.05-3.32 -> 2.91-3.07 ms on 4 vCPUs,
+                // throughput unchanged (`TASK-165`, benchmark report section 8.13).
+                thread::yield_now();
             }
             if let Some(n) = failed_at {
                 // `flush_ids` re-queued its own batch; the batches after it go back too.
@@ -3978,11 +3983,16 @@ impl<T: ZeroCopyRecord + Indexable> SharedEngineInner<T> {
         let mut rest = Vec::new();
         let mut items: Vec<(InlineId, Version, AlignedBytes, DiskLocation)> = Vec::with_capacity(ids.len());
         for &id in ids {
-            let Some(entry) = self.primary.get(id) else { continue };
-            let Some(frame) = entry.hot_dirty else { continue };
-            match entry.location {
+            // Only what the flush needs, not a copy of the whole entry: this lookup was a third
+            // of the flusher's CPU time (`TASK-165`).
+            let Some(Some((version, frame, location))) =
+                self.primary.with_entry(id, |e| e.hot_dirty.clone().map(|f| (e.version, f, e.location)))
+            else {
+                continue;
+            };
+            match location {
                 DiskLocation::Unflushed | DiskLocation::Arena(_) if frame.len() <= arena_threshold_bytes => {
-                    items.push((id, entry.version, frame, entry.location));
+                    items.push((id, version, frame, location));
                 }
                 _ => rest.push(id),
             }
